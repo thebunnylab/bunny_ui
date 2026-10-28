@@ -2434,6 +2434,13 @@ pub struct VisualProps {
     /// layout are untouched — a decoration drawn over a control (plants
     /// over a room, a glow over a chart) stops being a wall.
     pub passive: bool,
+    /// `.sticky(top)` — CSS `position: sticky; top`. Placement only, like
+    /// `text_align`: the box measures and takes its slot as it would, and
+    /// the placement moves it down to the line `top` below its nearest
+    /// vertical region's top edge once the region has carried the slot
+    /// above that line — never past the bottom of its containing block,
+    /// the box of the stack, grid or pile that lays it out.
+    pub sticky: Option<Px>,
 }
 
 impl VisualProps {
@@ -2482,6 +2489,7 @@ impl VisualProps {
             hidden: self.hidden || outer.hidden,
             from_group: self.from_group || outer.from_group,
             passive: self.passive || outer.passive,
+            sticky: self.sticky.or(outer.sticky),
         }
     }
 
@@ -4342,6 +4350,16 @@ pub struct Placement {
     /// Stack of the enclosing scroll region paths — a virtual window
     /// that misses reports against the innermost one.
     region_stack: Vec<String>,
+    /// Stack of the enclosing VERTICAL regions' viewports — the edge a
+    /// sticky box holds its line against ([`Placement::stuck`]). A
+    /// sideways strip between them joins nothing.
+    ports: Vec<Rect>,
+    /// Stack of the open containing blocks: the box of every node that
+    /// lays out several children side by side ([`LayoutNode::holds_siblings`])
+    /// and the content of every scroll region. A sticky box never
+    /// crosses the bottom edge of the innermost — CSS's containing
+    /// block, which is the element that lays the box out.
+    containing: Vec<Rect>,
     /// Regions whose virtual window failed to cover the visible band —
     /// the runtime invalidates their boundary for a follow-up pass.
     pub misses: Vec<String>,
@@ -4462,6 +4480,30 @@ impl Placement {
     /// Takes the capture out — the caller splices its scene.
     pub(crate) fn take_capture(&mut self) -> crate::dom::DomCapture {
         self.dom.take().expect("the capture was riding")
+    }
+
+    /// How far down a sticky box placed at `slot` moves: to the line
+    /// `inset` below the nearest vertical region's top edge, once the
+    /// region has carried the slot above it — and never so far that the
+    /// box crosses the bottom edge of its containing block, which is
+    /// what carries it away again. Zero outside every vertical region,
+    /// for a slot at or below the line, and for an inset that is no
+    /// finite number.
+    ///
+    /// The bound is the block CSS uses, carried down the walk, not the
+    /// region's content: a panel beside a catalogue leaves with the
+    /// catalogue's row, and never slides over the footer below it.
+    fn stuck(&self, slot: Rect, inset: Px) -> Px {
+        let Some(port) = self.ports.last().filter(|_| inset.is_finite()) else {
+            return 0.0;
+        };
+        let wanted = port.origin.y + inset - slot.origin.y;
+        // a region always opens a block (its content), so the fallback
+        // only answers a box with no room at all
+        let room = self.containing.last().map_or(0.0, |block| {
+            (block.origin.y + block.size.height) - (slot.origin.y + slot.size.height)
+        });
+        if wanted > 0.0 { wanted.min(room).max(0.0) } else { 0.0 }
     }
 
     /// A draw command joins the display list — unless this pass skips
@@ -7011,6 +7053,30 @@ impl LayoutNode {
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        // a sticky box moves before anything reads its frame, so its focus
+        // stop, its own target, its ring and its accessible frame move
+        // with its paint. The engine sticks only what it paints itself:
+        // an element capture hands the stick to the browser, which
+        // scrolls without asking for a layout (the `Styled` arm)
+        let shift = match self {
+            LayoutNode::Styled { props, .. } => props
+                .sticky
+                .filter(|_| out.dom.as_ref().is_none_or(crate::dom::DomCapture::in_canvas))
+                .map_or(0.0, |inset| out.stuck(frame, inset)),
+            _ => 0.0,
+        };
+        let stuck = shift > 0.0;
+        let frame = Rect { origin: Point { x: frame.origin.x, y: frame.origin.y + shift }, size: frame.size };
+        if stuck {
+            // springs below anchor to the box that moved: the stick
+            // carries them 1:1, as scrolling does, and never flies them
+            let anchor = out.anchors.last().copied().unwrap_or_default();
+            out.anchors.push(Point { x: anchor.x, y: anchor.y + shift });
+        }
+        let holds = self.holds_siblings();
+        if holds {
+            out.containing.push(frame);
+        }
         // a subtree that declines hit testing opens its depth here, so the
         // style's own target declines too
         let passive = matches!(self, LayoutNode::Styled { props, .. } if props.passive);
@@ -7050,6 +7116,30 @@ impl LayoutNode {
             semantics.collect(semantic_start, bounds, &out.accessibility_surface, &mut out.accessibility);
         }
         out.passive -= u32::from(passive);
+        if holds {
+            out.containing.pop();
+        }
+        if stuck {
+            out.anchors.pop();
+        }
+    }
+
+    /// Does this node lay several children out side by side — the
+    /// containing block of a sticky box among them? A wrapper of ONE box
+    /// (a frame, a padding, a style, an overlay's base) is that box itself
+    /// and bounds nothing: a block the size of the box would hold it still.
+    fn holds_siblings(&self) -> bool {
+        match self {
+            LayoutNode::Stack { .. }
+            | LayoutNode::Flow { .. }
+            | LayoutNode::Grid { .. }
+            | LayoutNode::Layered { .. }
+            | LayoutNode::VirtualStack { .. }
+            | LayoutNode::Split { .. } => true,
+            // a component's body of several views is a column of them
+            LayoutNode::Boundary { children, .. } => children.len() > 1,
+            _ => false,
+        }
     }
 
     /// The node itself, its own action aside.
@@ -8652,12 +8742,20 @@ impl LayoutNode {
                         content_origin,
                     );
                 }
-                child.place(
-                    Rect { origin: content_origin, size: *content },
-                    fit,
-                    env,
-                    out,
-                );
+                // a sticky box inside holds its line against THIS
+                // viewport when the region travels up and down, and its
+                // content is the block of a box that sits in it directly
+                let content_box = Rect { origin: content_origin, size: *content };
+                let port = axes.vertical();
+                if port {
+                    out.ports.push(frame);
+                }
+                out.containing.push(content_box);
+                child.place(content_box, fit, env, out);
+                out.containing.pop();
+                if port {
+                    out.ports.pop();
+                }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
                     dom.close();
@@ -8739,12 +8837,32 @@ impl LayoutNode {
                         .resolve_color(scope.key, scope.spec, slot, color),
                     _ => color,
                 };
+                // a box the BROWSER sticks stands in its containing block:
+                // from its slot down to the bottom edge of the block that
+                // lays it out, which is where CSS releases it
+                let sticky = props
+                    .sticky
+                    .filter(|top| top.is_finite() && out.dom.as_ref().is_some_and(|dom| !dom.in_canvas()))
+                    .map(|top| {
+                        let bottom = out.containing.last().map_or(frame.origin.y + frame.size.height, |block| {
+                            block.origin.y + block.size.height
+                        });
+                        let block = Rect {
+                            origin: frame.origin,
+                            size: Size { width: frame.size.width, height: (bottom - frame.origin.y).max(frame.size.height) },
+                        };
+                        let stick = crate::dom::DomSticky { top: top as f32, takes_pointer: out.passive == 0 };
+                        (block, stick)
+                    });
                 if let Some(dom) = out.dom.as_mut() {
                     // base + hover + pressed side by side, never the
                     // pointer-resolved paint: the scene stays pointer-
                     // invariant and a hover frame diffs to zero patches
                     // (the capture keeps the base ink of its own)
-                    dom.open_styled(props, frame);
+                    match sticky {
+                        Some((block, stick)) => dom.open_sticky(props, frame, block, stick),
+                        None => dom.open_styled(props, frame),
+                    }
                 }
                 // what the fade covers starts HERE: the box's own halo,
                 // background and border fade with the subtree, the way
@@ -8915,7 +9033,11 @@ impl LayoutNode {
                     let _ = scope;
                 }
                 if let Some(dom) = out.dom.as_mut() {
-                    dom.close();
+                    if sticky.is_some() {
+                        dom.close_sticky();
+                    } else {
+                        dom.close();
+                    }
                 }
             }
 

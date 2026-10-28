@@ -392,6 +392,8 @@ fn stamp_position(
                     fill_y: child.is_flexible(Axis::Vertical, axis),
                 }),
                 span: None,
+                // the box's own stick survives the stack's stamp
+                sticky: layout.placement.as_ref().and_then(|placement| placement.sticky),
             }));
             layout.grow = false;
             layout.stretch = false;
@@ -646,6 +648,8 @@ impl Walk<'_> {
                             layout.placement = Some(std::rc::Rc::new(crate::dom::DomPlacement {
                                 at: None,
                                 span: Some(span),
+                                // a sticky cell keeps its stick
+                                sticky: layout.placement.as_ref().and_then(|placement| placement.sticky),
                             }));
                             layout.grow = false;
                             layout.fill = false;
@@ -945,12 +949,14 @@ impl Walk<'_> {
                 // the ink answers to, an ink inside a hover scope, a
                 // layer, a transition — those keep their box
                 // (a text that wears hints or an action stood behind their
-                // wrapper, and a style over a wrapper keeps its box)
+                // wrapper, and a style over a wrapper keeps its box; so
+                // does a stuck one, the box the browser holds)
                 if matches!(child.without_semantics(), LayoutNode::Text { .. })
                     && child.without_semantics().is_bare()
                     && !states
                     && !inheriting
                     && turned.is_none()
+                    && props.sticky.is_none()
                     && self.overlay_depth == 0
                     && self.pending_transition.is_none()
                     && !DomLook::paints(props)
@@ -965,8 +971,19 @@ impl Walk<'_> {
                     return;
                 }
                 let boxed = placed(out, node(DomKind::Box));
-                if let (Some(direction), Some(layout)) = (turned, boxed.layout.as_mut()) {
-                    layout.direction = Some(direction);
+                if let Some(layout) = boxed.layout.as_mut() {
+                    if let Some(direction) = turned {
+                        layout.direction = Some(direction);
+                    }
+                    // the browser sticks the box, and bounds it by its DOM
+                    // parent: the element that lays it out among its
+                    // siblings, the engine's containing block too
+                    if let Some(top) = props.sticky.filter(|top| top.is_finite()) {
+                        layout.placement = Some(std::rc::Rc::new(crate::dom::DomPlacement {
+                            sticky: Some(crate::dom::DomSticky { top: top as f32, takes_pointer: false }),
+                            ..layout.placement.as_deref().cloned().unwrap_or_default()
+                        }));
+                    }
                 }
                 let interactive = self.pending_interactive.take();
                 let mut look = DomLook {

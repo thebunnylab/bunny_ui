@@ -466,6 +466,7 @@ impl Tree {
                 slot_y,
                 at,
                 span,
+                sticky,
             } => {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
@@ -507,6 +508,7 @@ impl Tree {
                     "grid-column",
                     "grid-row",
                     "bottom",
+                    "pointer-events",
                 ] {
                     element.style.remove(name);
                 }
@@ -545,6 +547,15 @@ impl Tree {
                     element
                         .style
                         .insert("grid-row", format!("span {}", span.rows));
+                }
+                // last: the browser holds the box at the line — unless the
+                // stack took it out of the flow, where CSS has no stick
+                if let Some(sticky) = sticky.filter(|_| at.is_none_or(|at| at.layered)) {
+                    element.style.insert("position", "sticky".into());
+                    element.style.insert("top", px(f64::from(sticky.top)));
+                    if sticky.takes_pointer {
+                        element.style.insert("pointer-events", "auto".into());
+                    }
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {

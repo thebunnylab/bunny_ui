@@ -62,6 +62,9 @@ pub enum Modifier {
     Hidden,
     /// `.allows_hit_testing(false)`: the subtree takes no pointer.
     AllowsHitTesting(bool),
+    /// `.sticky(top)`: CSS `position: sticky; top` — the view holds the
+    /// line `top` below its scroll region's top edge once scrolled past.
+    Sticky(f64),
     /// A reactive accessible name for one semantic element.
     AccessibilityLabel(crate::bind::TextSource),
     /// Decorative content excluded from the accessibility tree.
@@ -293,6 +296,7 @@ impl Modifier {
             Modifier::IgnoresSafeArea => "ignores_safe_area",
             Modifier::Hidden => "hidden",
             Modifier::AllowsHitTesting(_) => "allows_hit_testing",
+            Modifier::Sticky(_) => "sticky",
             Modifier::AccessibilityLabel { .. } => "accessibility_label",
             Modifier::AccessibilityHidden => "accessibility_hidden",
             Modifier::Equatable => "equatable",
@@ -423,6 +427,7 @@ impl Modifier {
             Modifier::AccessibilityHidden => " [.accessibility_hidden()]".into(),
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::AllowsHitTesting(on) => format!(" [.allowsHitTesting({on})]"),
+            Modifier::Sticky(top) => format!(" [.sticky(top: {top})]"),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
             Modifier::BackgroundGradient(gradient) => match gradient {
@@ -1908,6 +1913,9 @@ pub(crate) fn apply(
         Modifier::Hidden => wrap_styled(out, mark, VisualProps { hidden: true, ..VisualProps::default() }),
         Modifier::AllowsHitTesting(on) => {
             wrap_styled(out, mark, VisualProps { passive: !on, ..VisualProps::default() });
+        }
+        Modifier::Sticky(top) => {
+            wrap_styled(out, mark, VisualProps { sticky: Some(*top), ..VisualProps::default() });
         }
         Modifier::GroupHovered => wrap_styled(
             out,

@@ -47,7 +47,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 22;
+const EXPECTED_ABI = 23;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -1530,6 +1530,7 @@ function applyPatches(view, length) {
       const slotY = mask & 16 ? f32() : null;
       const at = mask & 32 ? { flags: u8(), x: f32(), y: f32() } : null;
       const span = mask & 64 ? { columns: u16(), rows: u16(), fillX: u8() !== 0 } : null;
+      const sticky = mask & 128 ? { top: f32(), pointer: u8() !== 0 } : null;
       if (el) {
         const style = el.style;
         const dressed = style.length !== 0;
@@ -1553,7 +1554,7 @@ function applyPatches(view, length) {
           style.left = "";
           style.right = "";
         }
-        for (const key of ["marginLeft", "marginTop", "alignSelf", "justifySelf", "zIndex", "gridColumn", "gridRow", "bottom"]) style[key] = "";
+        for (const key of ["marginLeft", "marginTop", "alignSelf", "justifySelf", "zIndex", "gridColumn", "gridRow", "bottom", "pointerEvents"]) style[key] = "";
         if (at) {
           if (at.flags & 1) {
             style.marginLeft = `${at.x}px`;
@@ -1574,7 +1575,14 @@ function applyPatches(view, length) {
           style.gridRow = `span ${span.rows}`;
           if (span.fillX) style.justifySelf = "stretch";
         }
-
+        // last: the browser holds the box at the line — unless the stack
+        // took it out of the flow, where CSS has no stick — and a box an
+        // exact interior stood in a wrapper of no pointer takes it back
+        if (sticky && !(at && !(at.flags & 1))) {
+          style.position = "sticky";
+          style.top = `${sticky.top}px`;
+          if (sticky.pointer) style.pointerEvents = "auto";
+        }
       }
     } else if (op === 24) {
       // the element's marks: the tooltip it shows, the group it owns
