@@ -66,6 +66,24 @@ fn a_served_passive_box_says_pointer_events_none() {
     assert!(page.css.contains("pointer-events:none"), "{}", page.css);
 }
 
+/// An exact interior captures its elements by frame, apart from the flow
+/// lowering: the declined hit must survive that capture too.
+#[cfg(feature = "canvas")]
+#[test]
+fn a_passive_box_in_an_exact_interior_says_pointer_events_none() {
+    for passive in [false, true] {
+        let page = bunny_ui::ssr::render(
+            &vstack!(text("glow"))
+                .padding_length(4.0)
+                .background_color(Color::hex(0xeeeeee))
+                .allows_hit_testing(!passive)
+                .layout(bunny_ui::layout::LayoutMode::Exact),
+            BOX,
+        );
+        assert_eq!(page.css.contains("pointer-events:none"), passive, "passive {passive}: {}", page.css);
+    }
+}
+
 /// Is a control's focus ring painted this frame?
 fn ring(layout: &LayoutResult) -> bool {
     let focus = theme::current().focus;
