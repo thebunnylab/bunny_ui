@@ -77,6 +77,9 @@ unsafe extern "C" {
     fn CTFontGetAscent(font: CTFontRef) -> f64;
     fn CTFontGetDescent(font: CTFontRef) -> f64;
     fn CTFontGetLeading(font: CTFontRef) -> f64;
+    /// The face's own underline weight, in points at its size — the
+    /// `post` table's `underlineThickness`, scaled.
+    fn CTFontGetUnderlineThickness(font: CTFontRef) -> f64;
     fn CTLineCreateWithAttributedString(attributed: *const c_void) -> CTLineRef;
     fn CTLineGetTypographicBounds(
         line: CTLineRef,
@@ -103,6 +106,25 @@ unsafe extern "C" {
     /// Add a face to THIS PROCESS's font list. Nothing outside the app
     /// sees it, and it goes away with the app.
     fn CTFontManagerRegisterGraphicsFont(font: *mut c_void, error: *mut *const c_void) -> bool;
+    fn CTFontDescriptorCreateWithAttributes(attributes: *const c_void) -> *const c_void;
+    /// The same family at another point of its design space — here, its
+    /// weight. A family with no face there answers its nearest.
+    fn CTFontCreateCopyWithAttributes(
+        font: CTFontRef,
+        size: f64,
+        matrix: *const c_void,
+        attributes: *const c_void,
+    ) -> CTFontRef;
+    /// A font for a descriptor — matched: the family's nearest face to
+    /// the traits asked for.
+    fn CTFontCreateWithFontDescriptor(
+        descriptor: *const c_void,
+        size: f64,
+        matrix: *const c_void,
+    ) -> CTFontRef;
+    static kCTFontTraitsAttribute: CFStringRef;
+    static kCTFontWeightTrait: CFStringRef;
+    static kCTFontFamilyNameAttribute: CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -148,6 +170,16 @@ unsafe extern "C" {
         value: *const c_void,
     );
     static kCFBooleanTrue: *const c_void;
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
     fn CFNumberCreate(
         allocator: *const c_void,
         number_type: isize,
@@ -233,10 +265,14 @@ const FONT_TRAIT_BOLD: u32 = 2;
 
 /// A named family carries its own weights, so the bold face is asked
 /// for through the traits. A family without one keeps the regular —
-/// the same way the lean degrades rather than fails.
+/// the same way the lean degrades rather than fails. The light end is
+/// asked for by its weight trait, and lands on the nearest cut the
+/// family ships.
 unsafe fn emphasize(font: CTFontRef, spec: &FontSpec) -> CTFontRef {
-    if matches!(spec.weight, Weight::Regular | Weight::Medium) {
-        return font;
+    match spec.weight.number() {
+        ..400 => return unsafe { weighted(font, spec) },
+        400 | 500 => return font,
+        _ => {}
     }
     unsafe {
         let bold = CTFontCreateCopyWithSymbolicTraits(
@@ -251,6 +287,97 @@ unsafe fn emphasize(font: CTFontRef, spec: &FontSpec) -> CTFontRef {
         } else {
             CFRelease(font as *const c_void);
             bold
+        }
+    }
+}
+
+/// `kCTFontWeightTrait` for a weight — NSFontWeight's scale, from -1 to
+/// 1, at the points WebKit maps CSS's numbers to: 100 is the system
+/// face's UltraLight, 200 its Thin, 900 its Black.
+fn weight_trait(weight: Weight) -> f64 {
+    match weight {
+        Weight::Thin => -0.8,
+        Weight::ExtraLight => -0.6,
+        Weight::Light => -0.4,
+        Weight::Regular => 0.0,
+        Weight::Medium => 0.23,
+        Weight::Semibold => 0.3,
+        Weight::Bold => 0.4,
+        Weight::ExtraBold => 0.56,
+        Weight::Black => 0.62,
+    }
+}
+
+/// A descriptor of `{traits: {weight}}`, plus the family when one is
+/// named. The caller releases it.
+unsafe fn weight_descriptor(weight: Weight, family: Option<CFStringRef>) -> *const c_void {
+    let value = weight_trait(weight);
+    unsafe {
+        let number = CFNumberCreate(std::ptr::null(), CF_NUMBER_DOUBLE, (&raw const value).cast());
+        let traits = CFDictionaryCreate(
+            std::ptr::null(),
+            [kCTFontWeightTrait].as_ptr(),
+            [number].as_ptr(),
+            1,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
+        );
+        let (keys, values) = match family {
+            Some(name) => (
+                vec![kCTFontTraitsAttribute, kCTFontFamilyNameAttribute],
+                vec![traits, name],
+            ),
+            None => (vec![kCTFontTraitsAttribute], vec![traits]),
+        };
+        let attributes = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as isize,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
+        );
+        let descriptor = CTFontDescriptorCreateWithAttributes(attributes);
+        for owned in [attributes, traits, number] {
+            if !owned.is_null() {
+                CFRelease(owned);
+            }
+        }
+        descriptor
+    }
+}
+
+/// The font at the weight the spec asks for — the one road to a step
+/// the two UI font calls cannot name (the system face answers only its
+/// regular and its emphasized). The system face is variable, and a copy
+/// of it at the weight trait moves along its axis; a named family is a
+/// set of cuts, and its nearest one to the trait is MATCHED by family
+/// and weight — a copy of one cut never becomes another. A NULL answer
+/// keeps the font it was given: the weight degrades, never fails.
+unsafe fn weighted(font: CTFontRef, spec: &FontSpec) -> CTFontRef {
+    unsafe {
+        let landed = match spec.family.name() {
+            Some(name) => {
+                let cf_name = cf_string(&name);
+                let descriptor = weight_descriptor(spec.weight, Some(cf_name));
+                let matched = CTFontCreateWithFontDescriptor(descriptor, spec.size, std::ptr::null());
+                CFRelease(descriptor);
+                CFRelease(cf_name);
+                matched
+            }
+            None => {
+                let descriptor = weight_descriptor(spec.weight, None);
+                let copy =
+                    CTFontCreateCopyWithAttributes(font, spec.size, std::ptr::null(), descriptor);
+                CFRelease(descriptor);
+                copy
+            }
+        };
+        if landed.is_null() {
+            font
+        } else {
+            CFRelease(font as *const c_void);
+            landed
         }
     }
 }
@@ -281,23 +408,28 @@ unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
             }
         }
         match spec.design {
-            FontDesign::Default => {
-                // fine-grained weights via CTFontDescriptor come later —
-                // emphasized covers Semibold/Bold with dignity
-                let kind = match spec.weight {
-                    Weight::Regular | Weight::Medium => UI_FONT_SYSTEM,
-                    Weight::Semibold | Weight::Bold | Weight::ExtraBold | Weight::Black => {
-                        UI_FONT_EMPHASIZED
-                    }
-                };
-                CTFontCreateUIFontForLanguage(kind, spec.size, std::ptr::null())
-            }
+            // the system face is one family with every step of the
+            // scale: Regular and Bold are the two the UI font calls
+            // name, and every other step is its weight trait — so
+            // Medium is not Regular and Semibold is not Bold, as the
+            // browser draws them
+            FontDesign::Default => match spec.weight {
+                Weight::Regular => {
+                    CTFontCreateUIFontForLanguage(UI_FONT_SYSTEM, spec.size, std::ptr::null())
+                }
+                Weight::Bold => {
+                    CTFontCreateUIFontForLanguage(UI_FONT_EMPHASIZED, spec.size, std::ptr::null())
+                }
+                _ => weighted(
+                    CTFontCreateUIFontForLanguage(UI_FONT_SYSTEM, spec.size, std::ptr::null()),
+                    spec,
+                ),
+            },
             FontDesign::Mono => {
-                let name = match spec.weight {
-                    Weight::Regular | Weight::Medium => "Menlo-Regular",
-                    Weight::Semibold | Weight::Bold | Weight::ExtraBold | Weight::Black => {
-                        "Menlo-Bold"
-                    }
+                // Menlo ships two cuts: a lighter ask keeps the regular
+                let name = match spec.weight.number() {
+                    ..600 => "Menlo-Regular",
+                    _ => "Menlo-Bold",
                 };
                 let cf_name = cf_string(name);
                 let font = CTFontCreateWithName(cf_name, spec.size, std::ptr::null());
@@ -468,6 +600,11 @@ unsafe fn cf_string_out(string: CFStringRef) -> Option<String> {
 }
 
 impl TextEngine for CoreTextEngine {
+    fn decoration_thickness(&self, font: &FontSpec) -> Option<f64> {
+        let thickness = unsafe { CTFontGetUnderlineThickness(self.font(font)) };
+        (thickness > 0.0).then_some(thickness)
+    }
+
     fn line_geometry(
         &self,
         text: &str,

@@ -26,15 +26,13 @@
 //! The patch stream has a fixed little-endian encoding ([`encode`]) —
 //! one `DataView` walk on the other side of the border, no JSON.
 
-/// Shared text highlight byte ranges and their paint color.
-pub type TextHighlights = (Rc<Vec<(usize, usize)>>, Color);
-
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::layout::{
-    Color, Corners, DrawCommand, Point, Px, Rect, Size, Truncation, VisualProps,
+    Color, Corners, Decoration, DrawCommand, Point, Px, Rect, RuleInk, Size, TextMarks, Truncation,
+    VisualProps,
 };
 use crate::text_engine::{FontDesign, FontSpec, Weight};
 
@@ -569,8 +567,10 @@ pub struct DomText {
     /// Where each wrapped line sits in the box — `None` is leading, the
     /// browser's own default for our writing direction.
     pub text_align: Option<motor::views::TextAlignment>,
-    /// Match highlight spans (byte ranges) + their color.
-    pub highlights: Option<TextHighlights>,
+    /// What the words wear beyond the face ([`TextMarks`]): the runs,
+    /// the inks and the rules. The browser gets them as styled spans
+    /// ([`text_stretches`]).
+    pub highlights: Option<Rc<TextMarks>>,
     pub truncation: Option<Truncation>,
     /// The face is the one declared above: the text names no font of
     /// its own, and the look it wears carries none.
@@ -2337,8 +2337,8 @@ fn marks_of(style: &DomStyle) -> (Option<Arc<str>>, Option<u64>) {
     (style.tooltip().cloned(), style.group_owner())
 }
 
-/// A text's words: alone when nothing is highlighted, with the spans
-/// when something is.
+/// A text's words: alone when nothing marks them, with the spans and the
+/// rules when something does.
 fn text_words_patch(id: u32, text: &DomText) -> DomPatch {
     if text.highlights.is_some() {
         DomPatch::SetText { id, text: Box::new(text.clone()) }
@@ -3354,7 +3354,12 @@ fn diff_node(
                 before.content != after.content || before.highlights != after.highlights
             };
             if changed {
-                patches.push(text_words_patch(id, after));
+                // a text that loses its marks is written whole: the words
+                // alone would leave the rules it wore on the element
+                patches.push(match before.highlights {
+                    Some(_) => DomPatch::SetText { id, text: Box::new(after.clone()) },
+                    None => text_words_patch(id, after),
+                });
             }
             match &new.binding {
                 Some(binding) if changed || !same_binding => file_binding(id, binding, after, ctx),
@@ -4324,20 +4329,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(6);
                 push_u32(&mut out, *id);
                 push_bytes_u32(&mut out, text.content.as_bytes());
-                match &text.highlights {
-                    Some((ranges, color)) => {
-                        push_u16(&mut out, ranges.len() as u16);
-                        for (start, end) in ranges.iter() {
-                            push_u32(&mut out, *start as u32);
-                            push_u32(&mut out, *end as u32);
-                        }
-                        push_u32(&mut out, pack_color(*color));
-                    }
-                    None => {
-                        push_u16(&mut out, 0);
-                        push_u32(&mut out, 0);
-                    }
-                }
+                push_marks(&mut out, &text.content, text.highlights.as_deref());
             }
             DomPatch::SetField { id, field } => {
                 out.push(7);
@@ -4866,8 +4858,14 @@ fn kind_code(kind: CreateKind) -> u8 {
     }
 }
 
+/// The weight's byte on the wire. The six the scale first spelled keep
+/// their codes; the light end, which joined later, follows them — the
+/// glue's table is indexed by this byte, so a code never moves.
 fn weight_code(weight: Weight) -> u8 {
     match weight {
+        Weight::Thin => 6,
+        Weight::ExtraLight => 7,
+        Weight::Light => 8,
         Weight::Regular => 0,
         Weight::Medium => 1,
         Weight::Semibold => 2,
@@ -4875,6 +4873,134 @@ fn weight_code(weight: Weight) -> u8 {
         Weight::ExtraBold => 4,
         Weight::Black => 5,
     }
+}
+
+// =============================================================================
+// Styled stretches
+// =============================================================================
+
+/// One stretch of a text the browser wears in a `<span>` of its own: its
+/// BYTE range, and what it changes over the text's face and ink.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stretch {
+    pub start: usize,
+    pub end: usize,
+    pub color: Option<Color>,
+    pub background: Option<Color>,
+    pub weight: Option<Weight>,
+    pub italic: Option<bool>,
+    pub mono: Option<bool>,
+    pub size: Option<Px>,
+    pub family: Option<Arc<str>>,
+    pub decoration: Decoration,
+}
+
+/// The marks of a text, flattened for the browser: the runs and the inks
+/// cut into disjoint stretches in byte order, each with everything that
+/// differs from the text around it — an ink over a run wins the colour.
+/// Bytes no run and no ink touch are left out: the glue writes them as
+/// plain words between the spans.
+pub(crate) fn text_stretches(content: &str, marks: &TextMarks) -> Vec<Stretch> {
+    let clamp = |index: usize| crate::text_input::clamp_index(content, index).min(content.len());
+    let mut cuts: Vec<usize> = marks
+        .runs
+        .iter()
+        .flat_map(|run| [run.start, run.end])
+        .chain(marks.inks.iter().flat_map(|ink| [ink.start, ink.end]))
+        .map(clamp)
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .filter_map(|pair| {
+            let (start, end) = (pair[0], pair[1]);
+            let run = marks.runs.iter().find(|run| run.start <= start && end <= run.end);
+            let ink = marks.inks.iter().find(|ink| ink.start <= start && end <= ink.end);
+            if run.is_none() && ink.is_none() {
+                return None;
+            }
+            let style = run.map(|run| run.style).unwrap_or_default();
+            Some(Stretch {
+                start,
+                end,
+                color: ink.map(|ink| ink.color).or(style.color),
+                background: style.background,
+                weight: style.font.weight,
+                italic: style.font.slant.map(|slant| slant == crate::text_engine::Slant::Italic),
+                mono: style.font.design.map(|design| design == FontDesign::Mono),
+                size: style.font.size,
+                family: style.font.family.and_then(|family| family.name()),
+                decoration: style.decoration,
+            })
+        })
+        .collect()
+}
+
+/// A text's marks on the wire: the stretches ([`text_stretches`]), then
+/// the rules the whole text wears. Each stretch is its range and a mask
+/// of what follows — 1 ink, 2 ground, 4 weight, 8 slant, 16 design, 32
+/// size, 64 rules, 128 family — so a stretch pays for what it changes.
+fn push_marks(out: &mut Vec<u8>, content: &str, marks: Option<&TextMarks>) {
+    let stretches = marks.map(|marks| text_stretches(content, marks)).unwrap_or_default();
+    let count = stretches.len().min(u16::MAX as usize);
+    push_u16(out, count as u16);
+    for stretch in stretches.iter().take(count) {
+        push_u32(out, stretch.start as u32);
+        push_u32(out, stretch.end as u32);
+        let mask = u8::from(stretch.color.is_some())
+            | u8::from(stretch.background.is_some()) << 1
+            | u8::from(stretch.weight.is_some()) << 2
+            | u8::from(stretch.italic.is_some()) << 3
+            | u8::from(stretch.mono.is_some()) << 4
+            | u8::from(stretch.size.is_some()) << 5
+            | u8::from(!stretch.decoration.is_none()) << 6
+            | u8::from(stretch.family.is_some()) << 7;
+        out.push(mask);
+        if let Some(color) = stretch.color {
+            push_u32(out, pack_color(color));
+        }
+        if let Some(ground) = stretch.background {
+            push_u32(out, pack_color(ground));
+        }
+        if let Some(weight) = stretch.weight {
+            out.push(weight_code(weight));
+        }
+        if let Some(italic) = stretch.italic {
+            out.push(u8::from(italic));
+        }
+        if let Some(mono) = stretch.mono {
+            out.push(u8::from(mono));
+        }
+        if let Some(size) = stretch.size {
+            push_f32(out, size as f32);
+        }
+        if !stretch.decoration.is_none() {
+            push_rules(out, stretch.decoration);
+        }
+        if let Some(family) = &stretch.family {
+            push_bytes_u16(out, family.as_bytes());
+        }
+    }
+    push_rules(out, marks.map_or(Decoration::NONE, |marks| marks.decoration));
+}
+
+/// Rules on the wire: a flag byte (1 underline, 2 its own colour, 4
+/// strikethrough, 8 its own colour) and the two colours, `0` where the
+/// words' ink is the rule's.
+fn push_rules(out: &mut Vec<u8>, decoration: Decoration) {
+    let own = |rule: Option<RuleInk>| match rule {
+        Some(RuleInk::Color(color)) => Some(color),
+        _ => None,
+    };
+    let (under, through) = (own(decoration.underline), own(decoration.strikethrough));
+    out.push(
+        u8::from(decoration.underline.is_some())
+            | u8::from(under.is_some()) << 1
+            | u8::from(decoration.strikethrough.is_some()) << 2
+            | u8::from(through.is_some()) << 3,
+    );
+    push_u32(out, under.map_or(0, pack_color));
+    push_u32(out, through.map_or(0, pack_color));
 }
 
 fn pack_color(color: Color) -> u32 {
@@ -8851,6 +8977,58 @@ mod tests {
     /// contract are pinned to one number. Bump [`ABI_VERSION`] without
     /// touching the glue — or the other way around — and this test
     /// goes red before any browser meets the mismatch.
+    /// A text's marks reach the browser as disjoint stretches, each with
+    /// only what it changes — and the glue reads every slot the wire
+    /// writes.
+    #[test]
+    fn a_rich_text_travels_as_styled_stretches() {
+        use crate::layout::{InkSpan, RunStyle, TextRun};
+        let red = Color::hex(0xff0000);
+        let marks = TextMarks {
+            runs: vec![TextRun {
+                start: 2,
+                end: 6,
+                style: RunStyle {
+                    font: crate::text_engine::FontPatch { weight: Some(Weight::Light), ..Default::default() },
+                    ..RunStyle::default()
+                },
+            }],
+            inks: vec![InkSpan { start: 4, end: 8, color: red }],
+            decoration: Decoration { underline: Some(RuleInk::Text), ..Decoration::NONE },
+        };
+        let stretches = text_stretches("abcdefgh", &marks);
+        let shape: Vec<(usize, usize, Option<Weight>, Option<Color>)> =
+            stretches.iter().map(|s| (s.start, s.end, s.weight, s.color)).collect();
+        assert_eq!(
+            shape,
+            [(2, 4, Some(Weight::Light), None), (4, 6, Some(Weight::Light), Some(red)), (6, 8, None, Some(red))],
+            "cut at every boundary, the plain words left out"
+        );
+        let mut bytes = Vec::new();
+        push_marks(&mut bytes, "abcdefgh", Some(&marks));
+        // three stretches; the first: its range, a mask of weight only (4)
+        // and the Light code (8)
+        assert_eq!(&bytes[..2], &3u16.to_le_bytes());
+        assert_eq!(&bytes[2..12], &[2, 0, 0, 0, 4, 0, 0, 0, 4, 8]);
+        // the whole text's rules close the record: an underline in the
+        // words' ink
+        assert_eq!(&bytes[bytes.len() - 9..], &[1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for slot in [
+            "if (mask & 1) look.color",
+            "if (mask & 2) look.background",
+            "if (mask & 4) look.weight",
+            "if (mask & 8) look.italic",
+            "if (mask & 16) look.mono",
+            "if (mask & 32) look.size",
+            "if (mask & 64) look.rules",
+            "if (mask & 128) look.family",
+            "const rules = readRules();",
+        ] {
+            assert!(glue.contains(slot), "glue_dom.js reads `{slot}`");
+        }
+    }
+
     #[test]
     fn the_glue_expects_this_abi() {
         let pin = format!("const EXPECTED_ABI = {};", ABI_VERSION);

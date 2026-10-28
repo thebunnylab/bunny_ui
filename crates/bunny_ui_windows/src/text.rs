@@ -615,6 +615,9 @@ fn style_of(slant: Slant) -> u32 {
 
 fn weight_of(weight: Weight) -> u32 {
     match weight {
+        Weight::Thin => 100,
+        Weight::ExtraLight => 200,
+        Weight::Light => 300,
         Weight::Regular => 400,
         Weight::Medium => 500,
         Weight::Semibold => 600,

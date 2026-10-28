@@ -38,6 +38,8 @@ use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngin
 
 mod grid;
 pub use grid::{CellArea, grid_cells};
+mod paragraph;
+pub use paragraph::{Decoration, InkSpan, RuleInk, RunStyle, TextMarks, TextRun};
 
 /// Logical pixels. Snapping to device pixels is the real backend's
 /// decision, at a single point of the pipeline — never spread around.
@@ -754,15 +756,6 @@ impl<'a> FrameStamp<'a> {
     }
 }
 
-/// Colored spans ON TOP of the text (the match highlight of a finder):
-/// BYTE ranges into the content + the color. The font does not change —
-/// only the ink; the measure stays intact by construction.
-#[derive(Clone, Debug)]
-pub struct TextHighlight {
-    pub ranges: Rc<Vec<(usize, usize)>>,
-    pub color: Color,
-}
-
 /// Where the ellipsis lives when the text does not fit and wrapping is off.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Truncation {
@@ -816,13 +809,16 @@ impl std::fmt::Debug for SeamAt {
 /// static dispatch lives in the VIEW tree; this is the runtime structure.
 #[derive(Clone, Debug)]
 pub enum LayoutNode {
-    /// Text: wraps by word against the proposal, or shows an ellipsis
-    /// when truncation is on; highlight paints spans without touching the
-    /// measure.
+    /// Text: breaks at every `\n`, wraps by word against the proposal,
+    /// or shows an ellipsis when truncation is on.
     Text {
         /// The text — fixed, or read by the node itself (a binding).
         content: crate::bind::TextSource,
-        highlights: Option<TextHighlight>,
+        /// What the text paints beyond its face ([`TextMarks`]): the
+        /// runs of a rich paragraph, a highlight's inks, the rules the
+        /// whole text wears. Named for the first of them, which paints
+        /// spans without touching the measure.
+        highlights: Option<Rc<TextMarks>>,
         truncation: Option<Truncation>,
         /// What an `.element(…)` over the text says ([`ElementHints`]).
         hints: ElementHints,
@@ -1157,8 +1153,10 @@ pub enum LayoutNode {
         /// tints a `{{variable}}` inside an editable line.
         ///
         /// The ranges index the content, so a field showing its
-        /// PLACEHOLDER ignores them.
-        highlights: Option<TextHighlight>,
+        /// PLACEHOLDER ignores them. A field honours the INKS alone: its
+        /// caret and selection are measured on one shaping, which a run
+        /// in another face would move.
+        highlights: Option<Rc<TextMarks>>,
         /// The field must not SHOW what it holds: every character is
         /// drawn as a bullet, and the platform is refused a copy.
         ///
@@ -6076,9 +6074,9 @@ impl LayoutNode {
     /// pays nothing.
     fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
         match self {
-            LayoutNode::Text { content, .. } => {
+            LayoutNode::Text { content, highlights, .. } => {
                 let content = content.get();
-                Some(env.cache.get_or_measure(&content, &env.font, env.text).ascent)
+                Some(paragraph::first_baseline(&content, highlights.as_deref(), env))
             }
             LayoutNode::Field { inset, .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
@@ -6145,45 +6143,14 @@ impl LayoutNode {
 
     pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
         match self {
-            LayoutNode::Text { content, truncation, .. } => {
-                let content = content.get();
-                let metrics = env.cache.get_or_measure(&content, &env.font, env.text);
-                let natural = metrics.width;
-                // the line box a paragraph steps by: the face's own box,
-                // or the inherited `.line_height(…)` when one is set. With
-                // none, it is exactly the old `ascent + descent`.
-                let advance = env.line_height.unwrap_or(metrics.height());
+            LayoutNode::Text { content, highlights, truncation, .. } => {
                 // REAL word wrapping, with the engine's measurements —
                 // the width goes into the cache key (probe mode);
-                // truncation turns wrapping off: one line, always
-                let size = match proposal.width {
-                    Some(width) if width > 0.0 && width < natural => {
-                        if truncation.is_some() {
-                            Size { width, height: advance }
-                        } else {
-                            let lines =
-                                env.cache.get_or_break(&content, &env.font, width, env.text);
-                            // A paragraph told how tall it may be answers
-                            // that, not what it wishes it were. Answering
-                            // the wish is what put a card's text over the
-                            // card: the parent centres what it was told,
-                            // so an answer bigger than the room leaks HALF
-                            // of itself upward, into the sibling above.
-                            //
-                            // Proposed nothing on this axis, it still
-                            // answers everything — which is what a
-                            // scrolling region asks for, and how a column
-                            // of text keeps growing.
-                            Size {
-                                width,
-                                height: rows_that_fit(lines.len(), advance, proposal.height)
-                                    as Px
-                                    * advance,
-                            }
-                        }
-                    }
-                    _ => Size { width: natural, height: advance },
-                };
+                // truncation turns soft wrapping off: one line per hard
+                // line, always
+                let content = content.get();
+                let size =
+                    paragraph::measure_text(&content, highlights.as_deref(), *truncation, proposal, env);
                 (size, Fit::Leaf)
             }
 
@@ -6864,18 +6831,16 @@ impl LayoutNode {
                             font: env.font,
                             line_height: env.line_height.map(|height| height as f32),
                             text_align: env.text_align,
-                            highlights: highlights
-                                .as_ref()
-                                .map(|h| (Rc::clone(&h.ranges), h.color)),
+                            highlights: highlights.clone(),
                             truncation: *truncation,
                             inherits_face: false,
                         }),
                         frame,
                     );
                 }
-                place_text(
+                paragraph::place_text(
                     &content,
-                    highlights.as_ref(),
+                    highlights.as_deref(),
                     *truncation,
                     frame,
                     color,
@@ -7204,7 +7169,7 @@ impl LayoutNode {
                         emit_editor_line(
                             sample,
                             (start, end),
-                            highlights.as_ref().filter(|_| !content.is_empty()),
+                            highlights.as_deref().filter(|_| !content.is_empty()),
                             Point { x: line_x, y: y + leading },
                             color,
                             env,
@@ -7328,7 +7293,7 @@ impl LayoutNode {
                             // Shaping a selected substring would lose ligatures,
                             // kerning and its original directional context.
                             out.push_clip(rect, 0.0);
-                            emit_text_runs(
+                            paragraph::emit_text_runs(
                                 content,
                                 (start, end),
                                 None,
@@ -9457,165 +9422,43 @@ fn place_flow(
     }
 }
 
-/// Paints a placed text: single line, word-wrapped, or truncated with an
-/// ellipsis — always through the SAME caches as measurement.
-fn place_text(
-    content: &Arc<str>,
-    highlights: Option<&TextHighlight>,
-    truncation: Option<Truncation>,
-    frame: Rect,
-    base_color: Color,
-    env: &LayoutEnv<'_>,
-    out: &mut Placement,
-) {
-    if content.is_empty() {
-        return;
-    }
-    // the rows of a long list that are off the glass neither measure nor
-    // break their lines: the band is the one every line below is drawn in,
-    // with the reach a line of text is given everywhere (three sizes down,
-    // and one up for a line height tighter than the face)
-    if out.hides_band(
-        frame.origin.y - env.font.size,
-        frame.origin.y + frame.size.height + env.font.size * 3.0,
-    ) {
-        return;
-    }
-    let metrics = env.cache.get_or_measure(content, &env.font, env.text);
-    let line_h = metrics.height();
-    // the step between lines, and the half-leading that centres the glyph
-    // box inside a taller one — the baseline stays ascent-based, so the
-    // engine's own raster is unchanged. With no `.line_height(…)` the
-    // advance IS the face's box and the leading is zero: byte-identical.
-    let advance = env.line_height.unwrap_or(line_h);
-    let leading = (advance - line_h) / 2.0;
-    let top = frame.origin.y + leading;
-    // where a line sits in the room the box gives it: leading is offset
-    // zero, which is where every line has always been placed — and the
-    // whole room in a right-to-left scene, where the leading edge is the
-    // right one (a line wider than its box keeps its END on that edge
-    // and its start spills left, trailing). The origin stays the drawn
-    // run's LEFT edge either way: that is what every reader of a
-    // `TextLine` counts from.
-    let rtl = env.rtl();
-    let slide = |width: Px| -> Px {
-        let room = frame.size.width - width;
-        match (env.text_align, rtl) {
-            (None | Some(motor::views::TextAlignment::Leading), false) => 0.0,
-            (None | Some(motor::views::TextAlignment::Leading), true) => room,
-            (Some(motor::views::TextAlignment::Center), _) => room / 2.0,
-            (Some(motor::views::TextAlignment::Trailing), false) => room,
-            (Some(motor::views::TextAlignment::Trailing), true) => 0.0,
-        }
-    };
-
-    if metrics.width <= frame.size.width {
-        let origin = Point { x: frame.origin.x + slide(metrics.width), y: top };
-        emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out);
-        return;
-    }
-    if let Some(mode) = truncation {
-        // highlight does not survive the ellipsis (the original's ranges
-        // do not map onto the composed text) — honest v1, noted
-        let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
-        let length = composed.len();
-        let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
-        out.draw(DrawCommand::TextLine {
-            origin: Point { x: frame.origin.x + slide(cut), y: top },
-            content: composed,
-            range: (0, length),
-            color: base_color,
-            font: env.font,
-        });
-        return;
-    }
-    let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text);
-    // the same rule the measure used, so the two never disagree about
-    // which line is the last one
-    let shown = rows_that_fit(lines.len(), advance, Some(frame.size.height));
-    for (line_index, (start, end)) in lines.iter().enumerate().take(shown) {
-        // the last line of a paragraph that was CUT says so, the way a
-        // single line that does not fit already did
-        if line_index + 1 == shown && shown < lines.len() {
-            let rest: Arc<str> = Arc::from(content[*start..].trim_end());
-            let composed: Arc<str> =
-                Arc::from(truncate_to_width(&rest, Truncation::End, frame.size.width, env));
-            let length = composed.len();
-            let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
-            out.draw(DrawCommand::TextLine {
-                origin: Point {
-                    x: frame.origin.x + slide(cut),
-                    y: top + line_index as Px * advance,
-                },
-                content: composed,
-                range: (0, length),
-                color: base_color,
-                font: env.font,
-            });
-            break;
-        }
-        // a line that does not start at the frame's left edge has to know
-        // its OWN width; one that does never asks, so the common case
-        // measures nothing extra — leading left to right, trailing right
-        // to left
-        let starts_at_left = matches!(
-            (env.text_align, rtl),
-            (None | Some(motor::views::TextAlignment::Leading), false)
-                | (Some(motor::views::TextAlignment::Trailing), true)
-        );
-        let x = match starts_at_left {
-            true => frame.origin.x,
-            false => {
-                // the space a break swallowed is INVISIBLE, and counting
-                // it would slide the line half a space off centre — the
-                // browser trims it too, so the two lowerings agree
-                let line = content[*start..*end].trim_end();
-                let width = env.cache.get_or_measure(&Arc::from(line), &env.font, env.text).width;
-                frame.origin.x + slide(width)
-            }
-        };
-        emit_text_runs(
-            content,
-            (*start, *end),
-            highlights,
-            Point { x, y: top + line_index as Px * advance },
-            base_color,
-            env,
-            out,
-        );
-    }
-}
-
 /// Color an editable line by clipping its original shape, so highlights cannot
 /// reshape substrings and invalidate caret, selection or IME coordinates.
 fn emit_editor_line(
     content: &Arc<str>,
     line: (usize, usize),
-    highlights: Option<&TextHighlight>,
+    highlights: Option<&TextMarks>,
     origin: Point,
     base_color: Color,
     env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
-    let native = highlights.and_then(|highlight| {
+    let native = highlights.filter(|marks| !marks.inks.is_empty()).and_then(|marks| {
         let geometry = env
             .cache
             .get_or_geometry(&content[line.0..line.1], &env.font, env.text)?;
-        Some((highlight, geometry, out.current_clip()?))
+        Some((marks, geometry, out.current_clip()?))
     });
-    let Some((highlight, geometry, clip)) = native else {
-        emit_text_runs(content, line, highlights, origin, base_color, env, out);
+    let Some((marks, geometry, clip)) = native else {
+        paragraph::emit_text_runs(content, line, highlights, origin, base_color, env, out);
         return;
     };
     let left = clip.origin.x - origin.x;
     let right = left + clip.size.width;
-    let mut spans = Vec::new();
-    for &(start, end) in highlight.ranges.iter() {
-        let start = crate::text_input::clamp_index(content, start).clamp(line.0, line.1);
-        let end = crate::text_input::clamp_index(content, end).clamp(start, line.1);
-        spans.extend(geometry.selection_spans(start - line.0..end - line.0));
+    // every ink's stretches on the glass, each with its own colour — a
+    // stretch of a bidirectional line can be several
+    let mut spans: Vec<(std::ops::Range<Px>, Color)> = Vec::new();
+    for ink in &marks.inks {
+        let start = crate::text_input::clamp_index(content, ink.start).clamp(line.0, line.1);
+        let end = crate::text_input::clamp_index(content, ink.end).clamp(start, line.1);
+        spans.extend(
+            geometry
+                .selection_spans(start - line.0..end - line.0)
+                .into_iter()
+                .map(|span| (span, ink.color)),
+        );
     }
-    spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+    spans.sort_by(|a, b| a.0.start.total_cmp(&b.0.start));
     let mut paint = |start: Px, end: Px, color| {
         if end <= start {
             return;
@@ -9633,97 +9476,18 @@ fn emit_editor_line(
             },
             0.0,
         );
-        emit_text_runs(content, line, None, origin, color, env, out);
+        paragraph::emit_text_runs(content, line, None, origin, color, env, out);
         out.pop_clip();
     };
     let mut cursor = left;
-    for span in spans {
+    for (span, color) in spans {
         let start = span.start.clamp(cursor, right);
         let end = span.end.clamp(start, right);
         paint(cursor, start, base_color);
-        paint(start, end, highlight.color);
+        paint(start, end, color);
         cursor = end;
     }
     paint(cursor, right, base_color);
-}
-
-/// Emits the `TextLine`s of ONE line: whole in the base color, or sliced
-/// into segments when there is a highlight — each segment at its measured
-/// prefix position (kerning between segments is approximate; real
-/// shaping by runs arrives with the attributed text system).
-fn emit_text_runs(
-    content: &Arc<str>,
-    line: (usize, usize),
-    highlights: Option<&TextHighlight>,
-    origin: Point,
-    base_color: Color,
-    env: &LayoutEnv<'_>,
-    out: &mut Placement,
-) {
-    let (line_start, line_end) = line;
-    let whole = || DrawCommand::TextLine {
-        origin,
-        content: content.clone(),
-        range: (line_start, line_end),
-        color: base_color,
-        font: env.font,
-    };
-    let Some(highlight) = highlights else {
-        out.draw(whole());
-        return;
-    };
-
-    // segments covering the whole line, alternating base/highlighted
-    let clamp = |index: usize| crate::text_input::clamp_index(content, index);
-    let mut segments: Vec<(usize, usize, bool)> = Vec::new();
-    let mut cursor = line_start;
-    for &(start, end) in highlight.ranges.iter() {
-        let start = clamp(start).clamp(cursor, line_end);
-        let end = clamp(end).min(line_end);
-        if end <= start {
-            continue;
-        }
-        if start > cursor {
-            segments.push((cursor, start, false));
-        }
-        segments.push((start, end, true));
-        cursor = end;
-    }
-    if cursor < line_end {
-        segments.push((cursor, line_end, false));
-    }
-    if segments.len() == 1 && !segments[0].2 {
-        out.draw(whole());
-        return;
-    }
-
-    // a right-to-left line is drawn in visual order: its logical start
-    // is its right end, so a segment sits as far from the right as the
-    // text through its END measures. Pure runs exact; a mixed line
-    // follows its first word, like every reader of it here
-    let rtl = crate::text_input::reads_right_to_left(&content[line_start..line_end]);
-    let line_width = if rtl {
-        env.cache.get_or_measure(&content[line_start..line_end], &env.font, env.text).width
-    } else {
-        0.0
-    };
-    for (start, end, hot) in segments {
-        let x = if rtl {
-            let through = env.cache.get_or_measure(&content[line_start..end], &env.font, env.text).width;
-            origin.x + line_width - through
-        } else if start == line_start {
-            origin.x
-        } else {
-            origin.x + env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
-        };
-        out.draw(DrawCommand::TextLine {
-            origin: Point { x, y: origin.y },
-            content: content.clone(),
-            range: (start, end),
-            color: if hot { highlight.color } else { base_color },
-            font: env.font,
-        });
-    }
 }
 
 const ELLIPSIS: &str = "…";
@@ -10723,7 +10487,7 @@ mod tests {
         // the second letter lit
         let node = LayoutNode::Text {
             content: crate::bind::TextSource::from("שלום"),
-            highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: Color::WHITE }),
+            highlights: Some(Rc::new(TextMarks::of_inks([InkSpan { start: 2, end: 4, color: Color::WHITE }]))),
             truncation: None,
             hints: ElementHints::default(),
             action: None,
@@ -11924,7 +11688,7 @@ mod tests {
         let hot = Color::hex(0xFF0000);
         let node = LayoutNode::Text {
             content: crate::bind::TextSource::from("abcdef"),
-            highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
+            highlights: Some(Rc::new(TextMarks::of_inks([InkSpan { start: 2, end: 4, color: hot }]))),
             truncation: None,
             hints: ElementHints::default(),
             action: None,
@@ -11959,10 +11723,10 @@ mod tests {
         // cover the "bb" (line 1) and the "cc" (line 2)
         let node = LayoutNode::Text {
             content: crate::bind::TextSource::from("aa bb cc"),
-            highlights: Some(TextHighlight {
-                ranges: Rc::new(vec![(3, 5), (6, 8)]),
-                color: hot,
-            }),
+            highlights: Some(Rc::new(TextMarks::of_inks([
+                InkSpan { start: 3, end: 5, color: hot },
+                InkSpan { start: 6, end: 8, color: hot },
+            ]))),
             truncation: None,
             hints: ElementHints::default(),
             action: None,

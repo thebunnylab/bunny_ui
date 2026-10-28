@@ -25,7 +25,7 @@ macro_rules! fixed_text {
     ($($ty:ty),+ $(,)?) => {$(
         impl IntoText for $ty {
             fn into_text(self) -> Text {
-                Text { source: crate::bind::TextSource::Fixed(Arc::from(self)), site: crate::provenance::Site::Named("text") }
+                Text { source: crate::bind::TextSource::Fixed(Arc::from(self)), marks: None, site: crate::provenance::Site::Named("text") }
             }
         }
     )+};

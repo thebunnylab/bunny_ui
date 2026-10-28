@@ -1042,9 +1042,7 @@ impl Walk<'_> {
                     font: self.font,
                     line_height: self.line_height.map(|height| height as f32),
                     text_align: self.text_align,
-                    highlights: highlights
-                        .as_ref()
-                        .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),
+                    highlights: highlights.clone(),
                     truncation: *truncation,
                     inherits_face: self.font == self.declared,
                 })));

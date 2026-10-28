@@ -74,6 +74,9 @@ fn italic_flag(font: &FontSpec) -> u32 {
 /// The numeric weights `ctx.font` understands.
 fn css_weight(weight: Weight) -> u32 {
     match weight {
+        Weight::Thin => 100,
+        Weight::ExtraLight => 200,
+        Weight::Light => 300,
         Weight::Regular => 400,
         Weight::Medium => 500,
         Weight::Semibold => 600,
