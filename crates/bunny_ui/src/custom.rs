@@ -746,6 +746,13 @@ impl<'a> Painter<'a> {
     /// its newest frame into `rect`. The origin snaps to the nearest
     /// device pixel, so a picture stays crisp wherever the layout puts it
     /// ([`ImagePlacement::Pixel`]).
+    ///
+    /// The picture is rastered at the size it is drawn, and each size is
+    /// a raster (and a texture) of its own. A rect whose SIZE changes every
+    /// frame resamples and uploads the whole picture every frame: a
+    /// full-window sky grown 3% over a few seconds held a present at
+    /// 27 ms while the GPU idled. Move a picture by its origin, and keep
+    /// its size while it moves.
     pub fn image(&mut self, rect: Rect, source: impl Into<ImageSource>) {
         self.display.push(DrawCommand::Image {
             rect: self.shift(rect),
@@ -768,6 +775,13 @@ impl<'a> Painter<'a> {
     /// A picture at rest on the grid looks no different, so reach for this
     /// for what moves. At a fractional origin the edge pixels are shared
     /// with the neighbours, which reads a touch softer than a snapped icon.
+    ///
+    /// Let the shell pace the drift. A `.looping(…)` box is stepped by the
+    /// display's own clock. A task that writes the position should write
+    /// more often than the display refreshes (every few milliseconds):
+    /// the shell folds the writes into each beat. A task asleep 16 ms at a
+    /// time drifts against a 75 Hz display and shows every other position
+    /// twice.
     pub fn image_subpixel(&mut self, rect: Rect, source: impl Into<ImageSource>) {
         self.display.push(DrawCommand::Image {
             rect: self.shift(rect),

@@ -4260,7 +4260,8 @@ pub struct CustomPlacement {
     pub composited: bool,
     /// Paint that follows the box in the list lands on what it shows. A
     /// surface of its own would sit above that paint, so the box stays in
-    /// the scene and its steps repaint the frame ([`cover_islands`]).
+    /// the scene and its steps repaint the frame. Decided once the list is
+    /// whole, after layout.
     pub covered: bool,
     /// The box's own commands in the frame's display list
     /// (`start..end`) — what a live repaint replaces, and what the GPU
