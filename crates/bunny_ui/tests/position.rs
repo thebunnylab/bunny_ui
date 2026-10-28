@@ -109,10 +109,15 @@ fn a_placed_child_is_proposed_the_room_to_the_far_edges() {
             height: 120.0,
         }),
     );
+    // a column with nothing left in its flow is a pile of placed boxes,
+    // as big as what it places: 30 + 210 by 20 + 100
     assert_eq!(
         result.size,
-        Size::default(),
-        "placed children do not enlarge a flow stack"
+        Size {
+            width: 240.0,
+            height: 120.0
+        },
+        "a column of placed boxes is as big as what it places"
     );
     let fill = result
         .display
@@ -283,4 +288,98 @@ fn clearing_dom_placement_removes_its_inline_geometry() {
         !html.contains("left:10px") && !html.contains("top:20px") && !html.contains("bottom:0"),
         "{html}"
     );
+}
+
+#[test]
+fn placed_rows_of_a_list_sit_at_their_points_in_the_layers_they_are_written_in() {
+    // a chart's marks, one row of data each: the list is the zstack's
+    // child, and every mark is placed in the zstack it was written in —
+    // not in a column of the list's own that the zstack then centred
+    let points = vec![("a", 10.0, 20.0), ("b", 150.0, 60.0)];
+    let view = zstack!(
+        spacer(),
+        for_each(points, |(word, _, _)| (*word).to_owned(), |(word, x, y)| {
+            text(*word).position(*x, *y)
+        })
+    );
+    let result = Runtime::new().layout(
+        &view,
+        Proposal::exact(Size {
+            width: 200.0,
+            height: 100.0,
+        }),
+    );
+    assert_eq!(origin_of(&result.display, "a"), Point { x: 10.0, y: 20.0 });
+    assert_eq!(origin_of(&result.display, "b"), Point { x: 150.0, y: 60.0 });
+}
+
+#[test]
+fn a_list_of_placed_rows_grows_the_layers_extent_like_the_rows_would() {
+    let points = vec![("a", 10.0, 20.0), ("b", 50.0, 5.0)];
+    let view = zstack!(for_each(points, |(word, _, _)| (*word).to_owned(), |(word, x, y)| {
+        text(*word).position(*x, *y)
+    }));
+    let result = Runtime::new().layout(&view, Proposal::unspecified());
+    assert_eq!(
+        result.size,
+        Size {
+            width: 58.0,
+            height: 36.0
+        },
+        "the same extent the two marks give written straight into the zstack"
+    );
+}
+
+#[test]
+fn a_list_with_rows_in_the_flow_keeps_its_own_column() {
+    // only a list whose EVERY row is placed hands its rows to the layers:
+    // one row in the flow makes it a column again, and a placed row in it
+    // counts from that column, as in any stack
+    let view = zstack!(
+        spacer(),
+        for_each(vec![0, 1], |row| row.to_string(), |row| match row {
+            0 => erased(text("flow")),
+            _ => erased(text("placed").position(5.0, 30.0)),
+        })
+    )
+    .alignment(Alignment::TopLeading);
+    let result = Runtime::new().layout(
+        &view,
+        Proposal::exact(Size {
+            width: 200.0,
+            height: 100.0,
+        }),
+    );
+    assert_eq!(origin_of(&result.display, "flow"), Point { x: 0.0, y: 0.0 });
+    assert_eq!(origin_of(&result.display, "placed"), Point { x: 5.0, y: 30.0 });
+}
+
+#[test]
+fn placed_rows_of_a_bound_list_sit_at_their_points_too() {
+    // a list that reads its items is a boundary of its own, whose rows
+    // stack in the boundary's implicit column: the same pile
+    #[derive(Clone, Copy)]
+    struct Chart {
+        marks: State<Vec<(&'static str, f64, f64)>>,
+    }
+    impl Component for Chart {
+        fn body(self) -> impl View {
+            zstack!(
+                spacer(),
+                for_each(self.marks, |(word, _, _)| (*word).to_owned(), |(word, x, y)| {
+                    text(*word).position(*x, *y)
+                })
+            )
+        }
+    }
+    let view = Chart { marks: State::new(vec![("a", 10.0, 20.0), ("b", 150.0, 60.0)]) };
+    let result = Runtime::new().layout(
+        &view,
+        Proposal::exact(Size {
+            width: 200.0,
+            height: 100.0,
+        }),
+    );
+    assert_eq!(origin_of(&result.display, "a"), Point { x: 10.0, y: 20.0 });
+    assert_eq!(origin_of(&result.display, "b"), Point { x: 150.0, y: 60.0 });
 }

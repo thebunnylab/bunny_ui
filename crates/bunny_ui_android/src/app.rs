@@ -638,9 +638,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                 let explained = runtime.tooltip_tick();
                 let chorded = runtime.chord_tick();
                 // and the wheel's latch: two ticks with no wheel end
-                // the scroll gesture
-                runtime.wheel_tick();
-                if blinked || explained || chorded {
+                // the scroll gesture, and an overlay thumb goes with it
+                let unlatched = runtime.wheel_tick();
+                if blinked || explained || chorded || unlatched {
                     blit(runtime, root);
                 }
             }

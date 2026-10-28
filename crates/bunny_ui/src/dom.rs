@@ -388,6 +388,11 @@ pub struct DomLook {
     /// to the row underneath, and in this mode the browser routes by
     /// element and not by our hit list.
     pub pass_through: bool,
+    /// A scroll viewport that keeps its thumb to itself — the browser's
+    /// `scrollbar-width`: `thin` for an overlay thumb (the platform's own
+    /// overlay scrollbars then show it while it moves), `none` for one
+    /// never shown. `None` is the browser's own bar.
+    pub scrollbar: Option<crate::layout::ScrollIndicators>,
 }
 
 impl DomLook {
@@ -416,6 +421,7 @@ impl DomLook {
         group: None,
         glass: None,
         pass_through: false,
+        scrollbar: None,
     };
 
     pub(crate) fn from_props(props: &VisualProps) -> DomLook {
@@ -442,6 +448,7 @@ impl DomLook {
             group: None,
             glass: props.glass.map(GlassFilter::of),
             pass_through: false,
+            scrollbar: None,
         }
     }
 
@@ -1063,7 +1070,15 @@ pub struct DomLayout {
     pub relative: bool,
     /// Rare child placement parameters, shared when a scene is retained.
     pub placement: Option<Rc<DomPlacement>>,
-    /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
+    /// Alignment, in two nibbles. The low one is the cross axis: 0 start,
+    /// 1 center, 2 end, 3 baseline. The high one is the VERTICAL edge a
+    /// frame's child, a layer or a grid cell's child is held against, one
+    /// more than its code (1 top, 2 center, 3 bottom), and 0 when nothing
+    /// names one: only the top and bottom rows of an `Alignment`
+    /// (`.topLeading` … `.bottomTrailing`) say it, and the middle row
+    /// keeps the flow's own placement as it always did. A page that never
+    /// names a vertical edge is byte for byte what it was — the record,
+    /// the wire and the look's hash alike.
     pub align: Option<u8>,
     /// Padding `(top, trailing, bottom, leading)`, px — logical sides, so
     /// the page writes them as `padding-block` and `padding-inline` and
@@ -2177,6 +2192,12 @@ fn look_hash(node: &DomNode) -> u64 {
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
+    // only a viewport that keeps its thumb hashes it: every other look
+    // keeps the hash it always had
+    if let Some(indicators) = style.scrollbar {
+        0x7363726fu64.hash(&mut hasher);
+        indicators.hash(&mut hasher);
+    }
     hash_f64(style.opacity, &mut hasher);
     if let Some(blur) = style.blur {
         0x626c7572u64.hash(&mut hasher);
@@ -4592,6 +4613,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if style.blur.is_some() {
         mask |= 1 << 25;
     }
+    // a viewport's thumb: bit 31 and one byte at the record's end
+    if style.scrollbar.is_some() {
+        mask |= 1 << 31;
+    }
     push_u32(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -4685,6 +4710,14 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     }
     if let Some(blur) = style.blur {
         push_f32(out, blur);
+    }
+    if let Some(indicators) = style.scrollbar {
+        // 0 the overlay thumb (`thin`), 1 none (`none`); a visible bar
+        // is the browser's own and sends no bit at all
+        out.push(match indicators {
+            crate::layout::ScrollIndicators::Never => 1,
+            crate::layout::ScrollIndicators::Hidden | crate::layout::ScrollIndicators::Visible => 0,
+        });
     }
 }
 
@@ -6854,6 +6887,7 @@ mod tests {
                 rim_band: 1.5,
             }),
             pass_through: true,
+            scrollbar: None,
         });
         boxed.face = Some(Rc::new(FontSpec::DEFAULT));
         let mut words = flow_row("b");

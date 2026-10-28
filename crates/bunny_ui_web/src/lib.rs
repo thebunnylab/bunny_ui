@@ -938,9 +938,10 @@ pub fn start_with(
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go — and the
-                // wheel's latch: two ticks with no wheel end the gesture
-                runtime.wheel_tick();
-                if runtime.tooltip_tick() | runtime.chord_tick() {
+                // wheel's latch: two ticks with no wheel end the gesture,
+                // and an overlay thumb goes with it
+                let unlatched = runtime.wheel_tick();
+                if runtime.tooltip_tick() | runtime.chord_tick() | unlatched {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -1205,9 +1206,10 @@ fn start_dom_with(
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go — and the
-                // wheel's latch: two ticks with no wheel end the gesture
-                runtime.wheel_tick();
-                if runtime.tooltip_tick() | runtime.chord_tick() {
+                // wheel's latch: two ticks with no wheel end the gesture,
+                // and an overlay thumb goes with it
+                let unlatched = runtime.wheel_tick();
+                if runtime.tooltip_tick() | runtime.chord_tick() | unlatched {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }

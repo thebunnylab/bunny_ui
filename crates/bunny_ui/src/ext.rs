@@ -202,6 +202,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Places this view's outer box at a physical point in its enclosing stack.
     /// A row or column excludes it from flow; layers include its extent.
     /// Outside a stack this annotation is transparent. It never clips.
+    ///
+    /// A stack with NOTHING left in its flow — every child placed, the
+    /// marks of a chart drawn from a `for_each` — is a pile of placed
+    /// boxes: it is as big as what it places, and it stands at the
+    /// origin of the box it is written in, so a point means the same
+    /// inside the list as in the layers around it.
     #[track_caller]
     fn position(self, x: f64, y: f64) -> Modified<Self> {
         Modified::new(self, Modifier::Position(crate::layout::Point { x, y }))

@@ -475,6 +475,20 @@ fn align_code(align: CrossAlign) -> u8 {
     }
 }
 
+/// [`align_code`] with the vertical edge a node names in the high nibble
+/// ([`crate::dom::DomLayout::align`]): only the top and bottom rows of an
+/// `Alignment` hold a child against an edge. The middle row centres
+/// natively and keeps the flow's own placement here, which is what it
+/// lowered to before it had a name — so its byte is the one it was.
+fn align_both(align: CrossAlign, vertical: CrossAlign) -> u8 {
+    let edge = match vertical {
+        CrossAlign::Start | CrossAlign::Baseline => 1,
+        CrossAlign::End => 3,
+        CrossAlign::Center => 0,
+    };
+    align_code(align) | edge << 4
+}
+
 impl Walk<'_> {
     /// The environment a boundary met here would be lowered in.
     fn flow_key(&self) -> FlowKey {
@@ -605,6 +619,7 @@ impl Walk<'_> {
                 spacing,
                 row_spacing,
                 align,
+                vertical,
                 children,
             } => {
                 let container = placed(out, node(DomKind::Grid));
@@ -616,7 +631,7 @@ impl Walk<'_> {
                 layout.columns = Some(columns as u16);
                 layout.gap = Some(*spacing as f32);
                 layout.wrap = Some(*row_spacing as f32);
-                layout.align = Some(align_code(*align));
+                layout.align = Some(align_both(*align, *vertical));
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
@@ -754,10 +769,10 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 self.lower_into(content, &mut container.children);
             }
-            LayoutNode::Layered { align, children, .. } => {
+            LayoutNode::Layered { align, vertical, children, .. } => {
                 let container = placed(out, node(DomKind::Layers));
-                container.layout.as_mut().expect("flow node").align =
-                    Some(align_code(*align));
+                let layout = container.layout.as_mut().expect("flow node");
+                layout.align = Some(align_both(*align, *vertical));
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
@@ -802,7 +817,7 @@ impl Walk<'_> {
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
             }
-            LayoutNode::Frame { width, height, align, child } => {
+            LayoutNode::Frame { width, height, align, vertical, child } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
                 let outer_unbounded = self.unbounded;
@@ -818,7 +833,7 @@ impl Walk<'_> {
                     // the cross axis obeys align, the main one the
                     // browser's default; v1 concedes exact centring to
                     // the flow (Exact restores it)
-                    layout.align = Some(align_code(*align));
+                    layout.align = Some(align_both(*align, *vertical));
                 }
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
@@ -834,7 +849,7 @@ impl Walk<'_> {
             // node passes through and the child lowers as itself.
             LayoutNode::Hug { child, .. } => self.lower_into(child, out),
 
-            LayoutNode::MaxFrame { max_width, max_height, align, child } => {
+            LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
@@ -852,7 +867,7 @@ impl Walk<'_> {
                     if max_width.is_infinite() && max_height.is_infinite() {
                         layout.grow = true;
                     }
-                    layout.align = Some(align_code(*align));
+                    layout.align = Some(align_both(*align, *vertical));
                 }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
@@ -864,12 +879,12 @@ impl Walk<'_> {
             // honoured here yet — the flow layout carries no minimum, so a
             // pane narrower than a table's floors squeezes the lanes on the
             // web where the desktop scrolls them. Recorded, not hidden.
-            LayoutNode::FlexFrame { align, child, .. } => {
+            LayoutNode::FlexFrame { align, vertical, child, .. } => {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.grow = true;
-                    layout.align = Some(align_code(*align));
+                    layout.align = Some(align_both(*align, *vertical));
                 }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
@@ -1044,6 +1059,7 @@ impl Walk<'_> {
                 auto_focus,
                 multiline,
                 bare,
+                inset,
                 // a browser input paints ONE colour: there is no way to
                 // ink a range inside it without giving up the native
                 // caret, the native selection and the composition. The
@@ -1071,6 +1087,13 @@ impl Walk<'_> {
                     placeholder_color: Some(theme.placeholder),
                     ..DomLook::default()
                 });
+                // the glue gives an `<input>` the house inset; another one
+                // rides the record's own padding, which overrides it
+                if let Some(inset) = inset.as_deref() {
+                    let crate::layout::Edges { top, trailing, bottom, leading } = *inset;
+                    field.layout.as_mut().expect("flow node").padding =
+                        Some((top as f32, trailing as f32, bottom as f32, leading as f32));
+                }
             }
             // a feed has no bytes an `<img>` could name: it is painted,
             // as an island, by the road that scales it on the GPU
@@ -1126,7 +1149,7 @@ impl Walk<'_> {
                     forced: *forced,
                 })));
             }
-            LayoutNode::Scroll { path, target, commanded, child, axes, fill, .. } => {
+            LayoutNode::Scroll { path, target, commanded, child, axes, fill, indicators, .. } => {
                 // a region the app holds in a binding takes the app's
                 // value: here the BROWSER is the clamp and the scroll
                 // observer writes back what it settled on, so a value
@@ -1152,6 +1175,9 @@ impl Walk<'_> {
                     // the proposal's width, this one stretches to it
                     layout.grow = true;
                     layout.stretch = true;
+                }
+                if *indicators != crate::layout::ScrollIndicators::Visible {
+                    scroll.style.look_mut().scrollbar = Some(*indicators);
                 }
                 let mut lowered = Vec::new();
                 // down the axis it scrolls the content has no length —
@@ -1986,6 +2012,7 @@ mod tests {
             spacing: 4.0,
             row_spacing: 8.0,
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             children: vec![
                 LayoutNode::Spanned {
                     columns: 9,
@@ -2041,6 +2068,7 @@ mod tests {
             width: Some(40.0),
             height: Some(30.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Placed {
                 at: Point { x: 10.0, y: 20.0 },
                 child: Box::new(text_node("a")),
@@ -2056,6 +2084,7 @@ mod tests {
         };
         let layers = LayoutNode::Layered {
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             modal: false,
             children: vec![child()],
         };
@@ -2146,21 +2175,35 @@ mod tests {
             axes: crate::layout::ScrollAxes::Vertical,
             commanded: None,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             child: Box::new(text_node("long")),
         };
         let paper = crate::layout::VisualProps { background: Some(Color::BLACK), ..Default::default() };
         let tree = column(vec![
             column(vec![table()]),
-            LayoutNode::Frame { width: None, height: None, align: CrossAlign::Start, child: Box::new(table()) },
+            LayoutNode::Frame {
+                width: None,
+                height: None,
+                align: CrossAlign::Start,
+                vertical: CrossAlign::Center,
+                child: Box::new(table()),
+            },
             LayoutNode::MaxFrame {
                 max_width: f64::INFINITY,
                 max_height: f64::INFINITY,
                 align: CrossAlign::Start,
+                vertical: CrossAlign::Center,
                 child: Box::new(table()),
             },
             LayoutNode::Boundary { path: "g".into(), children: vec![scroll()], quiet: Default::default() },
             LayoutNode::Padding { edges: Edges::uniform(4.0), child: Box::new(scroll()) },
-            LayoutNode::Frame { width: Some(10.0), height: None, align: CrossAlign::Start, child: Box::new(scroll()) },
+            LayoutNode::Frame {
+                width: Some(10.0),
+                height: None,
+                align: CrossAlign::Start,
+                vertical: CrossAlign::Center,
+                child: Box::new(scroll()),
+            },
             LayoutNode::Styled { props: paper.shared(), child: Box::new(scroll()), hints: Default::default(), action: None },
         ]);
         let offsets = HashMap::default();
@@ -2381,6 +2424,7 @@ mod tests {
             width: Some(132.0),
             height: Some(30.0),
             align,
+            vertical: CrossAlign::Center,
             child: Box::new(text_node("Ada")),
         };
         let offsets = HashMap::default();
@@ -3126,6 +3170,7 @@ mod tests {
             max_width: f64::INFINITY,
             max_height: f64::MAX,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text_node("a band")),
         };
         let tree = LayoutNode::Stack {
@@ -3153,6 +3198,7 @@ mod tests {
             width: None,
             height: Some(1.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Horizontal,
                 spacing: 0.0,
@@ -3179,6 +3225,7 @@ mod tests {
             max_width: f64::INFINITY,
             max_height: f64::INFINITY,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text_node("a section")),
         };
         let row = LayoutNode::Stack {
@@ -3203,6 +3250,7 @@ mod tests {
             axes: crate::layout::ScrollAxes::Vertical,
             commanded: None,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             child: Box::new(page),
         };
         let offsets = HashMap::default();
@@ -3224,6 +3272,7 @@ mod tests {
             max_width: 500.0,
             max_height: f64::MAX,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text_node("words")),
         };
         let offsets = HashMap::default();
@@ -3243,6 +3292,7 @@ mod tests {
             width: Some(13.4),
             height: Some(22.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Image {
                 source: Some(crate::image_engine::ImageSource::bytes_keyed(1, vec![0u8; 4])),
                 resizable,

@@ -20,6 +20,7 @@ pub(super) struct Tracks {
     pub gap: Px,
     pub row_gap: Px,
     pub align: CrossAlign,
+    pub vertical: CrossAlign,
 }
 
 impl Tracks {
@@ -109,7 +110,7 @@ impl Tracks {
                     } else {
                         offset
                     },
-                y: cell.origin.y + align_offset(cell.size.height, size.height, CrossAlign::Center),
+                y: cell.origin.y + align_offset(cell.size.height, size.height, self.vertical),
             };
             child.place(
                 Rect {

@@ -542,6 +542,7 @@ fn rewrite_scroll_node(
         Option<String>,
         crate::layout::ScrollAxes,
         bool,
+        crate::layout::ScrollIndicators,
         Option<crate::layout::Point>,
         Box<LayoutNode>,
     ) -> LayoutNode,
@@ -566,8 +567,8 @@ fn rewrite_scroll_node(
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
-        LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
-            rewrite(path, axes, fill, commanded, child)
+        LayoutNode::Scroll { path, axes, fill, indicators, commanded, child, .. } => {
+            rewrite(path, axes, fill, indicators, commanded, child)
         }
         LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
@@ -600,22 +601,25 @@ fn rewrite_scroll_node(
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
         other => other,
@@ -634,6 +638,7 @@ struct FieldParts {
     multiline: bool,
     auto_focus: crate::layout::AutoFocus,
     bare: bool,
+    inset: Option<Rc<crate::layout::Edges>>,
     highlights: Option<TextHighlight>,
     secret: bool,
 }
@@ -647,6 +652,7 @@ impl FieldParts {
             multiline: self.multiline,
             auto_focus: self.auto_focus,
             bare: self.bare,
+            inset: self.inset,
             highlights: self.highlights,
             secret: self.secret,
         }
@@ -684,6 +690,7 @@ fn rewrite_field_node(
             multiline,
             auto_focus,
             bare,
+            inset,
             highlights,
             secret,
         } => rewrite(FieldParts {
@@ -693,6 +700,7 @@ fn rewrite_field_node(
             multiline,
             auto_focus,
             bare,
+            inset,
             highlights,
             secret,
         }),
@@ -727,22 +735,25 @@ fn rewrite_field_node(
             edges,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         other => other,
@@ -833,22 +844,25 @@ fn rewrite_pixel_node(
             edges,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         other => other,
@@ -1331,6 +1345,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(sheet_layouts.clone())],
                 }),
@@ -1381,6 +1396,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(dialog_layouts.clone())],
                 }),
@@ -1448,6 +1464,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(alert_layouts.clone())],
                 }),
@@ -1537,20 +1554,24 @@ pub(crate) fn apply(
         Modifier::FrameWH(width, height, alignment) => {
             let (width, height) = (Some(*width), Some(*height));
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
         Modifier::FrameWidth(width, alignment) => {
             let width = Some(*width);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height: None,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
@@ -1562,26 +1583,31 @@ pub(crate) fn apply(
                 // the width is the child's own answer, so there is no room
                 // to place it in: the horizontal edge has nothing to say
                 align: crate::layout::CrossAlign::Center,
+                vertical: crate::layout::CrossAlign::Center,
                 child: Box::new(node),
             });
         }
         Modifier::FrameMax(max_width, max_height, alignment) => {
             let (max_width, max_height) = (*max_width, *max_height);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
                 max_width,
                 max_height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
         Modifier::FrameFlex(min_width, min_height, alignment) => {
             let (min_width, min_height) = (*min_width, *min_height);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::FlexFrame {
                 min_width,
                 min_height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
@@ -1874,13 +1900,14 @@ pub(crate) fn apply(
             });
         }
         Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
-            rewrite_scroll_node(node, &|path, axes, fill, commanded, child| {
+            rewrite_scroll_node(node, &|path, axes, fill, indicators, commanded, child| {
                 LayoutNode::Scroll {
                     path,
                     target: Some(id.clone()),
                     axes,
                     commanded,
                     fill,
+                    indicators,
                     child,
                 }
             })

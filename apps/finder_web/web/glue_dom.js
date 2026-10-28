@@ -488,6 +488,13 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // layers: the same alignment across the cell, so a centred stack
   // centres both ways
   if (kind === 11 && decl["align-items"]) decl["justify-items"] = decl["align-items"];
+  // a named vertical edge (`.topLeading` … `.bottomTrailing`): a frame's
+  // column places its child along its main axis, a layer pile and a grid
+  // hold every cell's child on the block axis
+  if (layout.justify !== null) {
+    const edge = layout.justify === 1 ? "center" : layout.justify === 2 ? "flex-end" : "flex-start";
+    decl[kind === 11 || kind === 16 ? "align-items" : "justify-content"] = edge;
+  }
   if (layout.padding) {
     // the record's sides are logical (top, trailing, bottom, leading), and
     // so are the properties: a right-to-left mount puts the leading inset
@@ -539,6 +546,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // overflow + the radius already on the box: the browser clips the
   // subtree to the curve, natively, as a layer
   if (style.clip) decl.overflow = "hidden";
+  if (style.scrollbar) decl["scrollbar-width"] = style.scrollbar;
   // the fade is a real LAYER here: the browser composites the subtree
   // once, which the per-command multiply of the pixel pipelines only
   // approximates
@@ -867,6 +875,7 @@ function applyPatches(view, length) {
       hidden: false,
       filter: null,
       blur: null,
+      scrollbar: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -975,6 +984,8 @@ function applyPatches(view, length) {
       }
     }
     if (mask & 33554432) style.blur = f32();
+    // bit 31: a viewport that keeps its thumb to itself
+    if (mask >>> 31) style.scrollbar = u8() === 1 ? "none" : "thin";
     return style;
   };
   const readLayout = () => {
@@ -983,6 +994,7 @@ function applyPatches(view, length) {
       relative: (mask & 32768) !== 0,
       gap: null,
       align: null,
+      justify: null,
       padding: null,
       grow: (mask & 128) !== 0,
       stretch: (mask & 512) !== 0,
@@ -993,7 +1005,12 @@ function applyPatches(view, length) {
       columns: null,
     };
     if (mask & 1) layout.gap = f32();
-    if (mask & 2) layout.align = u8();
+    if (mask & 2) {
+      // the high nibble names a vertical edge, one more than its code
+      const byte = u8();
+      layout.align = byte & 15;
+      layout.justify = byte >> 4 ? (byte >> 4) - 1 : null;
+    }
     if (mask & 4) layout.padding = [f32(), f32(), f32(), f32()];
     // a look carries no box of its own (op 23 does), but the record
     // keeps the bits
