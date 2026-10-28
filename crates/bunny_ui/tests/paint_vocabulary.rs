@@ -164,6 +164,7 @@ fn a_turned_line_composites_its_upright_raster_turned() {
             size: Size { width: picture.width as f64, height: picture.height as f64 },
         },
         source: ImageSource::rgba(7, (picture.width as u32, picture.height as u32), picture.rgba),
+        placement: bunny_ui::layout::ImagePlacement::Pixel,
     }]);
     let painted = bunny_ui::raster::rasterize(&turned, 40, 60, GROUND);
     let expected = bunny_ui::raster::rasterize(&by_hand, 40, 60, GROUND);

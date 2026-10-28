@@ -125,7 +125,7 @@ fn present_live_blits(window: &ffi::WindowHandle, runtime: &Runtime, blits: Vec<
             scale,
             blit.width,
             blit.height,
-            &blit.rgba,
+            &blit.premultiplied,
         );
     }
 }
@@ -1634,7 +1634,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             scale,
                             blit.width,
                             blit.height,
-                            &blit.rgba,
+                            &blit.premultiplied,
                         );
                     }
                     for (path, frame) in runtime.live_frames() {
@@ -2707,7 +2707,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             scale,
                             blit.width,
                             blit.height,
-                            &blit.rgba,
+                            &blit.premultiplied,
                         );
                     }
                 } else {

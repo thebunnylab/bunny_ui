@@ -2635,8 +2635,10 @@ impl WindowHandle {
     /// points) and `view_height` is the height of the layout that
     /// placed it — the bottom-left flip uses the SAME world the rect
     /// was computed in, never whatever the view measures mid-resize.
-    /// The pixels are straight RGBA and premultiply here (a layer's
-    /// contents composite premultiplied). The layer is keyed by the
+    /// The pixels are PREMULTIPLIED RGBA, the convention a layer's
+    /// contents composite in: a raster onto a transparent ground already
+    /// is (`rgb = colour x coverage`), and multiplying again darkens every
+    /// soft edge. The layer is keyed by the
     /// box's identity and reused across steps; two backings alternate
     /// so the picture on screen is never the one being written.
     pub fn live_layer_blit(
@@ -2650,7 +2652,7 @@ impl WindowHandle {
         scale: usize,
         px_width: usize,
         px_height: usize,
-        rgba: &[u8],
+        premultiplied: &[u8],
     ) {
         unsafe {
             let root = msg_id(self.view, sel("layer"));
@@ -2713,7 +2715,7 @@ impl WindowHandle {
                     }
                 }
                 let surface = entry.surfaces[entry.flip as usize];
-                if !surface.is_null() && fill_surface(surface, px_width, px_height, rgba) {
+                if !surface.is_null() && fill_surface(surface, px_width, px_height, premultiplied) {
                     without_actions(|| {
                         msg_void_rect(
                             entry.layer,
@@ -2728,18 +2730,11 @@ impl WindowHandle {
                     });
                     return;
                 }
-                // premultiply into the spare backing
+                // the spare backing takes the bytes as they come: the
+                // image below declares them premultiplied, which they are
                 let backing = &mut entry.buffers[entry.flip as usize];
                 backing.clear();
-                backing.extend_from_slice(rgba);
-                for pixel in backing.chunks_exact_mut(4) {
-                    let alpha = pixel[3] as u32;
-                    if alpha < 255 {
-                        for channel in 0..3 {
-                            pixel[channel] = (pixel[channel] as u32 * alpha / 255) as u8;
-                        }
-                    }
-                }
+                backing.extend_from_slice(premultiplied);
                 let provider = owned_provider(backing.as_ptr(), backing.len());
                 let space = CGColorSpaceCreateDeviceRGB();
                 let image = CGImageCreate(
@@ -3963,6 +3958,19 @@ impl LiveLayer {
     }
 }
 
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceSetValue(surface: Id, key: Id, value: Id);
+    #[cfg(test)]
+    fn IOSurfaceCopyValue(surface: Id, key: Id) -> Id;
+    static kIOSurfaceColorSpace: Id;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGColorSpaceCopyPropertyList(space: *mut c_void) -> Id;
+}
+
 /// A BGRA IOSurface of `width` × `height` pixels, retained; null when the
 /// system refuses one (the caller falls back to a CGImage).
 unsafe fn make_surface(width: usize, height: usize) -> Id {
@@ -3986,13 +3994,38 @@ unsafe fn make_surface(width: usize, height: usize) -> Id {
         if class.is_null() {
             return std::ptr::null_mut();
         }
-        msg_id_arg(msg_id(class, sel("alloc")), sel("initWithProperties:"), dict)
+        let surface = msg_id_arg(msg_id(class, sel("alloc")), sel("initWithProperties:"), dict);
+        if !surface.is_null() {
+            tag_device_rgb(surface);
+        }
+        surface
     }
 }
 
-/// Writes straight RGBA rows into a locked surface as premultiplied BGRA,
-/// honouring the surface's own row stride.
-unsafe fn fill_surface(surface: Id, px_width: usize, px_height: usize, rgba: &[u8]) -> bool {
+/// Tags a live surface with the device's RGB, the space the Metal layer
+/// draws in without colour matching. An untagged IOSurface takes Core
+/// Animation's default profile and comes out lighter than the scene
+/// around it: a soft cloud on a looping box's layer read eight to ten
+/// levels brighter than the same cloud in the drawable. The software
+/// patches tag their surfaces the same way, for the same reason.
+unsafe fn tag_device_rgb(surface: Id) {
+    unsafe {
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            return;
+        }
+        let description = CGColorSpaceCopyPropertyList(space);
+        CGColorSpaceRelease(space);
+        if !description.is_null() {
+            IOSurfaceSetValue(surface, kIOSurfaceColorSpace, description);
+            CFRelease(description as *const c_void);
+        }
+    }
+}
+
+/// Writes premultiplied RGBA rows into a locked surface as premultiplied
+/// BGRA, honouring the surface's own row stride.
+unsafe fn fill_surface(surface: Id, px_width: usize, px_height: usize, premultiplied: &[u8]) -> bool {
     unsafe {
         let mut seed = 0u32;
         if msg_i32_u32_ptr(surface, sel("lockWithOptions:seed:"), 0, &mut seed) != 0 {
@@ -4005,23 +4038,22 @@ unsafe fn fill_surface(surface: Id, px_width: usize, px_height: usize, rgba: &[u
             return false;
         }
         for row in 0..px_height {
-            let src = &rgba[row * px_width * 4..(row + 1) * px_width * 4];
+            let src = &premultiplied[row * px_width * 4..(row + 1) * px_width * 4];
             let dst = std::slice::from_raw_parts_mut(base.add(row * stride), px_width * 4);
-            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-                let alpha = s[3] as u32;
-                let (r, g, b) = if alpha == 255 {
-                    (s[0], s[1], s[2])
-                } else {
-                    ((s[0] as u32 * alpha / 255) as u8, (s[1] as u32 * alpha / 255) as u8, (s[2] as u32 * alpha / 255) as u8)
-                };
-                d[0] = b;
-                d[1] = g;
-                d[2] = r;
-                d[3] = s[3];
-            }
+            bgra_row(src, dst);
         }
         let _ = msg_i32_u32_ptr(surface, sel("unlockWithOptions:seed:"), 0, &mut seed);
         true
+    }
+}
+
+/// One row of premultiplied RGBA as the surface's BGRA: the channels
+/// swap places and nothing else moves. The bytes are premultiplied on
+/// both sides — a raster onto a transparent ground already is — so a
+/// multiply here would square every soft edge's alpha into a dark fringe.
+fn bgra_row(premultiplied: &[u8], bgra: &mut [u8]) {
+    for (s, d) in premultiplied.as_chunks::<4>().0.iter().zip(bgra.as_chunks_mut::<4>().0) {
+        *d = [s[2], s[1], s[0], s[3]];
     }
 }
 
@@ -5016,6 +5048,32 @@ unsafe fn tiff_to_png(tiff: Id) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_surface_is_tagged_with_the_drawables_colour_space() {
+        let surface = unsafe { make_surface(4, 4) };
+        assert!(!surface.is_null(), "the system gives a 4×4 surface");
+        let tagged = unsafe { IOSurfaceCopyValue(surface, kIOSurfaceColorSpace) };
+        assert!(!tagged.is_null(), "untagged, Core Animation colour-matches it lighter than the scene");
+        unsafe {
+            CFRelease(tagged as *const c_void);
+            msg_void(surface, sel("release"));
+        }
+    }
+
+    #[test]
+    fn a_live_surface_takes_premultiplied_bytes_as_they_are() {
+        // a soft edge, rastered onto a transparent ground: half an orange
+        // ink is (100, 50, 25) at alpha 128 — already premultiplied
+        let soft = [100, 50, 25, 128, 200, 100, 50, 255, 0, 0, 0, 0];
+        let mut bgra = [0u8; 12];
+        bgra_row(&soft, &mut bgra);
+        assert_eq!(
+            bgra,
+            [25, 50, 100, 128, 50, 100, 200, 255, 0, 0, 0, 0],
+            "a second multiply would darken the edge to (50, 25, 12)"
+        );
+    }
 
     #[test]
     fn a_still_window_cannot_park_another_windows_slow_clock() {

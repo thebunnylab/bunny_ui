@@ -44,7 +44,8 @@ use motor::view::RenderNode;
 
 use crate::image_engine::ImageSource;
 use crate::layout::{
-    Color, Corners, DisplayList, DrawCommand, LayoutNode, Point, Proposal, Px, Rect, Size,
+    Color, Corners, DisplayList, DrawCommand, ImagePlacement, LayoutNode, Point, Proposal, Px, Rect,
+    Size,
 };
 use crate::text_engine::{FontSpec, LineMetrics, MeasureCache, TextEngine};
 use crate::view::{NodeList, Single, View};
@@ -587,7 +588,9 @@ impl<'a> Painter<'a> {
                 DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
                     DrawCommand::TurnedText { pivot: self.at(pivot), content, range, color, font, turn }
                 }
-                DrawCommand::Image { rect, source } => DrawCommand::Image { rect: self.shift(rect), source },
+                DrawCommand::Image { rect, source, placement } => {
+                    DrawCommand::Image { rect: self.shift(rect), source, placement }
+                }
                 DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
                 DrawCommand::PopClip => DrawCommand::PopClip,
             };
@@ -620,6 +623,7 @@ impl<'a> Painter<'a> {
             self.display.push(DrawCommand::Image {
                 rect: self.shift(rect),
                 source,
+                placement: ImagePlacement::Pixel,
             });
         }
     }
@@ -739,9 +743,37 @@ impl<'a> Painter<'a> {
 
     /// One image, at the platform's own decode of the destination size.
     /// A feed (`&ImageFeed`) goes through the same door: the GPU scales
-    /// its newest frame into `rect`.
+    /// its newest frame into `rect`. The origin snaps to the nearest
+    /// device pixel, so a picture stays crisp wherever the layout puts it
+    /// ([`ImagePlacement::Pixel`]).
     pub fn image(&mut self, rect: Rect, source: impl Into<ImageSource>) {
-        self.display.push(DrawCommand::Image { rect: self.shift(rect), source: source.into() });
+        self.display.push(DrawCommand::Image {
+            rect: self.shift(rect),
+            source: source.into(),
+            placement: ImagePlacement::Pixel,
+        });
+    }
+
+    /// One image at the rect's EXACT origin, between device pixels when it
+    /// falls there ([`ImagePlacement::Subpixel`]) — what a browser does for
+    /// an image under a `transform`. A picture that drifts a point a second
+    /// glides instead of stepping a whole pixel at a time, and layers that
+    /// drift at different speeds (parallax) each glide on their own.
+    ///
+    /// ```ignore
+    /// // a cloud bank drifting 1.2 pt/s, smooth at any refresh rate
+    /// p.image_subpixel(bank.offset(1.2 * seconds, 0.0), clouds.clone());
+    /// ```
+    ///
+    /// A picture at rest on the grid looks no different, so reach for this
+    /// for what moves. At a fractional origin the edge pixels are shared
+    /// with the neighbours, which reads a touch softer than a snapped icon.
+    pub fn image_subpixel(&mut self, rect: Rect, source: impl Into<ImageSource>) {
+        self.display.push(DrawCommand::Image {
+            rect: self.shift(rect),
+            source: source.into(),
+            placement: ImagePlacement::Subpixel,
+        });
     }
 
     /// A two-stop ramp inside the rounded rect — the same value
@@ -775,6 +807,7 @@ impl<'a> Painter<'a> {
         self.display.push(DrawCommand::Image {
             rect: self.shift(square),
             source: ImageSource::symbol(symbol, color),
+            placement: ImagePlacement::Pixel,
         });
     }
 
@@ -808,6 +841,7 @@ impl<'a> Painter<'a> {
         self.display.push(DrawCommand::Image {
             rect: self.shift(square),
             source: ImageSource::symbol_turned(symbol, color, false, angle),
+            placement: ImagePlacement::Pixel,
         });
     }
 
@@ -846,7 +880,11 @@ impl<'a> Painter<'a> {
     ) {
         let corner_radius = corner_radius.into();
         match crate::shapes::border_source(rect.size, color, width, style, corner_radius) {
-            Some(source) => self.display.push(DrawCommand::Image { rect: self.shift(rect), source }),
+            Some(source) => self.display.push(DrawCommand::Image {
+                rect: self.shift(rect),
+                source,
+                placement: ImagePlacement::Pixel,
+            }),
             None => self.stroke(rect, color, width, corner_radius),
         }
     }
@@ -864,7 +902,7 @@ impl<'a> Painter<'a> {
             return;
         };
         let corner_radius = corner_radius.into();
-        let image = DrawCommand::Image { rect: self.shift(rect), source };
+        let image = DrawCommand::Image { rect: self.shift(rect), source, placement: ImagePlacement::Pixel };
         if corner_radius.uniform() == Some(0.0) {
             self.display.push(image);
         } else {
@@ -944,7 +982,11 @@ impl<'a> Painter<'a> {
             ink.into(),
             (size.width as f32, size.height as f32),
         );
-        self.display.push(DrawCommand::Image { rect: self.shift(Rect { origin, size }), source });
+        self.display.push(DrawCommand::Image {
+            rect: self.shift(Rect { origin, size }),
+            source,
+            placement: ImagePlacement::Pixel,
+        });
     }
 
     /// Everything `body` paints is cut to `rect` — balanced by
@@ -2887,7 +2929,7 @@ mod tests {
         display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::Image { rect, source } => Some((*rect, source.clone())),
+                DrawCommand::Image { rect, source, .. } => Some((*rect, source.clone())),
                 _ => None,
             })
             .collect()

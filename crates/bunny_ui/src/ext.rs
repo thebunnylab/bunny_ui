@@ -585,6 +585,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// the clock — the scene around it stays untouched, so a small
     /// decoration costs its own pixels and nothing else.
     ///
+    /// That surface of its own sits above the window, so it is only the
+    /// box's while nothing painted after it lands on it. A box under a
+    /// later sibling — a sky under the sheet laid over it — stays in the
+    /// scene, where paint order holds, and each step repaints the frame.
+    ///
     /// `Loop::secs(9.6).fps(5.0).still_at(0.25)` picks the frame rate
     /// and the resting frame. A slow loop reads smoothly at a low
     /// rate — the eye sees the travel per step, not the rate. Reduced

@@ -2555,8 +2555,8 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                 paint: paint.shifted(dx, dy),
                 corner_radius,
             },
-            DrawCommand::Image { rect, source } => {
-                DrawCommand::Image { rect: shift(rect), source }
+            DrawCommand::Image { rect, source, placement } => {
+                DrawCommand::Image { rect: shift(rect), source, placement }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
                 DrawCommand::PushClip { rect: shift(rect), corner_radius }

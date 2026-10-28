@@ -2999,19 +2999,19 @@ mod tests {
         let first = &blits[0];
         assert_eq!((first.width, first.height), (20, 20));
         assert_eq!(first.frame.size.width, 20.0);
-        assert_eq!(first.rgba[0], 64, "the pixels carry the quarter phase");
+        assert_eq!(first.premultiplied[0], 64, "the pixels carry the quarter phase");
         assert!(runtime.live_islands(1).is_empty(), "the step was drained");
 
         // the next step paints a DIFFERENT picture
         assert!(runtime.tick(0.25).islands);
         let second = runtime.live_islands(1);
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].rgba[0], first.rgba[0]);
+        assert_ne!(second[0].premultiplied[0], first.premultiplied[0]);
 
         // an ordinary scene frame paints the CURRENT phase — the box
         // never jumps back when the app changes around it
         let scene = runtime.animation_frame(&Mark, size);
-        assert_eq!(red_of(&scene), second[0].rgba[0]);
+        assert_eq!(red_of(&scene), second[0].premultiplied[0]);
     }
 
     #[test]
@@ -3176,7 +3176,7 @@ mod tests {
         assert_eq!(grown.len(), 1, "a box that grew owes new pixels");
         assert_eq!(grown[0].width, 2, "the new size still contains the whole caret");
         assert_eq!(grown[0].frame.size.width, 2.0, "placed without stretching");
-        assert_eq!(grown[0].rgba, seed[0].rgba);
+        assert_eq!(grown[0].premultiplied, seed[0].premultiplied);
         // and settling at the new size goes quiet again
         assert!(runtime.live_islands_all(1).is_empty());
 

@@ -245,7 +245,7 @@ mod gpu {
     use super::*;
     use bunny_ui_core::gpu::walk::{FrameBatches, RecordingGround, RunAtlas, build_frame};
     use bunny_ui_core::image_engine::{ImageSource, RawImages};
-    use bunny_ui_core::layout::{DisplayList, DrawCommand, Point, Rect, Size};
+    use bunny_ui_core::layout::{DisplayList, DrawCommand, ImagePlacement, Point, Rect, Size};
     use bunny_ui_core::text_engine::PixelFont;
 
     const fn rect(x: f64) -> Rect {
@@ -262,6 +262,7 @@ mod gpu {
         vec![DrawCommand::Image {
             rect: rect(x),
             source,
+            placement: ImagePlacement::Pixel,
         }]
         .into()
     }
@@ -490,10 +491,12 @@ mod gpu {
             DrawCommand::Image {
                 rect: rect(0.0),
                 source: old,
+                placement: ImagePlacement::Pixel,
             },
             DrawCommand::Image {
                 rect: rect(20.0),
                 source: feed.source(),
+                placement: ImagePlacement::Pixel,
             },
         ]
         .into();

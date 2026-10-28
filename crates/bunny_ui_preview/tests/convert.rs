@@ -8,7 +8,7 @@ use bunny_ui_core as bunny_ui;
 use bunny_ui::icon::Verb::{Close, Cubic, Line, Move};
 use bunny_ui::icon::{Draw, Glyph};
 use bunny_ui::image_engine::{ImageSource, raster_source};
-use bunny_ui::layout::{DisplayList, DrawCommand};
+use bunny_ui::layout::{DisplayList, DrawCommand, ImagePlacement};
 use bunny_ui::prelude::*;
 use bunny_ui::preview::{Device, Preview, Traits as CoreTraits};
 use bunny_ui::raster::rasterize_scaled;
@@ -85,14 +85,14 @@ fn images_travel_by_key_with_their_wraps_folded_in() {
     let symbol = resource(&ImageSource::Symbol { key: 11, symbol: bunny_ui::icon::house::CHECK, color: Color::BLACK, forced: false, turn: 0.0 }).unwrap();
     assert!(matches!(image_source(&symbol), Some(ImageSource::Symbol { key: 11, .. })));
     let raised = raise(
-        &[wire::Draw::Image { rect: wire::Rect::default(), image }],
+        &[wire::Draw::Image { rect: wire::Rect::default(), image, subpixel: false }],
         &[],
         &HashMap::from([(7u64, rgba)]),
     )
     .unwrap();
     assert!(matches!(raised.as_slice(), [bunny_ui::layout::DrawCommand::Image { source: ImageSource::Faded { alpha: 128, .. }, .. }]));
     assert!(matches!(
-        raise(&[wire::Draw::Image { rect: wire::Rect::default(), image }], &[], &HashMap::new()),
+        raise(&[wire::Draw::Image { rect: wire::Rect::default(), image, subpixel: false }], &[], &HashMap::new()),
         Err(bunny_ui_preview::convert::Missing::Image { key: 7 })
     ));
 }
@@ -443,14 +443,15 @@ fn an_app_symbol_travels_as_the_path_it_draws() {
 fn a_frame_of_app_symbols_paints_as_the_app_paints_it() {
     let square = |x: f64, side: f64| Rect { origin: Point { x, y: 4.0 }, size: Size { width: side, height: side } };
     let display = DisplayList::from(vec![
-        DrawCommand::Image { rect: square(4.0, 24.0), source: ImageSource::symbol(ARCH, INK) },
-        DrawCommand::Image { rect: square(32.0, 16.0), source: ImageSource::symbol(ARCH, INK).faded(0.4) },
-        DrawCommand::Image { rect: square(52.0, 32.0), source: ImageSource::symbol(BADGE, INK).mirrored() },
+        DrawCommand::Image { rect: square(4.0, 24.0), source: ImageSource::symbol(ARCH, INK), placement: ImagePlacement::Pixel },
+        DrawCommand::Image { rect: square(32.0, 16.0), source: ImageSource::symbol(ARCH, INK).faded(0.4), placement: ImagePlacement::Pixel },
+        DrawCommand::Image { rect: square(52.0, 32.0), source: ImageSource::symbol(BADGE, INK).mirrored(), placement: ImagePlacement::Pixel },
         DrawCommand::Image {
             rect: square(88.0, 20.0),
             source: ImageSource::symbol_forced(TWO_TONE, ACCENT).mirrored().faded(0.6),
+            placement: ImagePlacement::Pixel,
         },
-        DrawCommand::Image { rect: square(112.0, 24.0), source: ImageSource::symbol(FLAME, INK) },
+        DrawCommand::Image { rect: square(112.0, 24.0), source: ImageSource::symbol(FLAME, INK), placement: ImagePlacement::Pixel },
     ]);
     let mut strings = Strings::new();
     let (commands, sources) = lower(&display, &mut strings);
@@ -523,14 +524,15 @@ fn a_glyph_one_path_cannot_draw_travels_whole_and_paints_as_the_app_does() {
 fn a_frame_of_whole_glyphs_paints_as_the_app_paints_it() {
     let square = |x: f64, side: f64| Rect { origin: Point { x, y: 4.0 }, size: Size { width: side, height: side } };
     let display = DisplayList::from(vec![
-        DrawCommand::Image { rect: square(4.0, 24.0), source: ImageSource::symbol(DOTTED, INK) },
-        DrawCommand::Image { rect: square(32.0, 16.0), source: ImageSource::symbol(DOTTED, INK).faded(0.4) },
-        DrawCommand::Image { rect: square(52.0, 32.0), source: ImageSource::symbol(TWO_TONE, INK).mirrored() },
+        DrawCommand::Image { rect: square(4.0, 24.0), source: ImageSource::symbol(DOTTED, INK), placement: ImagePlacement::Pixel },
+        DrawCommand::Image { rect: square(32.0, 16.0), source: ImageSource::symbol(DOTTED, INK).faded(0.4), placement: ImagePlacement::Pixel },
+        DrawCommand::Image { rect: square(52.0, 32.0), source: ImageSource::symbol(TWO_TONE, INK).mirrored(), placement: ImagePlacement::Pixel },
         DrawCommand::Image {
             rect: square(88.0, 20.0),
             source: ImageSource::symbol_forced(TWO_FILLS, ACCENT).mirrored().faded(0.6),
+            placement: ImagePlacement::Pixel,
         },
-        DrawCommand::Image { rect: square(112.0, 24.0), source: ImageSource::symbol(TAGGED, INK) },
+        DrawCommand::Image { rect: square(112.0, 24.0), source: ImageSource::symbol(TAGGED, INK), placement: ImagePlacement::Pixel },
     ]);
     let mut strings = Strings::new();
     let (commands, sources) = lower(&display, &mut strings);
@@ -591,7 +593,7 @@ fn an_app_symbol_travels_under_its_drawings_identity() {
     assert_ne!(key(&arch), key(&ImageSource::symbol(ARCH_EDITED, INK)), "an edited drawing under the same name");
     assert_ne!(key(&arch), key(&ImageSource::symbol(ARCH, ACCENT)), "a re-tint");
     let mut strings = Strings::new();
-    let display = DisplayList::from(vec![DrawCommand::Image { rect: Rect::default(), source: arch.clone() }]);
+    let display = DisplayList::from(vec![DrawCommand::Image { rect: Rect::default(), source: arch.clone(), placement: ImagePlacement::Pixel }]);
     let (commands, _) = lower(&display, &mut strings);
     assert!(matches!(commands.as_slice(), [wire::Draw::Image { image, .. }] if image.key == key(&arch)));
 }
@@ -642,4 +644,30 @@ fn the_frozen_wire_carries_a_dash_a_turn_and_a_turned_line_as_what_they_draw() {
         pictured.iter().next(),
         Some(DrawCommand::Image { source: ImageSource::Rgba { .. }, .. })
     ));
+}
+
+#[test]
+fn a_picture_between_pixels_crosses_the_wire_as_itself() {
+    let arch = ImageSource::symbol(ARCH, INK);
+    let at = |x: f64| Rect { origin: Point { x, y: 0.0 }, size: Size { width: 24.0, height: 24.0 } };
+    let display = DisplayList::from(vec![
+        DrawCommand::Image { rect: at(4.25), source: arch.clone(), placement: ImagePlacement::Pixel },
+        DrawCommand::Image { rect: at(32.25), source: arch, placement: ImagePlacement::Subpixel },
+    ]);
+    let mut strings = Strings::new();
+    let (commands, sources) = lower(&display, &mut strings);
+    assert!(matches!(
+        commands.as_slice(),
+        [wire::Draw::Image { subpixel: false, .. }, wire::Draw::Image { subpixel: true, .. }]
+    ));
+    let images: HashMap<u64, ImageSource> = sources.iter().map(received).map(|(sent, back)| (sent.key, back)).collect();
+    let raised = raise(&commands, &[], &images).unwrap();
+    let placements: Vec<ImagePlacement> = raised
+        .iter()
+        .filter_map(|command| match command {
+            DrawCommand::Image { placement, .. } => Some(*placement),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(placements, [ImagePlacement::Pixel, ImagePlacement::Subpixel]);
 }

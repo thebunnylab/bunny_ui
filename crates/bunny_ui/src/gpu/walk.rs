@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
-use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
+use crate::layout::{Color, Corners, DisplayList, DrawCommand, ImagePlacement, Rect};
 use crate::angle::QuarterTurn;
 use crate::raster::{baseline_row, physical_extent, turn_raster, turned_corner};
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
@@ -249,6 +249,18 @@ pub trait AtlasGround {
     #[cfg(feature = "3d")]
     fn world(&mut self) -> Option<&mut dyn super::world::WorldGround> {
         None
+    }
+
+    /// Can this tier's sprite shader place a picture BETWEEN pixels
+    /// ([`ImagePlacement::Subpixel`])? Such a picture then arrives as
+    /// sprites whose `dest` keeps the fraction (`tex` is the picture's
+    /// one whole tile, never a chunk), and the shader shares each pixel
+    /// among the four texels over it in premultiplied colour, reading
+    /// nothing outside `tex` — the CPU raster's `composite_subpixel`.
+    /// A whole-pixel `dest` is the one-for-one read it always was.
+    /// `false` = the walk snaps the origin, as for any other picture.
+    fn subpixel(&self) -> bool {
+        false
     }
 }
 
@@ -804,6 +816,11 @@ impl RunAtlas {
     /// or resampled by the engine and uploaded: small rides the shared
     /// atlas in chunk tiles, big claims a dedicated texture. `Ok(None)`
     /// = the engine has nothing yet (async decode, broken bytes).
+    ///
+    /// `whole` asks for the picture in ONE rectangle of texels — a shelf
+    /// tile only when it needs no chunks, a dedicated texture otherwise.
+    /// A picture placed between pixels reads its neighbours across what
+    /// would have been a chunk seam.
     pub fn resolve_image(
         &mut self,
         ground: &mut dyn AtlasGround,
@@ -811,6 +828,7 @@ impl RunAtlas {
         width: u32,
         height: u32,
         engine: &dyn ImageEngine,
+        whole: bool,
     ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
         let (width, height) = match source {
             ImageSource::Native { size, .. } => *size,
@@ -842,7 +860,9 @@ impl RunAtlas {
             entry.walk = walk;
             return Ok(Some(ResolvedImage::Dedicated(entry.id, entry.width, entry.height)));
         }
-        let shelf_size = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
+        let shelf_size = height <= DEDICATED_HEIGHT
+            && width * height <= DEDICATED_AREA
+            && (!whole || width <= ATLAS_CHUNK_WIDTH);
         if shelf_size && let Some(entry) = self.images.get_mut(&cache_key) {
             entry.walk = walk;
             return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
@@ -1467,7 +1487,7 @@ pub fn build_frame(
                     );
                 }
             }
-            DrawCommand::Image { rect, source } => {
+            DrawCommand::Image { rect, source, placement } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let width = physical_extent(rect.size.width, scale) as u32;
                 let height = physical_extent(rect.size.height, scale) as u32;
@@ -1479,7 +1499,26 @@ pub fn build_frame(
                 let base_x = (rect.origin.x * factor).round() as i64;
                 let base_y = (rect.origin.y * factor).round() as i64;
                 let dest = (base_x, base_y, base_x + width as i64, base_y + height as i64);
-                if box_intersect(dest, clip).is_none() {
+                // the composite_subpixel mirror, where the tier can: the
+                // origin keeps its fraction, and the picture covers the
+                // pixels its far edges spill into
+                let exact = (rect.origin.x * factor, rect.origin.y * factor);
+                let between = *placement == ImagePlacement::Subpixel
+                    && ground.subpixel()
+                    && (exact.0 != exact.0.floor() || exact.1 != exact.1.floor());
+                let reach = if between {
+                    let (x, y) = (exact.0.floor() as i64, exact.1.floor() as i64);
+                    (x, y, x + width as i64 + 1, y + height as i64 + 1)
+                } else {
+                    dest
+                };
+                let exact_dest = [
+                    exact.0 as f32,
+                    exact.1 as f32,
+                    (exact.0 + f64::from(width)) as f32,
+                    (exact.1 + f64::from(height)) as f32,
+                ];
+                if box_intersect(reach, clip).is_none() {
                     continue;
                 }
                 // a tier that draws worlds draws this one into a target of
@@ -1513,8 +1552,34 @@ pub fn build_frame(
                     );
                     continue;
                 }
-                match atlas.resolve_image(ground, source, width, height, images)? {
+                match atlas.resolve_image(ground, source, width, height, images, between)? {
                     None => {}
+                    // between pixels the picture is ONE tile: a shader that
+                    // shares a pixel among texels must find the neighbours
+                    // in the same rectangle, or every chunk seam would
+                    // blend twice
+                    Some(ResolvedImage::Tiles(entry)) if between => {
+                        debug_assert_eq!(entry.tiles.len(), 1, "a picture between pixels rides one tile");
+                        if let Some(tile) = entry.tiles.first() {
+                            batches.sprites.push(SpriteInstance {
+                                dest: exact_dest,
+                                tex: [
+                                    tile.x as f32,
+                                    tile.y as f32,
+                                    (tile.x + tile.width) as f32,
+                                    (tile.y + tile.height) as f32,
+                                ],
+                                clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                            });
+                            note_run(
+                                &mut batches.runs,
+                                RunKind::Sprites,
+                                round_of(&clips),
+                                batches.sprites.len() - 1,
+                                sprite_box(&batches.sprites[batches.sprites.len() - 1]),
+                            );
+                        }
+                    }
                     Some(ResolvedImage::Tiles(entry)) => {
                         let mut chunk_x: i64 = 0;
                         for tile in &entry.tiles {
@@ -1566,7 +1631,11 @@ pub fn build_frame(
                             }
                         };
                         batches.sprites.push(SpriteInstance {
-                            dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
+                            dest: if between {
+                                exact_dest
+                            } else {
+                                [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32]
+                            },
                             tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
                             clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                         });
@@ -1691,6 +1760,9 @@ pub struct RecordingGround {
     pub live_updates: usize,
     /// How many live textures were given back.
     pub live_drops: usize,
+    /// What [`AtlasGround::subpixel`] answers — a host picks the tier it
+    /// stands in for.
+    pub subpixel: bool,
     next: u64,
 }
 
@@ -1744,6 +1816,10 @@ impl AtlasGround for RecordingGround {
     fn drop_live(&mut self, id: u64) {
         self.live.retain(|(held, _, _)| *held != id);
         self.live_drops += 1;
+    }
+
+    fn subpixel(&self) -> bool {
+        self.subpixel
     }
 }
 
@@ -2191,6 +2267,7 @@ mod tests {
                     size: crate::layout::Size { width: size.0, height: size.1 },
                 },
                 source: photo(key),
+                placement: ImagePlacement::Pixel,
             });
         }
         display
@@ -2239,6 +2316,62 @@ mod tests {
         assert_eq!(ground.dedicated.len(), 12, "and the ground dropped them");
     }
 
+    /// One picture placed between pixels, walked once at 2×: the sprites
+    /// it became and the ground that took them.
+    fn subpixel_sprites(capable: bool, origin: (f64, f64), size: (f64, f64)) -> (Vec<SpriteInstance>, RecordingGround) {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Image {
+            rect: crate::layout::Rect {
+                origin: crate::layout::Point { x: origin.0, y: origin.1 },
+                size: crate::layout::Size { width: size.0, height: size.1 },
+            },
+            source: photo(77),
+            placement: ImagePlacement::Subpixel,
+        });
+        let mut ground = RecordingGround { subpixel: capable, ..RecordingGround::default() };
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            2,
+            (4000, 1000),
+            &crate::text_engine::PixelFont,
+            &RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the frame walks");
+        (batches.sprites.clone(), ground)
+    }
+
+    #[test]
+    fn a_tier_that_places_between_pixels_gets_the_fraction() {
+        // 10.25 pt at 2× is 20.5 px: the sprite keeps the half
+        let (sprites, _) = subpixel_sprites(true, (10.25, 3.0), (16.0, 16.0));
+        assert_eq!(sprites.len(), 1, "a picture between pixels is one sprite");
+        assert_eq!(sprites[0].dest, [20.5, 6.0, 52.5, 38.0]);
+        assert_eq!(sprites[0].tex[2] - sprites[0].tex[0], 32.0, "over the picture's one tile");
+        // a tier that cannot snaps it, as any other picture
+        let (snapped, _) = subpixel_sprites(false, (10.25, 3.0), (16.0, 16.0));
+        assert_eq!(snapped[0].dest, [21.0, 6.0, 53.0, 38.0]);
+        // and on the grid the fraction is nothing to keep
+        let (whole, _) = subpixel_sprites(true, (10.5, 3.0), (16.0, 16.0));
+        assert_eq!(whole[0].dest, [21.0, 6.0, 53.0, 38.0]);
+    }
+
+    #[test]
+    fn a_wide_picture_between_pixels_takes_one_texture_not_chunks() {
+        // 1100 pt × 20 pt at 2×: 2200 px wide, a shelf would cut it in three
+        let (snapped, chunked) = subpixel_sprites(false, (0.25, 0.0), (1100.0, 20.0));
+        assert_eq!(snapped.len(), 3, "snapped, the chunks join texel for texel");
+        assert!(chunked.dedicated.is_empty());
+        let (sprites, ground) = subpixel_sprites(true, (0.25, 0.0), (1100.0, 20.0));
+        assert_eq!(sprites.len(), 1, "between pixels a seam would blend twice");
+        assert_eq!(ground.dedicated.len(), 1, "so the picture takes a texture of its own");
+        assert_eq!(sprites[0].dest[0], 0.5);
+    }
+
     /// One feed over `rect`, as a frame to walk.
     fn feed_frame(feed: &crate::image_engine::ImageFeed, size: (f64, f64)) -> DisplayList {
         let mut display = DisplayList::default();
@@ -2248,6 +2381,7 @@ mod tests {
                 size: crate::layout::Size { width: size.0, height: size.1 },
             },
             source: feed.source(),
+            placement: ImagePlacement::Pixel,
         });
         display
     }

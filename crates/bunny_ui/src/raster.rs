@@ -20,7 +20,7 @@
 use crate::image_engine::{ImageEngine, RawImages, raster_source};
 use crate::glass::{Lens, Pyramid};
 use crate::layout::{
-    Color, Corners, DisplayList, DrawCommand, GlassPaint, GradientPaint, Point, Rect,
+    Color, Corners, DisplayList, DrawCommand, GlassPaint, GradientPaint, ImagePlacement, Point, Rect,
 };
 use crate::angle::QuarterTurn;
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
@@ -830,6 +830,99 @@ impl Bitmap {
         self.blit_rgba(base_x, base_y, width, height, rgba);
     }
 
+    /// An image's raster, landed by its placement: snapped to the grid
+    /// ([`Self::composite_rgba`]) or at its exact origin
+    /// ([`Self::composite_subpixel`]).
+    #[allow(clippy::too_many_arguments, reason = "the blit's own arguments plus the placement that picks it")]
+    fn composite_image(
+        &mut self,
+        origin: Point,
+        scale: usize,
+        placement: ImagePlacement,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) {
+        match placement {
+            ImagePlacement::Pixel => self.composite_rgba(origin.x, origin.y, scale, width, height, rgba),
+            ImagePlacement::Subpixel => self.composite_subpixel(origin, scale, width, height, rgba),
+        }
+    }
+
+    /// A straight-alpha raster at a FRACTIONAL physical origin. The texels
+    /// stand `fx`, `fy` of a pixel right of and below the whole pixel under
+    /// the origin, so each device pixel holds a share of the four texels
+    /// over it — `(1 − fx)` of the one it starts and `fx` of the one before,
+    /// the same down the rows. For a translation, that is both the bilinear
+    /// sample at the pixel's centre and the exact area each texel covers.
+    ///
+    /// The shares are summed PREMULTIPLIED: a transparent texel is no
+    /// colour at all, whatever its RGB says (a decoder leaves black there),
+    /// so a soft edge between pixels never darkens. The sum is turned back
+    /// into straight colour for the house blend. The box grows by the pixel
+    /// each fraction spills into, and a whole-pixel origin hands off to the
+    /// one-for-one blit: those bytes are [`ImagePlacement::Pixel`]'s.
+    ///
+    /// The Metal sprite shader computes the same sum in float; the two
+    /// agree within a step of rounding.
+    fn composite_subpixel(&mut self, origin: Point, scale: usize, width: usize, height: usize, rgba: &[u8]) {
+        let (x, y) = (origin.x * scale as f64, origin.y * scale as f64);
+        let (base_x, base_y) = (x.floor(), y.floor());
+        let (fx, fy) = ((x - base_x) as f32, (y - base_y) as f32);
+        let (base_x, base_y) = (base_x as i64, base_y as i64);
+        if fx == 0.0 && fy == 0.0 {
+            self.blit_rgba(base_x, base_y, width, height, rgba);
+            return;
+        }
+        // the texel at (column, row), premultiplied, or nothing off the raster
+        let texel = |column: i64, row: i64| -> [f32; 4] {
+            if column < 0 || row < 0 || column as usize >= width || row as usize >= height {
+                return [0.0; 4];
+            }
+            let index = (row as usize * width + column as usize) * 4;
+            let alpha = f32::from(rgba[index + 3]);
+            let premultiply = |channel: u8| f32::from(channel) * alpha / 255.0;
+            [premultiply(rgba[index]), premultiply(rgba[index + 1]), premultiply(rgba[index + 2]), alpha]
+        };
+        let spill_x = usize::from(fx > 0.0);
+        let spill_y = usize::from(fy > 0.0);
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        let row_first = (cy0 - base_y).max(0);
+        let row_last = (cy1 - base_y).max(0).min((height + spill_y) as i64);
+        let col_first = (cx0 - base_x).max(0);
+        let col_last = (cx1 - base_x).max(0).min((width + spill_x) as i64);
+        let shares = [
+            (-1, -1, fx * fy),
+            (0, -1, (1.0 - fx) * fy),
+            (-1, 0, fx * (1.0 - fy)),
+            (0, 0, (1.0 - fx) * (1.0 - fy)),
+        ];
+        for row in row_first..row_last {
+            for column in col_first..col_last {
+                let mut sum = [0.0f32; 4];
+                for (dx, dy, share) in shares {
+                    if share == 0.0 {
+                        continue;
+                    }
+                    let ink = texel(column + dx, row + dy);
+                    for (total, part) in sum.iter_mut().zip(ink) {
+                        *total += share * part;
+                    }
+                }
+                let alpha = sum[3].round();
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let straight = |total: f32| (total * 255.0 / sum[3]).round().clamp(0.0, 255.0) as u32;
+                let packed = (straight(sum[0]) << 24)
+                    | (straight(sum[1]) << 16)
+                    | (straight(sum[2]) << 8)
+                    | alpha.min(255.0) as u32;
+                self.set(base_x + column, base_y + row, packed);
+            }
+        }
+    }
+
     /// The source-over blit itself, at a PHYSICAL top-left already snapped.
     fn blit_rgba(&mut self, base_x: i64, base_y: i64, width: usize, height: usize, rgba: &[u8]) {
         // clamp the loop to the clip: a long line under a small damage
@@ -1310,7 +1403,7 @@ pub fn rasterize_over(
                     bitmap.composite_turned(*pivot, *turn, scale, &raster);
                 }
             }
-            DrawCommand::Image { rect, source } => {
+            DrawCommand::Image { rect, source, placement } => {
                 let width = physical_extent(rect.size.width, scale);
                 let height = physical_extent(rect.size.height, scale);
                 // A traced path allocates its BOUNDING BOX, whatever it
@@ -1331,10 +1424,10 @@ pub fn rasterize_over(
                     bitmap.height(),
                 );
                 if let Some(raster) = raster_source(images, source, width, height) {
-                    bitmap.composite_rgba(
-                        rect.origin.x,
-                        rect.origin.y,
+                    bitmap.composite_image(
+                        rect.origin,
                         scale,
+                        *placement,
                         raster.width,
                         raster.height,
                         &raster.rgba,
@@ -1419,7 +1512,19 @@ fn command_box(
             (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
         }
         // the destination rect is the whole truth — no slack needed
-        DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        DrawCommand::Image { rect, placement: ImagePlacement::Pixel, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        // between pixels the picture shares the ones its edges cross:
+        // the box runs from the pixels under its origin to the ones its
+        // far edges spill into
+        DrawCommand::Image { rect, placement: ImagePlacement::Subpixel, .. } => {
+            let scaled = scale_rect(*rect, factor);
+            (
+                scaled.origin.x.floor() as i64,
+                scaled.origin.y.floor() as i64,
+                (scaled.origin.x + scaled.size.width).ceil() as i64 + 1,
+                (scaled.origin.y + scaled.size.height).ceil() as i64 + 1,
+            )
+        }
         // a clip that CHANGES must damage everything it governs —
         // its own box is the safe superset (the curve and the
         // nested cuts only ever REMOVE coverage). Identical clips
@@ -1800,14 +1905,14 @@ impl Surface {
                             self.bitmap.composite_turned(*pivot, *turn, self.scale, &raster);
                         }
                     }
-                    DrawCommand::Image { rect: image_rect, source } => {
+                    DrawCommand::Image { rect: image_rect, source, placement } => {
                         let width = physical_extent(image_rect.size.width, self.scale);
                         let height = physical_extent(image_rect.size.height, self.scale);
                         if let Some(raster) = raster_source(images, source, width, height) {
-                            self.bitmap.composite_rgba(
-                                image_rect.origin.x,
-                                image_rect.origin.y,
+                            self.bitmap.composite_image(
+                                image_rect.origin,
                                 self.scale,
+                                *placement,
                                 raster.width,
                                 raster.height,
                                 &raster.rgba,
@@ -2829,6 +2934,7 @@ mod tests {
                     size: crate::layout::Size { width: 16.0, height: 16.0 },
                 },
                 source,
+                placement: ImagePlacement::Pixel,
             });
             display
         };
@@ -2941,6 +3047,7 @@ mod tests {
                     size: Size { width: 12.0, height: 12.0 },
                 },
                 source,
+                placement: ImagePlacement::Pixel,
             },
             DrawCommand::PopClip,
         ]);

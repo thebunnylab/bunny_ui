@@ -193,7 +193,9 @@ mod tests {
     fn cached_generation_without_a_current_upload_is_not_a_receipt_source() {
         use crate::metal::OffscreenGpu;
         use bunny_ui::image_engine::RawImages;
-        use bunny_ui::layout::{Color, DisplayList, DrawCommand, Point, Rect, Size};
+        use bunny_ui::layout::{
+            Color, DisplayList, DrawCommand, ImagePlacement, Point, Rect, Size,
+        };
         use bunny_ui::text_engine::PixelFont;
         let Some(mut gpu) = OffscreenGpu::new(8, 8) else {
             return;
@@ -209,6 +211,7 @@ mod tests {
                 },
             },
             source: feed.source(),
+            placement: ImagePlacement::Pixel,
         }]
         .into();
         gpu.ground.begin_slot(0, &mut gpu.atlas);
@@ -231,6 +234,7 @@ mod tests {
                 },
             },
             source: feed.source(),
+            placement: ImagePlacement::Pixel,
         }]
         .into();
         gpu.walk(&next, 1, &PixelFont, &RawImages::default());

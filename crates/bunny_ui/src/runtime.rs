@@ -71,11 +71,15 @@ pub struct LiveBlit {
     /// The rect the pixels cover, in LAYOUT coordinates (the visible
     /// window of the box, possibly cropped to its opaque ink).
     pub frame: Rect,
-    /// Physical pixel size of `rgba`.
+    /// Physical pixel size of `premultiplied`.
     pub width: usize,
     pub height: usize,
-    /// Straight (not premultiplied) RGBA rows, top-down.
-    pub rgba: Vec<u8>,
+    /// PREMULTIPLIED RGBA rows, top-down: the box is rastered onto a
+    /// transparent ground, where every blend leaves `rgb = colour x
+    /// coverage`. It is the convention a layer composites in, so a shell
+    /// hands the bytes over as they are; premultiplying them again squares
+    /// the alpha of every soft edge into a dark fringe.
+    pub premultiplied: Vec<u8>,
 }
 
 /// What one live box left on its own surface: the picture, full physical
@@ -5364,7 +5368,7 @@ impl Runtime {
                 .last_customs
                 .borrow()
                 .iter()
-                .any(|custom| custom.composited && custom.live.is_some())
+                .any(|custom| custom.live.is_some() && !custom.is_island())
         {
             moved.scene = true;
         }
@@ -6212,7 +6216,7 @@ impl Runtime {
             let focus = focus.as_deref()?;
             let customs = self.last_customs.borrow();
             let island = format!("{focus}/overlay");
-            if !customs.iter().any(|placement| placement.overlay && placement.path == island) {
+            if !customs.iter().any(|placement| placement.is_island() && placement.overlay && placement.path == island) {
                 return None;
             }
             Rc::from(island.as_str())
@@ -6631,7 +6635,7 @@ impl Runtime {
                 },
                 width: bitmap.width(),
                 height: bitmap.height(),
-                rgba: bitmap.to_rgba_bytes(),
+                premultiplied: bitmap.to_rgba_bytes(),
             });
         }
         blits

@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use bunny_ui_core::icon;
 use bunny_ui_core::image_engine::{ImageSource, PixelFormat};
-use bunny_ui_core::layout::{self, DisplayList, DrawCommand};
+use bunny_ui_core::layout::{self, DisplayList, DrawCommand, ImagePlacement};
 use bunny_ui_core::modifier::Modifier;
 use bunny_ui_core::prelude::{Alignment, Edge, LayoutDirection, Locale, Site, SizeClass};
 use bunny_ui_core::preview as core_preview;
@@ -839,7 +839,11 @@ pub fn turned_as_pictures(display: DisplayList, text: &dyn TextEngine, scale: us
                 size: layout::Size { width: turned.width as f64 / factor, height: turned.height as f64 / factor },
             };
             let size = (turned.width as u32, turned.height as u32);
-            Some(DrawCommand::Image { rect, source: ImageSource::rgba(fold.finish(), size, turned.rgba) })
+            Some(DrawCommand::Image {
+                rect,
+                source: ImageSource::rgba(fold.finish(), size, turned.rgba),
+                placement: ImagePlacement::Pixel,
+            })
         })
         .collect::<Vec<_>>();
     DisplayList::from(commands)
@@ -892,12 +896,12 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
                 color: (*color).into(),
                 font: font(spec, strings),
             },
-            DrawCommand::Image { rect, source } => {
+            DrawCommand::Image { rect, source, placement } => {
                 let (image, inner) = image_ref(source);
                 if seen.insert(image.key, ()).is_none() {
                     images.push(inner.into_owned());
                 }
-                Draw::Image { rect: (*rect).into(), image }
+                Draw::Image { rect: (*rect).into(), image, subpixel: *placement == ImagePlacement::Subpixel }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
                 Draw::PushClip { rect: (*rect).into(), corners: (*corner_radius).into() }
@@ -942,9 +946,13 @@ pub fn raise(commands: &[Draw], strings: &[String], images: &HashMap<u64, ImageS
                 color: (*color).into(),
                 font: font_spec(font, strings)?,
             },
-            Draw::Image { rect, image } => {
+            Draw::Image { rect, image, subpixel } => {
                 let inner = images.get(&image.key).ok_or(Missing::Image { key: image.key })?;
-                DrawCommand::Image { rect: (*rect).into(), source: wrap(inner.clone(), *image) }
+                DrawCommand::Image {
+                    rect: (*rect).into(),
+                    source: wrap(inner.clone(), *image),
+                    placement: if *subpixel { ImagePlacement::Subpixel } else { ImagePlacement::Pixel },
+                }
             }
             Draw::PushClip { rect, corners } => DrawCommand::PushClip { rect: (*rect).into(), corner_radius: (*corners).into() },
             Draw::PopClip => DrawCommand::PopClip,

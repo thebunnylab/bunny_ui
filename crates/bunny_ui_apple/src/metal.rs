@@ -416,8 +416,11 @@ vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
                                 device const SpriteInstance* sprites [[buffer(0)]],
                                 constant Uniforms& uniforms [[buffer(1)]]) {
     SpriteInstance sprite = sprites[iid];
-    float2 low = max(sprite.dest.xy, sprite.clip.xy);
-    float2 high = max(min(sprite.dest.zw, sprite.clip.zw), low);
+    // a picture between pixels covers the ones its edges cross: the quad
+    // grows to the whole pixels (the grid is the identity for every other
+    // sprite, whose dest is whole already)
+    float2 low = max(floor(sprite.dest.xy), sprite.clip.xy);
+    float2 high = max(min(ceil(sprite.dest.zw), sprite.clip.zw), low);
     float2 corner = unit_corners[vid];
     SpriteVary out;
     out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
@@ -506,6 +509,33 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
                                 texture2d<float, access::read> atlas [[texture(0)]]) {
     SpriteInstance sprite = sprites[in.id];
     float2 p = in.position.xy + uniforms.origin;
+    float2 shift = sprite.dest.xy - floor(sprite.dest.xy);
+    if (any(shift != 0.0)) {
+        // a picture BETWEEN pixels (`composite_subpixel`): the texel whose
+        // centre lies up and left of this pixel's, and the share of it and
+        // of its three neighbours that this pixel covers. Summed in
+        // premultiplied colour — a transparent texel adds nothing, whatever
+        // RGB its decoder left — and nothing is read outside the tile
+        float2 at = sprite.tex.xy + (p - sprite.dest.xy) - 0.5;
+        float2 low = floor(at);
+        float2 f = at - low;
+        float4 sum = float4(0.0);
+        for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                float2 texel = low + float2(dx, dy);
+                float share = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+                if (share > 0.0 && all(texel >= sprite.tex.xy) && all(texel < sprite.tex.zw)) {
+                    float4 ink = atlas.read(uint2(texel));
+                    sum += share * float4(ink.rgb * ink.a, ink.a);
+                }
+            }
+        }
+        if (sum.a <= 0.0) {
+            return float4(0.0);
+        }
+        // straight out, like every sprite: the blend premultiplies
+        return float4(sum.rgb / sum.a, sum.a * clip_cov(p, round));
+    }
     float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
     // Sample the pixel centre: a fast-math reciprocal just below one
     // must not round an integer texel boundary into its left neighbour.
@@ -1962,6 +1992,12 @@ impl AtlasGround for MetalGround {
     #[cfg(feature = "3d")]
     fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
         self.world.door()
+    }
+
+    /// `sprite_fragment` shares a pixel among the texels over it when a
+    /// sprite's `dest` keeps a fraction.
+    fn subpixel(&self) -> bool {
+        true
     }
 }
 
@@ -4560,6 +4596,65 @@ mod tests {
             "image scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
+    }
+
+    /// A soft cloud: opaque white in the middle, fading to nothing at
+    /// its rim, and BLACK in its transparent texels, as a decoder leaves
+    /// them.
+    fn cloud_source(key: u64) -> ImageSource {
+        let mut rgba = Vec::with_capacity(48 * 24 * 4);
+        for y in 0..24i32 {
+            for x in 0..48i32 {
+                let away = (((x - 24) as f64 / 24.0).powi(2) + ((y - 12) as f64 / 12.0).powi(2)).sqrt();
+                let alpha = ((1.0 - away) * 2.0).clamp(0.0, 1.0);
+                let alpha = (alpha * 255.0).round() as u8;
+                rgba.extend_from_slice(&if alpha == 0 { [0, 0, 0, 0] } else { [255, 255, 255, alpha] });
+            }
+        }
+        ImageSource::bytes_keyed(key, RawImages::encode(48, 24, &rgba))
+    }
+
+    /// Pictures placed between pixels — on a shelf tile, on a dedicated
+    /// texture, soft-edged over a sky — at `shift` points past the grid.
+    fn subpixel_scene(shift: f64) -> impl View {
+        use bunny_ui::custom::canvas;
+        use bunny_ui::layout::{Point, Rect};
+        canvas(move |_, p| {
+            let at = |x: f64, y: f64, width: f64, height: f64| Rect {
+                origin: Point { x: x + shift, y: y + shift * 0.5 },
+                size: Size { width, height },
+            };
+            p.fill(at(-shift, -shift * 0.5, 320.0, 400.0), Color::rgba(40, 60, 120, 255));
+            p.image_subpixel(at(4.0, 4.0, 24.0, 24.0), gradient_source(11));
+            p.image_subpixel(at(10.0, 40.0, 300.0, 300.0), gradient_source(12));
+            p.image_subpixel(at(60.0, 120.0, 96.0, 48.0), cloud_source(13));
+        })
+        .frame(320.0, 400.0)
+    }
+
+    #[test]
+    fn subpixel_pictures_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        for scale in [1, 2] {
+            for shift in [0.125, 0.25, 0.375, 0.5] {
+                let (gpu, cpu) =
+                    scene_bytes(&subpixel_scene(shift), Size { width: 320.0, height: 400.0 }, scale, Color::CANVAS);
+                assert_close(&gpu, &cpu, 2, &format!("subpixel pictures at {scale}x, {shift} pt past the grid"));
+            }
+        }
+    }
+
+    #[test]
+    fn subpixel_pictures_on_the_grid_match_byte_for_byte() {
+        if !device_present() {
+            return;
+        }
+        // a point across and half a point down are whole pixels at 2×:
+        // the one-for-one read
+        let (gpu, cpu) = scene_bytes(&subpixel_scene(1.0), Size { width: 320.0, height: 400.0 }, 2, Color::CANVAS);
+        assert!(gpu == cpu, "on the grid the sprite is a 1:1 read (max channel delta {})", max_channel_delta(&gpu, &cpu));
     }
 
     #[test]

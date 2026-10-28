@@ -81,7 +81,7 @@ fn frame() -> Frame {
             Draw::StrokeRect { rect: rect(20.0, 130.0, 60.0, 40.0), color: color(0, 0, 0, 255), width: 1.0, corners: corners(6.0) },
             Draw::PushClip { rect: rect(0.0, 0.0, 160.0, 100.0), corners: corners(2.0) },
             Draw::TextLine { origin: Point { x: 24.0, y: 140.0 }, text: 0, range: (0, 5), color: color(20, 20, 25, 255), font },
-            Draw::Image { rect: rect(200.0, 120.0, 64.0, 64.0), image: ImageRef { key: 0xdead_beef, alpha: 128, mirrored: true } },
+            Draw::Image { rect: rect(200.0, 120.0, 64.0, 64.0), image: ImageRef { key: 0xdead_beef, alpha: 128, mirrored: true }, subpixel: false },
             Draw::PopClip,
         ],
         sites: vec![
@@ -298,4 +298,26 @@ fn placement_keeps_the_preexisting_stream_as_an_exact_prefix() {
     let before = include_bytes!("fixtures/wire_v1_before_place.bin");
     assert!(bytes.starts_with(before));
     assert!(bytes.len() > before.len());
+}
+
+#[test]
+fn a_picture_between_pixels_rides_a_tag_of_its_own() {
+    // the golden frame's one picture, as it is and placed between pixels
+    let with = |subpixel: bool| {
+        let mut moved = frame();
+        for command in &mut moved.commands {
+            if let Draw::Image { subpixel: flag, .. } = command {
+                *flag = subpixel;
+            }
+        }
+        Message::ToIde(ToIde::Frame(moved))
+    };
+    let (snapped, between) = (encode(&with(false)), encode(&with(true)));
+    // one byte apart: the draw's tag, 6 for the snapped picture (the bytes
+    // the golden stream holds) and 9 for the one between pixels
+    let moved: Vec<(u8, u8)> = snapped.iter().zip(&between).filter(|(a, b)| a != b).map(|(a, b)| (*a, *b)).collect();
+    assert_eq!(moved, vec![(6, 9)]);
+    let mut reader = Reader::new();
+    reader.feed(&between);
+    assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(true))), "and it decodes to itself");
 }

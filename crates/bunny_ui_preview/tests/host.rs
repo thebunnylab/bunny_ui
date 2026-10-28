@@ -583,7 +583,7 @@ fn a_host_box_rides_the_frame_and_a_door_fills_it() {
         })
         .expect("a frame followed");
     assert!(
-        frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { rect, image } if *rect == webview.frame && image.key == 77)),
+        frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { rect, image, .. } if *rect == webview.frame && image.key == 77)),
         "the picture is drawn where the box stood: {:?}",
         frame.commands
     );
