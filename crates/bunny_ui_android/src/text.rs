@@ -320,7 +320,10 @@ impl TextEngine for AndroidTextEngine {
         }
         let metrics = self.measure_line(text, font);
         let width = (metrics.width * scale as f64).ceil() as usize;
-        let height = (metrics.height() * scale as f64).ceil() as usize;
+        // the glyphs stand on a WHOLE row; the compositor snaps the line's
+        // baseline instead, once, where it knows the origin
+        let baseline = (metrics.ascent * scale as f64).ceil() as usize;
+        let height = baseline + (metrics.descent * scale as f64).ceil() as usize;
         if width == 0 || height == 0 {
             return None;
         }
@@ -351,11 +354,11 @@ impl TextEngine for AndroidTextEngine {
         let paint_class = env.class(c"android/graphics/Paint")?;
         let argb_color = ((color.a as i32) << 24) | ((color.r as i32) << 16) | ((color.g as i32) << 8) | (color.b as i32);
         env.call_void(paint, env.method(paint_class, c"setColor", c"(I)V")?, &[int(argb_color)]);
-        // the baseline sits `ascent` below the top of the line box (the
-        // ceil slack stays at the bottom, sub-pixel)
+        // the baseline sits on row `baseline`, a whole pixel down
         let draw = env.method(canvas_class, c"drawText", c"(Ljava/lang/String;FFLandroid/graphics/Paint;)V")?;
         let string = env.string(text)?;
-        env.call_void(canvas, draw, &[object(string), float(0.0), float(metrics.ascent as f32), object(paint)]);
+        let on_row = baseline as f32 / scale as f32;
+        env.call_void(canvas, draw, &[object(string), float(0.0), float(on_row), object(paint)]);
         // the pixels, straight out of the bitmap's memory
         let mut rgba = vec![0u8; width * height * 4];
         let copied = unsafe {
@@ -390,7 +393,7 @@ impl TextEngine for AndroidTextEngine {
             return None;
         }
         crate::image::unpremultiply(&mut rgba);
-        Some(TextRaster { width, height, baseline: (metrics.ascent * scale as f64).round() as usize, rgba })
+        Some(TextRaster { width, height, baseline, ascent: metrics.ascent, rgba })
     }
 }
 

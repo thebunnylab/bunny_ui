@@ -280,13 +280,27 @@ impl LineMetrics {
 
 /// A rasterized line: an RGBA rectangle of STRAIGHT alpha (not pre-
 /// multiplied — the house compositor blends straight, on every target),
-/// origin at the top-left of the line box, already in PHYSICAL pixels.
-/// `baseline` is the baseline measured from the top (informative/tests —
-/// compositing uses the top-left directly).
+/// already in PHYSICAL pixels.
+///
+/// The compositor places it by its BASELINE, not by its corner: the line
+/// box's top plus `ascent` is where the layout put the baseline, that point
+/// is rounded ONCE to the nearest physical row
+/// ([`crate::raster::baseline_row`]), and row `baseline` of the raster lands
+/// there. So an engine owes exactly two things: glyphs that stand on row
+/// `baseline` (a flat foot's last ink is the row above it — whole pixels,
+/// never a fraction an engine's own snapping would floor), and an `ascent`
+/// equal to the one [`TextEngine::measure_line`] answers for the same text
+/// and font. Placing by the corner instead puts the ink up to two pixels
+/// below the baseline the layout reports: the corner's rounding, the
+/// bitmap's ceil slack and the engine's own vertical snap all add up.
 pub struct TextRaster {
     pub width: usize,
     pub height: usize,
+    /// The row the glyphs stand on, counted from the top.
     pub baseline: usize,
+    /// The line's ascent in LOGICAL points, unrounded — the layout's own
+    /// number, which the compositor adds to the line box's top.
+    pub ascent: Px,
     pub rgba: Vec<u8>,
 }
 
@@ -405,7 +419,7 @@ impl TextEngine for PixelFont {
             }
         }
 
-        Some(TextRaster { width, height, baseline: 13 * scale, rgba })
+        Some(TextRaster { width, height, baseline: 13 * scale, ascent: PIXEL_ASCENT, rgba })
     }
 }
 

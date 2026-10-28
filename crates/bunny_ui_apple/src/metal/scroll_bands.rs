@@ -182,7 +182,9 @@ impl Band {
         let display = software_patch::patch_coordinates(
             &DisplayList::from(commands.to_vec()),
             rect,
-            scale as f64,
+            scale,
+            text,
+            cache,
         )?;
         Some(Self { rect, display })
     }
@@ -642,6 +644,7 @@ fn copy_raster(r: &TextRaster) -> TextRaster {
         width: r.width,
         height: r.height,
         baseline: r.baseline,
+        ascent: r.ascent,
         rgba: r.rgba.clone(),
     }
 }

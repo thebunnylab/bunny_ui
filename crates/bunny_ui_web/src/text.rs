@@ -44,8 +44,9 @@ unsafe extern "C" {
     );
     /// Draws one line into a `width × height` physical rectangle and
     /// copies the straight-alpha RGBA into `out`. The glue places the
-    /// baseline at `height/scale − descent` in logical coordinates —
-    /// the ceil slack stays on top, like the desktop engine.
+    /// baseline at `height/scale − descent` in logical coordinates — the
+    /// engine hands it a `descent` of whole pixels, so the glyphs stand on
+    /// a whole row, like the desktop engines.
     #[allow(clippy::too_many_arguments)]
     fn js_raster_text(
         ptr: *const u8,
@@ -115,6 +116,7 @@ fn clone_raster(raster: &TextRaster) -> TextRaster {
         width: raster.width,
         height: raster.height,
         baseline: raster.baseline,
+        ascent: raster.ascent,
         rgba: raster.rgba.clone(),
     }
 }
@@ -198,7 +200,11 @@ impl TextEngine for CanvasTextEngine {
 
         let metrics = self.measure_line(text, font);
         let width = (metrics.width * scale as f64).ceil() as usize;
-        let height = (metrics.height() * scale as f64).ceil() as usize;
+        // the glyphs stand on a WHOLE row; the compositor snaps the line's
+        // baseline instead, once, where it knows the origin
+        let baseline = (metrics.ascent * scale as f64).ceil() as usize;
+        let below = (metrics.descent * scale as f64).ceil() as usize;
+        let height = baseline + below;
         if width == 0 || height == 0 {
             return None;
         }
@@ -218,7 +224,7 @@ impl TextEngine for CanvasTextEngine {
                 scale as f64,
                 width as u32,
                 height as u32,
-                metrics.descent,
+                below as f64 / scale as f64,
                 pack_color(color),
                 rgba.as_mut_ptr(),
             );
@@ -226,7 +232,8 @@ impl TextEngine for CanvasTextEngine {
         let raster = TextRaster {
             width,
             height,
-            baseline: (metrics.ascent * scale as f64).round() as usize,
+            baseline,
+            ascent: metrics.ascent,
             rgba,
         };
 
