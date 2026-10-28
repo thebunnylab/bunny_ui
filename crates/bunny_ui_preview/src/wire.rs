@@ -25,7 +25,10 @@
 //! old tag changed meaning and every stream without them is the bytes it
 //! was, but a tool that predates them reads a frame that draws one as
 //! malformed, naming the tag ([`Malformed::BadTag`]) — a host should not
-//! send a light face to a tool older than the weights.
+//! send a light face to a tool older than the weights. A picture placed
+//! between pixels (`Draw` tag 9) grew the draws the same way: a snapped
+//! one keeps tag 6 and its bytes, and a tool that predates the tag reads a
+//! frame that draws one as malformed.
 
 use std::fmt;
 
@@ -267,7 +270,10 @@ pub enum Draw {
     StrokeRect { rect: Rect, color: Color, width: f64, corners: Corners },
     /// One wrapped line: `text` names the string, `range` the byte span of it painted.
     TextLine { origin: Point, text: u32, range: (u32, u32), color: Color, font: Font },
-    Image { rect: Rect, image: ImageRef },
+    /// `subpixel`: the picture lands at its exact origin, between pixels
+    /// when it falls there (`ImagePlacement::Subpixel`). It travels as a
+    /// tag of its own (9), so a snapped picture is the bytes it was.
+    Image { rect: Rect, image: ImageRef, subpixel: bool },
     PushClip { rect: Rect, corners: Corners },
     PopClip,
 }
@@ -1383,8 +1389,8 @@ impl Wire for Draw {
                 color.put(out);
                 font.put(out);
             }
-            Draw::Image { rect, image } => {
-                out.u8(6);
+            Draw::Image { rect, image, subpixel } => {
+                out.u8(if *subpixel { 9 } else { 6 });
                 rect.put(out);
                 image.put(out);
             }
@@ -1410,9 +1416,10 @@ impl Wire for Draw {
                 color: Color::get(c)?,
                 font: Font::get(c)?,
             },
-            6 => Draw::Image { rect: Rect::get(c)?, image: ImageRef::get(c)? },
+            6 => Draw::Image { rect: Rect::get(c)?, image: ImageRef::get(c)?, subpixel: false },
             7 => Draw::PushClip { rect: Rect::get(c)?, corners: Corners::get(c)? },
             8 => Draw::PopClip,
+            9 => Draw::Image { rect: Rect::get(c)?, image: ImageRef::get(c)?, subpixel: true },
             tag => return Err(Malformed::BadTag { what: "Draw", tag }),
         })
     }

@@ -59,6 +59,7 @@ fn points(display: &DisplayList) -> Vec<(f64, f64)> {
             DrawCommand::Image {
                 rect,
                 source: ImageSource::Path { verbs, .. },
+                ..
             } => Some(
                 verbs
                     .iter()

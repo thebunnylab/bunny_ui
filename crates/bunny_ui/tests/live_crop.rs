@@ -41,7 +41,8 @@ fn composed(blit: &LiveBlit, size: Size, scale: usize) -> Vec<u8> {
     for row in 0..blit.height {
         let from = row * blit.width * 4;
         let to = ((y + row) * width + x) * 4;
-        rgba[to..to + blit.width * 4].copy_from_slice(&blit.rgba[from..from + blit.width * 4]);
+        rgba[to..to + blit.width * 4]
+            .copy_from_slice(&blit.premultiplied[from..from + blit.width * 4]);
     }
     rgba
 }

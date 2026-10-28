@@ -45,7 +45,7 @@ fn ellipse_fills_both_axes_and_is_an_ellipse_instead_of_a_pill() {
                 .iter()
                 .any(|site| site.kind.name() == "ellipse" && site.frame.size == size)
         );
-        let [DrawCommand::Image { rect, source }] = display.as_slice() else {
+        let [DrawCommand::Image { rect, source, .. }] = display.as_slice() else {
             panic!("ellipse must use the existing vector image pipeline: {display:?}");
         };
         assert_eq!(rect.size, size);

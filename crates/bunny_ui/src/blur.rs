@@ -141,6 +141,8 @@ pub(crate) fn paint(
             },
         },
         source: ImageSource::rgba(key, (width as u32, height as u32), rgba),
+        // the layer was rastered on the grid already
+        placement: crate::layout::ImagePlacement::Pixel,
     })
 }
 

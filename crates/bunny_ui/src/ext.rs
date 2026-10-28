@@ -585,6 +585,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// the clock — the scene around it stays untouched, so a small
     /// decoration costs its own pixels and nothing else.
     ///
+    /// That surface of its own sits above the window, so it is only the
+    /// box's while nothing painted after it lands on it. A box under a
+    /// later sibling — a sky under the sheet laid over it — stays in the
+    /// scene, where paint order holds, and each step repaints the frame.
+    ///
     /// `Loop::secs(9.6).fps(5.0).still_at(0.25)` picks the frame rate
     /// and the resting frame. A slow loop reads smoothly at a low
     /// rate — the eye sees the travel per step, not the rate. Reduced
@@ -841,6 +846,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Two stacked children with opposite fades are how a mark
     /// REPLACES another without the scene changing what it contains —
     /// the modified dot that becomes a close mark under the pointer.
+    ///
+    /// On a picture the fade is a veiled copy, rastered on the CPU once
+    /// per alpha byte and uploaded as a picture of its own. That is free
+    /// for a glyph's crossfade and costly for a large picture whose fade
+    /// moves every frame: each frame rasters the whole picture again. Fade
+    /// a fill over such a picture instead, or composite it yourself.
     #[track_caller]
     fn opacity(self, value: f64) -> Modified<Self> {
         Modified::new(self, Modifier::Opacity(value))

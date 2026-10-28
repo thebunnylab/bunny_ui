@@ -2622,6 +2622,30 @@ pub struct ThumbDrag {
     pub grab: Px,
 }
 
+/// Where an image's pixels land against the device's pixel grid.
+///
+/// A browser does both: an image in the flow is snapped to whole pixels,
+/// and a transformed one is sampled where the transform puts it, which is
+/// how a slow drift glides instead of stepping. The default is the snap:
+/// an icon or a photo half a pixel off the grid stays crisp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImagePlacement {
+    /// The origin is rounded once to the nearest device pixel and the
+    /// pixels are pasted one for one — the same bytes on every backend.
+    #[default]
+    Pixel,
+    /// The origin stays where it is, between pixels when it falls there.
+    /// Each device pixel takes its share of the four the picture puts
+    /// under it, weighed in PREMULTIPLIED colour (a transparent texel adds
+    /// no colour, so a soft edge never darkens), and the box grows by the
+    /// one pixel the fraction spills into. A whole-pixel origin paints the
+    /// very bytes [`ImagePlacement::Pixel`] does.
+    ///
+    /// The CPU raster and the Metal tier place by the fraction. A GPU tier
+    /// that cannot (`AtlasGround::subpixel` is `false`) snaps, as before.
+    Subpixel,
+}
+
 /// A draw command — the output of the placement pass, in paint order
 /// (whoever comes later paints on top; `Layered` counts on that).
 /// It is the rasterizer's interface and, later on, any backend's.
@@ -2688,8 +2712,9 @@ pub enum DrawCommand {
     /// asks the frame's [`ImageEngine`] for pixels at the rect's
     /// PHYSICAL size, so every pipeline composites the same bytes. The
     /// command carries identity, never pixels (equality is the source
-    /// key — cheap for the damage diff).
-    Image { rect: Rect, source: ImageSource },
+    /// key — cheap for the damage diff). `placement` says where those
+    /// pixels land against the device grid.
+    Image { rect: Rect, source: ImageSource, placement: ImagePlacement },
     /// From here to the paired [`DrawCommand::PopClip`], every draw is
     /// cut to this box — the rect INTERSECTS whatever clip is already
     /// open (each consumer keeps that stack), and `corner_radius` bends
@@ -2736,8 +2761,8 @@ impl PartialEq for DrawCommand {
                     if pivot == o && color == c && font == f && turn == q
                         && ((Arc::ptr_eq(content, t) && range == g)
                             || content[range.0..range.1] == t[g.0..g.1])),
-            Image { rect, source } => matches!(other,
-                Image { rect: r, source: s } if rect == r && source == s),
+            Image { rect, source, placement } => matches!(other,
+                Image { rect: r, source: s, placement: p } if rect == r && source == s && placement == p),
             PushClip { rect, corner_radius } => matches!(other,
                 PushClip { rect: r, corner_radius: k } if rect == r && corner_radius == k),
             PopClip => matches!(other, PopClip),
@@ -2995,8 +3020,8 @@ impl DrawCommand {
                     turn: *turn,
                 }
             }
-            DrawCommand::Image { rect, source } => {
-                DrawCommand::Image { rect: moved(rect), source: source.clone() }
+            DrawCommand::Image { rect, source, placement } => {
+                DrawCommand::Image { rect: moved(rect), source: source.clone(), placement: *placement }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
                 DrawCommand::PushClip { rect: moved(rect), corner_radius: *corner_radius }
@@ -3364,8 +3389,9 @@ impl DisplayList {
                         }
                     }
                 }
-                DrawCommand::Image { rect: r, source } => DrawCommand::Image {
+                DrawCommand::Image { rect: r, source, placement } => DrawCommand::Image {
                     rect: rect(r),
+                    placement,
                     source: match source {
                         crate::image_engine::ImageSource::Symbol { symbol, color, forced, turn: spun, .. } => {
                             crate::image_engine::ImageSource::symbol_turned(
@@ -3440,8 +3466,8 @@ impl DisplayList {
                         turn,
                     }
                 }
-                DrawCommand::Image { rect, source } => {
-                    DrawCommand::Image { rect: shift_rect(rect), source }
+                DrawCommand::Image { rect, source, placement } => {
+                    DrawCommand::Image { rect: shift_rect(rect), source, placement }
                 }
                 DrawCommand::PushClip { rect, corner_radius } => {
                     DrawCommand::PushClip { rect: shift_rect(rect), corner_radius }
@@ -3491,13 +3517,17 @@ impl DisplayList {
                 if *mark > index {
                     break;
                 }
-                commands.push(DrawCommand::Image { rect: *rect, source: source.clone() });
+                commands.push(DrawCommand::Image { rect: *rect, source: source.clone(), placement: ImagePlacement::Pixel });
                 next.next();
             }
             commands.push(command.clone());
         }
         commands.extend(
-            next.map(|(_, rect, source)| DrawCommand::Image { rect: *rect, source: source.clone() }),
+            next.map(|(_, rect, source)| DrawCommand::Image {
+                rect: *rect,
+                source: source.clone(),
+                placement: ImagePlacement::Pixel,
+            }),
         );
         DisplayList { commands }
     }
@@ -4228,6 +4258,11 @@ pub struct CustomPlacement {
     pub overlay: bool,
     /// This box paints inside a foreground effect; its animation repaints the scene.
     pub composited: bool,
+    /// Paint that follows the box in the list lands on what it shows. A
+    /// surface of its own would sit above that paint, so the box stays in
+    /// the scene and its steps repaint the frame. Decided once the list is
+    /// whole, after layout.
+    pub covered: bool,
     /// The box's own commands in the frame's display list
     /// (`start..end`) — what a live repaint replaces, and what the GPU
     /// presenter routes to the box's own layer.
@@ -4239,9 +4274,22 @@ pub struct CustomPlacement {
 
 impl CustomPlacement {
     /// Does the box present on a surface of its own — a loop's box, or
-    /// an overlay?
+    /// an overlay, when it paints inside no effect and nothing painted
+    /// after it reaches it?
     pub fn is_island(&self) -> bool {
-        !self.composited && (self.live.is_some() || self.overlay)
+        !self.composited && !self.covered && (self.live.is_some() || self.overlay)
+    }
+
+    /// The rect the box shows, in the window's coordinates — the most a
+    /// surface of its own can cover.
+    fn shown(&self) -> Rect {
+        Rect {
+            origin: Point {
+                x: self.frame.origin.x + self.visible.origin.x,
+                y: self.frame.origin.y + self.visible.origin.y,
+            },
+            size: self.visible.size,
+        }
     }
 }
 
@@ -5065,6 +5113,7 @@ pub(crate) fn layout_placing(
         assert_seen_placement(full, cut);
     }
     let thumbs = lift_thumbs(&mut out, &env);
+    cover_islands(&mut out, &env);
     LayoutResult {
         size,
         accessibility: out.accessibility,
@@ -5327,6 +5376,103 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
             radius: candidate.radius,
         })
         .collect()
+}
+
+/// Marks the live boxes and overlays that paint after them reaches. Each
+/// presents on a surface of its own, and the shell stacks that surface
+/// ABOVE the whole window: a sheet laid over a looping sky would sink
+/// under the sky's layer, a card laid over an editor would show its caret
+/// through. Such a box is `covered` and stays in the scene, where the
+/// list's order is the truth; its clock steps repaint the frame.
+///
+/// The reach is honest, not a superset: a rect by its box (a stroke and a
+/// shadow by their spread), a line of text by its measured box, each cut
+/// by the clip it was drawn under. A superset would cost the common case,
+/// a spinner with its label beside it, its surface. Only what the window
+/// presents counts: a popover paints on a surface above the island anyway.
+fn cover_islands(out: &mut Placement, env: &LayoutEnv<'_>) {
+    // (the box's index, where its slice ends, what it shows)
+    let mut islands: Vec<(usize, usize, Rect)> = out
+        .customs
+        .iter()
+        .enumerate()
+        .filter(|(_, custom)| custom.is_island())
+        .map(|(index, custom)| (index, custom.slice.1, custom.shown()))
+        .collect();
+    let Some(first) = islands.iter().map(|(_, after, _)| *after).min() else { return };
+    let window_end = out.overlays.first().map_or(out.display.len(), |overlay| overlay.display.0);
+    let mut clips: Vec<Option<Rect>> = Vec::new();
+    for (index, command) in out.display.iter().enumerate().take(window_end) {
+        match command {
+            DrawCommand::PushClip { rect, .. } => {
+                let cut = match clips.last() {
+                    Some(top) => top.and_then(|top| top.intersection(*rect)),
+                    None => Some(*rect),
+                };
+                clips.push(cut);
+            }
+            DrawCommand::PopClip => {
+                clips.pop();
+            }
+            _ if index >= first => {
+                let Some(reach) = painted_reach(command, env) else { continue };
+                let reach = match clips.last() {
+                    Some(top) => match top.and_then(|top| top.intersection(reach)) {
+                        Some(reach) => reach,
+                        None => continue,
+                    },
+                    None => reach,
+                };
+                let customs = &mut out.customs;
+                islands.retain(|&(owner, after, shown)| {
+                    let hit = index >= after && shown.intersection(reach).is_some_and(|hit| !hit.is_empty());
+                    customs[owner].covered |= hit;
+                    !hit
+                });
+                if islands.is_empty() {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The box a command's pixels can land in, in logical points — `None`
+/// for a clip, which paints nothing. Text is measured: a line's raster is
+/// blitted from its origin's column rightwards, so its box starts exactly
+/// at the origin (a label that abuts a spinner does not reach it), and a
+/// point of slack on the other three sides covers the raster's ceilings
+/// and a glyph that overhangs its advance.
+fn painted_reach(command: &DrawCommand, env: &LayoutEnv<'_>) -> Option<Rect> {
+    let around = |rect: &Rect, reach: Px| Rect {
+        origin: Point { x: rect.origin.x - reach, y: rect.origin.y - reach },
+        size: Size { width: rect.size.width + 2.0 * reach, height: rect.size.height + 2.0 * reach },
+    };
+    match command {
+        DrawCommand::FillRect { rect, .. }
+        | DrawCommand::Gradient { rect, .. }
+        | DrawCommand::Backdrop { rect, .. }
+        | DrawCommand::Image { rect, .. } => Some(*rect),
+        // a stroke straddles its edge and a shadow spreads; the point
+        // of anti-aliasing is the floor of both, as the damage diff keeps it
+        DrawCommand::StrokeRect { rect, width, .. } => Some(around(rect, (width / 2.0).max(1.0))),
+        DrawCommand::Shadow { rect, radius, .. } => Some(around(rect, radius.max(1.0))),
+        DrawCommand::TextLine { origin, content, range, font, .. } => {
+            let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
+            Some(Rect {
+                origin: Point { x: origin.x, y: origin.y - 1.0 },
+                size: Size { width: metrics.width + 1.0, height: metrics.height() + 2.0 },
+            })
+        }
+        // a turned line reads away from its pivot in any of three
+        // directions: the point of slack goes all the way round
+        DrawCommand::TurnedText { pivot, content, range, font, turn, .. } => {
+            let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
+            Some(around(&turn.line_box(*pivot, &metrics), 1.0))
+        }
+        DrawCommand::PushClip { .. } | DrawCommand::PopClip => None,
+    }
 }
 
 /// A fill over the stretch `from..to` of a thumb's length: the runs under
@@ -7240,7 +7386,7 @@ impl LayoutNode {
                             frame,
                         );
                     }
-                    out.draw(DrawCommand::Image { rect: frame, source });
+                    out.draw(DrawCommand::Image { rect: frame, source, placement: ImagePlacement::Pixel });
                 }
             }
 
@@ -7810,6 +7956,7 @@ impl LayoutNode {
                             live: env.live,
                             overlay: false,
                             composited: out.compositing > 0,
+                            covered: false,
                             slice: (0, 0),
                             direction: env.direction,
                         });
@@ -8034,6 +8181,7 @@ impl LayoutNode {
                             live: None,
                             overlay: true,
                             composited: false,
+                            covered: false,
                             slice: (overlay_from, overlay_end),
                             direction: env.direction,
                         });
@@ -8356,6 +8504,7 @@ impl LayoutNode {
                             out.draw(DrawCommand::Image {
                                 rect,
                                 source: if env.mirrors() { source.mirrored() } else { source.clone() },
+                                placement: ImagePlacement::Pixel,
                             });
                             out.pop_clip();
                         }
@@ -8365,6 +8514,7 @@ impl LayoutNode {
                         out.draw(DrawCommand::Image {
                             rect: frame,
                             source: if env.mirrors() { source.mirrored() } else { source.clone() },
+                            placement: ImagePlacement::Pixel,
                         });
                     }
                 }
@@ -8417,6 +8567,7 @@ impl LayoutNode {
                     out.draw(DrawCommand::Image {
                         rect,
                         source: if env.mirrors() { glyph.mirrored() } else { glyph },
+                        placement: ImagePlacement::Pixel,
                     });
                 }
             }
@@ -8961,7 +9112,7 @@ impl LayoutNode {
                     if rounded {
                         out.push_clip(frame, corners);
                     }
-                    out.draw(DrawCommand::Image { rect: frame, source });
+                    out.draw(DrawCommand::Image { rect: frame, source, placement: ImagePlacement::Pixel });
                     if rounded {
                         out.pop_clip();
                     }
@@ -9000,7 +9151,7 @@ impl LayoutNode {
                     match props.border_style.and_then(|style| {
                         crate::shapes::border_source(frame.size, color, width, style, corner_radius)
                     }) {
-                        Some(source) => out.draw(DrawCommand::Image { rect: frame, source }),
+                        Some(source) => out.draw(DrawCommand::Image { rect: frame, source, placement: ImagePlacement::Pixel }),
                         None => out.draw(DrawCommand::StrokeRect { rect: frame, color, width, corner_radius }),
                     }
                 }
