@@ -2449,6 +2449,11 @@ fn snap_patch(damage: DamageRect, physical: (usize, usize)) -> Option<DamageRect
 
 /// The patch for a damage box, or `None` when it would cover more of the
 /// window than [`PATCH_SHARE`].
+/// The smallest box holding both.
+fn span(a: DamageRect, b: DamageRect) -> DamageRect {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
 fn patch_box(damage: DamageRect, physical: (usize, usize)) -> Option<DamageRect> {
     let rect = snap_patch(damage, physical)?;
     let area = (rect.2 - rect.0) * (rect.3 - rect.1);
@@ -2660,12 +2665,15 @@ impl Easel {
     }
 }
 
-/// The shown patch kept up over a whole frame, its box repainted from
-/// that frame, until the frame's drawable lands (see
+/// A patch kept up over a whole frame, its box repainted from that
+/// frame, until the frame's drawable lands (see
 /// [`MetalPresenter::bridge`]).
 struct Bridge {
     /// The patch, by its index.
     patch: usize,
+    /// What it covers: the patch that showed, the scroll bands that
+    /// showed, or both.
+    rect: DamageRect,
     easel: Easel,
     /// The command that paints it, committed after the frame's own.
     command: Id,
@@ -2711,12 +2719,14 @@ pub struct MetalPresenter {
     /// the one on screen instead of over it.
     previous: Option<Rc<DisplayList>>,
     /// The patch kept up over the last whole frame, showing that frame's
-    /// own pixels in its box, until the frame's drawable lands. The
-    /// window's layer shows a drawable a refresh AFTER the transaction
-    /// that carries it, while a layer hidden in that transaction is gone
-    /// at once: hidden there, the patch would bare the frame before for
-    /// that refresh. Taken down by the first frame or rest that finds
-    /// the drawable landed ([`MetalPresenter::retire_bridge`]).
+    /// own pixels over what the patch or the scroll bands covered, until
+    /// the frame's drawable lands. The window's layer shows a drawable a
+    /// refresh AFTER the transaction that carries it, while a layer
+    /// hidden in that transaction is gone at once: hidden there, the
+    /// patch or the bands would bare the frame before for that refresh —
+    /// for the bands, the list where it stood before it scrolled. Taken
+    /// down by the first frame or rest that finds the drawable landed
+    /// ([`MetalPresenter::retire_bridge`]).
     bridge: Option<usize>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
@@ -3209,8 +3219,12 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            #[cfg(target_os = "macos")]
+            let rows = if rows_active { self.scroll_bands.covered() } else { None };
+            #[cfg(not(target_os = "macos"))]
+            let rows = None;
             let mut bridge = if self.transactional {
-                self.paint_bridge(index, canvas, physical, scale, (sprite_offset, glass_offset), &textures)
+                self.paint_bridge(index, canvas, (sprite_offset, glass_offset), &textures, rows)
             } else {
                 None
             };
@@ -3240,6 +3254,11 @@ impl MetalPresenter {
                 if rows_active { self.scroll_bands.hide(); }
                 for (at, patch) in self.patches.iter_mut().enumerate() {
                     if let Some(kept) = bridge.take_if(|bridge| bridge.patch == at) {
+                        if patch.shown != Some(kept.rect) {
+                            msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(kept.rect, physical, scale));
+                            msg_void_bool(patch.layer, sel("setHidden:"), 0);
+                            patch.shown = Some(kept.rect);
+                        }
                         patch.hang(kept.easel);
                         continue;
                     }
@@ -3274,24 +3293,26 @@ impl MetalPresenter {
         }
     }
 
-    /// Paints the box of the shown patch from the frame just encoded
-    /// whole into slot `index`, for the patch to stay up as the bridge
-    /// over it. `None` when no patch shows, the patch has no canvas free,
-    /// the window changed size or scale since the base (the box stands
-    /// where the old window put it), or the frame reads what a box cannot
-    /// paint alone — glass reads the whole scene, a world its targets —
-    /// and the patch steps aside as it always did. The command is
-    /// encoded, not committed.
+    /// Paints, from the frame just encoded whole into slot `index`, the
+    /// box of the patch that shows and the `rows` the scroll bands cover,
+    /// for a patch to stay up over both as the bridge: the patch that
+    /// shows, or a spare one. `None` when nothing shows, no canvas is
+    /// free, the window changed size or scale since the base (the box
+    /// stands where the old window put it), or the frame reads what a
+    /// box cannot paint alone — glass reads the whole scene, a world its
+    /// targets — and the layers step aside as they always did. The
+    /// command is encoded, not committed.
     unsafe fn paint_bridge(
         &mut self,
         index: usize,
         canvas: Color,
-        physical: (usize, usize),
-        scale: usize,
         (sprite_offset, glass_offset): (usize, usize),
         textures: &[Id],
+        rows: Option<DamageRect>,
     ) -> Option<Bridge> {
         unsafe {
+            // the frame's own size and scale, set before it walked
+            let (physical, scale) = (self.physical, self.scale);
             // iOS paints a patch into a drawable, which lands as late as
             // the frame's own: a bridge there would cover nothing
             if cfg!(not(target_os = "macos"))
@@ -3300,8 +3321,16 @@ impl MetalPresenter {
             {
                 return None;
             }
-            let patch = self.patches.iter().position(|patch| patch.shown.is_some())?;
-            let rect = self.patches[patch].shown?;
+            let shown = self.patches.iter().position(|patch| patch.shown.is_some());
+            let rect = match (shown.and_then(|at| self.patches[at].shown), rows) {
+                (Some(patch), Some(rows)) => span(patch, rows),
+                (Some(only), None) | (None, Some(only)) => only,
+                (None, None) => return None,
+            };
+            let patch = match shown {
+                Some(at) => at,
+                None => self.spare_patch(scale)?,
+            };
             let size = ((rect.2 - rect.0) as usize, (rect.3 - rect.1) as usize);
             let easel = self.patches[patch].easel(&self.stack, size, scale)?;
             let encoded = self.stack.encode_frame(EncodeFrame {
@@ -3323,8 +3352,18 @@ impl MetalPresenter {
                 live_copies: &[],
                 worlds: world::FramePass::default(),
             });
-            (!encoded.command.is_null()).then_some(Bridge { patch, easel, command: encoded.command })
+            (!encoded.command.is_null()).then_some(Bridge { patch, rect, easel, command: encoded.command })
         }
+    }
+
+    /// A hidden Metal patch to show, made if there is none.
+    unsafe fn spare_patch(&mut self, scale: usize) -> Option<usize> {
+        if let Some(at) = self.patches.iter().position(|patch| patch.kind == PatchKind::Metal && patch.shown.is_none()) {
+            return Some(at);
+        }
+        let fresh = unsafe { Patch::new(&self.stack, self.layer, scale, PatchKind::Metal) }?;
+        self.patches.push(fresh);
+        Some(self.patches.len() - 1)
     }
 
     /// Takes the bridge down once the whole frame under it has landed:
@@ -4446,6 +4485,74 @@ mod tests {
             presenter.offer_drawables();
             assert_eq!(presenter.bridge, None);
             assert!(presenter.patches[at].shown.is_none(), "down once the frame landed under it");
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    /// A 180 × 130 window at scale 1: its ground, and a clipped list of
+    /// seven opaque rows scrolled by `offset` — what the scroll bands take.
+    #[cfg(target_os = "macos")]
+    fn rows_scene(offset: f64, ground: Color) -> DisplayList {
+        use bunny_ui::layout::{Corners, DrawCommand, Point, Rect};
+        let rect = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let mut commands = vec![
+            DrawCommand::FillRect { rect: rect(0.0, 0.0, 180.0, 130.0), color: ground, corner_radius: Corners::ZERO },
+            DrawCommand::PushClip { rect: rect(10.0, 20.0, 160.0, 96.0), corner_radius: Corners::ZERO },
+        ];
+        for row in 0..7 {
+            commands.push(DrawCommand::FillRect {
+                rect: rect(10.0, 20.0 + f64::from(row) * 24.0 - offset, 160.0, 24.0),
+                color: Color::hex(if row % 2 == 0 { 0xeeeeee } else { 0x4466aa }),
+                corner_radius: Corners::ZERO,
+            });
+        }
+        commands.push(DrawCommand::PopClip);
+        DisplayList::from(commands)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_whole_frame_after_the_bands_scrolled_keeps_the_rows_where_they_are() {
+        // the scroll bands move a list over a window layer that still
+        // holds it where it stood before it scrolled. Hidden in the
+        // transaction of the next whole frame, they bared that for a
+        // refresh: the list jumped back. A bridge over them shows the
+        // whole frame's rows until its drawable lands
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let size = Size { width: 180.0, height: 130.0 };
+            let present = |presenter: &mut MetalPresenter, display: &DisplayList| {
+                presenter.present(display, size, 1, Color::WHITE, &PixelFont, &RawImages::default(), false);
+            };
+            for offset in [0.0, 24.0, 48.0] {
+                present(&mut presenter, &rows_scene(offset, Color::WHITE));
+            }
+            assert!(presenter.scroll_bands.active(), "the bands scroll the list");
+            let rows = presenter.scroll_bands.covered().expect("what the bands cover");
+            // the ground changes: a whole frame the bands refuse
+            present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
+            assert!(!presenter.scroll_bands.active());
+            let at = presenter.bridge.expect("a bridge over the rows");
+            assert_eq!(shown_patch(&presenter), (at, rows), "it covers what the bands did");
+            let patch = presenter.patches[at].layer;
+            // physical row 60 lies in row 3, scrolled up by 48: 44..68
+            let inside = |x: i64, y: i64| ((x - rows.0) as usize, (y - rows.1) as usize);
+            assert_eq!(contents_pixel(patch, inside(90, 60)), [0x44, 0x66, 0xaa, 0xff], "the rows as they stand now");
+            if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
+                *at -= PRESENT_LANDS_IN;
+            }
+            present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
+            assert_eq!(presenter.bridge, None, "down once the frame landed");
             drop(presenter);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);

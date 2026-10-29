@@ -918,6 +918,14 @@ impl Presenter {
             .map(|scene| &scene.outside)
     }
 
+    /// What the bands and their overlay cover while they show, in the
+    /// window's physical pixels: where the window's own layer still holds
+    /// the frame from before they moved.
+    pub(super) fn covered(&self) -> Option<DamageRect> {
+        let scene = self.prior.as_ref().filter(|_| self.active)?;
+        Some(scene.overlay.as_ref().map_or(scene.viewport, |(rect, _)| span(scene.viewport, *rect)))
+    }
+
     pub(super) fn discard_trial(&mut self) {
         if !self.active {
             self.prior = None;
