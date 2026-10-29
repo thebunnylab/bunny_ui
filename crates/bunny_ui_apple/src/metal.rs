@@ -53,6 +53,8 @@ use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, e
 
 #[cfg(target_os = "macos")]
 mod software_patch;
+#[cfg(target_os = "macos")]
+mod patch_canvas;
 mod presentation;
 #[cfg(target_os = "macos")]
 mod scroll_bands;
@@ -2388,6 +2390,11 @@ impl Drawables {
         }
     }
 
+    /// Whether the last present has landed — or there is none.
+    unsafe fn landed(&mut self) -> bool {
+        self.shown.as_mut().is_none_or(|shown| unsafe { shown.settled() }.is_some())
+    }
+
     /// How many surfaces are offered back right now.
     fn offered(&self) -> usize {
         self.surfaces.iter().filter(|(_, offered)| *offered).count()
@@ -2461,15 +2468,24 @@ enum PatchKind {
 /// pixels inside its box while the window's layer keeps the last whole
 /// frame. A keystroke or a scrollbar that moves then costs the GPU, and
 /// the window server compositing it, the box — not the window.
+///
+/// On the Mac every patch is a plain `CALayer` whose `contents` is an
+/// IOSurface — painted by Metal ([`patch_canvas`]) or by the CPU
+/// ([`software_patch`]) — so its pixels commit with its box. iOS keeps a
+/// `CAMetalLayer` and presents a drawable inside the transaction.
 struct Patch {
     layer: Id,
     kind: PatchKind,
     #[cfg(target_os = "macos")]
     software: software_patch::Backing,
+    /// The IOSurfaces a Metal patch paints, on the Mac.
+    #[cfg(target_os = "macos")]
+    canvases: patch_canvas::Canvases,
     /// The normalized scene of a still-visible software patch.
     #[cfg(target_os = "macos")]
     software_scene: Option<software_patch::Scene>,
-    /// The drawable size the layer was last given, in pixels.
+    /// The drawable size the layer was last given, in pixels (iOS, and
+    /// the software patch's bitmap).
     size: (usize, usize),
     /// The scale the layer was last given.
     scale: usize,
@@ -2489,16 +2505,14 @@ impl Patch {
     /// window's own layer is (opaque: the box is painted whole).
     unsafe fn new(stack: &MetalStack, root: Id, scale: usize, kind: PatchKind) -> Option<Patch> {
         unsafe {
-            let layer_class = match kind {
-                PatchKind::Metal => "CAMetalLayer",
-                #[cfg(target_os = "macos")]
-                PatchKind::Software => "CALayer",
-            };
+            // the Mac hands every patch its pixels as `contents`; only iOS
+            // presents a drawable into its patch
+            let layer_class = if cfg!(target_os = "macos") { "CALayer" } else { "CAMetalLayer" };
             let layer = msg_id(msg_id(class(layer_class), sel("alloc")), sel("init"));
             if layer.is_null() {
                 return None;
             }
-            if kind == PatchKind::Metal {
+            if cfg!(not(target_os = "macos")) && kind == PatchKind::Metal {
                 msg_void_id(layer, sel("setDevice:"), stack.device);
                 msg_void_u64(layer, sel("setPixelFormat:"), stack.format);
                 msg_void_bool(layer, sel("setFramebufferOnly:"), 1);
@@ -2506,11 +2520,13 @@ impl Patch {
                 // on screen and one to paint
                 msg_void_u64(layer, sel("setMaximumDrawableCount:"), 2);
                 msg_void_bool(layer, sel("setAllowsNextDrawableTimeout:"), 0);
-                // every patch presents inside the transaction, its box and
-                // its pixels together. A layer that flips between that and
-                // the asynchronous present loses frames: a drawable once
-                // presented inside a transaction and later presented on its
-                // own is not shown (seen on screen, a stroke behind)
+                // every patch presents inside the transaction that sets its
+                // box. A layer that flips between that and the asynchronous
+                // present loses frames: a drawable once presented inside a
+                // transaction and later presented on its own is not shown
+                // (seen on screen, a stroke behind). The Mac showed such a
+                // drawable a refresh AFTER its box (see `patch_canvas`);
+                // iOS is unverified
                 msg_void_bool(layer, sel("setPresentsWithTransaction:"), 1);
             }
             msg_void_bool(layer, sel("setOpaque:"), 1);
@@ -2523,6 +2539,8 @@ impl Patch {
             Some(Patch { layer, kind,
                 #[cfg(target_os = "macos")]
                 software: software_patch::Backing::default(),
+                #[cfg(target_os = "macos")]
+                canvases: patch_canvas::Canvases::default(),
                 #[cfg(target_os = "macos")]
                 software_scene: None,
                 size: (0, 0), scale, shown: None, held: None, drawables: Drawables::default() })
@@ -2552,6 +2570,105 @@ impl Patch {
             crate::trace::mark("Q", format_args!("hide"));
         }
     }
+
+    /// Where this frame's box of `size` pixels is painted. `None` when
+    /// the layer has nothing free to paint into — the frame paints whole.
+    unsafe fn easel(&mut self, stack: &MetalStack, size: (usize, usize), scale: usize) -> Option<Easel> {
+        unsafe {
+            if self.scale != scale {
+                msg_void_f64(self.layer, stack.sels.set_contents_scale, scale as f64);
+                self.scale = scale;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                self.canvases.free(stack.device, size).map(Easel::Canvas)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if self.size != size {
+                    self.drawables.forget();
+                    msg_void_size(
+                        self.layer,
+                        stack.sels.set_drawable_size,
+                        CGSize { width: size.0 as f64, height: size.1 as f64 },
+                    );
+                    self.size = size;
+                }
+                let drawable = msg_id(self.layer, stack.sels.next_drawable);
+                if drawable.is_null() {
+                    return None;
+                }
+                self.drawables.take(msg_id(drawable, stack.sels.texture));
+                Some(Easel::Drawable(drawable))
+            }
+        }
+    }
+
+    /// Hangs the box painted on `easel` on the layer, inside the
+    /// transaction the caller has open.
+    unsafe fn hang(&mut self, easel: Easel) {
+        unsafe {
+            match easel {
+                #[cfg(target_os = "macos")]
+                Easel::Canvas(free) => {
+                    let surface = self.canvases.show(free);
+                    msg_void_id(self.layer, sel("setContents:"), surface);
+                }
+                #[cfg(not(target_os = "macos"))]
+                Easel::Drawable(drawable) => {
+                    msg_void(drawable, sel("present"));
+                    self.drawables.presented(drawable);
+                }
+            }
+        }
+    }
+}
+
+/// Where a patch paints its box, and the road its pixels take to the
+/// layer.
+enum Easel {
+    /// A canvas the layer takes as its `contents`, in the commit that
+    /// moves it — the Mac.
+    #[cfg(target_os = "macos")]
+    Canvas(patch_canvas::Free),
+    /// The layer's next drawable, presented inside the transaction — iOS.
+    #[cfg(not(target_os = "macos"))]
+    Drawable(Id),
+}
+
+impl Easel {
+    /// The render target the box paints into.
+    unsafe fn texture(&self) -> Id {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Canvas(free) => free.texture(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Drawable(drawable) => unsafe { msg_id(*drawable, sel("texture")) },
+        }
+    }
+
+    /// How far the paint must be before the commit: the compositor reads
+    /// a canvas the moment the commit lands, so its paint completes; a
+    /// drawable presented in a transaction need only be scheduled.
+    fn wait(&self, sels: &Sels) -> Sel {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Canvas(_) => sels.wait_completed,
+            #[cfg(not(target_os = "macos"))]
+            Self::Drawable(_) => sels.wait_scheduled,
+        }
+    }
+}
+
+/// The shown patch kept up over a whole frame, its box repainted from
+/// that frame, until the frame's drawable lands (see
+/// [`MetalPresenter::bridge`]).
+struct Bridge {
+    /// The patch, by its index.
+    patch: usize,
+    easel: Easel,
+    /// The command that paints it, committed after the frame's own.
+    command: Id,
 }
 
 impl Drop for Patch {
@@ -2593,6 +2710,14 @@ pub struct MetalPresenter {
     /// frame equal to it is a change coming back, and is painted beside
     /// the one on screen instead of over it.
     previous: Option<Rc<DisplayList>>,
+    /// The patch kept up over the last whole frame, showing that frame's
+    /// own pixels in its box, until the frame's drawable lands. The
+    /// window's layer shows a drawable a refresh AFTER the transaction
+    /// that carries it, while a layer hidden in that transaction is gone
+    /// at once: hidden there, the patch would bare the frame before for
+    /// that refresh. Taken down by the first frame or rest that finds
+    /// the drawable landed ([`MetalPresenter::retire_bridge`]).
+    bridge: Option<usize>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
     /// The window's own drawables, offered back while it rests.
@@ -2701,9 +2826,12 @@ impl MetalPresenter {
             return true;
         }
         unsafe {
+            self.retire_bridge();
             let window = self.drawables.offer(false);
             let mut patch = true;
             for each in &mut self.patches {
+                #[cfg(target_os = "macos")]
+                each.canvases.rest();
                 // a patch that holds a frame to show again keeps its
                 // pixels, hidden or not
                 let unused = each.shown.is_none() && each.held.is_none();
@@ -2852,6 +2980,7 @@ impl MetalPresenter {
                 (size.height.round().max(0.0) as usize) * scale,
             );
             self.drawable_wait_ms = 0.0;
+            self.retire_bridge();
             if poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels) {
                 self.forget_failed_frame();
             }
@@ -2897,12 +3026,14 @@ impl MetalPresenter {
             if plan == Plan::Same {
                 // the window's layer already shows this frame (a stroke
                 // undone, a hover gone): the patch over it steps aside
-                // and nothing encodes
-                if self.patches.iter().any(|patch| patch.shown.is_some()) {
+                // and nothing encodes. A bridge shows this frame too, and
+                // stays until the frame lands under it
+                let bridge = self.bridge;
+                if self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge) {
                     self.previous = self.patch_on_screen();
                     let transaction = class("CATransaction");
                     msg_void(transaction, sel("begin"));
-                    for patch in &mut self.patches {
+                    for (_, patch) in self.patches.iter_mut().enumerate().filter(|(at, _)| Some(*at) != bridge) {
                         patch.hide();
                     }
                     msg_void(transaction, sel("commit"));
@@ -2934,6 +3065,7 @@ impl MetalPresenter {
                     }
                 }
                 msg_void(transaction, sel("commit"));
+                self.bridge = None;
                 let held = self.patches[again].held.as_ref().map(|(held, _)| held.clone());
                 self.retained = held.map(|held| (held, physical, scale, canvas));
                 crate::trace::mark("Q", format_args!("box={},{},{},{} again", rect.0, rect.1, rect.2, rect.3));
@@ -3002,9 +3134,10 @@ impl MetalPresenter {
                     }
                 }
             }
-            // a whole frame over a patch takes the patch down in the same
-            // transaction — apart, the box would show the old frame for
-            // one refresh
+            // a whole frame over a patch takes the patch down, or keeps it
+            // up as the bridge, in the transaction that carries the
+            // frame's drawable — apart, the box would show the old frame
+            // for one refresh
             let hiding = rows_active || self.patches.iter().any(|patch| patch.shown.is_some());
             // the contract of THIS frame's drawable, settled before it
             // is asked for. A window whose delegate armed the drag
@@ -3076,6 +3209,11 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            let mut bridge = if self.transactional {
+                self.paint_bridge(index, canvas, physical, scale, (sprite_offset, glass_offset), &textures)
+            } else {
+                None
+            };
             // the jobs are on the GPU: their targets hold what they draw
             #[cfg(feature = "3d")]
             self.atlas.worlds.drawn();
@@ -3088,15 +3226,32 @@ impl MetalPresenter {
             if self.transactional {
                 msg_void(command, self.stack.sels.commit);
                 msg_void(command, self.stack.sels.wait_scheduled);
+                // the bridge paints after the frame, on the same queue —
+                // its live textures hold this frame's bytes by then
+                if let Some(bridge) = &bridge {
+                    msg_void(bridge.command, self.stack.sels.commit);
+                    msg_void(bridge.command, bridge.easel.wait(&self.stack.sels));
+                }
+                let bridged = bridge.as_ref().map(|bridge| bridge.patch);
                 let transaction = class("CATransaction");
                 msg_void(transaction, sel("begin"));
                 msg_void(drawable, self.stack.sels.present);
                 #[cfg(target_os = "macos")]
                 if rows_active { self.scroll_bands.hide(); }
-                for patch in &mut self.patches {
+                for (at, patch) in self.patches.iter_mut().enumerate() {
+                    if let Some(kept) = bridge.take_if(|bridge| bridge.patch == at) {
+                        patch.hang(kept.easel);
+                        continue;
+                    }
                     patch.hide();
                 }
                 msg_void(transaction, sel("commit"));
+                self.bridge = bridged;
+                if let Some(at) = bridged
+                    && let Some(rect) = self.patches[at].shown
+                {
+                    crate::trace::mark("Q", format_args!("box={},{},{},{} bridge", rect.0, rect.1, rect.2, rect.3));
+                }
             } else {
                 msg_void_id(command, self.stack.sels.present_drawable, drawable);
                 msg_void(command, self.stack.sels.commit);
@@ -3116,6 +3271,75 @@ impl MetalPresenter {
             self.base = Some(kept.clone());
             self.retained = Some(kept);
             objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    /// Paints the box of the shown patch from the frame just encoded
+    /// whole into slot `index`, for the patch to stay up as the bridge
+    /// over it. `None` when no patch shows, the patch has no canvas free,
+    /// the window changed size or scale since the base (the box stands
+    /// where the old window put it), or the frame reads what a box cannot
+    /// paint alone — glass reads the whole scene, a world its targets —
+    /// and the patch steps aside as it always did. The command is
+    /// encoded, not committed.
+    unsafe fn paint_bridge(
+        &mut self,
+        index: usize,
+        canvas: Color,
+        physical: (usize, usize),
+        scale: usize,
+        (sprite_offset, glass_offset): (usize, usize),
+        textures: &[Id],
+    ) -> Option<Bridge> {
+        unsafe {
+            // iOS paints a patch into a drawable, which lands as late as
+            // the frame's own: a bridge there would cover nothing
+            if cfg!(not(target_os = "macos"))
+                || !self.base.as_ref().is_some_and(|(_, at, by, _)| *at == physical && *by == scale)
+                || self.batches.runs.iter().any(|run| matches!(run.kind, RunKind::Glass | RunKind::World(_)))
+            {
+                return None;
+            }
+            let patch = self.patches.iter().position(|patch| patch.shown.is_some())?;
+            let rect = self.patches[patch].shown?;
+            let size = ((rect.2 - rect.0) as usize, (rect.3 - rect.1) as usize);
+            let easel = self.patches[patch].easel(&self.stack, size, scale)?;
+            let encoded = self.stack.encode_frame(EncodeFrame {
+                target: easel.texture(),
+                present_to: null_mut(),
+                canvas,
+                viewport: (size.0 as f32, size.1 as f32),
+                origin: (rect.0 as f32, rect.1 as f32),
+                instances: self.slots[index].buffer,
+                sprite_offset,
+                glass_offset,
+                runs: &self.batches.runs,
+                rounds: &self.batches.rounds,
+                atlas_texture: self.ground.shared,
+                textures,
+                pyramid: None,
+                staging: self.ground.staging_buffer(),
+                // the frame's own command copies them, ahead on the queue
+                live_copies: &[],
+                worlds: world::FramePass::default(),
+            });
+            (!encoded.command.is_null()).then_some(Bridge { patch, easel, command: encoded.command })
+        }
+    }
+
+    /// Takes the bridge down once the whole frame under it has landed:
+    /// from then on the window's own layer shows the same pixels.
+    unsafe fn retire_bridge(&mut self) {
+        unsafe {
+            let Some(at) = self.bridge else { return };
+            if !self.drawables.landed() {
+                return;
+            }
+            self.bridge = None;
+            let transaction = class("CATransaction");
+            msg_void(transaction, sel("begin"));
+            self.patches[at].hide();
+            msg_void(transaction, sel("commit"));
         }
     }
 
@@ -3226,6 +3450,7 @@ impl MetalPresenter {
                 }
             }
             msg_void(transaction, sel("commit"));
+            self.bridge = None;
             self.patches[target].software_scene = Some(scene);
             self.retained = Some((held, physical, scale, canvas));
             crate::trace::mark("Q", format_args!("box={},{},{},{} software", rect.0, rect.1, rect.2, rect.3));
@@ -3235,10 +3460,10 @@ impl MetalPresenter {
 
     /// Presents `rect` of the frame just walked into slot `index`
     /// through the patch layer, which the window's own layer keeps
-    /// showing the base under. The patch presents inside the
-    /// transaction, with its new geometry when the box moved, resized or
-    /// shows from hiding. False when no patch layer can be had — the
-    /// caller paints whole.
+    /// showing the base under. The patch's pixels and its new geometry —
+    /// moved, resized or shown from hiding — commit in one transaction.
+    /// False when no patch layer or canvas can be had — the caller
+    /// paints whole.
     unsafe fn present_patch(
         &mut self,
         index: usize,
@@ -3252,42 +3477,23 @@ impl MetalPresenter {
             let Some(target) = self.patch_target(held, scale, PatchKind::Metal) else {
                 return false;
             };
-            self.previous = self.patch_on_screen();
-            let (before, rest) = self.patches.split_at_mut(target);
-            let (patch, after) = rest.split_first_mut().expect("the target patch");
             let size = ((rect.2 - rect.0) as usize, (rect.3 - rect.1) as usize);
-            let moves = patch.shown != Some(rect);
-            if patch.scale != scale {
-                msg_void_f64(patch.layer, self.stack.sels.set_contents_scale, scale as f64);
-                patch.scale = scale;
-            }
-            if patch.size != size {
-                patch.drawables.forget();
-                msg_void_size(
-                    patch.layer,
-                    self.stack.sels.set_drawable_size,
-                    CGSize { width: size.0 as f64, height: size.1 as f64 },
-                );
-                patch.size = size;
-            }
+            let Some(easel) = self.patches[target].easel(&self.stack, size, scale) else {
+                return false;
+            };
+            self.previous = self.patch_on_screen();
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
                 &self.stack.sels,
                 &self.batches,
             );
-            let drawable = msg_id(patch.layer, self.stack.sels.next_drawable);
-            if drawable.is_null() {
-                return false;
-            }
-            let texture = msg_id(drawable, self.stack.sels.texture);
             self.resting = false;
-            patch.drawables.take(texture);
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
             let encoded = self.stack.encode_frame(EncodeFrame {
-                target: texture,
+                target: easel.texture(),
                 present_to: null_mut(),
                 canvas,
                 viewport: (size.0 as f32, size.1 as f32),
@@ -3312,7 +3518,10 @@ impl MetalPresenter {
             #[cfg(feature = "3d")]
             self.atlas.worlds.drawn();
             msg_void(command, self.stack.sels.commit);
-            msg_void(command, self.stack.sels.wait_scheduled);
+            msg_void(command, easel.wait(&self.stack.sels));
+            let (before, rest) = self.patches.split_at_mut(target);
+            let (patch, after) = rest.split_first_mut().expect("the target patch");
+            let moves = patch.shown != Some(rect);
             let transaction = class("CATransaction");
             msg_void(transaction, sel("begin"));
             if moves {
@@ -3320,15 +3529,15 @@ impl MetalPresenter {
                 msg_void_bool(patch.layer, sel("setHidden:"), 0);
                 patch.shown = Some(rect);
             }
-            msg_void(drawable, self.stack.sels.present);
+            patch.hang(easel);
             // the other patch steps aside in the same transaction, and
             // keeps what it holds
             for other in before.iter_mut().chain(after.iter_mut()) {
                 other.hide();
             }
             msg_void(transaction, sel("commit"));
+            self.bridge = None;
             patch.held = Some((held.clone(), rect));
-            patch.drawables.presented(drawable);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             self.slots[index].submitted_uploads(&mut self.ground, &self.atlas);
             crate::trace::mark(
@@ -3405,6 +3614,7 @@ impl MetalPresenter {
             #[cfg(target_os = "macos")]
             scroll_bands: scroll_bands::Presenter::default(),
             previous: None,
+            bridge: None,
             boxes: MeasureCache::default(),
             drawables: Drawables::default(),
             resting: false,
@@ -4071,6 +4281,201 @@ mod tests {
                 }
                 assert_close(&gpu_crop, &patch.to_rgba_bytes(), 2, "software patch against Metal");
             }
+        }
+    }
+
+    /// A 512 × 512 window at scale 1: its ground, a small box at the top
+    /// left and a large one at the bottom right, each shown or not. A
+    /// shadow under each keeps its change off the software patch — these
+    /// scenes are about the Metal one.
+    #[cfg(target_os = "macos")]
+    fn boxes_scene(small: bool, large: bool, ground: Color) -> DisplayList {
+        use bunny_ui::layout::{Corners, DrawCommand, Point, Rect};
+        let rect = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let mut commands = vec![DrawCommand::FillRect {
+            rect: rect(0.0, 0.0, 512.0, 512.0),
+            color: ground,
+            corner_radius: Corners::ZERO,
+        }];
+        for (shows, at, color) in [
+            (small, rect(40.0, 40.0, 80.0, 60.0), BOX_SMALL),
+            (large, rect(280.0, 260.0, 160.0, 120.0), BOX_LARGE),
+        ] {
+            if shows {
+                commands.push(DrawCommand::Shadow { rect: at, radius: 4.0, color: Color::BLACK, corner_radius: Corners::ZERO });
+                commands.push(DrawCommand::FillRect { rect: at, color, corner_radius: Corners::ZERO });
+            }
+        }
+        DisplayList::from(commands)
+    }
+
+    #[cfg(target_os = "macos")]
+    const BOX_SMALL: Color = Color::rgb(250, 220, 40);
+    #[cfg(target_os = "macos")]
+    const BOX_LARGE: Color = Color::rgb(20, 40, 160);
+
+    #[cfg(target_os = "macos")]
+    fn present_boxes(presenter: &mut MetalPresenter, display: &DisplayList) {
+        let size = Size { width: 512.0, height: 512.0 };
+        presenter.present(display, size, 1, Color::CANVAS, &PixelFont, &RawImages::default(), false);
+    }
+
+    /// The patch on screen and its box.
+    #[cfg(target_os = "macos")]
+    fn shown_patch(presenter: &MetalPresenter) -> (usize, DamageRect) {
+        presenter
+            .patches
+            .iter()
+            .enumerate()
+            .find_map(|(at, patch)| patch.shown.map(|rect| (at, rect)))
+            .expect("a patch on screen")
+    }
+
+    /// The RGBA pixel at `(x, y)` of the IOSurface a layer holds as its
+    /// contents — what the window server composites at the commit.
+    #[cfg(target_os = "macos")]
+    unsafe fn contents_pixel(layer: Id, (x, y): (usize, usize)) -> [u8; 4] {
+        #[link(name = "IOSurface", kind = "framework")]
+        unsafe extern "C" {
+            fn IOSurfaceGetTypeID() -> usize;
+            fn IOSurfaceLock(surface: Id, options: u32, seed: *mut u32) -> i32;
+            fn IOSurfaceUnlock(surface: Id, options: u32, seed: *mut u32) -> i32;
+            fn IOSurfaceGetBaseAddress(surface: Id) -> *mut c_void;
+            fn IOSurfaceGetBytesPerRow(surface: Id) -> usize;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFGetTypeID(object: Id) -> usize;
+        }
+        unsafe {
+            let surface = msg_id(layer, sel("contents"));
+            assert!(
+                !surface.is_null() && CFGetTypeID(surface) == IOSurfaceGetTypeID(),
+                "the patch layer holds its pixels as an IOSurface"
+            );
+            assert_eq!(IOSurfaceLock(surface, 1, null_mut()), 0);
+            let row = IOSurfaceGetBaseAddress(surface).cast::<u8>().add(y * IOSurfaceGetBytesPerRow(surface));
+            let bgra = std::slice::from_raw_parts(row.add(x * 4), 4);
+            let rgba = [bgra[2], bgra[1], bgra[0], bgra[3]];
+            assert_eq!(IOSurfaceUnlock(surface, 1, null_mut()), 0);
+            rgba
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rgba(color: Color) -> [u8; 4] {
+        [color.r, color.g, color.b, color.a]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_patch_that_moves_commits_its_new_pixels_with_its_new_box() {
+        // T2-BUNNY-385: a patch layer that moved and grew showed its old
+        // box's pixels stretched over the new one for a refresh — the
+        // drawable reached the screen a refresh after the geometry. The
+        // pixels must be the layer's contents when the commit returns.
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let ground = Color::rgb(18, 22, 34);
+            present_boxes(&mut presenter, &boxes_scene(false, false, ground));
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground));
+            let (_, small) = shown_patch(&presenter);
+            present_boxes(&mut presenter, &boxes_scene(false, true, ground));
+            let (at, large) = shown_patch(&presenter);
+            assert_ne!(large, small, "the patch moved to the large box");
+            assert!(large.2 - large.0 > small.2 - small.0, "and grew");
+            let patch = presenter.patches[at].layer;
+            let inside = |x: i64, y: i64| ((x - large.0) as usize, (y - large.1) as usize);
+            assert_eq!(contents_pixel(patch, inside(360, 320)), rgba(BOX_LARGE), "the large box, at once");
+            assert_eq!(contents_pixel(patch, inside(large.0 + 1, large.1 + 1)), rgba(ground));
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_whole_frame_keeps_the_patch_up_until_it_lands() {
+        // the window's layer shows a whole frame's drawable a refresh
+        // after the commit that carries it. A patch hidden in that commit
+        // bared the frame BEFORE for that refresh; it stays up instead,
+        // repainted from the whole frame, until the drawable lands
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let (first, second) = (Color::rgb(18, 22, 34), Color::rgb(30, 22, 34));
+            present_boxes(&mut presenter, &boxes_scene(false, false, first));
+            present_boxes(&mut presenter, &boxes_scene(true, false, first));
+            let (at, rect) = shown_patch(&presenter);
+            // the ground changes: a whole frame
+            present_boxes(&mut presenter, &boxes_scene(true, false, second));
+            assert_eq!(presenter.bridge, Some(at), "the patch bridges the whole frame");
+            assert_eq!(shown_patch(&presenter), (at, rect), "still up, where it was");
+            let patch = presenter.patches[at].layer;
+            let inside = |x: i64, y: i64| ((x - rect.0) as usize, (y - rect.1) as usize);
+            assert_eq!(contents_pixel(patch, inside(80, 70)), rgba(BOX_SMALL));
+            assert_eq!(
+                contents_pixel(patch, inside(rect.0 + 1, rect.1 + 1)),
+                rgba(second),
+                "repainted from the whole frame"
+            );
+            // presented just now, never on screen: not landed
+            let fresh = |presenter: &mut MetalPresenter, age: std::time::Duration| {
+                if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
+                    *at = std::time::Instant::now() - age;
+                }
+            };
+            fresh(&mut presenter, std::time::Duration::ZERO);
+            presenter.rest();
+            assert_eq!(presenter.bridge, Some(at), "a rest before it lands keeps the bridge");
+            assert!(presenter.patches[at].shown.is_some());
+            fresh(&mut presenter, PRESENT_LANDS_IN);
+            presenter.offer_drawables();
+            assert_eq!(presenter.bridge, None);
+            assert!(presenter.patches[at].shown.is_none(), "down once the frame landed under it");
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_of_another_size_takes_the_patch_down_at_once() {
+        // the patch's box stands where the window before put it: a whole
+        // frame at another size or scale cannot repaint it as a bridge
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let ground = Color::rgb(18, 22, 34);
+            present_boxes(&mut presenter, &boxes_scene(false, false, ground));
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground));
+            let (at, _) = shown_patch(&presenter);
+            let taller = Size { width: 512.0, height: 640.0 };
+            let display = boxes_scene(true, false, ground);
+            presenter.present(&display, taller, 1, Color::CANVAS, &PixelFont, &RawImages::default(), false);
+            assert_eq!(presenter.bridge, None, "no bridge across a resize");
+            assert!(presenter.patches[at].shown.is_none(), "the patch steps aside with the frame");
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
         }
     }
 

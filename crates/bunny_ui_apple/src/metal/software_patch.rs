@@ -728,6 +728,16 @@ impl Surface {
             .then_some(surface)
     }
 
+    /// The IOSurface itself: a layer's contents, or a texture's storage.
+    pub(super) fn raw(&self) -> Id {
+        self.raw
+    }
+
+    /// Its size in pixels.
+    pub(super) fn size(&self) -> (usize, usize) {
+        self.size
+    }
+
     pub(super) fn allocated_bytes(&self) -> usize {
         unsafe { IOSurfaceGetAllocSize(self.raw) }
     }
