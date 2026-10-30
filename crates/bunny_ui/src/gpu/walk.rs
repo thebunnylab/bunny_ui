@@ -378,9 +378,9 @@ pub const ATLAS_KEEP_WALKS: u64 = 8;
 #[derive(Debug)]
 pub struct AtlasFull;
 
-/// What a moving fade's live slot is hashed with, apart from every other
-/// slot's identity.
-const FADE_SLOT_TAG: u64 = 0x626e_795f_6661_6465; // "bny_fade"
+/// What a moving big draw's live slot is hashed with, apart from every
+/// other slot's identity.
+const MOVING_SLOT_TAG: u64 = 0x626e_795f_6d6f_7665; // "bny_move"
 
 /// One cached run: the engine's raster uploaded as chunk tiles. The
 /// color sits IN the key — the engine bakes it, which keeps emoji true
@@ -463,14 +463,16 @@ pub const LIVE_KEEP: usize = 16;
 /// Walks a feed may go unread before its texture is given back — a tile
 /// that scrolled away, a call that ended. Two seconds of frames.
 pub const LIVE_IDLE_WALKS: u64 = 120;
-/// A fade whose veil moved within this many walks is on the move: the
-/// walk after a change, and one more for a retry of it.
-const FADE_SETTLES: u64 = 2;
+/// A big picture whose identity moved within this many walks is on the
+/// move: the walk after a change, and one more for a retry of it.
+const SETTLES: u64 = 2;
 
-/// Where one faded picture's veil stands, for one of its draws in a walk.
-pub struct Fade {
-    alpha: u8,
-    /// The walk the veil last moved.
+/// What one draw of a picture too big for a shelf showed, by its place
+/// among a walk's big draws.
+pub struct BigDraw {
+    /// The picture's identity and its physical size.
+    picture: (u64, u32, u32),
+    /// The walk it last changed.
     moved: u64,
     /// The last walk that drew it.
     read: u64,
@@ -503,17 +505,16 @@ pub struct RunAtlas {
     /// The walk in progress: `build_frame` opens one per attempt, and
     /// every dedicated read stamps its texture with it.
     pub walk: u64,
-    /// Faded pictures by inner picture and draw in the walk: the veil each
-    /// showed and the walk it last moved. A veil is in the picture's
-    /// identity, so a fade on the move would mint a picture a frame —
-    /// past a shelf's height, a texture of its own, and the cap's drain
-    /// every frame. On the move it rides a live slot instead; a fade that
-    /// holds still is a picture on the shelves like any other.
-    pub fades: HashMap<(u64, u32), Fade>,
-    /// How many times this walk drew each faded picture so far: the k-th
-    /// draw keeps the k-th slot, so one picture faded twice in a frame
-    /// keeps two textures.
-    fade_draws: HashMap<u64, u32>,
+    /// The draws of pictures too big for a shelf, by their place among a
+    /// walk's big draws: what each showed and the walk it last changed.
+    /// A veil, a tint and a size are all in a picture's identity, so a
+    /// mark that fades, warms or grows mints a picture a frame — a
+    /// texture of its own, and the cap's drain every frame. On the move
+    /// such a draw rides a live slot instead; one that holds still keeps
+    /// its texture like any other.
+    pub big_draws: HashMap<u32, BigDraw>,
+    /// How many big draws this walk has made so far.
+    big_count: u32,
     /// The walk the last reset closed — `fresh` reads the pair.
     pub reset_walk: u64,
     /// What the ground holds for worlds: targets by slot, meshes,
@@ -565,8 +566,8 @@ impl RunAtlas {
             dedicated: HashMap::new(),
             live: HashMap::new(),
             walk: 0,
-            fades: HashMap::new(),
-            fade_draws: HashMap::new(),
+            big_draws: HashMap::new(),
+            big_count: 0,
             reset_walk: 0,
             #[cfg(feature = "3d")]
             worlds: super::world::WorldResidency::default(),
@@ -578,8 +579,8 @@ impl RunAtlas {
     pub fn begin_walk(&mut self) {
         self.walk = self.walk.wrapping_add(1);
         let walk = self.walk;
-        self.fade_draws.clear();
-        self.fades.retain(|_, fade| walk.wrapping_sub(fade.read) <= LIVE_IDLE_WALKS);
+        self.big_count = 0;
+        self.big_draws.retain(|_, draw| walk.wrapping_sub(draw.read) <= LIVE_IDLE_WALKS);
         #[cfg(feature = "3d")]
         self.worlds.begin_walk(self.walk);
     }
@@ -698,32 +699,30 @@ impl RunAtlas {
         Some(ResolvedImage::Live(id, size.0, size.1))
     }
 
-    /// The live slot of this draw of `picture` faded to `alpha`, when its
-    /// veil is on the move; `None` while it holds still, or on first
-    /// sight. The slot is the picture and its draw's place among this
-    /// walk's draws of it.
-    fn moving_fade(&mut self, picture: u64, alpha: u8) -> Option<u64> {
-        let draws = self.fade_draws.entry(picture).or_insert(0);
-        let draw = *draws;
-        *draws += 1;
+    /// The live slot of this big draw showing `picture` (identity and
+    /// size), when what its place in the frame shows moved within
+    /// [`SETTLES`] walks; `None` while it holds still, or on first sight.
+    /// The slot is the draw's place among this walk's big draws.
+    fn moving_big(&mut self, picture: (u64, u32, u32)) -> Option<u64> {
+        let place = self.big_count;
+        self.big_count += 1;
         let walk = self.walk;
-        let fade = self.fades.entry((picture, draw)).or_insert(Fade {
-            alpha,
-            moved: walk.wrapping_sub(FADE_SETTLES + 1),
+        let draw = self.big_draws.entry(place).or_insert(BigDraw {
+            picture,
+            moved: walk.wrapping_sub(SETTLES + 1),
             read: walk,
         });
-        if fade.alpha != alpha {
-            fade.alpha = alpha;
-            fade.moved = walk;
+        if draw.picture != picture {
+            draw.picture = picture;
+            draw.moved = walk;
         }
-        fade.read = walk;
-        if walk.wrapping_sub(fade.moved) > FADE_SETTLES {
+        draw.read = walk;
+        if walk.wrapping_sub(draw.moved) > SETTLES {
             return None;
         }
         let mut hasher = motor::hash::FxHasher::default();
-        hasher.write_u64(FADE_SLOT_TAG);
-        hasher.write_u64(picture);
-        hasher.write_u32(draw);
+        hasher.write_u64(MOVING_SLOT_TAG);
+        hasher.write_u32(place);
         Some(hasher.finish())
     }
 
@@ -906,15 +905,6 @@ impl RunAtlas {
         if let ImageSource::Feed { key, generation, size, format, bytes } = source {
             return Ok(self.resolve_live(ground, *key, *generation, *size, *format, bytes));
         }
-        if !whole
-            && let ImageSource::Faded { inner, alpha, .. } = source
-            && let Some(slot) = self.moving_fade(inner.key(), *alpha)
-        {
-            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
-                return Ok(None);
-            };
-            return Ok(self.resolve_live(ground, slot, source.key(), (width, height), PixelFormat::Rgba8, &raster.rgba));
-        }
         // a world's key is its SLOT: the shelf and the dedicated caches
         // would show an old picture. Where no tier draws worlds, the
         // oracle's picture rides the live road, once per generation.
@@ -933,6 +923,20 @@ impl RunAtlas {
         let shelf_size = height <= DEDICATED_HEIGHT
             && width * height <= DEDICATED_AREA
             && (!whole || width <= ATLAS_CHUNK_WIDTH);
+        // a big picture on the move: one live slot for its place in the
+        // frame, its bytes replaced as they change. Between pixels it
+        // keeps its own road — the live sprite stands on the grid
+        if !shelf_size
+            && !whole
+            && let Some(slot) = self.moving_big(cache_key)
+        {
+            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+                return Ok(None);
+            };
+            let mut generation = motor::hash::FxHasher::default();
+            cache_key.hash(&mut generation);
+            return Ok(self.resolve_live(ground, slot, generation.finish(), (width, height), PixelFormat::Rgba8, &raster.rgba));
+        }
         if shelf_size && let Some(entry) = self.images.get_mut(&cache_key) {
             entry.walk = walk;
             return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
@@ -959,6 +963,21 @@ impl RunAtlas {
         // this walk read is not garbage; after the drain+reset the map
         // holds nothing else, and the walk that re-runs keeps what it
         // needs instead of running into the same wall
+        if self.dedicated.len() >= DEDICATED_KEEP {
+            // the cheap road first, as for the shelves: a texture no walk
+            // read for a while is one no frame in flight samples
+            let stale: Vec<_> = self
+                .dedicated
+                .iter()
+                .filter(|(_, entry)| walk.wrapping_sub(entry.walk) > ATLAS_KEEP_WALKS)
+                .map(|(key, _)| *key)
+                .collect();
+            for key in stale {
+                if let Some(entry) = self.dedicated.remove(&key) {
+                    ground.drop_dedicated(entry.id);
+                }
+            }
+        }
         if self.dedicated.len() >= DEDICATED_KEEP
             && self.dedicated.values().any(|entry| entry.walk != walk)
         {
@@ -2778,27 +2797,28 @@ mod tests {
     }
 
     #[test]
-    fn a_fade_that_holds_still_stays_a_picture_on_the_atlas() {
-        // a dimmed icon is the same picture frame after frame: one shelf
-        // picture, no texture and no draw run of its own
+    fn a_big_picture_that_holds_still_keeps_its_texture() {
+        // a dimmed photo is the same picture frame after frame: one
+        // texture, uploaded once, no live slot
         let mut ground = RecordingGround::default();
         let mut atlas = RunAtlas::new();
         for _ in 0..10 {
-            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.4], 20.0), (1000, 500));
+            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.4], 200.0), (1000, 500));
         }
-        assert!(atlas.live.is_empty(), "no live slot for a fade that holds still");
-        assert_eq!(atlas.images.len(), 1);
-        assert_eq!(ground.uploads.len(), 1, "uploaded once");
-        // and a fade that comes to rest goes back to the shelves
+        assert!(atlas.live.is_empty(), "no live slot for a picture that holds still");
+        assert_eq!(atlas.dedicated.len(), 1);
+        assert_eq!(ground.dedicated.len(), 1, "made once");
+        // on the move it takes a slot, and at rest its texture again
         for frame in 1..=6 {
-            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.4 + 0.05 * f64::from(frame)], 20.0), (1000, 500));
+            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.4 + 0.05 * f64::from(frame)], 200.0), (1000, 500));
         }
         assert_eq!(atlas.live.len(), 1, "on the move: a slot");
-        let images = atlas.images.len();
-        for _ in 0..(FADE_SETTLES + 3) {
-            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.7], 20.0), (1000, 500));
+        let made = ground.dedicated.len();
+        for _ in 0..(SETTLES + 3) {
+            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[0.7], 200.0), (1000, 500));
         }
-        assert_eq!(atlas.images.len(), images + 1, "at rest: one picture on the shelves again");
+        assert_eq!(ground.dedicated.len(), made + 1, "at rest: a texture of its own again");
+        assert_eq!(ground.drops, 0);
     }
 
     #[test]
@@ -2809,10 +2829,51 @@ mod tests {
         let mut atlas = RunAtlas::new();
         for frame in 1..=8 {
             let t = f64::from(frame) / 10.0;
-            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[t, 1.0 - t * 0.5], 120.0), (1000, 500));
+            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[t, 1.0 - t * 0.5], 200.0), (1000, 500));
         }
         assert_eq!(atlas.live.len(), 2, "a slot per draw");
         let generations: Vec<u64> = atlas.live.values().map(|entry| entry.generation).collect();
-        assert_ne!(generations[0], generations[1], "each holds its own veil");
+        assert_ne!(generations[0], generations[1], "each holds its own picture");
+        assert_eq!(ground.drops, 0);
+    }
+
+    #[test]
+    fn a_big_picture_that_resizes_every_frame_rides_one_slot_and_never_drains() {
+        // FlexSuite's lockup glides to its corner and shrinks: each mark
+        // drawn at a new size every frame, each size a picture of its own
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        for frame in 0..60 {
+            let size = 240.0 - f64::from(frame);
+            present_as_tiers(&mut ground, &mut atlas, &faded_photos(&[1.0], size), (1000, 500));
+        }
+        assert_eq!(ground.drops, 0, "no drain, no reset");
+        assert_eq!(atlas.live.len(), 1, "one slot for the one draw");
+        assert!(atlas.dedicated.len() <= 1, "the first sight only");
+    }
+
+    #[test]
+    fn a_texture_no_walk_read_for_a_while_is_given_back_without_a_drain() {
+        // big pictures that showed once and went: past the cap, the ones
+        // no frame in flight can still read make room, and the atlas
+        // never drains for them
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        for key in 0..(DEDICATED_KEEP as u64 + 1) {
+            let display = DisplayList::from(vec![DrawCommand::Image {
+                rect: crate::layout::Rect {
+                    origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                    size: crate::layout::Size { width: 200.0, height: 200.0 },
+                },
+                source: photo(0xb16 + key),
+                placement: ImagePlacement::Pixel,
+            }]);
+            // each shows for longer than the frames in flight
+            for _ in 0..=ATLAS_KEEP_WALKS {
+                present_as_tiers(&mut ground, &mut atlas, &display, (1000, 500));
+            }
+        }
+        assert_eq!(ground.drops, 0, "no drain");
+        assert!(atlas.dedicated.len() <= DEDICATED_KEEP, "within the cap: {}", atlas.dedicated.len());
     }
 }
