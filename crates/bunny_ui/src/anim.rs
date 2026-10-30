@@ -76,6 +76,12 @@ impl Loop {
     /// Caps the distinct frames per second. A slow animation reads
     /// smoothly at a low rate — the eye sees the travel per step, not
     /// the rate itself.
+    ///
+    /// From [`EVERY_REFRESH`] up the loop asks for the display's own pace
+    /// and rides the display link, as a [`pulse`] does: a rate that does
+    /// not divide the refresh lands its steps two and three refreshes
+    /// apart (30 on a 75 Hz display), which a moving figure shows as a
+    /// judder.
     pub fn fps(mut self, fps: f64) -> Loop {
         self.fps = fps.clamp(1.0, 120.0);
         self
@@ -119,6 +125,10 @@ struct LoopClock {
     dirty: bool,
     touched: u64,
 }
+
+/// The rate, in frames a second, from which a clock asks for every
+/// refresh rather than a step of its own.
+pub const EVERY_REFRESH: f64 = 60.0;
 
 /// How fast the shell should drive frames right now.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -569,28 +579,21 @@ impl Animator {
         if self.entries.values().any(NodeAnim::active) || !self.scrolls.is_empty() {
             return FramePace::Display;
         }
-        if let Some(fps) = PULSE.with(|pulse| pulse.get()) {
-            // a pulse that wants the display rate takes it; a capped one
-            // is served at its cap, unless a loop asks faster
-            if fps >= 60.0 {
-                return FramePace::Display;
-            }
-            let loops = if self.loops_alive() {
-                self.loops.values().map(|clock| clock.spec.fps).fold(1.0_f64, f64::max)
-            } else {
-                1.0
-            };
-            return FramePace::Slow(1.0 / fps.max(loops));
+        let loops = self
+            .loops_alive()
+            .then(|| self.loops.values().map(|clock| clock.spec.fps).fold(1.0_f64, f64::max));
+        // the fastest clock alive: a pulse, a loop, or both
+        let Some(fastest) = PULSE.with(|pulse| pulse.get()).into_iter().chain(loops).reduce(f64::max) else {
+            return FramePace::Idle;
+        };
+        // a clock that wants the display rate takes the display link; a
+        // capped one is served at its cap. A timer at a step shorter than
+        // a refresh beats between refreshes and paints frames nobody sees
+        if fastest >= EVERY_REFRESH {
+            return FramePace::Display;
         }
-        if self.loops_alive() {
-            let fastest = self
-                .loops
-                .values()
-                .map(|clock| clock.spec.fps)
-                .fold(1.0_f64, f64::max);
-            return FramePace::Slow(1.0 / fastest);
-        }
-        FramePace::Idle
+        // never slower than a frame a second, as before
+        FramePace::Slow(1.0 / fastest.max(1.0))
     }
 
     /// Accessibility switch: on, every animation completes instantly
@@ -882,6 +885,18 @@ mod tests {
         animator.tick(0.1);
         assert!(!animator.wants_frame(), "the sweep collected the orphan clock");
         assert_eq!(animator.pace(), FramePace::Idle);
+    }
+
+    #[test]
+    fn a_loop_that_asks_for_the_display_rate_rides_the_display_link() {
+        let mut animator = Animator::default();
+        animator.note_place();
+        let _ = animator.resolve_phase("dial", Loop::secs(60.0).fps(30.0));
+        assert_eq!(animator.pace(), FramePace::Slow(1.0 / 30.0));
+        // a timer at 1/120 s beats between the refreshes of any display
+        // slower than that, and paints frames nobody sees
+        let _ = animator.resolve_phase("face", Loop::secs(9.6).fps(120.0));
+        assert_eq!(animator.pace(), FramePace::Display);
     }
 
     #[test]
