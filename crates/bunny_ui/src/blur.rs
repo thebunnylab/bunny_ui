@@ -8,6 +8,17 @@
 //! and the atlas drained nearly every frame (T2-BUNNY-386). Element targets keep
 //! their native controls and apply a CSS filter. Three separable box filters
 //! approximate a Gaussian on premultiplied RGBA, including transparent edges.
+//!
+//! The six passes are most of a blur's cost — a screen blurring in is a
+//! megapixel and more, every frame of the move, and it held FlexSuite's
+//! set-up to half the display's rate (T2-BUNNY-388). Each pass runs
+//! row-major, the vertical one sliding a sum per column down the rows; the
+//! box's mean is a multiply and a shift, not a division ([`Mean`]); and a
+//! picture big enough to pay for it splits its rows into bands a few
+//! workers take in turn, so a slow core takes fewer. The sums and their
+//! rounding are the same in every split — a band starts from the window
+//! its first row would have — so the pixels never depend on how many cores
+//! ran, and they are the pixels the one-core division gave.
 
 pub(crate) fn radius(value: f64) -> Option<f64> {
     (value.is_finite() && value > 0.0).then(|| value.min(128.0))
@@ -96,6 +107,7 @@ pub(crate) fn paint(
         .map(|pixel| pixel.to_be_bytes().map(|channel| u16::from(channel) * 256))
         .collect();
     let mut scratch = vec![[0; 4]; pixels.len()];
+    let split = Split::for_picture(width, height);
     // A box of width w has variance (w² - 1) / 12. Mix the two
     // neighbouring odd widths so three boxes approximate sigma².
     let physical_sigma = sigma * factor;
@@ -116,8 +128,8 @@ pub(crate) fn paint(
         .clamp(0.0, 3.0) as usize;
     for pass in 0..3 {
         let radius = (if pass < low_count { lower } else { upper }) / 2;
-        box_pass(&pixels, &mut scratch, width, height, radius);
-        box_pass(&scratch, &mut pixels, height, width, radius);
+        across_rows(&pixels, &mut scratch, width, radius, split);
+        down_columns(&scratch, &mut pixels, width, height, radius, split);
     }
     // The raster's transparent canvas is premultiplied. Images cross every
     // backend as straight alpha, so unpremultiply once, after all six passes.
@@ -155,37 +167,196 @@ pub(crate) fn paint(
     })
 }
 
-/// A sliding box, transposed on output so the vertical pass has the same
-/// contiguous reads. Samples outside the layer are transparent, never clamped.
+/// Pixels below this a single core blurs faster than threads can start.
 #[cfg(feature = "canvas")]
-fn box_pass(
+const PARALLEL_FROM: usize = 1 << 16;
+/// The most workers a blur takes: past it the passes are memory's, not
+/// the cores'.
+#[cfg(feature = "canvas")]
+const WORKERS: usize = 8;
+/// Bands per worker: small enough that a fast core takes the bands a slow
+/// one has not reached.
+#[cfg(feature = "canvas")]
+const BANDS_PER_WORKER: usize = 4;
+/// The fewest rows a band holds.
+#[cfg(feature = "canvas")]
+const BAND_ROWS: usize = 16;
+
+/// How the passes over one picture divide: `workers` threads taking bands
+/// of `rows` rows in turn. One worker on the web, where a page has no
+/// threads to give, and for a picture too small to pay for them.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Split {
+    workers: usize,
+    rows: usize,
+}
+
+#[cfg(feature = "canvas")]
+impl Split {
+    fn for_picture(width: usize, height: usize) -> Split {
+        let one = Split { workers: 1, rows: height.max(1) };
+        if cfg!(target_arch = "wasm32") || width * height < PARALLEL_FROM {
+            return one;
+        }
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(WORKERS);
+        let rows = height.div_ceil(workers * BANDS_PER_WORKER).max(BAND_ROWS);
+        if workers < 2 || rows >= height {
+            return one;
+        }
+        Split { workers, rows }
+    }
+
+    /// Runs `work` over every band, the bands taken in turn by the
+    /// workers. Each band is its index and whatever `bands` paired with it.
+    fn run<B: Send>(self, bands: impl Iterator<Item = B>, work: impl Fn(B) + Sync) {
+        if self.workers == 1 {
+            return bands.for_each(work);
+        }
+        let queue = std::sync::Mutex::new(bands.collect::<Vec<_>>().into_iter());
+        let next = || queue.lock().map_or(None, |mut bands| bands.next());
+        std::thread::scope(|scope| {
+            for _ in 0..self.workers {
+                scope.spawn(|| {
+                    while let Some(band) = next() {
+                        work(band);
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// A box's rounded mean as a multiply and a shift: for `n = sum + d / 2`
+/// and `m = ⌈2⁴⁰ / d⌉ = (2⁴⁰ + e) / d` with `0 ≤ e < d`,
+/// `n·m / 2⁴⁰ = ⌊n / d⌋ + r/d + n·e / (d·2⁴⁰)` where `r = n mod d`, so the
+/// floor is exact while `n·e < 2⁴⁰`. A sum of `d` sixteen-bit channels plus
+/// `d / 2` keeps `n < 2¹⁶·d`, and `e < d`, so every divisor below 2¹² is
+/// exact — a box is at most a few hundred pixels wide — and `n·m` stays
+/// below 2⁵⁷.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct Mean {
+    half: u32,
+    scale: u64,
+}
+
+#[cfg(feature = "canvas")]
+impl Mean {
+    const SHIFT: u32 = 40;
+
+    fn over(divisor: u32) -> Mean {
+        Mean { half: divisor / 2, scale: (1u64 << Self::SHIFT).div_ceil(u64::from(divisor)) }
+    }
+
+    fn of(self, sum: [u32; 4]) -> [u16; 4] {
+        sum.map(|channel| ((u64::from(channel + self.half) * self.scale) >> Self::SHIFT) as u16)
+    }
+}
+
+#[cfg(feature = "canvas")]
+fn add(sum: &mut [u32; 4], pixel: [u16; 4]) {
+    for (total, channel) in sum.iter_mut().zip(pixel) {
+        *total += u32::from(channel);
+    }
+}
+
+#[cfg(feature = "canvas")]
+fn take(sum: &mut [u32; 4], pixel: [u16; 4]) {
+    for (total, channel) in sum.iter_mut().zip(pixel) {
+        *total -= u32::from(channel);
+    }
+}
+
+/// The horizontal pass: each pixel the rounded mean of the
+/// `2 * radius + 1` around it in its row.
+#[cfg(feature = "canvas")]
+fn across_rows(source: &[[u16; 4]], target: &mut [[u16; 4]], width: usize, radius: usize, split: Split) {
+    let band = split.rows * width;
+    split.run(source.chunks(band).zip(target.chunks_mut(band)), |(from, to)| {
+        box_rows(from, to, width, radius);
+    });
+}
+
+/// The vertical pass: each pixel the rounded mean of the
+/// `2 * radius + 1` around it in its column.
+#[cfg(feature = "canvas")]
+fn down_columns(
     source: &[[u16; 4]],
     target: &mut [[u16; 4]],
     width: usize,
     height: usize,
     radius: usize,
+    split: Split,
 ) {
-    let divisor = (radius * 2 + 1) as u32;
-    for y in 0..height {
-        let row = &source[y * width..(y + 1) * width];
+    split.run(target.chunks_mut(split.rows * width).enumerate(), |(at, rows)| {
+        box_columns(source, rows, width, height, at * split.rows, radius);
+    });
+}
+
+/// A sliding box along each row of `source` into the same row of
+/// `target`. Samples outside the layer are transparent, never clamped.
+#[cfg(feature = "canvas")]
+fn box_rows(source: &[[u16; 4]], target: &mut [[u16; 4]], width: usize, radius: usize) {
+    let mean = Mean::over((radius * 2 + 1) as u32);
+    for (row, out) in source.chunks_exact(width).zip(target.chunks_exact_mut(width)) {
         let mut sum = [0u32; 4];
-        for pixel in row.iter().take(radius + 1) {
-            for channel in 0..4 {
-                sum[channel] += u32::from(pixel[channel]);
-            }
+        for &pixel in row.iter().take(radius + 1) {
+            add(&mut sum, pixel);
         }
-        for x in 0..width {
-            target[x * height + y] = sum.map(|channel| ((channel + divisor / 2) / divisor) as u16);
+        for (x, slot) in out.iter_mut().enumerate() {
+            *slot = mean.of(sum);
             if x >= radius {
-                for channel in 0..4 {
-                    sum[channel] -= u32::from(row[x - radius][channel]);
-                }
+                take(&mut sum, row[x - radius]);
             }
-            if let Some(next) = row.get(x + radius + 1) {
-                for channel in 0..4 {
-                    sum[channel] += u32::from(next[channel]);
-                }
+            if let Some(&next) = row.get(x + radius + 1) {
+                add(&mut sum, next);
             }
         }
     }
 }
+
+/// A sliding box down each column of `source`, for the rows of `target`,
+/// the first of which is row `first`: a sum per column starts from that
+/// row's own window and slides down a row at a time. Samples outside the
+/// layer are transparent, never clamped.
+#[cfg(feature = "canvas")]
+fn box_columns(
+    source: &[[u16; 4]],
+    target: &mut [[u16; 4]],
+    width: usize,
+    height: usize,
+    first: usize,
+    radius: usize,
+) {
+    let mean = Mean::over((radius * 2 + 1) as u32);
+    let row = |y: usize| &source[y * width..(y + 1) * width];
+    let mut sums = vec![[0u32; 4]; width];
+    for y in first.saturating_sub(radius)..=(first + radius).min(height - 1) {
+        for (sum, &pixel) in sums.iter_mut().zip(row(y)) {
+            add(sum, pixel);
+        }
+    }
+    for (offset, out) in target.chunks_exact_mut(width).enumerate() {
+        let y = first + offset;
+        for (slot, &sum) in out.iter_mut().zip(&sums) {
+            *slot = mean.of(sum);
+        }
+        if y >= radius {
+            for (sum, &pixel) in sums.iter_mut().zip(row(y - radius)) {
+                take(sum, pixel);
+            }
+        }
+        if y + radius + 1 < height {
+            for (sum, &pixel) in sums.iter_mut().zip(row(y + radius + 1)) {
+                add(sum, pixel);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "canvas"))]
+#[path = "blur_tests.rs"]
+mod tests;
