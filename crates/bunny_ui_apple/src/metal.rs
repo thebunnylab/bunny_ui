@@ -5800,6 +5800,71 @@ mod tests {
         assert_glass_close(&gpu.read_rgba(), &cpu, 3, 0.005, "cards");
     }
 
+    #[test]
+    fn the_rows_of_one_frosted_shape_read_one_capture() {
+        if !device_present() {
+            return;
+        }
+        // a speech bubble's tail cut into rows, as FlexSuite draws it:
+        // each row a tall frosted pane clipped to its own row, its clear
+        // background after it. The GPU draws the rows as one batch over
+        // one capture; the CPU reads the scene row by row, so each row's
+        // blur carries the frost of the rows above it. The gap is that,
+        // and only that: small, and bounded here
+        use bunny_ui::layout::{Corners, DrawCommand, Glass, Point, Rect};
+        let at = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let (width, height) = (240, 160);
+        let mut commands = Vec::new();
+        for row in 0..20 {
+            commands.push(DrawCommand::FillRect {
+                rect: at(0.0, f64::from(row) * 8.0, 240.0, 8.0),
+                color: if row % 2 == 0 { Color::hex(0x102A64) } else { Color::hex(0xE8D14A) },
+                corner_radius: Corners::ZERO,
+            });
+        }
+        for column in 0..12 {
+            commands.push(DrawCommand::FillRect {
+                rect: at(f64::from(column) * 20.0, 0.0, 6.0, 160.0),
+                color: Color::rgba(200, 40, 90, 160),
+                corner_radius: Corners::ZERO,
+            });
+        }
+        let frost = Glass::regular()
+            .blur(18.0)
+            .tint(Color::rgba(255, 255, 255, 0))
+            .refraction(0.0, 0.0)
+            .highlight(Color::WHITE, 0.0, 0.0)
+            .saturation(1.0);
+        for row in 0..30 {
+            let y = 60.0 + f64::from(row);
+            let reach = 30.0 - f64::from(row);
+            let piece = at(120.0 - reach, y - 20.0, 2.0 * reach + 10.0, 41.0);
+            commands.push(DrawCommand::PushClip { rect: at(0.0, y, 240.0, 1.0), corner_radius: Corners::ZERO });
+            commands.push(DrawCommand::Backdrop {
+                rect: piece,
+                glass: frost.resolve(piece),
+                corner_radius: Corners::ZERO,
+            });
+            commands.push(DrawCommand::FillRect {
+                rect: piece,
+                color: Color::rgba(255, 255, 255, 0),
+                corner_radius: Corners::ZERO,
+            });
+            commands.push(DrawCommand::PopClip);
+        }
+        let display = DisplayList::from(commands);
+        let cpu = rasterize_with(&display, width, height, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+            .to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(width, height).expect("offscreen gpu");
+        gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+        // measured: within 5 of the row-by-row answer, 0.9% of channels
+        // beyond one step. Drawn a batch a row, the GPU matched within 1
+        assert_glass_close(&gpu.read_rgba(), &cpu, 6, 0.012, "rows of one shape");
+    }
+
     /// The wrapper's lifetime is observable independently of the pixels:
     /// a weak Objective-C reference must clear while the visible IOSurface
     /// remains usable. No window, sleeps or private Metal selectors needed.

@@ -1223,6 +1223,20 @@ fn box_union(a: Box4, b: Box4) -> Box4 {
 /// panes that overlap must not share it: the upper one would sample a
 /// blur taken before the lower one existed, and stacked glass would
 /// show nothing of the glass beneath it.
+///
+/// A pane touches by `bounds`, the quad it draws — its box cut by its
+/// clip — not by the box it was given: a shape cut into rows, each a
+/// tall pane clipped to its own row, is pieces that never overlap, and
+/// one capture is what makes them one material. Each batch costs a store
+/// and a load of the whole target, so the thirty rows of a speech
+/// bubble's tail had cost thirty.
+///
+/// The CPU rasterizer reads the scene pane by pane, so where panes in
+/// one batch lie within each other's blur — the rows of one shape — its
+/// answer carries what the earlier ones painted and the GPU's does not.
+/// Its retained surface repaints damaged regions alone and cannot
+/// recover the pixels an earlier piece covered, so it stays the
+/// sequential reference.
 fn note_glass(
     runs: &mut Vec<DrawRun>,
     round: u32,
@@ -1305,6 +1319,14 @@ pub fn build_frame(
     let mut glass_batch: Option<Box4> = None;
     for command in display.iter() {
         match command {
+            // paint that paints nothing is no instance: it would only
+            // split the runs around it. A view's clear background between
+            // two pieces of one frosted shape closed the glass batch, and
+            // every piece paid a pass of its own
+            DrawCommand::FillRect { color, .. }
+            | DrawCommand::StrokeRect { color, .. }
+            | DrawCommand::Shadow { color, .. }
+                if color.a == 0 => {}
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -1369,7 +1391,7 @@ pub fn build_frame(
                     &mut batches.runs,
                     round_of(&clips),
                     batches.glass.len() - 1,
-                    snapped,
+                    visible,
                     reads,
                     crate::glass::levels_for(paint.blur) as u32,
                     &mut glass_batch,
@@ -2662,6 +2684,91 @@ mod tests {
         assert_eq!(over[1].levels, 2);
         assert_eq!(over[0].reads, (-3, -3, 23, 23));
         assert_eq!(over[1].reads, (7, 7, 33, 33), "its capture holds its own pane alone");
+    }
+
+    /// The glass batches of a display list: each one's pane count.
+    fn glass_batches(display: &DisplayList) -> Vec<u32> {
+        walk_runs(display)
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == RunKind::Glass)
+            .map(|(_, _, count)| count)
+            .collect()
+    }
+
+    fn at(x: f64, y: f64, w: f64, h: f64) -> Rect {
+        Rect {
+            origin: crate::layout::Point { x, y },
+            size: crate::layout::Size { width: w, height: h },
+        }
+    }
+
+    fn pane(rect: Rect) -> DrawCommand {
+        DrawCommand::Backdrop {
+            rect,
+            glass: crate::layout::Glass::frosted().resolve(rect),
+            corner_radius: Corners::ZERO,
+        }
+    }
+
+    #[test]
+    fn paint_that_paints_nothing_leaves_the_batch_whole_and_paint_splits_it() {
+        // a view's clear background between two panes is no instance:
+        // the panes share one capture. Ink between them is paint the
+        // second one reads, so it takes a capture of its own
+        let between = |color: Color| {
+            DisplayList::from(vec![
+                pane(at(10.0, 10.0, 40.0, 40.0)),
+                DrawCommand::FillRect { rect: at(10.0, 10.0, 40.0, 40.0), color, corner_radius: Corners::ZERO },
+                DrawCommand::StrokeRect {
+                    rect: at(10.0, 10.0, 40.0, 40.0),
+                    color,
+                    width: 1.0,
+                    corner_radius: Corners::ZERO,
+                },
+                DrawCommand::Shadow { rect: at(10.0, 10.0, 40.0, 40.0), radius: 4.0, color, corner_radius: Corners::ZERO },
+                pane(at(100.0, 10.0, 40.0, 40.0)),
+            ])
+        };
+        assert_eq!(glass_batches(&between(Color::rgba(255, 255, 255, 0))), vec![2]);
+        assert_eq!(
+            walk_runs(&between(Color::rgba(255, 255, 255, 0))).len(),
+            1,
+            "a clear fill, stroke or shadow draws no instance at all"
+        );
+        assert_eq!(glass_batches(&between(Color::rgba(255, 255, 255, 1))), vec![1, 1]);
+    }
+
+    #[test]
+    fn the_rows_of_one_shape_share_a_batch_by_the_quads_they_draw() {
+        // a tail cut into rows: each row a tall pane clipped to its own
+        // row, its clear background painted after it. The boxes overlap
+        // by all but a row; the quads they draw never do
+        let rows = |clipped: bool| {
+            let mut commands = Vec::new();
+            for row in 0..6 {
+                let y = 40.0 + f64::from(row) * 2.0;
+                let tall = at(20.0 + f64::from(row), y - 20.0, 60.0, 42.0);
+                if clipped {
+                    commands.push(DrawCommand::PushClip { rect: at(0.0, y, 200.0, 2.0), corner_radius: Corners::ZERO });
+                }
+                commands.push(pane(tall));
+                commands.push(DrawCommand::FillRect {
+                    rect: tall,
+                    color: Color::rgba(255, 255, 255, 0),
+                    corner_radius: Corners::ZERO,
+                });
+                if clipped {
+                    commands.push(DrawCommand::PopClip);
+                }
+            }
+            DisplayList::from(commands)
+        };
+        assert_eq!(glass_batches(&rows(true)), vec![6], "the pieces of one shape read one capture");
+        assert_eq!(
+            glass_batches(&rows(false)),
+            vec![1; 6],
+            "unclipped, every pane draws over the one before and reads it"
+        );
     }
 
     #[test]
