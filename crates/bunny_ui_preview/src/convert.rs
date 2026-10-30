@@ -222,6 +222,7 @@ impl From<layout::GlassPaint> for wire::Glass {
             spot_center: g.spot_center.into(),
             spot_radius: g.spot_radius,
             spot_alpha: g.spot_alpha,
+            opacity: g.opacity,
         }
     }
 }
@@ -243,6 +244,7 @@ impl From<wire::Glass> for layout::GlassPaint {
             spot_center: g.spot_center.into(),
             spot_radius: g.spot_radius,
             spot_alpha: g.spot_alpha,
+            opacity: g.opacity,
         }
     }
 }

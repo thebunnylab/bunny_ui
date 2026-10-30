@@ -1067,7 +1067,7 @@ struct GlassInstance {
     uint tint;      // straight RGBA, r in the low byte
     uint highlight;
     float spot_alpha;
-    float glass_pad;
+    float opacity;  // how much of the pane lands over the scene
 };
 
 StructuredBuffer<GlassInstance> panes : register(t0);
@@ -1273,7 +1273,7 @@ float4 glass_fragment(GlassVary vary) : SV_Target {
 
     // straight alpha out — the blend state premultiplies, exactly as it
     // does for a rect
-    return float4(color.rgb, color.a * coverage * clip_cov(p));
+    return float4(color.rgb, color.a * coverage * pane.opacity * clip_cov(p));
 }
 "#;
 

@@ -70,7 +70,7 @@ pub struct GlassInstance {
     pub tint: [u8; 4],    // straight RGBA (a normalized attribute)
     pub highlight: [u8; 4],
     pub spot_alpha: f32,
-    pub pad: f32,
+    pub opacity: f32, // how much of the pane lands over the scene
 }
 
 const _: () = {
@@ -84,6 +84,7 @@ const _: () = {
     assert!(std::mem::offset_of!(GlassInstance, tint) == 96);
     assert!(std::mem::offset_of!(GlassInstance, highlight) == 100);
     assert!(std::mem::offset_of!(GlassInstance, spot_alpha) == 104);
+    assert!(std::mem::offset_of!(GlassInstance, opacity) == 108);
 };
 
 /// One text run (or chunk of one): a rectangle of atlas texels copied
@@ -1327,6 +1328,8 @@ pub fn build_frame(
             | DrawCommand::StrokeRect { color, .. }
             | DrawCommand::Shadow { color, .. }
                 if color.a == 0 => {}
+            // and a pane faded out lands nothing over the scene it reads
+            DrawCommand::Backdrop { glass, .. } if glass.opacity <= 0.0 => {}
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -1379,7 +1382,7 @@ pub fn build_frame(
                         paint.highlight.a,
                     ],
                     spot_alpha: paint.spot_alpha as f32,
-                    pad: 0.0,
+                    opacity: paint.opacity.min(1.0) as f32,
                 });
                 // the quad is the box cut by the clip: only those pixels
                 // shade, so only their lens reads the scene
@@ -2736,6 +2739,36 @@ mod tests {
             "a clear fill, stroke or shadow draws no instance at all"
         );
         assert_eq!(glass_batches(&between(Color::rgba(255, 255, 255, 1))), vec![1, 1]);
+    }
+
+    #[test]
+    fn a_pane_faded_out_takes_no_capture_and_one_fading_carries_its_opacity() {
+        // a pane over another would take a capture of its own; faded to
+        // nothing it lands nothing, so it is no instance at all
+        let over = |opacity: f64| {
+            let rect = at(20.0, 20.0, 40.0, 40.0);
+            let mut glass = crate::layout::Glass::frosted().resolve(rect);
+            glass.opacity = opacity;
+            let display = DisplayList::from(vec![
+                pane(at(10.0, 10.0, 40.0, 40.0)),
+                DrawCommand::Backdrop { rect, glass, corner_radius: Corners::ZERO },
+            ]);
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut RecordingGround::default(),
+                &display,
+                1,
+                (400, 400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut RunAtlas::new(),
+                &mut batches,
+            )
+            .expect("the scene fits the atlas");
+            (glass_batches(&display), batches.glass.iter().map(|pane| pane.opacity).collect::<Vec<_>>())
+        };
+        assert_eq!(over(0.0), (vec![1], vec![1.0]), "a pane at none is not drawn");
+        assert_eq!(over(0.3), (vec![1, 1], vec![1.0, 0.3]), "a fading pane carries how much of it lands");
     }
 
     #[test]

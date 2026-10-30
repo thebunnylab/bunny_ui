@@ -21,6 +21,7 @@ layout(location = 4) flat in vec4 v_touch;
 layout(location = 5) flat in vec4 v_tint;
 layout(location = 6) flat in vec4 v_highlight;
 layout(location = 7) flat in float v_spot_alpha;
+layout(location = 8) flat in float v_opacity;
 
 layout(location = 0) out vec4 out_color;
 
@@ -173,5 +174,5 @@ void main() {
 
     // straight alpha out — the blend state premultiplies, exactly as it
     // does for a rect
-    out_color = vec4(color.rgb, color.a * coverage * clip_cov(p));
+    out_color = vec4(color.rgb, color.a * coverage * v_opacity * clip_cov(p));
 }

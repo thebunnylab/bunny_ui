@@ -28,7 +28,9 @@
 //! send a light face to a tool older than the weights. A picture placed
 //! between pixels (`Draw` tag 9) grew the draws the same way: a snapped
 //! one keeps tag 6 and its bytes, and a tool that predates the tag reads a
-//! frame that draws one as malformed.
+//! frame that draws one as malformed. A pane of glass faded under an
+//! opacity grew the draws once more (`Draw` tag 10, its opacity after
+//! the `Backdrop` bytes): a whole pane keeps tag 2 and its bytes.
 
 use std::fmt;
 
@@ -208,6 +210,10 @@ pub struct Glass {
     pub spot_center: Point,
     pub spot_radius: f64,
     pub spot_alpha: f64,
+    /// How much of the pane lands over the scene, 1 for all of it. It
+    /// travels outside the glass's own bytes: a whole pane is a
+    /// `Backdrop` as it always was, and only a faded one carries it.
+    pub opacity: f64,
 }
 
 /// A font weight.
@@ -265,6 +271,8 @@ pub struct ImageRef {
 pub enum Draw {
     FillRect { rect: Rect, color: Color, corners: Corners },
     Gradient { rect: Rect, paint: GradientPaint, corners: Corners },
+    /// A pane of glass. One faded under an opacity travels as a tag of
+    /// its own (10), so a whole pane is the bytes it was.
     Backdrop { rect: Rect, glass: Glass, corners: Corners },
     Shadow { rect: Rect, radius: f64, color: Color, corners: Corners },
     StrokeRect { rect: Rect, color: Color, width: f64, corners: Corners },
@@ -1309,6 +1317,7 @@ impl Wire for Glass {
             spot_center: Point::get(c)?,
             spot_radius: c.f64()?,
             spot_alpha: c.f64()?,
+            opacity: 1.0,
         })
     }
 }
@@ -1361,10 +1370,14 @@ impl Wire for Draw {
                 corners.put(out);
             }
             Draw::Backdrop { rect, glass, corners } => {
-                out.u8(2);
+                let faded = glass.opacity < 1.0;
+                out.u8(if faded { 10 } else { 2 });
                 rect.put(out);
                 glass.put(out);
                 corners.put(out);
+                if faded {
+                    out.f64(glass.opacity);
+                }
             }
             Draw::Shadow { rect, radius, color, corners } => {
                 out.u8(3);
@@ -1420,6 +1433,11 @@ impl Wire for Draw {
             7 => Draw::PushClip { rect: Rect::get(c)?, corners: Corners::get(c)? },
             8 => Draw::PopClip,
             9 => Draw::Image { rect: Rect::get(c)?, image: ImageRef::get(c)?, subpixel: true },
+            10 => {
+                let (rect, mut glass, corners) = (Rect::get(c)?, Glass::get(c)?, Corners::get(c)?);
+                glass.opacity = c.f64()?;
+                Draw::Backdrop { rect, glass, corners }
+            }
             tag => return Err(Malformed::BadTag { what: "Draw", tag }),
         })
     }

@@ -487,7 +487,7 @@ impl Bitmap {
     /// one pixel must never move the blur of the next.
     fn glass_pane(&mut self, rect: Rect, glass: GlassPaint, corner_radius: Corners) {
         let (x0, y0, x1, y1) = Self::snap(rect);
-        if x1 <= x0 || y1 <= y0 {
+        if x1 <= x0 || y1 <= y0 || glass.opacity <= 0.0 {
             return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip_box();
@@ -526,13 +526,16 @@ impl Bitmap {
             }
             out
         });
+        // the answer lands at the pane's opacity, after the memo: a pane
+        // fading in or out reuses the pixels it derived once
+        let opacity = glass.opacity.min(1.0);
         let mut at = 0usize;
         for y in by0..by1 {
             for x in bx0..bx1 {
                 let (color, coverage) = shaded[at];
                 at += 1;
                 if coverage > 0.0 {
-                    self.set_covered(x, y, unpack(color), f64::from(coverage));
+                    self.set_covered(x, y, unpack(color), f64::from(coverage) * opacity);
                 }
             }
         }

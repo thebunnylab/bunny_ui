@@ -392,6 +392,7 @@ flat out vec4 v_touch;
 flat out vec4 v_tint;
 flat out vec4 v_highlight;
 flat out float v_spot_alpha;
+flat out float v_opacity;
 
 const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -412,6 +413,7 @@ void main() {
     v_tint = a_tint;
     v_highlight = a_highlight;
     v_spot_alpha = a_spot.x;
+    v_opacity = a_spot.y;
 }
 "#;
 
@@ -426,6 +428,7 @@ flat in vec4 v_touch;
 flat in vec4 v_tint;
 flat in vec4 v_highlight;
 flat in float v_spot_alpha;
+flat in float v_opacity;
 out vec4 out_color;
 
 const float GLASS_SIGMA_L0 = 5.2;
@@ -562,7 +565,7 @@ void main() {
 
     // straight alpha out — the blend state premultiplies, exactly as it
     // does for a rect
-    out_color = vec4(color.rgb, color.a * coverage * clip_cov(p));
+    out_color = vec4(color.rgb, color.a * coverage * v_opacity * clip_cov(p));
 }
 "#;
 

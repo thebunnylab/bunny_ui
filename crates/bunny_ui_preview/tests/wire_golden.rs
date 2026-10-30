@@ -74,6 +74,7 @@ fn frame() -> Frame {
                     spot_center: Point { x: 140.0, y: 30.0 },
                     spot_radius: 40.0,
                     spot_alpha: 0.25,
+                    opacity: 1.0,
                 },
                 corners: corners(16.0),
             },
@@ -320,4 +321,27 @@ fn a_picture_between_pixels_rides_a_tag_of_its_own() {
     let mut reader = Reader::new();
     reader.feed(&between);
     assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(true))), "and it decodes to itself");
+}
+
+#[test]
+fn a_faded_pane_rides_a_tag_of_its_own() {
+    // the golden frame's one pane, whole and faded under an opacity
+    let with = |opacity: f64| {
+        let mut faded = frame();
+        for command in &mut faded.commands {
+            if let Draw::Backdrop { glass, .. } = command {
+                glass.opacity = opacity;
+            }
+        }
+        Message::ToIde(ToIde::Frame(faded))
+    };
+    let (whole, faded) = (encode(&with(1.0)), encode(&with(0.4)));
+    // a whole pane is tag 2 and the bytes the golden stream holds; a faded
+    // one is tag 10, the same bytes, and its opacity after them
+    assert_eq!(faded.len(), whole.len() + 8);
+    let first = whole[4..].iter().zip(&faded[4..]).find(|(a, b)| a != b).map(|(a, b)| (*a, *b));
+    assert_eq!(first, Some((2, 10)));
+    let mut reader = Reader::new();
+    reader.feed(&faded);
+    assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(0.4))), "and it decodes to itself");
 }
