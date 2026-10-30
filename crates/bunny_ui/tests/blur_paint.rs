@@ -379,7 +379,9 @@ fn every_step_of_a_clearing_blur_shows_and_none_jumps() {
         let pixels = rasterize(&runtime.display_frame(&bar, size), 80, 60, Color::rgba(0, 0, 0, 0))
             .to_rgba_bytes();
         let alpha: Vec<f64> = pixels[30 * 80 * 4..31 * 80 * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| f64::from(pixel[3]))
             .collect();
         let total: f64 = alpha.iter().sum();
