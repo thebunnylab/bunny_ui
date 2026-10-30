@@ -1,4 +1,5 @@
-//! Effect pixels reach ImageIO-backed native painting without being decoded again.
+//! Effect pixels reach ImageIO-backed native painting without being decoded again:
+//! they ride a feed slot of raw bytes.
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use bunny_ui::image_engine::{ImageSource, raster_source};
@@ -40,8 +41,10 @@ fn native_decoder_displays_the_complete_blurred_subtree() {
             .iter()
             .any(|p| p[2] > 100 && p[3] > 240)
     );
+    // raw bytes, never a platform decoder — on the feed road, so a blur
+    // that animates replaces one texture instead of minting a picture
     assert!(
-        matches!(source, ImageSource::Rgba { .. }),
-        "computed pixels use the decoder-independent source variant"
+        matches!(source, ImageSource::Feed { .. }),
+        "computed pixels ride a feed slot of raw bytes"
     );
 }
