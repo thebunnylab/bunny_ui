@@ -274,13 +274,21 @@ pub type Area = (i64, i64, i64, i64);
 /// One pass reads nine taps at up to 7.25 destination texels, plus a
 /// texel of bilinear footprint. Going down a level doubles what a texel
 /// is worth, so the margins compose from the top.
+///
+/// A level is only NEARLY half the one below: an odd size rounds up
+/// (241 px is 121 texels, then 60), so a texel's taps land up to one
+/// texel of its own level further out than the halving says. Without
+/// that texel the far edge of a level read past its window — clamped to
+/// the edge on the CPU, whatever an earlier pane left there on a GPU
+/// that windows its passes.
 fn margin_for(level: usize, max_level: usize) -> i64 {
     let mut margin = 2 * (1 << (max_level + 1)) as i64;
     let mut current = max_level;
     while current > level {
-        // the vertical pass (+9 texels of this level) and the
-        // horizontal one (+16 texels of the level below)
-        margin += 34 * (1 << current) as i64;
+        // the vertical pass (+9 texels of this level), the horizontal
+        // one (+16 texels of the level below) and the odd size's texel
+        // of this level
+        margin += 36 * (1 << current) as i64;
         current -= 1;
     }
     margin
@@ -288,6 +296,61 @@ fn margin_for(level: usize, max_level: usize) -> i64 {
 
 fn inflate(area: Area, by: i64) -> Area {
     (area.0 - by, area.1 - by, area.2 + by, area.3 + by)
+}
+
+/// The device-px area a pane over `rect` reads — its own box plus the
+/// reach of the lens: the bend, widened by the chromatic spread, and two
+/// px of bilinear footprint.
+pub fn read_area(rect: (f64, f64, f64, f64), glass: &GlassPaint) -> Area {
+    let reach =
+        (glass.refraction_amount.abs() * (1.0 + glass.chromatic.max(0.0))).ceil() as i64 + 2;
+    (
+        rect.0.floor() as i64 - reach,
+        rect.1.floor() as i64 - reach,
+        rect.2.ceil() as i64 + reach,
+        rect.3.ceil() as i64 + reach,
+    )
+}
+
+/// A window of one level's texels, `[x0, y0, x1, y1)`. Empty when
+/// `x1 <= x0` or `y1 <= y0`: the area lies off that level.
+pub type Texels = (i64, i64, i64, i64);
+
+/// What one level of a pyramid over an area writes, in that level's
+/// texels. The horizontal pass fills `wide`, which keeps the rows and
+/// columns the vertical pass's taps reach; the vertical pass fills
+/// `window`, which holds every texel the levels above and the composite
+/// read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LevelWindows {
+    pub level: usize,
+    /// The whole level, in texels: half the scene, halved again per level.
+    pub size: (usize, usize),
+    pub wide: Texels,
+    pub window: Texels,
+}
+
+/// The windows a pyramid over `area` (device px) of a `width` × `height`
+/// scene builds, level 0 first and `max_level` (at most [`MAX_LEVEL`])
+/// last.
+///
+/// The rasterizer builds exactly these, and a GPU that confines each
+/// pass to its window reads only texels a pass of the same frame wrote:
+/// a pane's blur costs its neighbourhood, never the whole viewport.
+pub fn level_windows(
+    area: Area,
+    width: usize,
+    height: usize,
+    max_level: usize,
+) -> impl Iterator<Item = LevelWindows> {
+    let max_level = max_level.min(MAX_LEVEL);
+    let base = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+    (0..=max_level).map(move |level| {
+        let size = ((base.0 >> level).max(1), (base.1 >> level).max(1));
+        let texel_size = (1 << (level + 1)) as f64;
+        let window = texels_of(inflate(area, margin_for(level, max_level)), texel_size, size);
+        LevelWindows { level, size, wide: inflate_texels(window, 9, size), window }
+    })
 }
 
 impl Pyramid {
@@ -303,18 +366,13 @@ impl Pyramid {
         let max_level = max_level.min(MAX_LEVEL);
         let scene_window = inflate(area, margin_for(0, max_level) + 34);
         let scene = Plane::from_scene(pixels, width, height, scene_window);
-        let base = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
         let mut levels: Vec<Plane> = Vec::with_capacity(max_level + 1);
-        for level in 0..=max_level {
-            let full = ((base.0 >> level).max(1), (base.1 >> level).max(1));
-            let texel_size = (1 << (level + 1)) as f64;
-            let window = texels_of(inflate(area, margin_for(level, max_level)), texel_size, full);
+        for windows in level_windows(area, width, height, max_level) {
             let source = levels.last().unwrap_or(&scene);
             // the horizontal pass carries the downsample and keeps the
             // extra rows the vertical one reads
-            let wide = inflate_texels(window, 9, full);
-            let horizontal = blur_pass(source, full, wide, (1.0, 0.0));
-            levels.push(blur_pass(&horizontal, full, window, (0.0, 1.0)));
+            let horizontal = blur_pass(source, windows.size, windows.wide, (1.0, 0.0));
+            levels.push(blur_pass(&horizontal, windows.size, windows.window, (0.0, 1.0)));
         }
         Pyramid { levels }
     }
@@ -486,16 +544,7 @@ impl Lens {
     /// The device-px area the pane reads — its own box plus the reach
     /// of the lens.
     pub fn area(&self) -> Area {
-        let reach = (self.glass.refraction_amount.abs()
-            * (1.0 + self.glass.chromatic.max(0.0)))
-        .ceil() as i64
-            + 2;
-        (
-            self.rect.0.floor() as i64 - reach,
-            self.rect.1.floor() as i64 - reach,
-            self.rect.2.ceil() as i64 + reach,
-            self.rect.3.ceil() as i64 + reach,
-        )
+        read_area(self.rect, &self.glass)
     }
 
     /// The colour one pixel of the pane becomes, and how much of the
@@ -707,5 +756,112 @@ mod tests {
             blur.contains(&format!("const float BLUR_O[5] = float[5]({});", offsets.join(", "))),
             "the blur offsets drifted from the taps this module resolves",
         );
+    }
+
+    /// Every texel a pass of a windowed pyramid reads lies in a window an
+    /// earlier pass of the same build wrote, and so does every texel the
+    /// composite samples. A GPU that confines its passes to these windows
+    /// keeps the texels outside from the panes before: a window one texel
+    /// short would show the last pane's leftovers at this one's rim.
+    #[test]
+    fn the_windows_hold_every_texel_a_pass_or_the_composite_reads() {
+        // the texels a bilinear sample at `u` weighs across a level `size`
+        // texels long, clamped to the edge as the sampler clamps: the next
+        // one only when it carries weight — a sample ON a texel reads that
+        // texel alone, here, in `Plane::sample` and in the hardware
+        let footprint = |u: f64, size: usize| {
+            let at = u * size as f64 - 0.5;
+            let low = at.floor() as i64;
+            let high = if at > at.floor() { low + 1 } else { low };
+            (low.clamp(0, size as i64 - 1), high.clamp(0, size as i64 - 1))
+        };
+        let within = |(low, high): (i64, i64), from: i64, to: i64| from <= low && high < to;
+        let mut offsets = vec![0.0];
+        offsets.extend(TAPS[1..].iter().flat_map(|&(_, offset)| [offset, -offset]));
+        let mut checked = 0;
+        for (width, height) in [(1440, 900), (241, 161), (7, 5)] {
+            for area in [
+                // the pane at (230, 2) on the odd viewport is the one a
+                // margin that assumed exact halving left a texel short
+                (600, 300, 680, 341),
+                (-40, -40, 30, 20),
+                (1400, 880, 1500, 960),
+                (0, 0, 1, 1),
+                (100, 100, 900, 700),
+                (230, 2, 260, 3),
+            ] {
+                for max_level in 0..=MAX_LEVEL {
+                    let levels: Vec<LevelWindows> =
+                        level_windows(area, width, height, max_level).collect();
+                    assert_eq!(levels.len(), max_level + 1);
+                    for (index, at) in levels.iter().enumerate() {
+                        let ((x0, y0, x1, y1), wide) = (at.window, at.wide);
+                        let (sx, sy) = at.size;
+                        if x1 <= x0 || y1 <= y0 {
+                            continue;
+                        }
+                        // the vertical pass reads what the horizontal one
+                        // wrote, at the same column
+                        for (x, y) in [(x0, y0), (x1 - 1, y1 - 1)] {
+                            let column = footprint((x as f64 + 0.5) / sx as f64, sx);
+                            assert!(within(column, wide.0, wide.2), "{area:?} level {index}");
+                            for offset in &offsets {
+                                let row = footprint((y as f64 + 0.5 + offset) / sy as f64, sy);
+                                assert!(within(row, wide.1, wide.3), "{area:?} level {index}");
+                            }
+                        }
+                        // the horizontal pass reads the level below, which
+                        // the level 0 pass has whole: it is the scene
+                        let Some(below) = index.checked_sub(1).map(|low| levels[low]) else {
+                            continue;
+                        };
+                        let (bx, by) = below.size;
+                        for (x, y) in [(wide.0, wide.1), (wide.2 - 1, wide.3 - 1)] {
+                            let row = footprint((y as f64 + 0.5) / sy as f64, by);
+                            assert!(within(row, below.window.1, below.window.3), "{area:?} level {index}");
+                            for offset in &offsets {
+                                let column = footprint((x as f64 + 0.5 + offset) / sx as f64, bx);
+                                assert!(
+                                    within(column, below.window.0, below.window.2),
+                                    "{area:?} level {index}"
+                                );
+                            }
+                            checked += 1;
+                        }
+                    }
+                    // the composite samples every level up to the deepest,
+                    // anywhere in the area the panes read that is on screen
+                    let (ax0, ay0) = (area.0.max(0), area.1.max(0));
+                    let (ax1, ay1) = (area.2.min(width as i64), area.3.min(height as i64));
+                    if ax1 <= ax0 || ay1 <= ay0 {
+                        continue;
+                    }
+                    for at in &levels {
+                        let (sx, sy) = at.size;
+                        for (x, y) in [(ax0, ay0), (ax1, ay1)] {
+                            let column = footprint(x as f64 / width as f64, sx);
+                            let row = footprint(y as f64 / height as f64, sy);
+                            assert!(within(column, at.window.0, at.window.2), "{area:?} level {}", at.level);
+                            assert!(within(row, at.window.1, at.window.3), "{area:?} level {}", at.level);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "the cases reach the passes they mean to check");
+    }
+
+    /// The pyramid windows are a pane's neighbourhood, not the viewport:
+    /// a card in the middle of a big screen builds under a quarter of
+    /// each level, its deepest levels far less.
+    #[test]
+    fn a_small_pane_builds_a_small_share_of_each_level() {
+        let glass = crate::layout::Glass::regular().resolve(crate::layout::Rect::default());
+        let pane = read_area((700.0, 400.0, 760.0, 441.0), &glass);
+        for at in level_windows(pane, 1440, 900, 2) {
+            let (x0, y0, x1, y1) = at.window;
+            let share = ((x1 - x0) * (y1 - y0)) as f64 / (at.size.0 * at.size.1) as f64;
+            assert!(share < 0.25, "level {} builds {:.0}% of itself", at.level, share * 100.0);
+        }
     }
 }
