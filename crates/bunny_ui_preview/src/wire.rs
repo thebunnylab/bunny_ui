@@ -390,7 +390,8 @@ pub enum ResourceKind {
     Symbol { name: String, color: Color, forced: bool },
     /// A file's icon, by path — the tool resolves it on its side.
     FileIcon { path: String },
-    /// One generation of a live feed.
+    /// One generation of a live feed, under its slot's key: a newer one
+    /// comes again under the same key and replaces it.
     Feed { generation: u64, size: (u32, u32), rgba: Vec<u8> },
     /// An app's own symbol whole, tinted: its draws in order, which a tool
     /// paints as the framework paints a glyph — one ink's draws piled in

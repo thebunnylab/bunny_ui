@@ -35,8 +35,9 @@
 //!
 //! ## Production gotchas
 //!
-//! - A resource (an image's pixels, a vector icon) travels once per key;
-//!   the tool caches it until the host says `Forget`. A `Native` image —
+//! - A resource (an image's pixels, a vector icon) travels once per key,
+//!   and again after the tool says `Forget`; a live feed's travels again
+//!   at every new generation, under its slot's key. A `Native` image —
 //!   a platform surface — has no bytes to send, and a webview or a video
 //!   is a `HostBox` on the frame: the tool draws a placeholder there
 //!   unless the host's shell gave it a picture (`host::Pictures` — the
