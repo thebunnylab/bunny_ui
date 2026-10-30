@@ -357,3 +357,48 @@ fn computed_blur_pixels_need_no_encoded_image_decoder() {
         "computed pixels are independent of platform codecs"
     );
 }
+
+#[test]
+fn every_step_of_a_clearing_blur_shows_and_none_jumps() {
+    // a word condensing out of a blur asks for a little less radius every
+    // frame. Each step must reach the pixels, by about what it asked, and
+    // never as a notch: whole box widths held a blur for frames and then
+    // jumped it a third of a pixel (T2-BUNNY-393)
+    let runtime = Runtime::new();
+    let size = Size {
+        width: 80.0,
+        height: 60.0,
+    };
+    // how far the blur spread an eight-pixel bar, read off its middle row
+    let spread = |radius: f64| {
+        let bar = rectangle()
+            .frame(8.0, 60.0)
+            .foreground_color(Color::rgb(255, 255, 255))
+            .blur(radius)
+            .frame(80.0, 60.0);
+        let pixels = rasterize(&runtime.display_frame(&bar, size), 80, 60, Color::rgba(0, 0, 0, 0))
+            .to_rgba_bytes();
+        let alpha: Vec<f64> = pixels[30 * 80 * 4..31 * 80 * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| f64::from(pixel[3]))
+            .collect();
+        let total: f64 = alpha.iter().sum();
+        let at = |x: usize| x as f64 + 0.5;
+        let mean = alpha.iter().enumerate().map(|(x, a)| at(x) * a).sum::<f64>() / total;
+        let variance = alpha.iter().enumerate().map(|(x, a)| (at(x) - mean).powi(2) * a).sum::<f64>() / total;
+        // the bar alone: eight pixels, (8² - 1) / 12
+        (variance - 63.0 / 12.0).max(0.0).sqrt()
+    };
+    // the lightest edge (0.15 px) is the first blur a pass can draw
+    let mut last = spread(0.15);
+    for twentieths in 4..=60 {
+        let radius = f64::from(twentieths) / 20.0;
+        let now = spread(radius);
+        assert!(now > last, "radius {radius}: the blur held at {now}");
+        assert!(now - last < 0.12, "radius {radius}: the blur jumped from {last} to {now}");
+        assert!((now - radius).abs() < 0.1, "radius {radius}: the blur spread {now}");
+        last = now;
+    }
+}

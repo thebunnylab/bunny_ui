@@ -1,31 +1,33 @@
 use super::*;
 
-/// The pass this module shipped before T2-BUNNY-388: a sliding box,
-/// transposed on output. The oracle the row-major passes must match.
-fn transposed_pass(source: &[[u16; 4]], target: &mut [[u16; 4]], width: usize, height: usize, radius: usize) {
-    let divisor = (radius * 2 + 1) as u32;
+/// A pass computed the plain way: every pixel's weighted sum taken whole,
+/// divided, and written transposed. The oracle the sliding, row-major,
+/// banded passes must match.
+fn transposed_pass(source: &[[u16; 4]], target: &mut [[u16; 4]], width: usize, height: usize, pass: Pass) {
+    let divisor = u64::from(pass.divisor());
+    let radius = pass.radius as isize;
     for y in 0..height {
         let row = &source[y * width..(y + 1) * width];
-        let mut sum = [0u32; 4];
-        for pixel in row.iter().take(radius + 1) {
-            for channel in 0..4 {
-                sum[channel] += u32::from(pixel[channel]);
-            }
-        }
-        for x in 0..width {
-            target[x * height + y] = sum.map(|channel| ((channel + divisor / 2) / divisor) as u16);
-            if x >= radius {
-                for channel in 0..4 {
-                    sum[channel] -= u32::from(row[x - radius][channel]);
+        let sample = |x: isize| usize::try_from(x).ok().and_then(|x| row.get(x)).copied().unwrap_or_default();
+        for x in 0..width as isize {
+            let mut total = [0u64; 4];
+            for (offset, weight) in (-radius - 1..=radius + 1).map(|k| {
+                (k, if k.abs() > radius { u64::from(pass.edge) } else { u64::from(pass.unit) })
+            }) {
+                for (sum, channel) in total.iter_mut().zip(sample(x + offset)) {
+                    *sum += weight * u64::from(channel);
                 }
             }
-            if let Some(next) = row.get(x + radius + 1) {
-                for channel in 0..4 {
-                    sum[channel] += u32::from(next[channel]);
-                }
-            }
+            target[x as usize * height + y] = total.map(|sum| ((sum + divisor / 2) / divisor) as u16);
         }
     }
+}
+
+/// Three passes' variance, from the extended box's closed form.
+fn variance(pass: Pass) -> f64 {
+    let (r, alpha) = (pass.radius as f64, f64::from(pass.edge) / f64::from(pass.unit));
+    3.0 * (r * (r + 1.0) * 2.0f64.mul_add(r, 1.0) / 3.0 + 2.0 * alpha * (r + 1.0) * (r + 1.0))
+        / 2.0f64.mul_add(alpha, 2.0f64.mul_add(r, 1.0))
 }
 
 /// Premultiplied-looking noise: a deterministic generator, each pixel's
@@ -45,29 +47,31 @@ fn noise(width: usize, height: usize, seed: u64) -> Vec<[u16; 4]> {
 
 #[test]
 fn the_row_major_passes_match_the_transposed_ones_bit_for_bit() {
-    for (width, height, radius) in [
-        (1, 1, 0),
-        (7, 3, 1),
-        (3, 9, 4),
-        (33, 17, 2),
-        (64, 48, 7),
-        (130, 70, 40),
-        (12, 200, 100),
+    for (width, height, radius, edge) in [
+        (1, 1, 0, 0),
+        (7, 3, 1, 0),
+        (7, 3, 0, 1),
+        (3, 9, 4, 255),
+        (33, 17, 2, 128),
+        (64, 48, 7, 13),
+        (130, 70, 40, 200),
+        (12, 200, 100, 77),
     ] {
+        let pass = Pass { radius, edge, unit: Pass::unit(radius) };
         let source = noise(width, height, (width * 31 + height) as u64);
         let mut middle = vec![[0; 4]; source.len()];
         let mut expected = vec![[0; 4]; source.len()];
-        transposed_pass(&source, &mut middle, width, height, radius);
-        transposed_pass(&middle, &mut expected, height, width, radius);
+        transposed_pass(&source, &mut middle, width, height, pass);
+        transposed_pass(&middle, &mut expected, height, width, pass);
         for (workers, rows) in [(1, height), (2, 1), (3, 2), (4, 5), (8, 16)] {
             let split = Split { workers, rows: rows.min(height) };
             let mut across = vec![[0; 4]; source.len()];
             let mut down = vec![[0; 4]; source.len()];
-            across_rows(&source, &mut across, width, radius, split);
-            down_columns(&across, &mut down, width, height, radius, split);
+            across_rows(&source, &mut across, width, pass, split);
+            down_columns(&across, &mut down, width, height, pass, split);
             assert!(
                 down == expected,
-                "{width}x{height}, radius {radius}, {split:?}: the same pixels as the transposed passes"
+                "{width}x{height}, {pass:?}, {split:?}: the same pixels as the transposed passes"
             );
         }
     }
@@ -76,15 +80,45 @@ fn the_row_major_passes_match_the_transposed_ones_bit_for_bit() {
 #[test]
 fn the_mean_is_the_division_at_every_boundary() {
     // the floor can only change where n crosses a multiple of the divisor:
-    // checking both sides of every multiple a sum can reach checks it all
-    for divisor in 1..=1100u32 {
-        let mean = Mean::over(divisor);
+    // checking both sides of every multiple a sum can reach checks it all.
+    // Every divisor of a pass up to four pixels wide, and wide ones around
+    // where the unit starts to coarsen (radius 126) and past the widest a
+    // blur asks for (radius 383)
+    let pass = |radius, edge| Pass { radius, edge, unit: Pass::unit(radius) };
+    let narrow = (0..4).flat_map(|radius| (0..Pass::FINEST).map(move |edge| pass(radius, edge)));
+    let wide = [50, 125, 126, 383, 1000].into_iter().flat_map(|radius| {
+        let unit = Pass::unit(radius);
+        [0, 1, unit / 2, unit - 1].map(|edge| pass(radius, edge))
+    });
+    for pass in narrow.chain(wide) {
+        let divisor = u64::from(pass.divisor());
+        assert!(divisor < 1 << 16, "{pass:?} divides by {divisor}");
+        let mean = Mean::over(pass.divisor());
         for q in 0..=65_535u64 {
-            for n in [q * u64::from(divisor), q * u64::from(divisor) + u64::from(divisor) - 1] {
+            for n in [q * divisor, q * divisor + divisor - 1] {
                 let got = (n * mean.scale) >> Mean::SHIFT;
-                assert_eq!(got, n / u64::from(divisor), "divisor {divisor}, n {n}");
+                assert_eq!(got, n / divisor, "{pass:?}, n {n}");
             }
         }
+    }
+}
+
+#[test]
+fn a_blur_follows_its_sigma_without_notches() {
+    // a word clearing out of a blur asks a little less every frame: a
+    // hundredth of a pixel less never jumps the blur by more than the
+    // lightest edge does out of none (0.15 px), never backs it up, and
+    // past half a pixel the three passes blur by sigma
+    let mut last = 0.0;
+    for hundredths in 0..=38_400 {
+        let sigma = f64::from(hundredths) / 100.0;
+        let pass = Pass::for_sigma(sigma);
+        assert!(pass.edge < pass.unit, "{sigma}: {pass:?} is a wider plain box");
+        let blurs = variance(pass).sqrt();
+        assert!(blurs >= last, "{sigma}: {blurs} backs up from {last}");
+        assert!(blurs - last < 0.16, "{sigma}: {blurs} jumps from {last}");
+        assert!(sigma < 0.5 || (blurs - sigma).abs() < sigma * 0.015, "{sigma}: blurs by {blurs}");
+        last = blurs;
     }
 }
 
