@@ -42,6 +42,7 @@ use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
     RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame, ATLAS_KEEP_WALKS,
 };
+use bunny_ui::glass;
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageSource;
@@ -174,6 +175,10 @@ unsafe extern "C" {
         bytes: *const c_void,
         per_row: u64,
     );
+    // `setScissorRect:` — `MTLScissorRect` is 4×u64 (32 bytes), passed
+    // INDIRECTLY like the region above.
+    #[link_name = "objc_msgSend"]
+    fn msg_void_scissor(obj: Id, sel: Sel, rect: MTLScissorRect);
     // `copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:
     // sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:`
     // — `MTLSize` and `MTLOrigin` are 3×u64 aggregates, passed INDIRECTLY
@@ -256,6 +261,14 @@ struct MTLSize {
 struct MTLRegion {
     origin: MTLOrigin,
     size: MTLSize,
+}
+
+#[repr(C)]
+struct MTLScissorRect {
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
 }
 
 // MARK: - The wire format shared with the shaders
@@ -828,6 +841,7 @@ struct Sels {
     set_load_action: Sel,
     set_store_action: Sel,
     set_clear_color: Sel,
+    set_scissor_rect: Sel,
     command_buffer: Sel,
     encoder: Sel,
     end_encoding: Sel,
@@ -875,6 +889,7 @@ impl Sels {
                 set_load_action: sel("setLoadAction:"),
                 set_store_action: sel("setStoreAction:"),
                 set_clear_color: sel("setClearColor:"),
+                set_scissor_rect: sel("setScissorRect:"),
                 command_buffer: sel("commandBuffer"),
                 encoder: sel("renderCommandEncoderWithDescriptor:"),
                 end_encoding: sel("endEncoding"),
@@ -1059,9 +1074,12 @@ impl MetalStack {
     ///
     /// A pane of glass READS the scene, so it cannot share a pass with
     /// the scene it reads. Each glass batch closes the pass before it,
-    /// blurs what is there into the pyramid, and opens a pass that
-    /// LOADS instead of clearing. `present_to` is the drawable a glass
-    /// frame is copied onto at the end — a drawable is
+    /// blurs what its panes read into the pyramid, and opens a pass that
+    /// LOADS instead of clearing: the batch first, then whatever is
+    /// painted after it, up to the next batch. One break per batch, so a
+    /// screen of cards each carrying its own words stores and loads the
+    /// target once a card, not twice. `present_to` is the drawable a
+    /// glass frame is copied onto at the end — a drawable is
     /// `framebufferOnly` and cannot be read, so the frame rendered into
     /// an offscreen texture instead.
     ///
@@ -1112,29 +1130,32 @@ impl MetalStack {
             // below samples them
             frame.worlds.encode(command, self.queue, &self.sels, self.pass_class, frame.staging);
             let mut cleared = false;
+            // a glass batch whose pyramid is built, waiting to head the
+            // pass that paints what follows it
+            let mut lead: Option<(DrawRun, &GlassTextures)> = None;
             let mut index = 0;
-            while index < frame.runs.len() {
+            loop {
                 let start = index;
                 while index < frame.runs.len() && frame.runs[index].kind != RunKind::Glass {
                     index += 1;
                 }
-                if index > start || !cleared {
-                    feed_uploads_encoded &=
-                        self.encode_paint(command, &frame, &frame.runs[start..index], !cleared);
+                if lead.is_some() || index > start || !cleared {
+                    feed_uploads_encoded &= self.encode_paint(
+                        command,
+                        &frame,
+                        lead.take(),
+                        &frame.runs[start..index],
+                        !cleared,
+                    );
                     cleared = true;
                 }
-                if index < frame.runs.len() {
-                    let run = frame.runs[index];
-                    feed_uploads_encoded = false;
-                    if let Some(pyramid) = frame.pyramid {
-                        self.build_pyramid(command, pyramid, frame.target, frame.viewport, run.levels);
-                        self.encode_glass(command, &frame, run, pyramid);
-                    }
-                    index += 1;
+                let Some(&run) = frame.runs.get(index) else { break };
+                feed_uploads_encoded = false;
+                if let Some(pyramid) = frame.pyramid {
+                    self.build_pyramid(command, pyramid, frame.target, frame.viewport, run);
+                    lead = Some((run, pyramid));
                 }
-            }
-            if !cleared {
-                feed_uploads_encoded &= self.encode_paint(command, &frame, &[], true);
+                index += 1;
             }
             if !frame.present_to.is_null() {
                 self.encode_blit(command, frame.target, frame.present_to);
@@ -1173,11 +1194,14 @@ impl MetalStack {
     }
 
     /// One pass of rects and text — the pass this backend has always
-    /// encoded.
+    /// encoded — headed by the glass batch `lead` when one closed the
+    /// pass before: the panes over the scene their pyramid just read,
+    /// then what is painted on them.
     unsafe fn encode_paint(
         &self,
         command: Id,
         frame: &EncodeFrame,
+        lead: Option<(DrawRun, &GlassTextures)>,
         runs: &[DrawRun],
         clear: bool,
     ) -> bool {
@@ -1187,7 +1211,7 @@ impl MetalStack {
             if encoder.is_null() {
                 return false;
             }
-            if !runs.is_empty() {
+            if lead.is_some() || !runs.is_empty() {
                 let uniforms = [frame.viewport.0, frame.viewport.1, frame.origin.0, frame.origin.1];
                 // argument bindings persist across pipeline swaps — the
                 // uniforms bind once, to both stages
@@ -1207,6 +1231,11 @@ impl MetalStack {
                 );
                 let mut bound: Option<RunKind> = None;
                 let mut bound_round: Option<u32> = None;
+                if let Some((run, pyramid)) = lead {
+                    self.draw_glass(encoder, frame, run, pyramid);
+                    bound = Some(RunKind::Glass);
+                    bound_round = Some(run.round);
+                }
                 for run in runs {
                     // 32 bytes per SHAPE change — a frame with no
                     // rounded clip binds slot zero once; bindings
@@ -1316,25 +1345,16 @@ impl MetalStack {
         }
     }
 
-    /// One batch of panes, over the scene they just read.
-    unsafe fn encode_glass(
+    /// One batch of panes, over the scene they just read, into the open
+    /// pass `encoder` — whose uniforms are already bound.
+    unsafe fn draw_glass(
         &self,
-        command: Id,
+        encoder: Id,
         frame: &EncodeFrame,
         run: DrawRun,
         pyramid: &GlassTextures,
     ) {
         unsafe {
-            let encoder =
-                self.begin_pass(command, frame.target, 0, LOAD_ACTION_LOAD, frame.canvas);
-            let size = [frame.viewport.0, frame.viewport.1, frame.origin.0, frame.origin.1];
-            msg_void_ptr_u64_u64(
-                encoder,
-                self.sels.set_vertex_bytes,
-                size.as_ptr() as *const c_void,
-                16,
-                1,
-            );
             msg_void_id(encoder, self.sels.set_pipeline, self.glass_pipeline);
             msg_void_id_u64_u64(
                 encoder,
@@ -1357,13 +1377,6 @@ impl MetalStack {
                 32,
                 1,
             );
-            msg_void_ptr_u64_u64(
-                encoder,
-                self.sels.set_fragment_bytes,
-                size.as_ptr() as *const c_void,
-                16,
-                2,
-            );
             msg_void_id_u64(encoder, self.sels.set_fragment_texture, pyramid.ping, 0);
             msg_void_u64x5(
                 encoder,
@@ -1374,11 +1387,11 @@ impl MetalStack {
                 run.count as u64,
                 run.base as u64,
             );
-            msg_void(encoder, self.sels.end_encoding);
         }
     }
 
-    /// The blur pyramid, from the scene as it stands right now.
+    /// The blur pyramid of what a glass batch reads, from the scene as
+    /// it stands right now.
     ///
     /// Level 0 is the scene at half resolution blurred to sigma 5.2
     /// device px, and each level halves again and composes another. The
@@ -1387,21 +1400,24 @@ impl MetalStack {
     /// bilinear tap averages a 2x2 neighbourhood on the way. Ping and
     /// pong are two textures on purpose — no pass ever reads the
     /// texture it writes.
+    ///
+    /// Every pass keeps to its level's window over the batch's read area
+    /// — the windows the rasterizer builds ([`glass::level_windows`]) —
+    /// so a pane's blur costs its neighbourhood, not the viewport. A
+    /// screen of forty panes rebuilt forty full pyramids a frame.
     unsafe fn build_pyramid(
         &self,
         command: Id,
         pyramid: &GlassTextures,
         scene: Id,
         viewport: (f32, f32),
-        max_level: u32,
+        run: DrawRun,
     ) {
         unsafe {
-            let base_width = (viewport.0.max(1.0) as u32).div_ceil(2).max(1);
-            let base_height = (viewport.1.max(1.0) as u32).div_ceil(2).max(1);
-            for level in 0..=max_level.min(GLASS_MAX_LEVEL) {
-                let width = (base_width >> level).max(1);
-                let height = (base_height >> level).max(1);
-                let inv_dst = [1.0 / width as f32, 1.0 / height as f32];
+            let (width, height) = (viewport.0.max(1.0) as usize, viewport.1.max(1.0) as usize);
+            for windows in glass::level_windows(run.reads, width, height, run.levels as usize) {
+                let level = windows.level as u32;
+                let inv_dst = [1.0 / windows.size.0 as f32, 1.0 / windows.size.1 as f32];
                 // level 0 reads raw scene colour, which no format
                 // decodes for us
                 let (source, source_level, decode) = match level {
@@ -1413,6 +1429,7 @@ impl MetalStack {
                     source,
                     pyramid.pong,
                     level,
+                    windows.wide,
                     BlurParams {
                         inv_dst,
                         direction: [1.0, 0.0],
@@ -1426,6 +1443,7 @@ impl MetalStack {
                     pyramid.pong,
                     pyramid.ping,
                     level,
+                    windows.window,
                     BlurParams {
                         inv_dst,
                         direction: [0.0, 1.0],
@@ -1438,16 +1456,41 @@ impl MetalStack {
         }
     }
 
-    unsafe fn blur_pass(&self, command: Id, source: Id, target: Id, level: u32, params: BlurParams) {
+    /// One separable pass into `window` of a level. A window off the
+    /// level is a pass with nothing to write, and none is encoded.
+    unsafe fn blur_pass(
+        &self,
+        command: Id,
+        source: Id,
+        target: Id,
+        level: u32,
+        window: glass::Texels,
+        params: BlurParams,
+    ) {
         unsafe {
-            // the pass covers its whole destination: there is nothing
-            // to load and nothing to clear
+            let (x0, y0, x1, y1) = window;
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            // the pass writes all of its window and nothing outside it
+            // is read this frame: there is nothing to load and nothing
+            // to clear
             let encoder = self.begin_pass(
                 command,
                 target,
                 level as u64,
                 LOAD_ACTION_DONT_CARE,
                 Color::BLACK,
+            );
+            msg_void_scissor(
+                encoder,
+                self.sels.set_scissor_rect,
+                MTLScissorRect {
+                    x: x0 as u64,
+                    y: y0 as u64,
+                    width: (x1 - x0) as u64,
+                    height: (y1 - y0) as u64,
+                },
             );
             msg_void_id(encoder, self.sels.set_pipeline, self.blur_pipeline);
             msg_void_ptr_u64_u64(
@@ -5698,6 +5741,63 @@ mod tests {
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    #[test]
+    fn cards_carrying_their_words_each_build_their_own_window_of_the_pyramid() {
+        if !device_present() {
+            return;
+        }
+        // the words on a card close its batch, so every card builds its
+        // pyramid over its own window of the SAME textures — a window
+        // short of what the card reads would show the card before's
+        // leftovers at this one's rim. An odd viewport, a card cut by the
+        // edge and one that bends and fringes put the margins at their
+        // limits
+        use bunny_ui::layout::{Corners, DrawCommand, Glass, Point, Rect};
+        let at = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let (width, height) = (241, 161);
+        let mut commands = Vec::new();
+        for row in 0..21 {
+            commands.push(DrawCommand::FillRect {
+                rect: at(0.0, f64::from(row) * 8.0, 241.0, 8.0),
+                color: if row % 2 == 0 { Color::hex(0x102A64) } else { Color::hex(0xE8D14A) },
+                corner_radius: Corners::ZERO,
+            });
+        }
+        for column in 0..12 {
+            commands.push(DrawCommand::FillRect {
+                rect: at(f64::from(column) * 21.0, 0.0, 6.0, 161.0),
+                color: Color::rgba(200, 40, 90, 160),
+                corner_radius: Corners::ZERO,
+            });
+        }
+        for (glass, card) in [
+            (Glass::regular(), at(8.0, 10.0, 70.0, 50.0)),
+            (Glass::clear().chromatic(0.4), at(92.0, 14.0, 80.0, 60.0)),
+            (Glass::frosted(), at(196.0, 88.0, 70.0, 60.0)),
+            (Glass::regular().refraction(10.0, 14.0), at(26.0, 98.0, 90.0, 50.0)),
+        ] {
+            commands.push(DrawCommand::Backdrop {
+                rect: card,
+                glass: glass.resolve(card),
+                corner_radius: Corners::all(12.0),
+            });
+            commands.push(DrawCommand::FillRect {
+                rect: at(card.origin.x + 10.0, card.origin.y + 10.0, 24.0, 6.0),
+                color: Color::rgba(255, 255, 255, 220),
+                corner_radius: Corners::all(3.0),
+            });
+        }
+        let display = DisplayList::from(commands);
+        let cpu = rasterize_with(&display, width, height, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+            .to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(width, height).expect("offscreen gpu");
+        gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_glass_close(&gpu.read_rgba(), &cpu, 3, 0.005, "cards");
     }
 
     /// The wrapper's lifetime is observable independently of the pixels:

@@ -1129,6 +1129,11 @@ pub struct DrawRun {
     /// The pixels the run's instances may touch, clipped: what decides
     /// whether a later instance may join it past runs painted after it.
     pub bounds: Box4,
+    /// Glass only: the device px the batch's panes read — each pane's
+    /// box cut by its clip, plus the reach of its lens
+    /// ([`crate::glass::read_area`]). The blur pyramid is built over this
+    /// and nothing more. Empty for every other run.
+    pub reads: Box4,
 }
 
 /// Which instance list a run reads: rects (and shadows and ramps), the
@@ -1185,8 +1190,11 @@ fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize, bo
             break;
         }
     }
-    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, bounds });
+    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, bounds, reads: NO_READS });
 }
+
+/// What a run that is not glass reads of the scene beneath it: nothing.
+const NO_READS: Box4 = (0, 0, 0, 0);
 
 /// The pixels a rect instance may touch: its quad cut by its clip.
 fn rect_box(instance: &RectInstance) -> Box4 {
@@ -1220,6 +1228,7 @@ fn note_glass(
     round: u32,
     index: usize,
     bounds: Box4,
+    reads: Box4,
     levels: u32,
     batch: &mut Option<Box4>,
 ) {
@@ -1229,9 +1238,10 @@ fn note_glass(
         let run = runs.last_mut().expect("the run the match found");
         run.count += 1;
         run.levels = run.levels.max(levels);
+        run.reads = box_union(run.reads, reads);
         *batch = batch.map(|acc| box_union(acc, bounds));
     } else {
-        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, bounds });
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, bounds, reads });
         *batch = Some(bounds);
     }
 }
@@ -1314,9 +1324,7 @@ pub fn build_frame(
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
                 }
-                if box_intersect(snapped, clip).is_none() {
-                    continue;
-                }
+                let Some(visible) = box_intersect(snapped, clip) else { continue };
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 let paint = glass.scaled(factor);
                 batches.glass.push(GlassInstance {
@@ -1351,11 +1359,18 @@ pub fn build_frame(
                     spot_alpha: paint.spot_alpha as f32,
                     pad: 0.0,
                 });
+                // the quad is the box cut by the clip: only those pixels
+                // shade, so only their lens reads the scene
+                let reads = crate::glass::read_area(
+                    (visible.0 as f64, visible.1 as f64, visible.2 as f64, visible.3 as f64),
+                    &paint,
+                );
                 note_glass(
                     &mut batches.runs,
                     round_of(&clips),
                     batches.glass.len() - 1,
                     snapped,
+                    reads,
                     crate::glass::levels_for(paint.blur) as u32,
                     &mut glass_batch,
                 );
@@ -2627,21 +2642,80 @@ mod tests {
     fn overlapping_panes_break_the_batch_and_apart_ones_share_it() {
         // one batch reads ONE capture of the scene: two panes that
         // touch take two batches, two that never meet take one
+        // each pane reads its box and three px of lens around it
+        let reads = |pane: Box4| (pane.0 - 3, pane.1 - 3, pane.2 + 3, pane.3 + 3);
         let batch = |first: Box4, second: Box4| {
             let mut runs: Vec<DrawRun> = Vec::new();
             let mut open: Option<Box4> = None;
-            note_glass(&mut runs, 0, 0, first, 1, &mut open);
-            note_glass(&mut runs, 0, 1, second, 2, &mut open);
+            note_glass(&mut runs, 0, 0, first, reads(first), 1, &mut open);
+            note_glass(&mut runs, 0, 1, second, reads(second), 2, &mut open);
             runs
         };
         let apart = batch((0, 0, 10, 10), (20, 20, 30, 30));
         assert_eq!(apart.len(), 1, "panes that never meet share one capture");
         assert_eq!(apart[0].count, 2);
         assert_eq!(apart[0].levels, 2, "the batch digs as deep as its deepest pane");
+        assert_eq!(apart[0].reads, (-3, -3, 33, 33), "one capture holds what both panes read");
 
         let over = batch((0, 0, 20, 20), (10, 10, 30, 30));
         assert_eq!(over.len(), 2, "glass over glass takes a capture of its own");
         assert_eq!(over[1].levels, 2);
+        assert_eq!(over[0].reads, (-3, -3, 23, 23));
+        assert_eq!(over[1].reads, (7, 7, 33, 33), "its capture holds its own pane alone");
+    }
+
+    #[test]
+    fn a_pane_reads_its_box_cut_by_its_clip_plus_the_reach_of_its_lens() {
+        // the quad is the box cut by the clip, so the lens reads from
+        // there: a pane mostly clipped away builds a small pyramid
+        let at = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: crate::layout::Point { x, y },
+            size: crate::layout::Size { width: w, height: h },
+        };
+        let glass = crate::layout::Glass::regular()
+            .refraction(10.0, 8.0)
+            .chromatic(0.5)
+            .resolve(at(0.0, 0.0, 1.0, 1.0));
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: at(0.0, 0.0, 400.0, 400.0),
+            color: Color::rgba(20, 30, 40, 255),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(DrawCommand::PushClip { rect: at(100.0, 100.0, 50.0, 20.0), corner_radius: Corners::ZERO });
+        display.push(DrawCommand::Backdrop {
+            rect: at(80.0, 90.0, 200.0, 200.0),
+            glass,
+            corner_radius: Corners::all(12.0),
+        });
+        display.push(DrawCommand::PopClip);
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            2,
+            (800, 800),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the scene fits the atlas");
+        let runs: Vec<&DrawRun> = batches.runs.iter().collect();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].reads, NO_READS, "a fill reads nothing beneath it");
+        assert_eq!(runs[1].kind, RunKind::Glass);
+        // the clip in device px at scale 2 is (200, 200)–(300, 240); the
+        // bend of 8pt is 16 px, widened by half for the fringe and two px
+        // of footprint: 26
+        assert_eq!(runs[1].reads, (174, 174, 326, 266));
+        assert_eq!(
+            runs[1].reads,
+            crate::glass::read_area((200.0, 200.0, 300.0, 240.0), &glass.scaled(2.0)),
+            "the walk and the rasterizer measure a pane's reach the one way"
+        );
     }
 
     #[test]
