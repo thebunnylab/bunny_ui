@@ -1,6 +1,11 @@
 //! Foreground effects composite paint without changing the placed interaction tree.
 //!
-//! Pixel targets use the existing immutable image transport; element targets keep
+//! Pixel targets paint a picture through the feed transport: each blurred
+//! subtree keeps one slot ([`FeedKey::effect`]), whose texture a GPU tier
+//! replaces in place when the pixels change. A blur that animates mints new
+//! pixels every frame; as atlas pictures, every one of them was a fresh
+//! picture on the shared shelves — too big for a shelf, a texture of its own —
+//! and the atlas drained nearly every frame (T2-BUNNY-386). Element targets keep
 //! their native controls and apply a CSS filter. Three separable box filters
 //! approximate a Gaussian on premultiplied RGBA, including transparent edges.
 
@@ -10,10 +15,13 @@ pub(crate) fn radius(value: f64) -> Option<f64> {
 
 #[cfg(feature = "canvas")]
 use crate::{
-    image_engine::{ImageSource, RawImages},
+    image_engine::{FeedKey, ImageSource, RawImages},
     layout::{Color, DisplayList, DrawCommand, LayoutEnv, Point, Rect, Size},
 };
 
+/// The blurred picture of `layer` (over `beneath` when the layer reads a
+/// backdrop), as an image command on `slot`: its pixels' identity is the
+/// feed's generation, so a blur that holds still uploads nothing.
 #[cfg(feature = "canvas")]
 pub(crate) fn paint(
     layer: &DisplayList,
@@ -21,6 +29,7 @@ pub(crate) fn paint(
     sigma: f64,
     viewport: Rect,
     env: &LayoutEnv<'_>,
+    slot: FeedKey,
 ) -> Option<DrawCommand> {
     let ink = crate::raster::list_bounds(layer, env.text)?;
     let expand = |rect: Rect, reach: f64| Rect {
@@ -131,7 +140,7 @@ pub(crate) fn paint(
         .collect();
     // These pixels are already decoded. RawImages supplies the existing
     // content-and-size identity, but its envelope is not a platform codec.
-    let key = ImageSource::from_bytes(RawImages::encode(width as u32, height as u32, &rgba)).key();
+    let generation = ImageSource::from_bytes(RawImages::encode(width as u32, height as u32, &rgba)).key();
     Some(DrawCommand::Image {
         rect: Rect {
             origin: Point { x, y },
@@ -140,7 +149,7 @@ pub(crate) fn paint(
                 height: height as f64 / factor,
             },
         },
-        source: ImageSource::rgba(key, (width as u32, height as u32), rgba),
+        source: ImageSource::feed(slot, generation, (width as u32, height as u32), rgba),
         // the layer was rastered on the grid already
         placement: crate::layout::ImagePlacement::Pixel,
     })

@@ -4335,6 +4335,10 @@ struct BlurScope {
 pub struct Placement {
     /// Nested pixel effects keep custom and scrollbar paint on the scene.
     compositing: usize,
+    /// The pictures composited effects painted so far this pass, in the
+    /// order they closed: each takes the next feed slot
+    /// ([`crate::image_engine::FeedKey::effect`]).
+    effects: u64,
     /// The sited nodes placed so far (`crate::provenance`), in placement
     /// order; empty unless the pass recorded sites.
     pub(crate) sites: Vec<crate::provenance::SitePlacement>,
@@ -4631,7 +4635,9 @@ impl Placement {
             } else {
                 DisplayList::default()
             };
-            if let Some(image) = crate::blur::paint(&layer, &beneath, scope.radius, viewport, env) {
+            let slot = crate::image_engine::FeedKey::effect(self.effects);
+            self.effects += 1;
+            if let Some(image) = crate::blur::paint(&layer, &beneath, scope.radius, viewport, env, slot) {
                 self.draw(image);
             }
             if let Some(host) = self.hosts.get_mut(scope.hosts + index) {

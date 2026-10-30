@@ -849,7 +849,19 @@ impl FeedKey {
     pub fn raw(self) -> u64 {
         self.0
     }
+
+    /// The slot of the `ordinal`-th effect a placement composites into a
+    /// picture of its own — a blurred subtree — counted in the order the
+    /// effects close. Its top two bits are set: an app's numbers keep the
+    /// top bit clear and [`ImageFeed::new`]'s serials never reach bit 62,
+    /// so an effect never shares a slot with either.
+    pub(crate) fn effect(ordinal: u64) -> FeedKey {
+        FeedKey((ordinal | EFFECT_SLOTS) ^ FEED_TAG)
+    }
 }
+
+/// The slots [`FeedKey::effect`] numbers from.
+const EFFECT_SLOTS: u64 = 3 << 62;
 
 /// The slots `ImageFeed::new` mints, counted once for the process — a
 /// feed made on any thread never shares a slot with another.

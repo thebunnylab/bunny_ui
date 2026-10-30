@@ -2603,4 +2603,69 @@ mod tests {
         assert!(ground.uploads.len() > uploads, "the fresh run landed on a shelf");
         assert_eq!(atlas.packer.next_y, rows_used, "on a freed shelf, not a new row");
     }
+
+    /// The presenters' retry loop: on overflow, the cheap road first —
+    /// shelves nobody read for a while — then the drain and the reset,
+    /// which `ground.drops` counts.
+    fn present_as_tiers(ground: &mut RecordingGround, atlas: &mut RunAtlas, display: &DisplayList, physical: (usize, usize)) {
+        let mut batches = FrameBatches::default();
+        for attempt in 0..4 {
+            match build_frame(ground, display, 2, physical, &crate::text_engine::PixelFont, &RawImages::default(), atlas, &mut batches) {
+                Ok(()) => return,
+                Err(AtlasFull) if attempt == 0 && atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 => {}
+                Err(AtlasFull) => atlas.reset(ground, true),
+            }
+        }
+        panic!("the frame never walked whole");
+    }
+
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_blur_that_animates_keeps_one_texture_and_never_drains_the_atlas() {
+        // FlexSuite's words condense: each its own `.blur(σ)`, σ easing
+        // to nothing, so every frame paints new pixels. As atlas pictures
+        // each frame's was a picture of its own — this one too tall for a
+        // shelf, a texture of its own — and the cap on those drained the
+        // atlas nearly every frame. On its feed slot it is one texture,
+        // its bytes replaced in place
+        use crate::prelude::*;
+        let size = Size { width: 500.0, height: 125.0 };
+        let runtime = crate::runtime::Runtime::new();
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let frames = 48;
+        for frame in 0..frames {
+            let sigma = 12.0 * (1.0 - f64::from(frame) / f64::from(frames));
+            let scene = vstack!(
+                text("Ok Ana, let's get you connected").font_size(44.0).blur(sigma),
+                text("Read-only unless you choose otherwise.").font_size(15.0)
+            );
+            let display = runtime.display_frame(&scene, size);
+            present_as_tiers(&mut ground, &mut atlas, &display, (1000, 250));
+        }
+        assert_eq!(ground.drops, 0, "no drain, no reset");
+        assert!(atlas.dedicated.is_empty(), "no texture of its own per frame");
+        assert_eq!(atlas.live.len(), 1, "one slot for the one blur");
+        assert_eq!(ground.live.len(), 1, "one texture standing: a new size replaces the old one");
+        assert!(ground.live_updates >= frames as usize - 1, "its bytes replaced as they changed: {}", ground.live_updates);
+    }
+
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_blur_that_holds_still_uploads_nothing_again() {
+        // the slot's generation is the picture's content: the same pixels
+        // the next frame are the same generation, and the tier keeps them
+        use crate::prelude::*;
+        let size = Size { width: 500.0, height: 125.0 };
+        let runtime = crate::runtime::Runtime::new();
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let scene = text("Ana").font_size(44.0).blur(6.0);
+        for _ in 0..3 {
+            let display = runtime.display_frame(&scene, size);
+            present_as_tiers(&mut ground, &mut atlas, &display, (1000, 250));
+        }
+        assert_eq!(ground.live.len(), 1);
+        assert_eq!(ground.live_updates, 1, "the first frame's bytes, and none after");
+    }
 }
