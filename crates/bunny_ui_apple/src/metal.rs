@@ -287,6 +287,7 @@ const _: () = {
     assert!(std::mem::offset_of!(GlassInstance, tint) == 96);
     assert!(std::mem::offset_of!(GlassInstance, highlight) == 100);
     assert!(std::mem::offset_of!(GlassInstance, spot_alpha) == 104);
+    assert!(std::mem::offset_of!(GlassInstance, opacity) == 108);
 };
 
 /// What one blur pass needs — the twin of `BlurParams` in the shader.
@@ -680,7 +681,7 @@ struct GlassInstance {
     uchar4 tint;
     uchar4 highlight;
     float spot_alpha;
-    float pad;
+    float opacity;  // how much of the pane lands over the scene
 };
 
 struct GlassVary {
@@ -825,7 +826,7 @@ fragment float4 glass_fragment(GlassVary in [[stage_in]],
 
     // straight alpha out — the blend state premultiplies, exactly as it
     // does for a rect
-    return float4(color.rgb, color.a * coverage * clip_cov(point, round));
+    return float4(color.rgb, color.a * coverage * pane.opacity * clip_cov(point, round));
 }
 "#;
 
@@ -5798,6 +5799,47 @@ mod tests {
         let mut gpu = OffscreenGpu::new(width, height).expect("offscreen gpu");
         gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
         assert_glass_close(&gpu.read_rgba(), &cpu, 3, 0.005, "cards");
+    }
+
+    #[test]
+    fn a_pane_fading_lands_as_much_of_itself_as_the_cpu_does() {
+        if !device_present() {
+            return;
+        }
+        // a pane faded under an opacity is that much of itself over the
+        // scene: the GPU's composite scales the pane's alpha where the CPU
+        // scales its coverage, and the two must land the same pixels. One
+        // pane at none draws nothing at all
+        use bunny_ui::layout::{Corners, DrawCommand, Glass, Point, Rect};
+        let at = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let (width, height) = (200, 120);
+        let mut commands = Vec::new();
+        for column in 0..25 {
+            commands.push(DrawCommand::FillRect {
+                rect: at(f64::from(column) * 8.0, 0.0, 4.0, 120.0),
+                color: if column % 2 == 0 { Color::hex(0x102A64) } else { Color::hex(0xE8D14A) },
+                corner_radius: Corners::ZERO,
+            });
+        }
+        for (opacity, card) in [
+            (0.0, at(8.0, 10.0, 50.0, 40.0)),
+            (0.25, at(72.0, 10.0, 50.0, 40.0)),
+            (0.5, at(136.0, 10.0, 50.0, 40.0)),
+            (0.8, at(40.0, 66.0, 120.0, 44.0)),
+        ] {
+            let mut glass = Glass::frosted().resolve(card);
+            glass.opacity = opacity;
+            commands.push(DrawCommand::Backdrop { rect: card, glass, corner_radius: Corners::all(10.0) });
+        }
+        let display = DisplayList::from(commands);
+        let cpu = rasterize_with(&display, width, height, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+            .to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(width, height).expect("offscreen gpu");
+        gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_glass_close(&gpu.read_rgba(), &cpu, 3, 0.005, "fading panes");
     }
 
     #[test]

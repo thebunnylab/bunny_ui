@@ -28,6 +28,7 @@ layout(location = 4) flat out vec4 v_touch;
 layout(location = 5) flat out vec4 v_tint;
 layout(location = 6) flat out vec4 v_highlight;
 layout(location = 7) flat out float v_spot_alpha;
+layout(location = 8) flat out float v_opacity;
 
 vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -49,4 +50,5 @@ void main() {
     v_tint = a_tint;
     v_highlight = a_highlight;
     v_spot_alpha = a_spot.x;
+    v_opacity = a_spot.y;
 }

@@ -2025,7 +2025,8 @@ pub struct Glass {
     /// Gaussian sigma of the backdrop blur, in logical px. The floor is
     /// the material's own: a value below the first level of the blur
     /// pyramid renders as that level. The minimum glass is light
-    /// glass, never clear glass.
+    /// glass, never clear glass — a pane fades to clear by its
+    /// [`Glass::opacity`], not by its blur.
     ///
     /// CAUTION: the blur decides what the LENS has left to bend. A
     /// blur erases every detail thinner than itself, so a heavy blur
@@ -2057,6 +2058,13 @@ pub struct Glass {
     /// it sits in the pane, its radius as a fraction of the pane's
     /// SMALLER side, and its peak white.
     pub spot: Option<(UnitPoint, f64, f64)>,
+    /// How much of the pane lands over the scene, `0..1`: the material
+    /// alone fades, and what the box draws over it keeps its own alpha.
+    /// A pane arriving or leaving fades by this — its blur stops at the
+    /// pyramid's floor, and a pane faded by that alone holds the floor's
+    /// frost and then vanishes. `.opacity(…)` around the view multiplies
+    /// it.
+    pub opacity: Option<f64>,
 }
 
 impl Glass {
@@ -2082,6 +2090,7 @@ impl Glass {
             brightness: None,
             sheen: None,
             spot: None,
+            opacity: None,
         }
     }
 
@@ -2166,6 +2175,12 @@ impl Glass {
         self
     }
 
+    /// How much of the pane lands over the scene: 1 all of it, 0 none.
+    pub const fn opacity(mut self, opacity: f64) -> Glass {
+        self.opacity = Some(opacity);
+        self
+    }
+
     /// Merge of two glass modifiers on the same view: the knob already
     /// set (CLOSEST to the view) wins, and the outer one only fills
     /// what is missing — the same rule [`VisualProps::or`] follows.
@@ -2180,6 +2195,7 @@ impl Glass {
             brightness: self.brightness.or(outer.brightness),
             sheen: self.sheen.or(outer.sheen),
             spot: self.spot.or(outer.spot),
+            opacity: self.opacity.or(outer.opacity),
         }
     }
 
@@ -2215,6 +2231,9 @@ impl Glass {
         if let Some((center, radius, alpha)) = self.spot {
             parts.push(format!("spot: {} {} {radius}/{alpha}", center.x, center.y));
         }
+        if let Some(opacity) = self.opacity {
+            parts.push(format!("opacity: {opacity}"));
+        }
         parts.join(", ")
     }
 
@@ -2245,6 +2264,7 @@ impl Glass {
             spot_center,
             spot_radius,
             spot_alpha: spot_alpha.clamp(0.0, 1.0),
+            opacity: self.opacity.map_or(1.0, |opacity| opacity.clamp(0.0, 1.0)),
         }
     }
 }
@@ -2267,12 +2287,21 @@ pub struct GlassPaint {
     pub spot_center: Point,
     pub spot_radius: Px,
     pub spot_alpha: f64,
+    /// How much of the pane there is: the pane composites over the scene
+    /// beneath at this alpha, so at 0.4 the pixels are 0.4 of the whole
+    /// pane over 0.6 of the scene, and at 0 they are the scene. What
+    /// `.opacity(…)` sets ([`DisplayList::fade_from`]). A pane faded by
+    /// its blur alone stops clearing at the pyramid's floor, 5.2 device
+    /// px, and then vanishes in one frame (T2-BUNNY-394).
+    pub opacity: f64,
 }
 
 impl GlassPaint {
     /// Every number that changes what this material answers, as bytes a memo
     /// can compare — so a pane whose knobs have not moved is recognised
-    /// without deriving it again.
+    /// without deriving it again. The opacity is left out: it scales how
+    /// much of the answer lands, after the answer, so a pane fading in or
+    /// out derives its pixels once.
     #[must_use]
     pub fn signature(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(96);
@@ -3247,14 +3276,11 @@ impl DisplayList {
                 | DrawCommand::Shadow { color, .. }
                 | DrawCommand::TextLine { color, .. }
                 | DrawCommand::TurnedText { color, .. } => fade(color),
-                // the pane fades by its TINT and its lights: what it
-                // samples is the scene, and the scene is already there
-                DrawCommand::Backdrop { glass, .. } => {
-                    fade(&mut glass.tint);
-                    fade(&mut glass.highlight);
-                    glass.sheen *= opacity;
-                    glass.spot_alpha *= opacity;
-                }
+                // the pane fades whole: what it lands over is the scene it
+                // samples, so a pane at opacity 0.4 is 0.4 of itself over
+                // the scene. Fading its tint and lights alone left the
+                // blurred scene at full strength, an empty box at 0
+                DrawCommand::Backdrop { glass, .. } => glass.opacity *= opacity,
                 DrawCommand::Gradient { paint, .. } => match paint {
                     GradientPaint::Radial { inner, outer, .. } => {
                         fade(inner);

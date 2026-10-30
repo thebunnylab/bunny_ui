@@ -537,12 +537,16 @@ impl GlassFilter {
             origin: Point { x: 0.0, y: 0.0 },
             size: crate::layout::Size { width: 0.0, height: 0.0 },
         });
+        // a pane fading by its own opacity: a browser's blur has no floor,
+        // so the blur and the rim fall with it to clear, and the words in
+        // the box keep their own alpha
+        let opacity = resolved.opacity;
         GlassFilter {
-            blur: resolved.blur,
+            blur: resolved.blur * opacity,
             saturation: resolved.saturation,
             brightness: resolved.brightness,
             rim: Color {
-                a: (resolved.highlight.a as f64 * resolved.highlight_intensity.clamp(0.0, 1.0))
+                a: (resolved.highlight.a as f64 * resolved.highlight_intensity.clamp(0.0, 1.0) * opacity)
                     .round() as u8,
                 ..resolved.highlight
             },
@@ -946,7 +950,9 @@ impl DomCapture {
         // the background, where it belongs — under whatever the box
         // paints itself and over the blurred backdrop
         if let Some(glass) = props.glass {
-            let tint = glass.resolve(frame).tint;
+            // a pane fading by its own opacity fades its tint with it
+            let paint = glass.resolve(frame);
+            let tint = Color { a: (f64::from(paint.tint.a) * paint.opacity).round() as u8, ..paint.tint };
             look.background = GlassFilter::under(tint, look.background);
             look.hover_background =
                 look.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
