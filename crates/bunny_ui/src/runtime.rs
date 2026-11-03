@@ -7053,21 +7053,18 @@ impl Runtime {
             }
             let Some(row) = scroll_target_frame(result, region, &target.id) else { continue };
             self.scroll_targets.borrow_mut().insert(region.path.clone(), target.id.clone());
-            let region_top = region.frame.origin.y;
-            let region_bottom = region_top + region.frame.size.height;
-            let row_top = row.origin.y;
-            let row_bottom = row_top + row.size.height;
-            let delta = match target.anchor {
-                // a named point of the row meets the same point of the
-                // window, wherever the row stood
-                Some(anchor) => {
-                    (row_top + anchor * row.size.height)
-                        - (region_top + anchor * region.frame.size.height)
-                }
-                None if row_top < region_top => row_top - region_top,
-                None if row_bottom > region_bottom => row_bottom - region_bottom,
-                None => 0.0,
+            // Unanchored targets follow the region on both axes, including
+            // horizontal tab strips and right-to-left content. Use the same
+            // shortest-distance geometry and animation as element reveals.
+            let Some(anchor) = target.anchor else {
+                moved |= self.reveal_in(region, row);
+                continue;
             };
+            let region_top = region.frame.origin.y;
+            let row_top = row.origin.y;
+            // A named point of the row meets the same point of the window.
+            let delta = (row_top + anchor * row.size.height)
+                - (region_top + anchor * region.frame.size.height);
             if delta != 0.0 {
                 let current = self.scroll_offset(&region.path);
                 let travel =

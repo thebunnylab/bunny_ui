@@ -13066,6 +13066,53 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_scroll_target_reveals_tabs_without_fighting_the_wheel() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Tabs { selected: State<usize> }
+
+        #[derive(Clone, Copy)]
+        struct Tab(usize);
+
+        impl Component for Tab {
+            fn body(self) -> impl View {
+                text(format!("tab {}", self.0)).frame(64.0, 24.0)
+            }
+        }
+
+        impl Component for Tabs {
+            fn body(self) -> impl View {
+                scroll(for_each((0..10).collect::<Vec<_>>(),
+                    |index| format!("tab{index}"),
+                    |index| Tab(*index),
+                ).horizontal().spacing(0.0))
+                    .horizontal()
+                    .scroll_target(format!("tab{}", self.selected.get()))
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 120.0, height: 24.0 });
+        let tabs = Tabs { selected: State::new(0) };
+        let runtime = Runtime::new();
+        let layout = runtime.settled_layout(&tabs, viewport);
+        let region = layout.scrolls[0].path.clone();
+        assert_eq!(runtime.scroll_offset(&region).x, 0.0);
+        tabs.selected.set(8);
+        runtime.settled_layout(&tabs, viewport);
+        assert_eq!(runtime.scroll_offset(&region).x, 9.0 * 64.0 - 120.0);
+        runtime.wheel(60.0, 12.0, 30.0, 0.0);
+        let wheeled = runtime.scroll_offset(&region);
+        assert_ne!(wheeled.x, 456.0);
+        runtime.settled_layout(&tabs, viewport);
+        assert_eq!(runtime.scroll_offset(&region), wheeled);
+        tabs.selected.set(0);
+        runtime.settled_layout(&tabs, viewport);
+        assert_eq!(runtime.scroll_offset(&region).x, 0.0);
+        assert_eq!(runtime.scroll_offset(&region).y, 0.0);
+    }
+
+    #[test]
     fn auto_focus_takes_the_keyboard_once_and_respects_blur() {
         use crate::layout::{Proposal, Size};
 
