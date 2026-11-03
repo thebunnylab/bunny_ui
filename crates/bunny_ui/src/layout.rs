@@ -4678,7 +4678,7 @@ impl Placement {
         }
     }
 
-    /// Is this box FAR off the glass — a whole window away from the clip
+    /// Is this box vertically FAR off the glass — a whole window away from the clip
     /// it stands under, and never less than 64 points? A quiet child of a
     /// stack that far out is left unplaced ([`Quiet`]). The distance is for
     /// what a box draws outside itself — a shadow, a badge hung on a corner,
@@ -4689,10 +4689,12 @@ impl Placement {
             return false;
         }
         self.clip.last().is_some_and(|clip| {
-            let (far_x, far_y) = (clip.size.width.max(64.0), clip.size.height.max(64.0));
-            frame.origin.x + frame.size.width < clip.origin.x - far_x
-                || frame.origin.x > clip.origin.x + clip.size.width + far_x
-                || frame.origin.y + frame.size.height < clip.origin.y - far_y
+            // Text's horizontal paint reach is deliberately unbounded in
+            // `may_reach`: a narrow frame does not clip a long line. A row
+            // off either side must still place its children and let each
+            // draw command decide whether it can reach the viewport.
+            let far_y = clip.size.height.max(64.0);
+            frame.origin.y + frame.size.height < clip.origin.y - far_y
                 || frame.origin.y > clip.origin.y + clip.size.height + far_y
         })
     }
