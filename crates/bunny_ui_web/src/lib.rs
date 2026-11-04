@@ -271,6 +271,7 @@ fn named_key(code: u32) -> Option<bunny_ui::action::Key> {
         11 => Key::Tab,
         12 => Key::PageUp,
         13 => Key::PageDown,
+        14 => Key::Insert,
         // the function row: `F1` to `F24` as 101 to 124
         101..=124 => Key::F((code - 100) as u8),
         _ => return None,
@@ -340,10 +341,11 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     if !typing {
         match runtime.chord(&pattern) {
             KeyMatch::Action(action) if runtime.dispatch_action(action) => return true,
-            // the stroke opened (or let go of) a sequence: it is spent,
-            // and a which-key panel may have just changed
-            KeyMatch::Pending => return true,
-            _ => {}
+            // the stroke opened (or let go of) a sequence, or a binding
+            // disabled it: it is spent, and a which-key panel may have
+            // just changed
+            KeyMatch::Pending | KeyMatch::Disabled => return true,
+            KeyMatch::Action(_) | KeyMatch::None => {}
         }
     }
     let edit = match pattern.key {
@@ -957,7 +959,7 @@ pub fn start_with(
                 }
             }
             Event::Modifiers(mods) => {
-                if runtime.modifiers_changed(held(mods)) {
+                if runtime.modifiers_changed(held(mods)).present {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -1267,7 +1269,7 @@ fn start_dom_with(
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
             }
             Event::Modifiers(mods) => {
-                if runtime.modifiers_changed(held(mods)) {
+                if runtime.modifiers_changed(held(mods)).present {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }

@@ -32,7 +32,7 @@ fn press(runtime: &Runtime, key: Key) -> bool {
     let pattern = KeyPattern::key(key);
     match runtime.chord(pattern) {
         bunny_ui::action::KeyMatch::Action(action) => runtime.dispatch_action(action),
-        bunny_ui::action::KeyMatch::Pending => true,
+        bunny_ui::action::KeyMatch::Pending | bunny_ui::action::KeyMatch::Disabled => true,
         bunny_ui::action::KeyMatch::None => runtime.key_stroke(pattern).handled,
     }
 }

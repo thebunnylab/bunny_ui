@@ -181,6 +181,9 @@ fn key_character(key: Key) -> Option<char> {
         // NSF1FunctionKey (U+F704) onwards, F1 to F35 in a row
         Key::F(number @ 1..=24) => char::from_u32(0xF704 + u32::from(number) - 1)?,
         Key::F(_) => return None,
+        Key::Insert => '\u{f727}',
+        // a lone modifier is a keymap stroke, never a menu's equivalent
+        Key::Shift | Key::Command | Key::Option | Key::Control => return None,
     })
 }
 

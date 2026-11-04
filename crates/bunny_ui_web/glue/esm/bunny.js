@@ -493,6 +493,7 @@ const KEYS = {
   Tab: 11,
   PageUp: 12,
   PageDown: 13,
+  Insert: 14,
 };
 
 // The keys a field asks a software keyboard for, as the editable's

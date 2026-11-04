@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, Stroke};
+use bunny_ui::action::Stroke;
 use bunny_ui::layout::{Edges, Size};
 use bunny_ui::prelude::{EditCommand, Locale, Runtime, SizeClass};
 use bunny_ui::view::View;
@@ -395,6 +395,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
     // straight through to whoever holds the keyboard AND is taking text
     // (typing is never stolen); a binding with no handler mounted does
     // not consume
+    // the break reaches a field by the keyboard's own road here, so the
+    // shared gate leaves a bare Enter to it
+    runtime.set_key_platform(bunny_ui::action::KeyPlatform { enter_by_text: true, ..bunny_ui::action::KeyPlatform::default() });
     let key_gate: Box<dyn FnMut(&keys::KeyStroke) -> bool> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
@@ -403,45 +406,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
             let Some(pattern) = key_pattern(stroke) else {
                 return false;
             };
-            // MID-CHORD the keyboard belongs to the keymap: the stroke
-            // that finishes `ctrl-k s` is not typing
-            let mid_chord = !runtime.pending_chord().is_empty();
-            if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
-            }
-            // a focused escape hatch owns its strokes: an editor's
-            // arrows, Enter and Tab are its own
-            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
-            if taken.handled {
-                if let Some(text) = taken.text {
-                    ffi::clipboard_write(&text);
-                }
-                blit(&runtime, &*root);
-                return true;
-            }
-            // a field of MANY lines owns the bare vertical arrows before
-            // any binding — the break arrives by the keyboard's road
-            if !mid_chord
-                && pattern.is_plain()
-                && let Some(command) = match pattern.key {
-                    Key::Up => Some(EditCommand::Up(pattern.shift)),
-                    Key::Down => Some(EditCommand::Down(pattern.shift)),
-                    _ => None,
-                }
-                && runtime.key(command).applied
-            {
-                blit(&runtime, &*root);
-                return true;
-            }
-            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
-                KeyMatch::Action(action) => action,
-                KeyMatch::Pending => {
-                    blit(&runtime, &*root);
-                    return true;
-                }
-                KeyMatch::None => return false,
-            };
-            if runtime.dispatch_action(action) {
+            // the shared gate: typing first, then whoever holds the
+            // keyboard, a field of many lines, and the keymap
+            if runtime.offer_key(Stroke::new(pattern, stroke.typed)) {
                 blit(&runtime, &*root);
                 true
             } else {
@@ -580,7 +547,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                 }
             }
             AppEvent::Modifiers(held) => {
-                if runtime.modifiers_changed(held) {
+                if runtime.modifiers_changed(held).present {
                     blit(runtime, root);
                 }
             }

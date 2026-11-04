@@ -93,6 +93,7 @@ const KEYS = {
   Tab: 11,
   PageUp: 12,
   PageDown: 13,
+  Insert: 14,
 };
 
 // The function row: `F1` to `F24`, sent as 101 to 124.

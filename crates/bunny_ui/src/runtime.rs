@@ -21,8 +21,8 @@ use std::rc::Rc;
 use motor::state::{Context, EnvironmentValues, LayoutDirection, Locale, SizeClass};
 
 use crate::action::{
-    ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, KeyPattern, OVERLAY_CONTEXT,
-    OVERLAY_DISMISS,
+    ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, ContextStack, Fallback, KeyMatch,
+    KeyPattern, KeyResolution, OVERLAY_CONTEXT, OVERLAY_DISMISS, Stroke,
 };
 mod dialog_geometry;
 
@@ -127,6 +127,52 @@ struct Chord {
     strokes: Box<[KeyPattern]>,
     action: ActionId,
     context: Option<&'static str>,
+}
+
+/// One stroke of a sequence in the air: the stroke, whether the
+/// platform would have typed it (so a replay types what the platform
+/// would have), and what the strokes up to it mean on their own.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    stroke: Stroke,
+    typing: bool,
+    fallback: Fallback,
+}
+
+/// Who offered a stroke to the gate — and so who types it when nobody
+/// takes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Door {
+    /// The shell: declined, the platform's own road goes on.
+    Platform,
+    /// The runtime, replaying a sequence: declined, the runtime types it.
+    Replay,
+}
+
+/// The keymap's reading of one stroke.
+enum Reading {
+    Answered(KeyMatch),
+    /// The stroke ended a sequence leading nowhere, which unwound and
+    /// offered the stroke again: it was answered there.
+    Unwound,
+}
+
+/// How a binding's strokes match the strokes typed: `None` when they do
+/// not, else how many positions matched only by the character a stroke
+/// typed — the fewer, the closer the binding was spelled.
+fn spelled_by_character(binding: &[KeyPattern], strokes: &[Stroke]) -> Option<usize> {
+    if binding.len() != strokes.len() {
+        return None;
+    }
+    binding.iter().zip(strokes).try_fold(0, |typed, (bound, stroke)| {
+        if *bound == stroke.pattern {
+            Some(typed)
+        } else if stroke.typed_pattern() == Some(*bound) {
+            Some(typed + 1)
+        } else {
+            None
+        }
+    })
 }
 
 /// Who hears the modifier keys move ([`Runtime::observe_modifiers`]).
@@ -355,7 +401,15 @@ pub struct Runtime {
     chords: RefCell<Vec<Chord>>,
     /// The strokes of a sequence still in the air. Empty means the
     /// keyboard is free.
-    pending: RefCell<Vec<KeyPattern>>,
+    pending: RefCell<Vec<Held>>,
+    /// The Strategy that resolves strokes ([`Runtime::set_key_resolver`]);
+    /// the tables above answer alone without one.
+    key_resolver: RefCell<Option<Rc<dyn crate::action::KeyResolver>>>,
+    /// How this platform types ([`Runtime::set_key_platform`]).
+    key_platform: Cell<crate::action::KeyPlatform>,
+    /// A modifier pressed with nothing else held, while nothing has come
+    /// between: let go, it is a stroke of its own.
+    modifier_tap: Cell<Option<crate::action::Key>>,
     /// A pending prefix that has seen one slow tick. The second one
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
@@ -1752,6 +1806,9 @@ impl Runtime {
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
+            key_resolver: RefCell::new(None),
+            key_platform: Cell::new(crate::action::KeyPlatform::default()),
+            modifier_tap: Cell::new(None),
             chord_sink: RefCell::new(None),
             chord_announced: Cell::new(false),
             held: Cell::new(crate::action::Modifiers::NONE),
@@ -2667,8 +2724,10 @@ impl Runtime {
     ) -> bool {
         let shift = modifiers.shift;
         // the hand left the keyboard: a sequence in the air goes with
-        // it, the way it does in every editor that has chords
+        // it, the way it does in every editor that has chords — and a
+        // modifier held for the click is no tap
         self.cancel_chord();
+        self.modifier_tap.set(None);
         // an open menu owns the press whole: a row fires ON THE DOWN
         // (menu semantics, not button semantics) and a press outside
         // closes and consumes — AppKit's own manners
@@ -3590,7 +3649,9 @@ impl Runtime {
 
     /// Binds the pattern INSIDE a key context: the binding only answers
     /// while some mounted view declares `.key_context(context)`. Scoped
-    /// bindings beat global ones on the same pattern.
+    /// bindings beat global ones on the same pattern, and among two
+    /// contexts binding it the declaration nearest the keyboard wins
+    /// ([`Runtime::context_stack`]'s order).
     pub fn bind_in(&self, context: &'static str, pattern: KeyPattern, action: ActionId) {
         self.scoped_keymap
             .borrow_mut()
@@ -3636,14 +3697,19 @@ impl Runtime {
         self.chords.borrow_mut().retain(|chord| chord.context != Some(context));
     }
 
-    /// The binding for the pattern: ACTIVE scoped contexts first (a
-    /// mounted `.key_context` turns its bindings on), the global map as
-    /// the fallback — and while an alert is up, its reserved context
-    /// alone.
+    /// The binding for the pattern in the runtime's own tables: while an
+    /// alert is up, its reserved context alone; the popover's reserved
+    /// keys next; then the contexts in force, INNERMOST first (a mounted
+    /// `.key_context` turns its bindings on, and the declaration nearest
+    /// the keyboard wins a key two of them bind); the global map last.
+    ///
+    /// A [`KeyResolver`]'s answers are its own and are not read here —
+    /// this is the pure lookup of one pattern in the tables beneath it.
+    ///
+    /// [`KeyResolver`]: crate::action::KeyResolver
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
         let focus = self.focus.borrow().clone();
         let focus = focus.as_deref();
-        let scoped = self.scoped_keymap.borrow();
         // an open alert answers ALONE: its own keys, and nothing of the
         // page's under it. Modal to the keyboard as to the pointer — a
         // ⌘W that reached the page past an unsaved-work ask would close
@@ -3652,133 +3718,378 @@ impl Runtime {
         // Nothing inside an alert takes Escape from it either, a popover
         // included: an ask holds words and buttons, not menus.
         if reconciler::context_active(ALERT_CONTEXT, focus) {
+            let scoped = self.scoped_keymap.borrow();
             return scoped.get(ALERT_CONTEXT).and_then(|map| map.get(pattern)).copied();
         }
-        // the reserved popover context wins DETERMINISTICALLY — the
-        // map below iterates in arbitrary order, and an app binding
-        // Escape in its own active context must not shadow the dismiss
-        if reconciler::context_active(OVERLAY_CONTEXT, focus)
-            && let Some(action) =
-                scoped.get(OVERLAY_CONTEXT).and_then(|map| map.get(pattern))
-        {
-            return Some(*action);
+        self.popover_key(pattern, focus)
+            .or_else(|| self.table_single(pattern, &reconciler::context_stack(focus)))
+    }
+
+    /// The reserved popover's own binding for the pattern — ahead of every
+    /// context and every resolver, so an app binding Escape somewhere
+    /// nearer the keyboard can never shadow the dismiss.
+    fn popover_key(&self, pattern: &KeyPattern, focus: Option<&str>) -> Option<ActionId> {
+        if !reconciler::context_active(OVERLAY_CONTEXT, focus) {
+            return None;
         }
-        for (context, map) in scoped.iter() {
-            if let Some(action) = map.get(pattern)
-                && reconciler::context_active(context, focus)
-            {
-                return Some(*action);
+        self.scoped_keymap.borrow().get(OVERLAY_CONTEXT).and_then(|map| map.get(pattern)).copied()
+    }
+
+    /// One pattern in the single-stroke tables: the contexts in stack
+    /// order, innermost first, then the global map.
+    fn table_single(&self, pattern: &KeyPattern, stack: &ContextStack) -> Option<ActionId> {
+        let scoped = self.scoped_keymap.borrow();
+        stack
+            .levels()
+            .iter()
+            .flat_map(|level| level.frame().idents().iter())
+            .find_map(|ident| scoped.get(ident).and_then(|map| map.get(pattern)).copied())
+            .or_else(|| self.keymap.borrow().get(pattern).copied())
+    }
+
+    /// The tables' reading of the strokes in the air — the runtime's own
+    /// resolver, and the floor beneath an installed one.
+    ///
+    /// One stroke reads the single-stroke tables, first by the KEY it is
+    /// and then by the character it TYPED: a keymap written by a hand
+    /// spells `>` and `$` and `?`, never `shift-.`, and which key makes a
+    /// `?` is the layout's answer, so only the second reading can find
+    /// it. A sequence reads the chords the same way, stroke by stroke —
+    /// `g ~` completes on a layout where `~` is shift and a key. The key's
+    /// own spelling wins a tie, so an app that wrote both gets the one it
+    /// was more precise about; among equals the innermost context wins.
+    fn table_resolution(&self, strokes: &[Stroke], stack: &ContextStack) -> KeyResolution {
+        let Some(first) = strokes.first() else {
+            return KeyResolution::None;
+        };
+        let rank = |context: Option<&'static str>| match context {
+            Some(name) => stack.levels().iter().position(|level| level.frame().has_ident(name)),
+            None => Some(usize::MAX),
+        };
+        let chords = self.chords.borrow();
+        let exact = if strokes.len() == 1 {
+            self.table_single(&first.pattern, stack).or_else(|| {
+                first.typed_pattern().and_then(|typed| self.table_single(&typed, stack))
+            })
+        } else {
+            chords
+                .iter()
+                .filter(|chord| chord.strokes.len() == strokes.len())
+                .filter_map(|chord| {
+                    let typed = spelled_by_character(&chord.strokes, strokes)?;
+                    Some(((typed, rank(chord.context)?), chord.action))
+                })
+                .min_by_key(|(order, _)| *order)
+                .map(|(_, action)| action)
+        };
+        let ahead = chords.iter().any(|chord| {
+            chord.strokes.len() > strokes.len()
+                && rank(chord.context).is_some()
+                && spelled_by_character(&chord.strokes[..strokes.len()], strokes).is_some()
+        });
+        match (exact, ahead) {
+            (Some(action), false) => KeyResolution::Action(action),
+            // a longer chord is still reachable: hold the keyboard, and
+            // remember what these strokes mean if it never completes
+            (Some(action), true) => KeyResolution::Pending(Fallback::Fire(action)),
+            (None, true) => KeyResolution::Pending(Fallback::Replay),
+            (None, false) => KeyResolution::None,
+        }
+    }
+
+    /// Installs the Strategy that turns strokes into intent (D435): from
+    /// now on every stroke the keymap reads is asked of `resolver` first,
+    /// against the live [`ContextStack`] — and the runtime's own tables
+    /// answer only what it leaves unbound. One resolver; installing
+    /// another replaces it, and a sequence in the air is let go.
+    ///
+    /// [`ContextStack`]: crate::action::ContextStack
+    pub fn set_key_resolver(&self, resolver: impl crate::action::KeyResolver + 'static) {
+        *self.key_resolver.borrow_mut() = Some(Rc::new(resolver));
+        self.cancel_chord();
+    }
+
+    /// Takes the resolver down: the tables answer alone again.
+    pub fn clear_key_resolver(&self) {
+        self.key_resolver.borrow_mut().take();
+        self.cancel_chord();
+    }
+
+    /// Tells the gate how this platform types ([`KeyPlatform`]) — the
+    /// shell's half, said once when the app is made.
+    ///
+    /// [`KeyPlatform`]: crate::action::KeyPlatform
+    pub fn set_key_platform(&self, platform: crate::action::KeyPlatform) {
+        self.key_platform.set(platform);
+    }
+
+    /// How the gate believes this platform types.
+    pub fn key_platform(&self) -> crate::action::KeyPlatform {
+        self.key_platform.get()
+    }
+
+    /// The key contexts in force right now, INNERMOST first, with their
+    /// facts and their parents — what a resolver reads, and what a
+    /// key-context debugger shows.
+    pub fn context_stack(&self) -> ContextStack {
+        self.enter_scene();
+        let focus = self.focus.borrow().clone();
+        reconciler::context_stack(focus.as_deref())
+    }
+
+    /// What the strokes mean: the resolver's answer, or the tables' when
+    /// it has none.
+    fn resolution(&self, strokes: &[Stroke], stack: &ContextStack) -> KeyResolution {
+        // out of the borrow before it runs: a resolver may read the runtime
+        let resolver = self.key_resolver.borrow().clone();
+        if let Some(resolver) = resolver {
+            let answer = resolver.resolve(strokes, stack);
+            if answer != KeyResolution::None {
+                return answer;
             }
         }
-        drop(scoped);
-        self.keymap.borrow().get(pattern).copied()
+        self.table_resolution(strokes, stack)
     }
 
-    /// One stroke offered to the keymap, which may be MID-CHORD. This
-    /// is the door a shell uses; [`Runtime::match_key`] stays the pure
-    /// lookup of a single pattern.
+    /// One stroke offered to the WHOLE gate, in the order every shell
+    /// owes its platform — the shell's door for a key. `true` = taken:
+    /// the shell presents a frame and the platform never sees the key;
+    /// `false` = the platform's own road goes on, and its input system
+    /// types what the key types.
     ///
-    /// Three answers, and the middle one is why this exists: a stroke
-    /// that opens a sequence fires nothing and is SPENT — it belongs to
-    /// the chord, not to the field and not to the app.
+    /// 1. Typing is never stolen: with nothing in the air, a stroke the
+    ///    platform types ([`KeyPlatform::types`]) goes straight to a
+    ///    field or box that takes text, bound or not.
+    /// 2. Whoever holds the keyboard hears it next ([`Runtime::key_stroke`]):
+    ///    an editor owns its arrows, its Enter and its Tab, and a copy
+    ///    hands its text to the clipboard here.
+    /// 3. A field of many lines owns the bare break and the bare vertical
+    ///    arrows, before any binding — and only it: a one-line field
+    ///    declines, so the app keeps its Enter and a list its arrows.
+    /// 4. The keymap ([`Runtime::chord`]): an action runs if a handler
+    ///    answers it; a sequence, a dead end it unwound, or a disabled
+    ///    key is spent; a binding nobody answers does NOT consume, and
+    ///    the stroke walks on as if unbound.
     ///
-    /// The prefix cannot hold the keyboard for good. Escape lets it go,
-    /// a press of the pointer lets it go, a stroke that leads nowhere
-    /// ends it, and the shell's slow clock ages it out through
-    /// [`Runtime::chord_tick`].
-    pub fn chord(&self, stroke: impl Into<crate::action::Stroke>) -> crate::action::KeyMatch {
+    /// MID-CHORD the keyboard belongs to the keymap: steps 1 and 3 stand
+    /// aside, because the stroke that finishes `cmd-k s` is not typing.
+    ///
+    /// [`KeyPlatform::types`]: crate::action::KeyPlatform::types
+    pub fn offer_key(&self, stroke: impl Into<Stroke>) -> bool {
         self.enter_scene();
         let stroke = stroke.into();
-        let matched = self.resolve_chord(&stroke);
-        // out of every borrow: the sink writes the app's state
-        let sink = self.key_sink.borrow().clone();
-        if let Some(sink) = sink {
-            let contexts = self.active_contexts();
-            sink(&crate::action::KeyReport { stroke, contexts, matched });
-        }
-        matched
+        let typing = self.key_platform.get().types(&stroke.pattern);
+        self.gate(Held { stroke, typing, fallback: Fallback::Replay }, Door::Platform)
     }
 
-    /// The keymap's reading of one stroke — [`Runtime::chord`] without
-    /// the report.
-    fn resolve_chord(&self, stroke: &crate::action::Stroke) -> crate::action::KeyMatch {
-        use crate::action::KeyMatch;
-        let pattern = &stroke.pattern;
+    fn gate(&self, held: Held, door: Door) -> bool {
+        let pattern = held.stroke.pattern;
+        // a lone modifier is the keymap's word alone: no box hears it as a
+        // key, and it types nothing
+        if pattern.key.is_modifier() {
+            return match self.read_and_report(held) {
+                KeyMatch::Action(action) => self.dispatch_action(action),
+                KeyMatch::Pending | KeyMatch::Disabled => true,
+                KeyMatch::None => false,
+            };
+        }
+        let in_air = !self.pending.borrow().is_empty();
+        if !in_air && held.typing && self.focus_takes_text() {
+            return self.walk_on(held, door);
+        }
+        let taken = self.key_stroke(held.stroke);
+        if taken.handled {
+            if let Some(text) = taken.text {
+                crate::clipboard::write(&text);
+            }
+            return true;
+        }
+        let enter_by_text = self.key_platform.get().enter_by_text;
+        if !in_air
+            && pattern.is_plain()
+            && let Some(command) = match pattern.key {
+                crate::action::Key::Enter if !enter_by_text => Some(EditCommand::Newline),
+                crate::action::Key::Up => Some(EditCommand::Up(pattern.shift)),
+                crate::action::Key::Down => Some(EditCommand::Down(pattern.shift)),
+                _ => None,
+            }
+            && self.key(command).applied
+        {
+            return true;
+        }
+        match self.read_and_report(held) {
+            KeyMatch::Action(action) => self.dispatch_action(action) || self.walk_on(held, door),
+            // the stroke opened, continued or unwound a sequence, or a
+            // binding disabled it: it is spent
+            KeyMatch::Pending | KeyMatch::Disabled => true,
+            KeyMatch::None => self.walk_on(held, door),
+        }
+    }
+
+    /// Nobody took the stroke. Offered by the platform, the platform's
+    /// own road goes on; replayed by the runtime, the runtime IS the
+    /// platform, and the stroke types what it typed.
+    fn walk_on(&self, held: Held, door: Door) -> bool {
+        match door {
+            Door::Platform => false,
+            Door::Replay => {
+                self.type_held(&held);
+                true
+            }
+        }
+    }
+
+    /// The text door for a held stroke: what it typed reaches whoever
+    /// holds the keyboard, as the platform's input system would have
+    /// delivered it — a field inserts it, a box hears it as text.
+    fn type_held(&self, held: &Held) {
+        if let Some(typed) = held.stroke.typed {
+            let _ = self.key(EditCommand::Insert(typed.to_string()));
+        }
+    }
+
+    /// One stroke offered to the keymap, which may be MID-CHORD — the
+    /// keymap step of [`Runtime::offer_key`], and the door a shell that
+    /// runs its own gate uses. [`Runtime::match_key`] stays the pure
+    /// lookup of a single pattern in the tables.
+    ///
+    /// Four answers, and the middle ones are why this exists: a stroke
+    /// that opens a sequence fires nothing and is SPENT — it belongs to
+    /// the chord, not to the field and not to the app — and so is a
+    /// stroke a resolver disabled.
+    ///
+    /// The prefix cannot hold the keyboard for good. Escape lets it go
+    /// and is spent; a press of the pointer lets it go. A stroke that
+    /// leads nowhere, and the shell's slow clock ([`Runtime::chord_tick`]),
+    /// UNWIND it: the longest run of the held strokes bound on its own
+    /// fires, or — bound to nothing — the first goes to the text door as
+    /// if no binding had ever seen it, and what came after is offered
+    /// to the whole gate again. That is how a `g` an editor's keymap held
+    /// for `g g` still reaches the editor's own `g` when the next key is
+    /// one no binding names.
+    pub fn chord(&self, stroke: impl Into<Stroke>) -> KeyMatch {
+        self.enter_scene();
+        let stroke = stroke.into();
+        let typing = self.key_platform.get().types(&stroke.pattern);
+        self.read_and_report(Held { stroke, typing, fallback: Fallback::Replay })
+    }
+
+    /// The keymap's reading of a stroke, reported to the key sink. A
+    /// stroke that unwound a sequence is not reported here: it was
+    /// offered again, and that offer reports what it became.
+    fn read_and_report(&self, held: Held) -> KeyMatch {
+        self.modifier_tap.set(None);
+        match self.read_stroke(held) {
+            Reading::Answered(matched) => {
+                // out of every borrow: the sink writes the app's state
+                let sink = self.key_sink.borrow().clone();
+                if let Some(sink) = sink {
+                    let contexts = self.active_contexts();
+                    sink(&crate::action::KeyReport { stroke: held.stroke, contexts, matched });
+                }
+                matched
+            }
+            Reading::Unwound => KeyMatch::Pending,
+        }
+    }
+
+    /// The keymap's reading of one stroke — the mechanics the runtime
+    /// keeps whoever resolves: the alert, Escape out of a sequence, the
+    /// popover's reserved keys, the strokes in the air.
+    fn read_stroke(&self, mut held: Held) -> Reading {
+        let pattern = held.stroke.pattern;
+        let focus = self.focus.borrow().clone();
         // under an open alert nothing is held in the air: a sequence the
         // page began before the ask cannot finish beneath it, and only
         // the alert's own single strokes answer (`match_key`)
-        let focus = self.focus.borrow().clone();
         if reconciler::context_active(ALERT_CONTEXT, focus.as_deref()) {
             self.cancel_chord();
-            return self.match_key(pattern).map_or(KeyMatch::None, KeyMatch::Action);
+            return Reading::Answered(self.match_key(&pattern).map_or(KeyMatch::None, KeyMatch::Action));
         }
-        let held = !self.pending.borrow().is_empty();
+        let in_air = !self.pending.borrow().is_empty();
         // the explicit way out, and it consumes: a chord abandoned with
         // Escape must not also close the app's palette behind it
-        if held && *pattern == KeyPattern::key(crate::action::Key::Escape) {
+        if in_air && pattern == KeyPattern::key(crate::action::Key::Escape) {
             self.cancel_chord();
-            return KeyMatch::Pending;
+            return Reading::Answered(KeyMatch::Pending);
         }
-        self.pending.borrow_mut().push(*pattern);
+        if !in_air && let Some(action) = self.popover_key(&pattern, focus.as_deref()) {
+            return Reading::Answered(KeyMatch::Action(action));
+        }
+        let strokes: Vec<Stroke> =
+            self.pending.borrow().iter().map(|held| held.stroke).chain([held.stroke]).collect();
+        let stack = reconciler::context_stack(focus.as_deref());
+        match self.resolution(&strokes, &stack) {
+            KeyResolution::Pending(fallback) => {
+                held.fallback = fallback;
+                self.pending.borrow_mut().push(held);
+                self.pending_aged.set(false);
+                // the sequence is in the air: a which-key panel hears it now
+                self.announce_chord();
+                Reading::Answered(KeyMatch::Pending)
+            }
+            resolved => {
+                let earlier = self.take_pending();
+                match resolved {
+                    KeyResolution::Action(action) => Reading::Answered(KeyMatch::Action(action)),
+                    KeyResolution::Disabled => Reading::Answered(KeyMatch::Disabled),
+                    // a plain stroke that started nothing: nothing is bound
+                    _ if earlier.is_empty() => Reading::Answered(KeyMatch::None),
+                    // a sequence that leads nowhere: the held strokes get
+                    // their meaning, and this one is offered again
+                    _ => {
+                        let mut held_strokes = earlier;
+                        held_strokes.push(held);
+                        self.unwind(held_strokes);
+                        Reading::Unwound
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gives the strokes of a sequence their meaning once the wait for
+    /// more is over: the longest run of them bound on its own runs (or,
+    /// disabled, is spent), and what came after is offered to the whole
+    /// gate again; bound to nothing at any length, the first goes to the
+    /// text door and the rest are offered again.
+    ///
+    /// The first stroke is always given a meaning before anything is
+    /// offered again, so the replay ends: each turn spends one.
+    fn unwind(&self, held: Vec<Held>) {
+        let meant = held.iter().rposition(|stroke| stroke.fallback != Fallback::Replay);
+        let rest = match meant.map(|at| (at, held[at].fallback)) {
+            Some((at, Fallback::Fire(action))) if self.dispatch_action(action) => &held[at + 1..],
+            Some((at, Fallback::Swallow)) => &held[at + 1..],
+            // bound to nothing — or bound to an action nobody answers,
+            // which does not consume: the first is typing
+            _ => {
+                self.type_held(&held[0]);
+                &held[1..]
+            }
+        };
+        for stroke in rest {
+            self.gate(Held { fallback: Fallback::Replay, ..*stroke }, Door::Replay);
+        }
+    }
+
+    /// The sequence in the air, taken out of it — announced to the
+    /// which-key door as over.
+    fn take_pending(&self) -> Vec<Held> {
         self.pending_aged.set(false);
-        let live = |context: &Option<&'static str>| {
-            context.is_none_or(|name| reconciler::context_active(name, focus.as_deref()))
-        };
-        let answer = {
-            let chords = self.chords.borrow();
-            let pending = self.pending.borrow();
-            let exact = chords
-                .iter()
-                .find(|chord| live(&chord.context) && *chord.strokes == pending[..])
-                .map(|chord| chord.action);
-            let ahead = chords.iter().any(|chord| {
-                live(&chord.context)
-                    && chord.strokes.len() > pending.len()
-                    && chord.strokes.starts_with(&pending)
-            });
-            match (exact, ahead) {
-                (Some(action), _) => Some(KeyMatch::Action(action)),
-                // a longer chord is still reachable: hold the keyboard
-                (None, true) => None,
-                (None, false) => Some(KeyMatch::None),
-            }
-        };
-        let Some(answer) = answer else {
-            // the sequence is in the air: a which-key panel hears it now
+        let held = std::mem::take(&mut *self.pending.borrow_mut());
+        if self.chord_announced.replace(false) {
             self.announce_chord();
-            return KeyMatch::Pending;
-        };
-        // whatever it was, the sequence is over
-        let strokes = self.pending.borrow().len();
-        self.cancel_chord();
-        match answer {
-            KeyMatch::None if strokes == 1 => {
-                // a plain stroke that started nothing: the single-stroke
-                // table answers — first for the KEY it is, and then for
-                // the character it TYPED. A keymap written by a hand
-                // spells `>` and `$` and `?`, never `shift-.`, and
-                // which key makes a `?` is the layout's answer: the
-                // second reading is the only one that can find it.
-                //
-                // The key's own spelling always wins, so an app that
-                // wrote both gets the one it was more precise about.
-                self.match_key(pattern)
-                    .or_else(|| {
-                        stroke.typed_pattern().and_then(|typed| self.match_key(&typed))
-                    })
-                    .map_or(KeyMatch::None, KeyMatch::Action)
-            }
-            // a sequence that dead-ended spends its last stroke: the
-            // hand was mid-chord, and re-reading it as a fresh one is
-            // how an editor fires something nobody asked for
-            other => other,
         }
+        held
     }
 
     /// The key contexts in force right now, OUTERMOST first, each named
     /// once: the ones mounted views declare, and the focused ones whose
-    /// view holds the keyboard. The stack a key-context debugger shows,
-    /// read the same way the keymap reads it.
+    /// view holds the keyboard. The names a key-context debugger lists,
+    /// read the same way the keymap reads them —
+    /// [`Runtime::context_stack`] is the same set as frames, innermost
+    /// first.
     pub fn active_contexts(&self) -> Vec<&'static str> {
         self.enter_scene();
         let focus = self.focus.borrow().clone();
@@ -3800,29 +4111,25 @@ impl Runtime {
         *self.key_sink.borrow_mut() = Some(Rc::new(sink));
     }
 
-    /// The strokes of a sequence still in the air — what a which-key
-    /// panel draws. Empty means the keyboard is free.
+    /// The keys of a sequence still in the air — what a which-key panel
+    /// draws. Empty means the keyboard is free.
     pub fn pending_chord(&self) -> Vec<KeyPattern> {
-        self.pending.borrow().clone()
+        self.pending.borrow().iter().map(|held| held.stroke.pattern).collect()
     }
 
-    /// Drops a sequence in the air. `true` = one was held.
+    /// The strokes of a sequence still in the air, with what each typed —
+    /// [`Runtime::pending_chord`] for a panel that reads the characters.
+    pub fn pending_strokes(&self) -> Vec<Stroke> {
+        self.pending.borrow().iter().map(|held| held.stroke).collect()
+    }
+
+    /// Drops a sequence in the air, unread. `true` = one was held.
     pub fn cancel_chord(&self) -> bool {
-        self.pending_aged.set(false);
-        let held = {
-            let mut pending = self.pending.borrow_mut();
-            let held = !pending.is_empty();
-            pending.clear();
-            held
-        };
-        if self.chord_announced.replace(false) {
-            self.announce_chord();
-        }
-        held
+        !self.take_pending().is_empty()
     }
 
     /// Installs who hears the sequence move: the sink is called with the
-    /// strokes in the air after every change — the door a which-key panel
+    /// keys in the air after every change — the door a which-key panel
     /// reads through, since the app's bodies never see a stroke. One sink;
     /// installing another replaces it.
     pub fn observe_chord(&self, sink: impl Fn(&[KeyPattern]) + 'static) {
@@ -3832,7 +4139,7 @@ impl Runtime {
     fn announce_chord(&self) {
         let sink = self.chord_sink.borrow().clone();
         let Some(sink) = sink else { return };
-        let pending = self.pending.borrow().clone();
+        let pending = self.pending_chord();
         self.chord_announced.set(!pending.is_empty());
         sink(&pending);
     }
@@ -3855,25 +4162,61 @@ impl Runtime {
     /// (`flagsChanged:` on the mac, the key-up of a modifier on Windows,
     /// the keyboard's modifier state on Linux, `keyup` in a browser).
     ///
-    /// `true` when the change was news AND someone heard it — the
-    /// shell presents a frame, because the sink may well have written
-    /// state. Reporting the same modifiers twice is not a change.
-    pub fn modifiers_changed(&self, held: crate::action::Modifiers) -> bool {
+    /// It is also where a LONE modifier becomes a stroke: one pressed
+    /// with nothing else held and let go with no key, no text and no
+    /// click in between is offered to the keymap as [`Key::Shift`] (and
+    /// its three siblings) — how `shift shift` opens a search. Chorded
+    /// with another modifier it is no tap.
+    ///
+    /// Reporting the same modifiers twice is not a change.
+    ///
+    /// [`Key::Shift`]: crate::action::Key::Shift
+    pub fn modifiers_changed(&self, held: crate::action::Modifiers) -> crate::action::ModifierChange {
         let was = self.held.replace(held);
         if was == held {
-            return false;
+            return crate::action::ModifierChange::default();
         }
         self.enter_scene();
+        let tap = self.lone_modifier(was, held);
         // out of the borrow before it runs: the sink writes state, and
         // may install another sink
         let sink = self.modifier_sink.borrow().clone();
-        match sink {
-            Some(sink) => {
-                sink(was, held);
-                true
-            }
-            None => false,
+        let heard = sink.is_some_and(|sink| {
+            sink(was, held);
+            true
+        });
+        let tap_taken = tap.is_some_and(|key| {
+            let stroke = Stroke::from(KeyPattern::key(key));
+            self.gate(Held { stroke, typing: false, fallback: Fallback::Replay }, Door::Platform)
+        });
+        crate::action::ModifierChange { present: heard || tap_taken, tap_taken }
+    }
+
+    /// Follows a lone modifier through one report: the key it names when
+    /// this report let it go alone, after nothing came between.
+    fn lone_modifier(
+        &self,
+        was: crate::action::Modifiers,
+        now: crate::action::Modifiers,
+    ) -> Option<crate::action::Key> {
+        use crate::action::Key;
+        let lone = |held: crate::action::Modifiers| match (held.shift, held.command, held.option, held.control) {
+            (true, false, false, false) => Some(Key::Shift),
+            (false, true, false, false) => Some(Key::Command),
+            (false, false, true, false) => Some(Key::Option),
+            (false, false, false, true) => Some(Key::Control),
+            _ => None,
+        };
+        if was == crate::action::Modifiers::NONE {
+            self.modifier_tap.set(lone(now));
+            return None;
         }
+        if now == crate::action::Modifiers::NONE {
+            return self.modifier_tap.take().filter(|key| lone(was) == Some(*key));
+        }
+        // a second modifier joined, or one of two let go: no lone tap
+        self.modifier_tap.set(None);
+        None
     }
 
     /// Installs who hears the modifier keys move: the sink is called
@@ -3888,12 +4231,17 @@ impl Runtime {
         *self.modifier_sink.borrow_mut() = Some(Rc::new(sink));
     }
 
-    /// The slow clock, aging a pending prefix: the SECOND tick drops
-    /// it. Same shape as the tooltip's wait — a delay is this tick seen
-    /// twice, and no clock ever enters the engine.
+    /// The slow clock, aging a pending prefix: the SECOND tick ends the
+    /// wait. Same shape as the tooltip's wait — a delay is this tick
+    /// seen twice, and no clock ever enters the engine.
     ///
-    /// `true` = something changed and the frame is worth painting (a
-    /// which-key panel just went away).
+    /// The wait ending is not the strokes being lost: they UNWIND as a
+    /// dead end does ([`Runtime::chord`]) — the longest run bound on its
+    /// own fires, or the first goes to the text door and the rest are
+    /// offered again — so a lone `g` an editor's keymap held for `g g`
+    /// still reaches the editor.
+    ///
+    /// `true` = something changed and the frame is worth painting.
     pub fn chord_tick(&self) -> bool {
         if self.pending.borrow().is_empty() {
             return false;
@@ -3902,7 +4250,10 @@ impl Runtime {
             self.pending_aged.set(true);
             return false;
         }
-        self.cancel_chord()
+        self.enter_scene();
+        let held = self.take_pending();
+        self.unwind(held);
+        true
     }
 
     /// Mounts an action's handler OUTSIDE the view tree — the door for
@@ -5032,6 +5383,8 @@ impl Runtime {
     /// already dirtied whoever reads; typing returns the caret to solid.
     pub fn key(&self, command: EditCommand) -> Edited {
         self.enter_scene();
+        // text arriving is a key pressed: a modifier held around it is no tap
+        self.modifier_tap.set(None);
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };
@@ -8511,3 +8864,7 @@ fn scroll_target_frame(
 #[cfg(test)]
 #[path = "runtime_clock_tests.rs"]
 mod clock_tests;
+
+#[cfg(test)]
+#[path = "key_resolution_tests.rs"]
+mod key_resolution_tests;

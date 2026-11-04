@@ -26,7 +26,7 @@ mod x11;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, KeyPattern, Modifiers, Stroke};
+use bunny_ui::action::{Key, KeyPattern, Modifiers, Stroke};
 use bunny_ui::host::MouseButton;
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::menu::{AltTap, MenuKey};
@@ -71,6 +71,7 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0xffff => Some(Key::Delete),
         0xff50 => Some(Key::Home),
         0xff57 => Some(Key::End),
+        0xff63 => Some(Key::Insert),
         // XK_F1 to XK_F24, one run in the sym table
         0xffbe..=0xffd5 => Some(Key::F((stroke.sym - 0xffbd) as u8)),
         _ => None,
@@ -1467,6 +1468,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // and every press the handler hears breaks the tap, and the modifier
     // reports make it
     let alt_tap = Rc::new(RefCell::new(AltTap::default()));
+    // Alt and a letter types nothing here (AltGr does, and arrives as text
+    // before the gate): it is a menu's access key once the box and the
+    // keymap have declined it, never a letter for the field
+    runtime.set_key_platform(bunny_ui::action::KeyPlatform { option_types: false, ..bunny_ui::action::KeyPlatform::default() });
     let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
@@ -1483,59 +1488,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let Some(pattern) = pattern else {
                 return false;
             };
-            // MID-CHORD the keyboard belongs to the keymap: the stroke
-            // that finishes `cmd-k s` is not typing, and it is not the
-            // focused box's either
-            let mid_chord = !runtime.pending_chord().is_empty();
-            // Alt and a letter types nothing here (AltGr does, and arrived
-            // as text above): it is a menu's access key once the box and the
-            // keymap have declined it, never a letter for the field
-            let menu_letter = matches!(MenuKey::of_stroke(&pattern), Some(MenuKey::Access(_)));
-            if !mid_chord && !menu_letter && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
-            }
-            // a focused escape hatch owns its strokes: an editor's
-            // arrows, Enter and Tab are its own, and a copy hands the
-            // text back for the clipboard
-            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
-            if taken.handled {
-                if let Some(text) = taken.text {
-                    ffi::clipboard_write(&text);
-                }
-                blit(&runtime, &*root, ORIGIN_KEY);
-                return true;
-            }
-            // a field of MANY lines owns the bare break and the bare
-            // vertical arrows, before any binding — and only it: a
-            // one-line field declines and the stroke walks on, so the
-            // app keeps its Enter and a list keeps its arrows
-            if !mid_chord
-                && pattern.is_plain()
-                && let Some(command) = match pattern.key {
-                    Key::Enter => Some(EditCommand::Newline),
-                    Key::Up => Some(EditCommand::Up(pattern.shift)),
-                    Key::Down => Some(EditCommand::Down(pattern.shift)),
-                    _ => None,
-                }
-                && runtime.key(command).applied
-            {
-                blit(&runtime, &*root, ORIGIN_KEY);
-                return true;
-            }
-            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
-                KeyMatch::Action(action) => Some(action),
-                // the stroke opened (or let go of) a sequence: it is
-                // spent, and a which-key panel may have just changed
-                KeyMatch::Pending => {
-                    blit(&runtime, &*root, ORIGIN_KEY);
-                    return true;
-                }
-                KeyMatch::None => None,
-            };
-            // nothing bound, or a binding nobody answered: the stroke may
-            // still be the menu bar's — F10, an access key
-            let taken = action.is_some_and(|action| runtime.dispatch_action(action))
-                || menu_key(&runtime, &pattern);
+            // the shared gate: typing first, then whoever holds the
+            // keyboard, a field of many lines, and the keymap; what all of
+            // them decline may still be the menu bar's — F10, an access key
+            let taken = runtime.offer_key(Stroke::new(pattern, stroke.typed)) || menu_key(&runtime, &pattern);
             if taken {
                 blit(&runtime, &*root, ORIGIN_KEY);
             }
@@ -1607,8 +1563,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // did, the frame that shows it is not one to wait for —
                 // and Alt let go alone is the menu bar's
                 let tapped = alt_tap.borrow_mut().modifiers(held.replace(now), now);
-                let changed = runtime.modifiers_changed(now);
-                if (tapped && runtime.menu_key(MenuKey::Bar)) || changed {
+                let change = runtime.modifiers_changed(now);
+                // a lone Alt the keymap took as a stroke is not the menu's
+                if (tapped && !change.tap_taken && runtime.menu_key(MenuKey::Bar)) || change.present {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
@@ -1950,6 +1907,11 @@ mod tests {
     fn a_lone_modifier_is_no_pattern() {
         // Shift_L alone: no named key, no base char
         assert!(key_pattern(&stroke(0xffe1, "", true, false, false)).is_none());
+    }
+
+    #[test]
+    fn insert_is_named() {
+        assert_eq!(key_pattern(&stroke(0xff63, "", false, false, false)).unwrap().key, Key::Insert);
     }
 
     #[test]
