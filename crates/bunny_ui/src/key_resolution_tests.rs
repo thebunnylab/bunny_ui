@@ -186,6 +186,14 @@ fn a_resolver_reads_the_live_frames_and_a_disabled_key_is_spent() {
     assert!(runtime.offer_key(Stroke::from(KeyPattern::key(Key::F(6)))));
     assert_eq!(floor.get(), 1);
 
+    // the pure lookup reads the resolver too: a disabled key means nothing,
+    // and what the resolver binds is what `match_key` names
+    assert_eq!(runtime.match_key(&KeyPattern::key(Key::F(5))), None, "disabled in insert");
+    assert_eq!(runtime.match_key(&KeyPattern::key(Key::F(6))), Some(FLOOR), "the floor still answers");
+    bench.mode.set("normal");
+    runtime.render_stable(&bench);
+    assert_eq!(runtime.match_key(&KeyPattern::key(Key::F(5))), Some(DELETE), "the resolver's action");
+
     // taken down, the tables answer alone again
     runtime.clear_key_resolver();
     assert!(runtime.offer_key(f5));

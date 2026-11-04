@@ -3697,14 +3697,17 @@ impl Runtime {
         self.chords.borrow_mut().retain(|chord| chord.context != Some(context));
     }
 
-    /// The binding for the pattern in the runtime's own tables: while an
-    /// alert is up, its reserved context alone; the popover's reserved
-    /// keys next; then the contexts in force, INNERMOST first (a mounted
-    /// `.key_context` turns its bindings on, and the declaration nearest
-    /// the keyboard wins a key two of them bind); the global map last.
+    /// The action the pattern means ON ITS OWN, right now: while an alert
+    /// is up, its reserved context alone; the popover's reserved keys
+    /// next; then the installed [`KeyResolver`] — what it would run for
+    /// this one stroke, or `None` for a key it disabled or holds only as
+    /// the start of a sequence; and beneath it the tables, the contexts in
+    /// force INNERMOST first (a mounted `.key_context` turns its bindings
+    /// on, and the declaration nearest the keyboard wins a key two of them
+    /// bind), the global map last.
     ///
-    /// A [`KeyResolver`]'s answers are its own and are not read here —
-    /// this is the pure lookup of one pattern in the tables beneath it.
+    /// The pure lookup of one pattern: no sequence is opened, nothing is
+    /// held and nothing runs. [`Runtime::chord`] is the door that does.
     ///
     /// [`KeyResolver`]: crate::action::KeyResolver
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
@@ -3721,8 +3724,22 @@ impl Runtime {
             let scoped = self.scoped_keymap.borrow();
             return scoped.get(ALERT_CONTEXT).and_then(|map| map.get(pattern)).copied();
         }
-        self.popover_key(pattern, focus)
-            .or_else(|| self.table_single(pattern, &reconciler::context_stack(focus)))
+        if let Some(action) = self.popover_key(pattern, focus) {
+            return Some(action);
+        }
+        let stack = reconciler::context_stack(focus);
+        let resolver = self.key_resolver.borrow().clone();
+        if let Some(resolver) = resolver {
+            match resolver.resolve(&[Stroke::from(*pattern)], &stack) {
+                KeyResolution::Action(action) | KeyResolution::Pending(Fallback::Fire(action)) => return Some(action),
+                // disabled, or only the start of a sequence: alone it means
+                // nothing, and the tables beneath are not asked — the same
+                // reading a pressed key gets
+                KeyResolution::Disabled | KeyResolution::Pending(Fallback::Swallow | Fallback::Replay) => return None,
+                KeyResolution::None => {}
+            }
+        }
+        self.table_single(pattern, &stack)
     }
 
     /// The reserved popover's own binding for the pattern — ahead of every
