@@ -50,6 +50,10 @@ use crate::layout::{
 use crate::text_engine::{FontSpec, LineMetrics, MeasureCache, TextEngine};
 use crate::view::{NodeList, Single, View};
 
+#[cfg(test)]
+#[path = "custom_geometry_tests.rs"]
+mod geometry_tests;
+
 /// What the app implements to own a box.
 ///
 /// Only [`paint`] is required: the default measure fills the proposal
@@ -388,6 +392,27 @@ impl<'a> Metrics<'a> {
     /// gutter number).
     pub fn line_in(&self, text: &str, font: &FontSpec) -> LineMetrics {
         self.cache.get_or_measure(text, font, self.text)
+    }
+
+    /// The complete line's shaped caret, hit-test and selection geometry,
+    /// with the inherited font. Coordinates are relative to the line's
+    /// visual left origin and ranges use UTF-8 bytes.
+    ///
+    /// Shares the built-in editors' text/font cache. `None` means the text
+    /// engine does not provide geometry; no approximate cells are invented.
+    pub fn line_geometry(&self, text: &str) -> Option<Rc<crate::text_geometry::LineGeometry>> {
+        self.line_geometry_in(text, &self.font)
+    }
+
+    /// The complete line's shaped geometry with an explicit font.
+    /// Measure and paint the same complete text with this font so its
+    /// coordinates agree with the glyphs, including fallback fonts and BiDi.
+    pub fn line_geometry_in(
+        &self,
+        text: &str,
+        font: &FontSpec,
+    ) -> Option<Rc<crate::text_geometry::LineGeometry>> {
+        self.cache.get_or_geometry(text, font, self.text)
     }
 
     /// The width of one line with the inherited font.
