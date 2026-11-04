@@ -499,7 +499,11 @@ pub struct ContextLevel {
 }
 
 impl ContextLevel {
-    pub(crate) fn new(frame: std::rc::Rc<ContextFrame>, parent: Option<usize>, on_focus_path: bool) -> ContextLevel {
+    /// A level of a stack built by hand — what a resolver's own tests feed
+    /// it. The runtime builds the live one ([`Runtime::context_stack`]).
+    ///
+    /// [`Runtime::context_stack`]: crate::runtime::Runtime::context_stack
+    pub fn new(frame: std::rc::Rc<ContextFrame>, parent: Option<usize>, on_focus_path: bool) -> ContextLevel {
         ContextLevel { frame, parent, on_focus_path }
     }
 
@@ -521,7 +525,10 @@ impl ContextLevel {
 }
 
 impl ContextStack {
-    pub(crate) fn new(levels: Vec<ContextLevel>) -> ContextStack {
+    /// A stack from its levels, innermost first, each `parent` an index into
+    /// the same list — a resolver's test fixture; the runtime builds the
+    /// live one.
+    pub fn new(levels: Vec<ContextLevel>) -> ContextStack {
         ContextStack { levels }
     }
 
