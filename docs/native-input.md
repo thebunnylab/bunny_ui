@@ -141,6 +141,13 @@ Geometry shares the font/text cache's aging rules; replacing the runtime's engin
 invalidates its cache. External users of `MeasureCache` must likewise keep one
 cache per engine and invalidate it when changing the engine's registered fonts.
 
+Custom surfaces can use `Metrics::line_geometry(text)` with their inherited
+font or `Metrics::line_geometry_in(text, &font)` with an explicit font. Both
+return the same cached `Rc<LineGeometry>` used by built-in editors, or `None`
+when the engine supplies no geometry. Paint the complete text with the same
+font and use its visual-left origin for caret, hit and selection coordinates;
+reshaping independently colored fragments can change those coordinates.
+
 Native cluster interiors depend on the platform's font data and hit API. Linux
 uses a complete valid GDEF caret list for a single-glyph ligature when available,
 translated by its shaped origin; otherwise it divides the cluster advance by
