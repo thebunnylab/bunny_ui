@@ -1375,6 +1375,27 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::KeyContextFocused(name))
     }
 
+    /// Declares a key context WITH FACTS, active while this view is
+    /// mounted — the frame a [`KeyResolver`] reads when a stroke arrives
+    /// (D435). `.key_context(name)` is this with a frame of one name.
+    ///
+    /// A frame is part of the view's value: the next render declares
+    /// the facts as they are then, so a mode that changed is the mode
+    /// the next stroke reads.
+    ///
+    /// [`KeyResolver`]: crate::action::KeyResolver
+    #[track_caller]
+    fn key_context_with(self, frame: crate::action::ContextFrame) -> Modified<Self> {
+        Modified::new(self, Modifier::KeyContextWith(std::rc::Rc::new(frame)))
+    }
+
+    /// [`ViewExt::key_context_with`], counting only while the keyboard is
+    /// inside this view — `.key_context_focused` with facts.
+    #[track_caller]
+    fn key_context_focused_with(self, frame: crate::action::ContextFrame) -> Modified<Self> {
+        Modified::new(self, Modifier::KeyContextFocusedWith(std::rc::Rc::new(frame)))
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

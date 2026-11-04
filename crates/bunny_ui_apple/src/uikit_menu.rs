@@ -202,7 +202,9 @@ impl UiKey {
             Key::End => UiInput::Named(NamedKey::End),
             Key::Delete => UiInput::Named(NamedKey::Delete),
             Key::F(number @ 1..=12) => UiInput::Named(NamedKey::F(number)),
-            Key::F(_) => return None,
+            // UIKit names no Insert key command, and a lone modifier is a
+            // keymap stroke, never a menu's equivalent
+            Key::F(_) | Key::Insert | Key::Shift | Key::Command | Key::Option | Key::Control => return None,
         };
         let modifiers = [
             (stroke.shift, SHIFT),

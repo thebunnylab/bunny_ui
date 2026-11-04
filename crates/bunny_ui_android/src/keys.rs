@@ -27,6 +27,7 @@ pub const KEYCODE_ESCAPE: i32 = 111;
 pub const KEYCODE_FORWARD_DEL: i32 = 112;
 pub const KEYCODE_MOVE_HOME: i32 = 122;
 pub const KEYCODE_MOVE_END: i32 = 123;
+pub const KEYCODE_INSERT: i32 = 124;
 pub const KEYCODE_F1: i32 = 131;
 pub const KEYCODE_F12: i32 = 142;
 pub const KEYCODE_NUMPAD_ENTER: i32 = 160;
@@ -166,6 +167,7 @@ pub fn key_pattern(stroke: &KeyStroke) -> Option<KeyPattern> {
         KEYCODE_FORWARD_DEL => Some(Key::Delete),
         KEYCODE_MOVE_HOME => Some(Key::Home),
         KEYCODE_MOVE_END => Some(Key::End),
+        KEYCODE_INSERT => Some(Key::Insert),
         // the platform names twelve, and a keyboard with more sends
         // nothing for the rest
         KEYCODE_F1..=KEYCODE_F12 => Some(Key::F((stroke.keycode - KEYCODE_F1 + 1) as u8)),
@@ -281,6 +283,11 @@ mod tests {
     #[test]
     fn a_lone_modifier_is_no_pattern() {
         assert!(key_pattern(&stroke_of(59, META_SHIFT_ON)).is_none(), "left shift alone");
+    }
+
+    #[test]
+    fn insert_is_named() {
+        assert_eq!(key_pattern(&stroke_of(KEYCODE_INSERT, 0)).unwrap().key, Key::Insert);
     }
 
     #[test]

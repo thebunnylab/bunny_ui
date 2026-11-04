@@ -21,7 +21,7 @@ pub mod webview;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
+use bunny_ui::action::{Key, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::View;
@@ -55,6 +55,7 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0x2E => Some(Key::Delete),
         0x24 => Some(Key::Home),
         0x23 => Some(Key::End),
+        0x2D => Some(Key::Insert),
         // VK_F1 to VK_F24; F10 arrives as a system key, and the pump
         // gates those too
         0x70..=0x87 => Some(Key::F((stroke.vk - 0x6F) as u8)),
@@ -1436,52 +1437,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let Some(pattern) = key_pattern(stroke) else {
                 return false;
             };
-            // MID-CHORD the keyboard belongs to the keymap: the stroke
-            // that finishes `cmd-k s` is not typing, and it is not the
-            // focused box's either
-            let mid_chord = !runtime.pending_chord().is_empty();
-            if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
-            }
-            // a focused escape hatch owns its strokes: an editor's
-            // arrows, Enter and Tab are its own, and a copy hands the
-            // text back for the clipboard
-            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
-            if taken.handled {
-                if let Some(text) = taken.text {
-                    ffi::clipboard_write(&text);
-                }
-                blit(&runtime, &*root);
-                return true;
-            }
-            // a field of MANY lines owns the bare break and the bare
-            // vertical arrows, before any binding — and only it: a
-            // one-line field declines and the stroke walks on, so the
-            // app keeps its Enter and a list keeps its arrows
-            if !mid_chord
-                && pattern.is_plain()
-                && let Some(command) = match pattern.key {
-                    Key::Enter => Some(EditCommand::Newline),
-                    Key::Up => Some(EditCommand::Up(pattern.shift)),
-                    Key::Down => Some(EditCommand::Down(pattern.shift)),
-                    _ => None,
-                }
-                && runtime.key(command).applied
-            {
-                blit(&runtime, &*root);
-                return true;
-            }
-            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
-                KeyMatch::Action(action) => action,
-                // the stroke opened (or let go of) a sequence: it is
-                // spent, and a which-key panel may have just changed
-                KeyMatch::Pending => {
-                    blit(&runtime, &*root);
-                    return true;
-                }
-                KeyMatch::None => return false,
-            };
-            if runtime.dispatch_action(action) {
+            // the shared gate: typing first, then whoever holds the
+            // keyboard, a field of many lines, and the keymap — a copy's
+            // text reaches the clipboard through the installed one
+            if runtime.offer_key(Stroke::new(pattern, stroke.typed)) {
                 blit(&runtime, &*root);
                 true
             } else {
@@ -1636,8 +1595,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::Modifiers(held) => {
                 // a release confirms, closes, opens — whatever the sink
-                // did, the frame that shows it is not one to wait for
-                if runtime.modifiers_changed(held) {
+                // did, the frame that shows it is not one to wait for; a
+                // modifier let go alone may have been a stroke taken
+                if runtime.modifiers_changed(held).present {
                     blit(runtime, root);
                 }
             }
@@ -1967,6 +1927,11 @@ mod tests {
     fn a_lone_modifier_is_no_pattern() {
         // VK_SHIFT alone: no named key, no base char
         assert!(key_pattern(&stroke(0x10, "", true, false, false)).is_none());
+    }
+
+    #[test]
+    fn insert_is_named() {
+        assert_eq!(key_pattern(&stroke(0x2D, "", false, false, false)).unwrap().key, Key::Insert);
     }
 
     #[test]

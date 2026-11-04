@@ -106,10 +106,52 @@ pub(crate) type ScrollEntry = (String, ScrollFn);
 pub(crate) type MeasureFn = Rc<dyn Fn(crate::layout::Size)>;
 pub(crate) type MeasureEntry = (String, MeasureFn);
 
-/// A key context declared at render: (the declaring view's path, the
-/// name, whether it counts only while the keyboard is inside that view).
-/// Retained like the handlers — a skipped view's context stays declared.
-pub(crate) type ContextEntry = (String, &'static str, bool);
+/// A key context declared at render: the declaring view's path, what it
+/// declared, and whether it counts only while the keyboard is inside that
+/// view. Retained like the handlers — a skipped view's context stays
+/// declared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextEntry {
+    pub(crate) path: String,
+    pub(crate) declared: Declared,
+    pub(crate) focused: bool,
+}
+
+/// What one declaration names: a bare name — the house's marks and
+/// `.key_context(name)`, which allocate nothing — or a frame with facts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Declared {
+    Name(&'static str),
+    Frame(Rc<crate::action::ContextFrame>),
+}
+
+impl Declared {
+    /// The names the declaration answers to.
+    pub(crate) fn idents(&self) -> &[&'static str] {
+        match self {
+            Declared::Name(name) => std::slice::from_ref(name),
+            Declared::Frame(frame) => frame.idents(),
+        }
+    }
+
+    fn answers(&self, name: &str) -> bool {
+        self.idents().contains(&name)
+    }
+
+    /// The declaration as a frame — a bare name becomes a frame of one
+    /// name, built when a stroke asks and never at render.
+    fn frame(&self) -> Rc<crate::action::ContextFrame> {
+        match self {
+            Declared::Name(name) => Rc::new(crate::action::ContextFrame::new(name)),
+            Declared::Frame(frame) => Rc::clone(frame),
+        }
+    }
+
+    /// A mark rides the table, but no key is ever read in it.
+    fn is_mark(&self) -> bool {
+        matches!(self, Declared::Name(KEYBOARD_NEUTRAL | FOCUS_RETURN))
+    }
+}
 
 /// The mark `.leaves_keyboard()` declares. It rides the key-context table
 /// because that table is the framework's retained record of subtree marks
@@ -1384,19 +1426,28 @@ pub(crate) fn attribute_custom(path: String, accepts_keys: bool) {
 /// view stays mounted, or, `focused`, only while the keyboard is inside
 /// that view (retained like the handlers; the sweep deactivates it).
 pub(crate) fn attribute_context(path: String, name: &'static str, focused: bool) {
+    attribute_declaration(ContextEntry { path, declared: Declared::Name(name), focused });
+}
+
+/// The same declaration with facts — `.key_context_with(frame)`.
+pub(crate) fn attribute_frame(path: String, frame: Rc<crate::action::ContextFrame>, focused: bool) {
+    attribute_declaration(ContextEntry { path, declared: Declared::Frame(frame), focused });
+}
+
+fn attribute_declaration(entry: ContextEntry) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
-            frame.contexts.push((path, name, focused));
+            frame.contexts.push(entry);
         } else {
-            pass.root_contexts.push((path, name, focused));
+            pass.root_contexts.push(entry);
         }
     });
 }
 
 thread_local! {
-    /// The contexts a mounted view declares — active for as long as it
-    /// is mounted, whoever holds the keyboard.
+    /// The names the mounted views declare — active for as long as they
+    /// are mounted, whoever holds the keyboard.
     static ACTIVE_CONTEXTS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::default());
     /// Every live declaration, in the order a stack reads them —
     /// outermost first — with the view it hangs on and whether it
@@ -1411,6 +1462,11 @@ fn carriers_under(root: &str, carriers: impl FnOnce(&Live) -> Vec<String>) -> Ve
     paths.retain(|path| covers(root, path));
     paths.sort();
     paths
+}
+
+/// How deep a declaring view sits — the stack's first key.
+fn depth(path: &str) -> usize {
+    path.split('/').count()
 }
 
 /// Rebuilds the active contexts from the entries that declare one —
@@ -1432,15 +1488,13 @@ pub(crate) fn assemble_contexts(root: &str) {
         }
     });
     // outermost first: a view nearer the root holds the ones below it,
-    // and among equals the tree's own order stands
-    declared.sort_by(|(a, ..), (b, ..)| {
-        let depth = |path: &str| path.split('/').count();
-        depth(a).cmp(&depth(b)).then_with(|| a.cmp(b))
-    });
+    // and among equals the tree's own order stands (the sort is stable,
+    // so one view's declarations keep the order they were made in)
+    declared.sort_by(|a, b| depth(&a.path).cmp(&depth(&b.path)).then_with(|| a.path.cmp(&b.path)));
     let mounted: HashSet<&'static str> = declared
         .iter()
-        .filter(|(_, _, focused)| !focused)
-        .map(|(_, name, _)| *name)
+        .filter(|entry| !entry.focused)
+        .flat_map(|entry| entry.declared.idents().iter().copied())
         .collect();
     ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = mounted);
     DECLARED_CONTEXTS.with(|contexts| *contexts.borrow_mut() = declared);
@@ -1449,8 +1503,8 @@ pub(crate) fn assemble_contexts(root: &str) {
 /// Does the declaration count for a keyboard held at `focus`? A context
 /// that waits for the keyboard counts only when the focused field or
 /// box sits inside the view that declares it.
-fn declaration_counts((path, _, focused): &ContextEntry, focus: Option<&str>) -> bool {
-    !focused || focus.is_some_and(|focus| covers(path, focus))
+fn declaration_counts(entry: &ContextEntry, focus: Option<&str>) -> bool {
+    !entry.focused || focus.is_some_and(|focus| covers(&entry.path, focus))
 }
 
 /// Is the context active for a keyboard held at `focus` — declared by a
@@ -1461,7 +1515,7 @@ pub(crate) fn context_active(name: &str, focus: Option<&str>) -> bool {
             contexts
                 .borrow()
                 .iter()
-                .any(|entry| entry.1 == name && entry.2 && declaration_counts(entry, focus))
+                .any(|entry| entry.focused && entry.declared.answers(name) && declaration_counts(entry, focus))
         })
 }
 
@@ -1469,7 +1523,10 @@ pub(crate) fn context_active(name: &str, focus: Option<&str>) -> bool {
 /// (`.leaves_keyboard()`)? A click there moves no focus.
 pub(crate) fn leaves_keyboard(path: &str) -> bool {
     DECLARED_CONTEXTS.with(|contexts| {
-        contexts.borrow().iter().any(|(declarer, name, _)| *name == KEYBOARD_NEUTRAL && covers(declarer, path))
+        contexts
+            .borrow()
+            .iter()
+            .any(|entry| entry.declared == Declared::Name(KEYBOARD_NEUTRAL) && covers(&entry.path, path))
     })
 }
 
@@ -1479,7 +1536,7 @@ pub(crate) fn leaves_keyboard(path: &str) -> bool {
 /// declaration is retained like a handler).
 pub(crate) fn declares(path: &str, name: &str) -> bool {
     DECLARED_CONTEXTS.with(|contexts| {
-        contexts.borrow().iter().any(|(declarer, declared, _)| *declared == name && declarer == path)
+        contexts.borrow().iter().any(|entry| entry.declared.answers(name) && entry.path == path)
     })
 }
 
@@ -1489,27 +1546,70 @@ pub(crate) fn focus_returns() -> Vec<String> {
         contexts
             .borrow()
             .iter()
-            .filter(|(_, name, _)| *name == FOCUS_RETURN)
-            .map(|(path, _, _)| path.clone())
+            .filter(|entry| entry.declared == Declared::Name(FOCUS_RETURN))
+            .map(|entry| entry.path.clone())
             .collect()
     })
 }
 
 /// The contexts active for a keyboard held at `focus`, outermost first,
-/// each named once — the stack a key-context debugger shows.
+/// each named once — the names a key-context debugger lists.
 pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
     DECLARED_CONTEXTS.with(|contexts| {
-        let mut stack: Vec<&'static str> = Vec::new();
+        let mut names: Vec<&'static str> = Vec::new();
         for entry in contexts.borrow().iter() {
             // a mark, not a context a key could be read in
-            if matches!(entry.1, KEYBOARD_NEUTRAL | FOCUS_RETURN) {
+            if entry.declared.is_mark() || !declaration_counts(entry, focus) {
                 continue;
             }
-            if declaration_counts(entry, focus) && !stack.contains(&entry.1) {
-                stack.push(entry.1);
+            for name in entry.declared.idents() {
+                if !names.contains(name) {
+                    names.push(name);
+                }
             }
         }
-        stack
+        names
+    })
+}
+
+/// The live stack for a keyboard held at `focus`, INNERMOST first: the
+/// declarations on the focus path deepest first, then the mounted ones
+/// the keyboard is not inside, deeper first and in the tree's order —
+/// [`crate::action::ContextStack`]'s three bands. Each level names its
+/// parent: the nearest declaration whose view holds its own (a second
+/// declaration on the same view holds the first).
+pub(crate) fn context_stack(focus: Option<&str>) -> crate::action::ContextStack {
+    DECLARED_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        // outermost first, as declared; the marks are no context at all
+        let counted: Vec<&ContextEntry> = contexts
+            .iter()
+            .filter(|entry| !entry.declared.is_mark() && declaration_counts(entry, focus))
+            .collect();
+        let on_path = |entry: &ContextEntry| focus.is_some_and(|focus| covers(&entry.path, focus));
+        // the precedence order, by index into `counted`: the path first,
+        // deepest first (a later declaration on one view is the inner one),
+        // then the rest, deeper first and in the tree's order
+        let mut order: Vec<usize> = (0..counted.len()).filter(|&at| on_path(counted[at])).rev().collect();
+        let mut off: Vec<usize> = (0..counted.len()).filter(|&at| !on_path(counted[at])).collect();
+        off.sort_by(|&a, &b| {
+            depth(&counted[b].path).cmp(&depth(&counted[a].path)).then_with(|| counted[a].path.cmp(&counted[b].path)).then(b.cmp(&a))
+        });
+        order.extend(off);
+        let mut place = vec![0; counted.len()];
+        for (index, &at) in order.iter().enumerate() {
+            place[at] = index;
+        }
+        let levels = order
+            .iter()
+            .map(|&at| {
+                let entry = counted[at];
+                // the nearest earlier (outer) declaration whose view holds this one
+                let parent = (0..at).rev().find(|&outer| covers(&counted[outer].path, &entry.path)).map(|outer| place[outer]);
+                crate::action::ContextLevel::new(entry.declared.frame(), parent, on_path(entry))
+            })
+            .collect();
+        crate::action::ContextStack::new(levels)
     })
 }
 
@@ -2080,6 +2180,15 @@ fn fingerprint_key(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// A declaration's fingerprint is what it SAYS, never where it lives:
+/// a frame rebuilt with the same names and facts is the same frame.
+fn fingerprint_declared(declared: &Declared) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = motor::hash::FxHasher::default();
+    declared.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
     Rc::as_ptr(shared) as *const () as usize as u64
 }
@@ -2190,8 +2299,8 @@ pub(crate) fn input_fingerprint() -> u64 {
     }));
     mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(fingerprint_key(key)))));
     mix(DECLARED_CONTEXTS.with(|list| {
-        list.borrow().iter().fold(0u64, |sum, (path, name, focused)| {
-            sum.wrapping_add(fingerprint_key(path) ^ fingerprint_key(name) ^ u64::from(*focused))
+        list.borrow().iter().fold(0u64, |sum, entry| {
+            sum.wrapping_add(fingerprint_key(&entry.path) ^ fingerprint_declared(&entry.declared) ^ u64::from(entry.focused))
         })
     }));
     total

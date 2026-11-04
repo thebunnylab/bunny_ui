@@ -27,8 +27,19 @@ pub enum KeyMatch {
     /// which-key can read [`Runtime::pending_chord`] to show what is
     /// still on offer.
     ///
+    /// The same answer comes back for a stroke that ENDED a sequence
+    /// leading nowhere: the runtime has already given the held strokes
+    /// their meaning — the longest one bound on its own fired, or the
+    /// first went to the text door — and offered the rest again, this
+    /// one included. It is spent here because it was answered there.
+    ///
     /// [`Runtime::pending_chord`]: crate::runtime::Runtime::pending_chord
     Pending,
+    /// A binding says the stroke means NOTHING here — a keymap's `null`,
+    /// answered by a [`KeyResolver`]. It is spent like a pending one:
+    /// nothing runs, and the field does not type it. A key that falls
+    /// through to the text instead is not disabled, only unbound.
+    Disabled,
     /// Nothing is bound. The stroke walks on, as it always did.
     None,
 }
@@ -117,6 +128,26 @@ pub enum Key {
     /// volume until `fn` is held, and those belong to the system — they
     /// never become a stroke, here or in any other app.
     F(u8),
+    /// Insert — the key a PC keyboard toggles overwriting with (Help on
+    /// an Apple extended keyboard, the same key code). A laptop without
+    /// one simply never sends it.
+    Insert,
+    /// Shift pressed and let go ON ITS OWN, with no key and no click in
+    /// between — the stroke behind a double-shift palette. Held with
+    /// another key it is that key's modifier and never a stroke of its
+    /// own, so the pattern carries no modifier flag: the key IS the
+    /// modifier. The runtime makes this stroke from the shell's modifier
+    /// reports ([`Runtime::modifiers_changed`]); no shell sends it.
+    ///
+    /// [`Runtime::modifiers_changed`]: crate::runtime::Runtime::modifiers_changed
+    Shift,
+    /// Command alone — Ctrl on a PC, where Ctrl is the primary modifier.
+    /// The same law as [`Key::Shift`].
+    Command,
+    /// Option alone — Alt on a PC. The same law as [`Key::Shift`].
+    Option,
+    /// Control alone — the Mac's ⌃. The same law as [`Key::Shift`].
+    Control,
     /// A printable key, named by THE CHARACTER IT TYPES WITH NO
     /// MODIFIER APPLIED, lowercased.
     ///
@@ -280,6 +311,14 @@ impl Stroke {
     }
 }
 
+impl Key {
+    /// Is this a lone modifier ([`Key::Shift`] and its siblings) — a key
+    /// the keymap reads and no box ever hears?
+    pub const fn is_modifier(&self) -> bool {
+        matches!(self, Key::Shift | Key::Command | Key::Option | Key::Control)
+    }
+}
+
 impl KeyPattern {
     /// The bare key.
     pub const fn key(key: Key) -> KeyPattern {
@@ -332,6 +371,286 @@ impl KeyPattern {
     }
 }
 
+// MARK: - Key contexts as frames, and the resolver port (D435)
+
+/// A key context as a view declares it: the NAMES it answers to and the
+/// FACTS it states about itself, read at the moment a stroke arrives.
+///
+/// A bare name was enough while a keymap only asked "is the palette up".
+/// A modal editor's keymap asks more of the same view at once — which
+/// mode, which operator is waiting, whether a count is typed, which
+/// language the file is — and a name per combination multiplies without
+/// end. A frame states each fact once; the [`KeyResolver`] reads them.
+///
+/// ```ignore
+/// editor.key_context_focused_with(
+///     ContextFrame::new("Editor").fact("vim_mode", "normal").fact("extension", ext),
+/// )
+/// ```
+///
+/// Order is kept, and it is the declaration's: a resolver that prints a
+/// frame prints what the view said, in the order it said it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ContextFrame {
+    idents: Vec<&'static str>,
+    facts: Vec<(&'static str, std::borrow::Cow<'static, str>)>,
+}
+
+impl ContextFrame {
+    /// A frame answering to one name — what `.key_context(name)` declares.
+    pub fn new(ident: &'static str) -> ContextFrame {
+        ContextFrame { idents: vec![ident], facts: Vec::new() }
+    }
+
+    /// One more name this frame answers to. Saying a name twice is saying
+    /// it once.
+    #[must_use]
+    pub fn ident(mut self, ident: &'static str) -> ContextFrame {
+        if !self.idents.contains(&ident) {
+            self.idents.push(ident);
+        }
+        self
+    }
+
+    /// A fact, `key = value`. A second value for the same key replaces
+    /// the first: a frame states one thing about each key, or a
+    /// predicate on it could be true and false at once.
+    #[must_use]
+    pub fn fact(mut self, key: &'static str, value: impl Into<std::borrow::Cow<'static, str>>) -> ContextFrame {
+        let value = value.into();
+        match self.facts.iter_mut().find(|(stated, _)| *stated == key) {
+            Some(fact) => fact.1 = value,
+            None => self.facts.push((key, value)),
+        }
+        self
+    }
+
+    /// The names, in the order they were declared.
+    pub fn idents(&self) -> &[&'static str] {
+        &self.idents
+    }
+
+    /// Does the frame answer to `ident`?
+    pub fn has_ident(&self, ident: &str) -> bool {
+        self.idents.contains(&ident)
+    }
+
+    /// The facts, in the order they were declared.
+    pub fn facts(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        self.facts.iter().map(|(key, value)| (*key, value.as_ref()))
+    }
+
+    /// The value the frame states for `key`, if it states one.
+    pub fn fact_value(&self, key: &str) -> Option<&str> {
+        self.facts.iter().find(|(stated, _)| *stated == key).map(|(_, value)| value.as_ref())
+    }
+}
+
+impl std::fmt::Display for ContextFrame {
+    /// `Editor vim_mode=normal` — the names, then the facts, the way a
+    /// key-context debugger lists them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for ident in &self.idents {
+            if !first {
+                f.write_str(" ")?;
+            }
+            f.write_str(ident)?;
+            first = false;
+        }
+        for (key, value) in &self.facts {
+            if !first {
+                f.write_str(" ")?;
+            }
+            write!(f, "{key}={value}")?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+/// The key contexts in force for one stroke, INNERMOST FIRST.
+///
+/// The order is the precedence, and it has three bands:
+///
+/// 1. the declarations on the FOCUS PATH — the views the focused field
+///    or box sits inside — deepest first;
+/// 2. then the views declared MOUNTED that the keyboard is not inside
+///    (a palette's list beside its field, a terminal in a dock), deeper
+///    first and then in the tree's order;
+/// 3. the global layer is beneath all of them, and is not a level: a
+///    binding with no context is the resolver's own floor.
+///
+/// A declaration that waits for the keyboard (`.key_context_focused`)
+/// and does not have it is not in the stack at all. Each level knows its
+/// PARENT — the nearest declaration whose view holds its own — so a
+/// predicate such as `Workspace > Editor` reads the tree, not the list.
+#[derive(Clone, Debug, Default)]
+pub struct ContextStack {
+    levels: Vec<ContextLevel>,
+}
+
+/// One declaration in a [`ContextStack`].
+#[derive(Clone, Debug)]
+pub struct ContextLevel {
+    frame: std::rc::Rc<ContextFrame>,
+    parent: Option<usize>,
+    on_focus_path: bool,
+}
+
+impl ContextLevel {
+    /// A level of a stack built by hand — what a resolver's own tests feed
+    /// it. The runtime builds the live one ([`Runtime::context_stack`]).
+    ///
+    /// [`Runtime::context_stack`]: crate::runtime::Runtime::context_stack
+    pub fn new(frame: std::rc::Rc<ContextFrame>, parent: Option<usize>, on_focus_path: bool) -> ContextLevel {
+        ContextLevel { frame, parent, on_focus_path }
+    }
+
+    /// What the view declared.
+    pub fn frame(&self) -> &ContextFrame {
+        &self.frame
+    }
+
+    /// The index, in the same stack, of the nearest declaration whose
+    /// view holds this one's — `None` at a root of the tree.
+    pub fn parent(&self) -> Option<usize> {
+        self.parent
+    }
+
+    /// Does the keyboard sit inside the declaring view?
+    pub fn on_focus_path(&self) -> bool {
+        self.on_focus_path
+    }
+}
+
+impl ContextStack {
+    /// A stack from its levels, innermost first, each `parent` an index into
+    /// the same list — a resolver's test fixture; the runtime builds the
+    /// live one.
+    pub fn new(levels: Vec<ContextLevel>) -> ContextStack {
+        ContextStack { levels }
+    }
+
+    /// The levels, innermost first.
+    pub fn levels(&self) -> &[ContextLevel] {
+        &self.levels
+    }
+
+    /// Is any level answering to `ident`?
+    pub fn has_ident(&self, ident: &str) -> bool {
+        self.levels.iter().any(|level| level.frame.has_ident(ident))
+    }
+
+    /// The level at `index` and its ancestors, innermost first — the
+    /// chain a `Parent > Child` predicate walks.
+    pub fn ancestry(&self, index: usize) -> impl Iterator<Item = &ContextLevel> + '_ {
+        std::iter::successors(self.levels.get(index), |level| level.parent.and_then(|parent| self.levels.get(parent)))
+    }
+}
+
+/// What the strokes held in the air mean when the wait for more ends —
+/// the stroke that leads nowhere, or the slow clock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Fallback {
+    /// Nothing by themselves: the first goes to the text door, as if no
+    /// binding had ever seen it, and the rest are offered again.
+    #[default]
+    Replay,
+    /// This action, by themselves: it runs, and what came after is
+    /// offered again.
+    Fire(ActionId),
+    /// Nothing, on purpose (a `null`): they are spent.
+    Swallow,
+}
+
+/// A resolver's answer for the strokes in the air.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyResolution {
+    /// Bound to this action, and no longer binding starts with them.
+    Action(ActionId),
+    /// Bound to nothing on purpose — the keymap's `null`. The stroke is
+    /// spent: nothing runs, and the field does not type it.
+    Disabled,
+    /// A longer binding starts with them: the keyboard is held. The
+    /// fallback is what they mean if the next stroke leads nowhere or
+    /// the slow clock runs out.
+    Pending(Fallback),
+    /// Nothing is bound.
+    None,
+}
+
+/// The Strategy that turns strokes into intent (D435).
+///
+/// The runtime keeps what is mechanical — the alert's and the popover's
+/// reserved keys, the strokes in the air, the slow clock, the replay —
+/// and asks the resolver what the strokes MEAN against the live
+/// [`ContextStack`]. A product with its own keymap language (predicates,
+/// layers, `null`) answers here in its own words; the runtime's
+/// `bind`/`bind_in`/`bind_sequence` tables stay beneath it as the floor,
+/// asked only when the resolver answers [`KeyResolution::None`].
+///
+/// `strokes` is the whole sequence so far, the newest last. Each stroke
+/// carries the key and the character it typed: a binding spelled by the
+/// character (`~`, `}`) matches by [`Stroke::typed_pattern`], the key's
+/// own spelling winning a tie.
+pub trait KeyResolver {
+    fn resolve(&self, strokes: &[Stroke], contexts: &ContextStack) -> KeyResolution;
+}
+
+impl<F> KeyResolver for F
+where
+    F: Fn(&[Stroke], &ContextStack) -> KeyResolution,
+{
+    fn resolve(&self, strokes: &[Stroke], contexts: &ContextStack) -> KeyResolution {
+        self(strokes, contexts)
+    }
+}
+
+/// How a shell's platform types — what the shared key gate needs to
+/// know about a stroke that only the platform can say. Set once per
+/// runtime ([`Runtime::set_key_platform`]); the default is the desktop's.
+///
+/// [`Runtime::set_key_platform`]: crate::runtime::Runtime::set_key_platform
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyPlatform {
+    /// Option and a letter TYPES here (the Mac's `å`): a field that takes
+    /// text keeps it without asking the keymap. Where Alt types nothing
+    /// (Linux) it is a menu's access key, and the keymap is asked first.
+    pub option_types: bool,
+    /// A bare Enter reaches a field by the text road (a touch keyboard's
+    /// return key), so the gate leaves it to that road instead of
+    /// breaking the line itself.
+    pub enter_by_text: bool,
+}
+
+impl Default for KeyPlatform {
+    fn default() -> KeyPlatform {
+        KeyPlatform { option_types: true, enter_by_text: false }
+    }
+}
+
+impl KeyPlatform {
+    /// Would the platform type this stroke into a field that takes text?
+    pub fn types(&self, pattern: &KeyPattern) -> bool {
+        pattern.is_text_input() && (self.option_types || !pattern.option)
+    }
+}
+
+/// What a modifier report did ([`Runtime::modifiers_changed`]).
+///
+/// [`Runtime::modifiers_changed`]: crate::runtime::Runtime::modifiers_changed
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ModifierChange {
+    /// The frame is worth presenting: a sink heard the change, or a lone
+    /// modifier became a stroke someone took.
+    pub present: bool,
+    /// A modifier was pressed and let go alone, and the keymap took it —
+    /// a shell with its own use for that tap (the menu bar's Alt) leaves
+    /// it alone.
+    pub tap_taken: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +662,37 @@ mod tests {
         assert!(!KeyPattern::key(Key::Down).is_text_input());
         let option_a = KeyPattern { option: true, ..KeyPattern::key(Key::Char('a')) };
         assert!(option_a.is_text_input(), "option composes text on macOS");
+    }
+
+    #[test]
+    fn a_frame_states_one_value_per_fact_and_each_name_once() {
+        let frame = ContextFrame::new("Editor")
+            .ident("Editor")
+            .ident("Vim")
+            .fact("mode", "normal")
+            .fact("extension", String::from("rs"))
+            .fact("mode", "insert");
+        assert_eq!(frame.idents(), ["Editor", "Vim"]);
+        assert_eq!(frame.fact_value("mode"), Some("insert"), "the second value replaced the first");
+        assert_eq!(frame.fact_value("operator"), None);
+        assert!(frame.has_ident("Vim") && !frame.has_ident("Terminal"));
+        assert_eq!(frame.to_string(), "Editor Vim mode=insert extension=rs", "in declaration order");
+    }
+
+    #[test]
+    fn the_platform_says_whether_option_types() {
+        let option_a = KeyPattern::option(Key::Char('a'));
+        assert!(KeyPlatform::default().types(&option_a), "the Mac composes å");
+        let linux = KeyPlatform { option_types: false, ..KeyPlatform::default() };
+        assert!(!linux.types(&option_a), "Alt and a letter is a menu's key there");
+        assert!(linux.types(&KeyPattern::key(Key::Char('a'))), "a bare letter still types");
+        assert!(!linux.types(&KeyPattern::key(Key::Insert)), "a named key never types");
+    }
+
+    #[test]
+    fn only_the_four_modifiers_are_modifier_keys() {
+        assert!([Key::Shift, Key::Command, Key::Option, Key::Control].iter().all(Key::is_modifier));
+        assert!(![Key::Insert, Key::Escape, Key::Char('s'), Key::F(1)].iter().any(Key::is_modifier));
     }
 
     #[test]

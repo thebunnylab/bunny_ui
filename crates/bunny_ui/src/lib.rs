@@ -12411,7 +12411,7 @@ mod tests {
                     runtime.render_stable(&page);
                     Some(action)
                 }
-                KeyMatch::Pending | KeyMatch::None => None,
+                KeyMatch::Pending | KeyMatch::Disabled | KeyMatch::None => None,
             }
         };
         let ask = |answer: &'static str| {
@@ -13334,9 +13334,14 @@ mod tests {
         runtime.bind_sequence(&[k, s_key], KEYMAP);
         runtime.bind_sequence_in("editor", &[k, i], QUICK_DOC);
         runtime.bind(s_key, SAVE);
-        // a single stroke that is also a PREFIX can never fire: it is
-        // the start of something, and the sequence has to win
+        // a single stroke that is also a PREFIX waits: the sequence wins
+        // while it can, and the stroke alone runs when the wait ends
         runtime.bind(k, LONE_K);
+        let lone = Rc::new(std::cell::Cell::new(0));
+        {
+            let lone = Rc::clone(&lone);
+            runtime.on_action(LONE_K, move || lone.set(lone.get() + 1));
+        }
 
         // the first stroke fires nothing and is spent — the keyboard is
         // held, and a which-key panel can read what is on offer
@@ -13349,11 +13354,14 @@ mod tests {
         // that same second stroke on its OWN is the single binding
         assert_eq!(runtime.chord(s_key), KeyMatch::Action(SAVE));
 
-        // a sequence that leads nowhere ends, and SPENDS its last
-        // stroke: re-reading it fresh is how an editor fires something
-        // nobody asked for
+        // a sequence that leads nowhere UNWINDS: the prefix means what it
+        // means alone — here the single binding, which runs — and the
+        // stroke after it is offered again, fresh. It is spent here
+        // because it was answered there.
         assert_eq!(runtime.chord(k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(x), KeyMatch::None);
+        assert_eq!(lone.get(), 0, "nothing runs while the sequence can still complete");
+        assert_eq!(runtime.chord(x), KeyMatch::Pending);
+        assert_eq!(lone.get(), 1, "the dead end gave the prefix its own meaning");
         assert!(runtime.pending_chord().is_empty());
 
         // Escape is the way out, and it CONSUMES — a chord abandoned
@@ -13370,21 +13378,23 @@ mod tests {
         runtime.pointer_pressed(10.0, 10.0);
         assert!(runtime.pending_chord().is_empty(), "a press ends the chord");
 
-        // and the slow clock ages it out: the SECOND tick drops it, the
-        // tooltip's own idiom
+        // and the slow clock ages it out: the SECOND tick ends the wait,
+        // the tooltip's own idiom — and the prefix alone runs then
         assert_eq!(runtime.chord(k), KeyMatch::Pending);
         assert!(!runtime.chord_tick(), "one tick only ages it");
         assert!(runtime.slow_tick_needed(), "a pending chord needs its second tick");
         assert_eq!(runtime.pending_chord(), vec![k]);
         assert!(runtime.chord_tick(), "the second lets the keyboard go");
         assert!(runtime.pending_chord().is_empty());
+        assert_eq!(lone.get(), 2, "and the wait ending is the stroke's own meaning, not its loss");
         assert!(!runtime.chord_tick(), "and an empty hand ticks for free");
         runtime.collect_garbage();
         assert!(!runtime.slow_tick_needed(), "an expired chord has no clock work");
 
         // a scoped sequence answers only while its context is mounted
         assert_eq!(runtime.chord(k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(i), KeyMatch::None, "the editor is not up");
+        assert_eq!(runtime.chord(i), KeyMatch::Pending, "the editor is not up: a dead end, unwound");
+        assert_eq!(lone.get(), 3, "and the prefix ran on its own");
         app.editing.set(true);
         runtime.settle(&app);
         runtime.layout(&app, viewport);
@@ -13428,7 +13438,7 @@ mod tests {
         assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the end is heard as empty");
 
         assert_eq!(runtime.chord(k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(x), KeyMatch::None);
+        assert_eq!(runtime.chord(x), KeyMatch::Pending, "a dead end unwinds, and its stroke is spent");
         assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "a dead end too");
 
         assert_eq!(runtime.chord(k), KeyMatch::Pending);
@@ -13471,8 +13481,8 @@ mod tests {
         }
         let command = Modifiers { command: true, ..Modifiers::NONE };
 
-        assert!(runtime.modifiers_changed(command), "the press is heard");
-        assert!(!runtime.modifiers_changed(command), "the same state twice is no change");
+        assert!(runtime.modifiers_changed(command).present, "the press is heard");
+        assert!(!runtime.modifiers_changed(command).present, "the same state twice is no change");
         assert_eq!(runtime.held_modifiers(), command);
         for _ in 0..3 {
             let crate::action::KeyMatch::Action(id) = runtime.chord(KeyPattern::command(Key::Char('p')))
@@ -13485,11 +13495,11 @@ mod tests {
         assert!(opened.borrow().is_empty(), "nothing opens while the key is down");
 
         // shift joins and leaves — the command key never came up
-        assert!(runtime.modifiers_changed(Modifiers { shift: true, ..command }));
-        assert!(runtime.modifiers_changed(command));
+        assert!(runtime.modifiers_changed(Modifiers { shift: true, ..command }).present);
+        assert!(runtime.modifiers_changed(command).present);
         assert!(opened.borrow().is_empty());
 
-        assert!(runtime.modifiers_changed(Modifiers::NONE), "the release is heard");
+        assert!(runtime.modifiers_changed(Modifiers::NONE).present, "the release is heard");
         assert_eq!(opened.borrow().as_slice(), [2], "and it opens the line the walk stopped on");
         assert_eq!(selected.get(), None, "the finder closed with it");
     }
@@ -13498,7 +13508,7 @@ mod tests {
     fn a_modifier_change_nobody_hears_asks_for_no_frame() {
         let runtime = Runtime::new();
         let shift = crate::action::Modifiers::SHIFT;
-        assert!(!runtime.modifiers_changed(shift), "no sink: nothing to redraw for");
+        assert!(!runtime.modifiers_changed(shift).present, "no sink: nothing to redraw for");
         assert_eq!(runtime.held_modifiers(), shift, "the state still moved");
     }
 

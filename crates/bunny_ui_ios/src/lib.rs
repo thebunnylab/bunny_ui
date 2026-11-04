@@ -45,7 +45,7 @@ mod ffi;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
+use bunny_ui::action::{Key, KeyPattern, Stroke};
 use bunny_ui::layout::{Edges, Size};
 use bunny_ui::prelude::{EditCommand, Locale, Runtime, SizeClass};
 use bunny_ui::view::View;
@@ -75,6 +75,7 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0x4C => Some(Key::Delete),
         0x4A => Some(Key::Home),
         0x4D => Some(Key::End),
+        0x49 => Some(Key::Insert),
         // the HID page keeps the function row in two runs: F1 to F12,
         // and F13 to F24 far below them
         0x3A..=0x45 => Some(Key::F((stroke.hid - 0x39) as u8)),
@@ -673,56 +674,19 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     // straight through to whoever holds the keyboard AND is taking text
     // (typing is never stolen); a binding with no handler mounted does
     // not consume
+    // the break reaches a field by the keyboard's own road here, so the
+    // shared gate leaves a bare Enter to it
+    runtime.set_key_platform(bunny_ui::action::KeyPlatform { enter_by_text: true, ..bunny_ui::action::KeyPlatform::default() });
     let offer: Rc<dyn Fn(Stroke) -> bool> = Rc::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
         move |stroke: Stroke| {
-            let pattern = stroke.pattern;
-            // MID-CHORD the keyboard belongs to the keymap: the stroke
-            // that finishes `cmd-k s` is not typing
-            let mid_chord = !runtime.pending_chord().is_empty();
-            if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
-            }
-            // a focused escape hatch owns its strokes: an editor's
-            // arrows, Enter and Tab are its own
-            let taken = runtime.key_stroke(stroke);
-            if taken.handled {
-                if let Some(text) = taken.text {
-                    ffi::clipboard_write(&text);
-                }
+            let taken = runtime.offer_key(stroke);
+            if taken {
                 blit(&runtime, &*root);
-                return true;
             }
-            // a field of MANY lines owns the bare vertical arrows before
-            // any binding — the break arrives by the keyboard's road
-            if !mid_chord
-                && pattern.is_plain()
-                && let Some(command) = match pattern.key {
-                    Key::Up => Some(EditCommand::Up(pattern.shift)),
-                    Key::Down => Some(EditCommand::Down(pattern.shift)),
-                    _ => None,
-                }
-                && runtime.key(command).applied
-            {
-                blit(&runtime, &*root);
-                return true;
-            }
-            let action = match runtime.chord(stroke) {
-                KeyMatch::Action(action) => action,
-                KeyMatch::Pending => {
-                    blit(&runtime, &*root);
-                    return true;
-                }
-                KeyMatch::None => return false,
-            };
-            if runtime.dispatch_action(action) {
-                blit(&runtime, &*root);
-                true
-            } else {
-                false
-            }
+            taken
         }
     });
     let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
@@ -912,7 +876,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 }
             }
             AppEvent::Modifiers(held) => {
-                if runtime.modifiers_changed(held) {
+                if runtime.modifiers_changed(held).present {
                     blit(runtime, root);
                 }
             }
@@ -1047,6 +1011,11 @@ mod tests {
     fn a_lone_modifier_is_no_pattern() {
         assert!(key_pattern(&stroke(0xE1, "", true, false, false)).is_none(), "left shift alone");
         assert!(key_pattern(&stroke(0x3D, "", false, false, false)).is_none(), "F4 is silent");
+    }
+
+    #[test]
+    fn insert_is_named() {
+        assert_eq!(key_pattern(&stroke(0x49, "", false, false, false)).unwrap().key, Key::Insert);
     }
 
     #[test]

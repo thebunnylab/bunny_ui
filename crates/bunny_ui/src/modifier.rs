@@ -165,6 +165,12 @@ pub enum Modifier {
     /// A key context that counts only while the keyboard is inside the
     /// view (`.key_context_focused`).
     KeyContextFocused(&'static str),
+    /// A key context with facts, active while this view is mounted
+    /// (`.key_context_with`).
+    KeyContextWith(std::rc::Rc<crate::action::ContextFrame>),
+    /// A key context with facts that counts only while the keyboard is
+    /// inside the view (`.key_context_focused_with`).
+    KeyContextFocusedWith(std::rc::Rc<crate::action::ContextFrame>),
     /// Pressing this view (where no interactive target wins) drags the
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
@@ -347,6 +353,8 @@ impl Modifier {
             Modifier::KeyContext { .. } => "key_context",
             Modifier::LeavesKeyboard => "leaves_keyboard",
             Modifier::KeyContextFocused { .. } => "key_context_focused",
+            Modifier::KeyContextWith { .. } => "key_context_with",
+            Modifier::KeyContextFocusedWith { .. } => "key_context_focused_with",
             Modifier::WindowDragRegion => "window_drag_region",
             Modifier::WindowControl { .. } => "window_control",
             Modifier::ElementHint { .. } => "element",
@@ -523,6 +531,8 @@ impl Modifier {
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::LeavesKeyboard => " [.leavesKeyboard()]".into(),
             Modifier::KeyContextFocused(name) => format!(" [.keyContextFocused({name})]"),
+            Modifier::KeyContextWith(frame) => format!(" [.keyContext({frame})]"),
+            Modifier::KeyContextFocusedWith(frame) => format!(" [.keyContextFocused({frame})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
             Modifier::WindowControl(control) => format!(
                 " [.windowControl(.{})]",
@@ -2097,6 +2107,14 @@ pub(crate) fn apply(
             // while the focused field or box is somewhere below it
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, name, true);
+        }
+        Modifier::KeyContextWith(frame) => {
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_frame(path, std::rc::Rc::clone(frame), false);
+        }
+        Modifier::KeyContextFocusedWith(frame) => {
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_frame(path, std::rc::Rc::clone(frame), true);
         }
         Modifier::LeavesKeyboard => {
             // a mark on the subtree, retained like a context's declaration
