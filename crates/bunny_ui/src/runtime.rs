@@ -7262,6 +7262,18 @@ impl Runtime {
         Rc::clone(&self.text)
     }
 
+    /// Read text metrics between frames, through the same engine and cache as
+    /// custom paint and input. The borrow stays within `read`; an application
+    /// can refresh geometry during a command sequence without a second cache
+    /// or a synthetic frame. `font` is the caller's effective text style.
+    pub fn with_metrics<R>(
+        &self,
+        font: FontSpec,
+        read: impl FnOnce(&crate::custom::Metrics<'_>) -> R,
+    ) -> R {
+        read(&crate::custom::Metrics::new(&*self.text, &self.cache, font))
+    }
+
     /// The font families this runtime's engine can shape — sorted, and
     /// without the system's own face, which every scene already has.
     /// A scene offering the reader a choice of face fills its list
@@ -8881,6 +8893,10 @@ fn scroll_target_frame(
 #[cfg(test)]
 #[path = "runtime_clock_tests.rs"]
 mod clock_tests;
+
+#[cfg(test)]
+#[path = "runtime_metrics_tests.rs"]
+mod metrics_tests;
 
 #[cfg(test)]
 #[path = "key_resolution_tests.rs"]

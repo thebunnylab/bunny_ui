@@ -148,6 +148,13 @@ when the engine supplies no geometry. Paint the complete text with the same
 font and use its visual-left origin for caret, hit and selection coordinates;
 reshaping independently colored fragments can change those coordinates.
 
+Commands outside a custom element callback can call
+`Runtime::with_metrics(font, read)` to borrow those same metrics and cache.
+This supports refreshing geometry after an edit inside a macro or batched
+input event, without manufacturing a paint or allocating another cache. The
+borrow ends with the callback; a retained host adapter should keep a weak
+runtime reference so closing its window still releases the runtime.
+
 Native cluster interiors depend on the platform's font data and hit API. Linux
 uses a complete valid GDEF caret list for a single-glyph ligature when available,
 translated by its shaped origin; otherwise it divides the cluster advance by
