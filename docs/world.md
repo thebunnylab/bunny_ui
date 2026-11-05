@@ -71,6 +71,7 @@ fixed `Camera` has no `.orbit()`: the call does not compile.
 | A lamp that lights one room | `entity.set_light_group(1)` on the room's entities, `Light::point(warm).groups(1 << 1)` |
 | Light and shade baked on the floor | `world.set_floor_map(Some(FloorMap { picture, origin, size }))`, `floor.set_reads_floor_map(true)` |
 | A group that moves its children | `world.add_group()`, then `child.set_parent(Some(group))` |
+| A figure the app places on every beat | `spec.posed()` or `entity.set_posed(true)`: it casts with what moves |
 | Many changes as one | `world.edit(|edit| …)` |
 | The world as a function of the app's data | `world.sync(items.map(|item| (item.id, spec(item))))` |
 
@@ -316,7 +317,15 @@ again each frame they move: 1024² with one lookup at `Quality::Medium`,
 2048² with four at `Quality::High`. A surface reads both maps, and the
 sun reaches a point only where both let it.
 
-At `Quality::Low` what moves casts nothing. `Model::blob_shadow(radius,
+An app that poses a figure itself — placing it again on every beat, as an
+office's own animation does — says so with `EntitySpec::posed()` (or
+`entity.set_posed(true)`), and the figure casts with what moves: the
+still map keeps its picture however often the figure is placed again,
+and the second map is drawn again only when a pose changes. Being posed
+asks for no frame; the app's beat does. What rides on a posed entity is
+posed with it.
+
+At `Quality::Low` what moves, and what is posed, casts nothing. `Model::blob_shadow(radius,
 darkness)` is the cheap road there: a soft dark disc, one see-through
 quad that casts nothing, parented to what it follows at the floor's
 height.
