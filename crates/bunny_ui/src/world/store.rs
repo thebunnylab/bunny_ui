@@ -71,6 +71,12 @@ pub struct EntitySpec {
     /// A walk the entity is on: while it lasts, it places the entity (and
     /// may turn it), whatever the transform says.
     pub motion: Option<Motion>,
+    /// The app poses the entity itself, again and again — a figure its own
+    /// animation places on every beat. It casts with what moves: into the
+    /// second shadow map, so the still one keeps its picture however often
+    /// the entity is placed again. It asks for no frame of its own; the
+    /// app's beat does. The entities below it are posed with it.
+    pub posed: bool,
     /// The weights of its mesh's morph targets, each in `[0, 1]`.
     pub morph: [f32; 2],
     /// A number the app chooses, given back with a pick.
@@ -100,6 +106,7 @@ impl EntitySpec {
             parts: None,
             play: None,
             motion: None,
+            posed: false,
             morph: [0.0; 2],
             tag: 0,
             extras: None,
@@ -154,6 +161,12 @@ impl EntitySpec {
     /// The entity's surfaces read the world's floor map.
     pub fn reading_floor_map(self) -> EntitySpec {
         EntitySpec { reads_floor_map: true, ..self }
+    }
+
+    /// The app poses the entity itself: it casts with what moves
+    /// ([`EntitySpec::posed`]).
+    pub fn posed(self) -> EntitySpec {
+        EntitySpec { posed: true, ..self }
     }
 
     /// The entity's surfaces answer to the lights of `group` (0 to 31).
@@ -368,6 +381,25 @@ impl WorldData {
         }
         let skinned = self.get(id).is_some_and(|data| matches!(&data.spec.shape, Shape::Model(model) if model.skin.is_some()));
         skinned && self.play_of(id).is_some_and(|(_, play)| play.moving(time))
+    }
+
+    /// Whether the app poses the entity, or one it rides on
+    /// ([`EntitySpec::posed`]).
+    pub(crate) fn posed(&self, id: EntityId) -> bool {
+        let mut current = Some(id);
+        let mut steps = 0u32;
+        while let Some(at) = current {
+            let Some(data) = self.get(at) else { return false };
+            if data.spec.posed {
+                return true;
+            }
+            current = data.parent;
+            steps += 1;
+            if steps > self.live + 1 {
+                break;
+            }
+        }
+        false
     }
 
     /// Whether a clip of the world still plays, or an entity still walks,
@@ -794,6 +826,11 @@ impl Entity {
 
     pub fn set_casts_shadow(self, casts: bool) -> Entity {
         self.change(|spec| spec.casts_shadow = casts)
+    }
+
+    /// Whether the app poses the entity itself ([`EntitySpec::posed`]).
+    pub fn set_posed(self, posed: bool) -> Entity {
+        self.change(|spec| spec.posed = posed)
     }
 
     /// Whether the entity's surfaces read the world's floor map.

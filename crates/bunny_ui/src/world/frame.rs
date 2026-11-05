@@ -701,7 +701,8 @@ pub(crate) fn build_frame(
                         joint_rows,
                         morph: super::mesh::pack_morph(data.spec.morph),
                         bounds: local,
-                        moving: world.moves(id, time),
+                        // what the app poses casts with what walks
+                        moving: world.moves(id, time) || world.posed(id),
                         in_view,
                     });
                 }
@@ -1573,6 +1574,46 @@ mod tests {
         // the walk goes on, the still map stays
         assert_eq!(at(Quality::Medium).shadow.as_ref().expect("still").generation, held.generation);
         // at Low what walks casts nothing: a blob stands in
+        let low = at(Quality::Low);
+        assert!(low.moving_shadow.is_none() && low.uniforms.moving[3] == 0.0);
+        assert_eq!(low.shadow.as_ref().expect("still").instances.len(), 2);
+    }
+
+    #[test]
+    fn what_the_app_poses_casts_with_what_moves() {
+        let world = World::new();
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        // a figure an app's own animation places again on every beat
+        let figure = world.add(Mesh::cuboid(0.5, 1.5, 0.5), gray()).set_position(vec3(-1.0, 0.25, 1.5)).set_posed(true);
+        world.add_light(crate::world::material::Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+        let camera = Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0);
+        let at = |quality: Quality| world.frame(&camera, &WorldStyle { quality, ..WorldStyle::default() }, (200, 150), 1.0);
+        let first = at(Quality::Medium);
+        let still = first.shadow.as_ref().expect("a still map").generation;
+        assert_eq!(first.shadow.as_ref().expect("still").instances.len(), 2, "the floor and the box, the figure apart");
+        let posed = first.moving_shadow.as_ref().expect("the map of what moves");
+        assert_eq!(posed.instances.len(), 1);
+        let posed = posed.generation;
+        // placed again, the figure moves its own map and never the still one
+        figure.set_position(vec3(0.5, 0.25, 1.5));
+        let next = at(Quality::Medium);
+        assert_eq!(next.shadow.as_ref().expect("still").generation, still, "the still map holds");
+        let moved = next.moving_shadow.as_ref().expect("moving").generation;
+        assert_ne!(moved, posed, "the figure's map follows it");
+        assert_eq!(at(Quality::Medium).moving_shadow.as_ref().map(|shadow| shadow.generation), Some(moved), "a pose that holds draws nothing again");
+        // being posed asks for no frame: the app's beat does
+        assert!(!world.with(|data| data.moving(motor::task::now())));
+        // what the app places without saying so stands with the still map
+        figure.set_posed(false);
+        let unposed = at(Quality::Medium);
+        assert!(unposed.moving_shadow.is_none());
+        assert_ne!(unposed.shadow.as_ref().expect("still").generation, still, "the figure joined the still map");
+        // what rides on a posed group is posed with it
+        let group = world.add_group().set_posed(true);
+        figure.set_parent(Some(group));
+        assert_eq!(at(Quality::Medium).moving_shadow.as_ref().expect("moving").instances.len(), 1);
+        // at Low what is posed casts nothing, as what walks
         let low = at(Quality::Low);
         assert!(low.moving_shadow.is_none() && low.uniforms.moving[3] == 0.0);
         assert_eq!(low.shadow.as_ref().expect("still").instances.len(), 2);
