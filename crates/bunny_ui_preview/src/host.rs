@@ -54,6 +54,14 @@
 //!   polls tasks per turn but keeps the engine's manual clock, so an
 //!   animation driven by a sleep stands still. A frame asked for by state
 //!   or a task's result is rendered on the next turn.
+//! - A live feed (`ImageFeed`) keeps one slot while its generation moves,
+//!   and its draw names only the slot. The host sends the slot's bytes
+//!   again at every generation a frame shows, and the frame with them —
+//!   a tool keeps a picture by the frame it came with — in every scene
+//!   that shows it: a feed costs its bytes per generation on the socket.
+//!   `request_frame()` is one flag on the thread, lowered by the first
+//!   scene to settle, so a turn renders every scene that wanted a frame
+//!   when it began.
 //! - Legacy selections retain the thread-wide override table. Instance
 //!   selections own versioned override contexts; painting, input and dirty
 //!   checks enter only their context and restore the outer table afterward.
@@ -236,11 +244,15 @@ struct Sent {
     sites: Vec<wire::SiteBox>,
     hosts: Vec<wire::HostBox>,
     strings: Vec<String>,
+    /// The generation of every live feed the frame showed, by slot. A
+    /// feed's draw names only its slot, and the tool keeps a picture by
+    /// the frame it came with: a feed that moved is a frame to send.
+    feeds: Vec<(u64, u64)>,
 }
 
 impl Sent {
-    fn same(&self, size: Size, commands: &[wire::Draw], sites: &[wire::SiteBox], hosts: &[wire::HostBox], strings: &[String]) -> bool {
-        self.size == size && self.commands == commands && self.sites == sites && self.hosts == hosts && self.strings == strings
+    fn same(&self, size: Size, commands: &[wire::Draw], sites: &[wire::SiteBox], hosts: &[wire::HostBox], strings: &[String], feeds: &[(u64, u64)]) -> bool {
+        self.size == size && self.commands == commands && self.sites == sites && self.hosts == hosts && self.strings == strings && self.feeds == feeds
     }
 }
 
@@ -314,6 +326,9 @@ pub struct Host {
     scenes: Vec<Scene>,
     next_scene: u32,
     sent_resources: HashSet<u64>,
+    /// The generation the tool holds of each live feed, by slot: a slot
+    /// keeps one picture, and a newer one is sent again under its key.
+    fed: HashMap<u64, u64>,
     generation: u32,
     sink: Box<dyn FnMut(ToIde)>,
     /// A shell's door to the pictures of its platform views, when it
@@ -343,6 +358,7 @@ impl Host {
             scenes: Vec::new(),
             next_scene: 0,
             sent_resources: HashSet::new(),
+            fed: HashMap::new(),
             generation: bunny_ui_hot::generation(),
             sink,
             pictures: None,
@@ -578,6 +594,7 @@ impl Host {
             ToHost::Forget { keys } => {
                 for key in keys {
                     self.sent_resources.remove(&key);
+                    self.fed.remove(&key);
                 }
             }
             ToHost::Ping { nonce } => (self.sink)(ToIde::Pong { nonce }),
@@ -765,11 +782,15 @@ impl Host {
         self.check_state_watch();
         let changed_state = self.state_changed().then(|| self.state_scene_index()).flatten();
         let mut sent = false;
-        for index in 0..self.scenes.len() {
+        // a frame asked of the thread is one flag, and the first scene to
+        // settle lowers it: every scene that wanted a frame when the turn
+        // began renders, or a feed two scenes show moves in one of them
+        let wanted: Vec<bool> = self.scenes.iter().map(Scene::needs_frame).collect();
+        for (index, wanted) in wanted.into_iter().enumerate() {
             if self.scenes[index].poisoned.is_some() {
                 continue;
             }
-            if !(self.scenes[index].dirty || self.scenes[index].needs_frame() || changed_state == Some(index)) {
+            if !(wanted || self.scenes[index].dirty || self.scenes[index].needs_frame() || changed_state == Some(index)) {
                 continue;
             }
             sent |= self.render(index);
@@ -961,24 +982,35 @@ impl Host {
             .map(|(index, host)| wire::HostBox { index: index as u32, kind: strings.intern(host_kind(&host.spec)), frame: host.frame.into() })
             .collect();
         let table = strings.into_table();
-        if scene.last.as_ref().is_some_and(|last| last.state == state && last.views == views && last.same(size, &commands, &sites, &hosts, &table)) {
+        let feeds: Vec<(u64, u64)> = images
+            .iter()
+            .filter_map(|image| match image {
+                ImageSource::Feed { key, generation, .. } => Some((*key, *generation)),
+                _ => None,
+            })
+            .collect();
+        // what the tool does not hold: a key never sent or since forgotten,
+        // and a feed's newer generation
+        let owed: Vec<wire::Resource> = images.iter().filter(|image| !self.holds(image)).filter_map(convert::resource).collect();
+        if owed.is_empty()
+            && scene.last.as_ref().is_some_and(|last| {
+                last.state == state && last.views == views && last.same(size, &commands, &sites, &hosts, &table, &feeds)
+            })
+        {
             return false;
         }
-        for image in images {
-            let key = convert::image_key(&image);
-            if self.sent_resources.contains(&key) {
-                continue;
+        for resource in owed {
+            self.sent_resources.insert(resource.key);
+            if let wire::ResourceKind::Feed { generation, .. } = resource.kind {
+                self.fed.insert(resource.key, generation);
             }
-            if let Some(resource) = convert::resource(&image) {
-                self.sent_resources.insert(key);
-                // a tool that predates a kind skips it: what it reads in its
-                // place goes first, under the same key, and a newer tool
-                // keeps what came last
-                if let Some(named) = resource.by_name() {
-                    (self.sink)(ToIde::Resource(named));
-                }
-                (self.sink)(ToIde::Resource(resource));
+            // a tool that predates a kind skips it: what it reads in its
+            // place goes first, under the same key, and a newer tool keeps
+            // what came last
+            if let Some(named) = resource.by_name() {
+                (self.sink)(ToIde::Resource(named));
             }
+            (self.sink)(ToIde::Resource(resource));
         }
         let scene = &mut self.scenes[index];
         let Some(seq) = self.publication.checked_add(1) else {
@@ -1022,7 +1054,7 @@ impl Host {
                 nodes: views.clone(),
             }));
         }
-        scene.last = Some(Sent { size, commands, sites, hosts, strings: table, views, state });
+        scene.last = Some(Sent { size, commands, sites, hosts, strings: table, views, state, feeds });
         let event = match scene.instance() {
             Some(instance) => ToIde::InstanceFrame {
                 instance: instance.clone(),
@@ -1032,6 +1064,17 @@ impl Host {
         };
         (self.sink)(event);
         true
+    }
+
+    /// Whether the tool holds what `image` needs from the wire: its key,
+    /// sent and not forgotten — and for a live feed, whose slot holds one
+    /// picture, the generation `image` shows.
+    fn holds(&self, image: &ImageSource) -> bool {
+        let key = convert::image_key(image);
+        match image {
+            ImageSource::Feed { generation, .. } => self.fed.get(&key) == Some(generation),
+            _ => self.sent_resources.contains(&key),
+        }
     }
 
     /// The scenes' ids, in order — what a test reads.
