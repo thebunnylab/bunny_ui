@@ -177,7 +177,7 @@ impl<T: Clone + PartialEq + 'static> Component for Open<T> {
                 .background_color(theme.panel)
                 .border(theme.border, 1.0)
                 .corner_radius(LIST_RADIUS);
-            let rows = Grouped { content: list, spec: GroupSpec { columns: 1, selects: false } };
+            let rows = Grouped { content: list, spec: GroupSpec { columns: 1, selects: false, leads: false, round: true } };
             erased(Quiet(AsWideAsItsRows(rows)))
         }))
     }

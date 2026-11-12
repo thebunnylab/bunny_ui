@@ -188,6 +188,29 @@ fn the_arrows_move_and_select_and_go_round() {
 }
 
 #[test]
+fn the_keyboard_goes_with_a_selection_the_app_writes_only_while_it_is_in_the_group() {
+    let runtime = Runtime::new();
+    let bar = Bar::new();
+    runtime.display_frame(&bar, SIZE);
+    assert!(runtime.focus_named("before"));
+    // the keyboard is in a field: a write moves the selection and nothing else
+    bar.mode.set(Mode::Columns);
+    runtime.display_frame(&bar, SIZE);
+    assert!(runtime.focused().is_some_and(|path| path.contains("[before]")), "a selection takes no keyboard");
+
+    assert!(key(&runtime, Key::Tab));
+    assert_eq!(focused_segment(&runtime), Some(2));
+    // the keyboard is on a segment: it goes where the selection goes
+    bar.mode.set(Mode::List);
+    runtime.display_frame(&bar, SIZE);
+    assert_eq!(focused_segment(&runtime), Some(0), "the keyboard and the selection are one");
+    // a value that is no choice selects nothing, and the keyboard stays where it is
+    bar.mode.set(Mode::Gallery);
+    runtime.display_frame(&bar, SIZE);
+    assert_eq!(focused_segment(&runtime), Some(0));
+}
+
+#[test]
 fn right_to_left_swaps_the_horizontal_arrows() {
     let runtime = Runtime::new();
     runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));

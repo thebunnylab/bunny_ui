@@ -48,6 +48,7 @@ pub mod anim;
 pub mod beat;
 pub mod bind;
 mod blur;
+pub mod calendar;
 pub mod catalog;
 pub mod choice;
 pub mod clipboard;
@@ -225,6 +226,7 @@ pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::beat::Beat;
+    pub use crate::calendar::{Calendar, DatePicker, calendar, date_picker};
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
     pub use crate::date::{Date, DateNames, Weekday};
     pub use crate::picker::{Picker, picker};

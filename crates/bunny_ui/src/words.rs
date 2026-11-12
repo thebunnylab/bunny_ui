@@ -4,9 +4,9 @@
 //! The mac's app menu and Window menu, the Edit items every platform
 //! lists, the iPad's Settings row, a notification's default action on
 //! a Linux desktop, the Android channel's name, the prompt of a search
-//! field and the name of the button that empties it: words no app can
-//! reach, because the shell or a built-in control writes them. They come
-//! from a
+//! field and the name of the button that empties it, the names of the two
+//! buttons of a calendar: words no app can reach, because the shell or a
+//! built-in control writes them. They come from a
 //! [`Catalog`] of sixteen languages, picked by the locale in effect —
 //! and the app has the last word through [`install`], a hook that may
 //! answer for any word in any language, or stay silent and leave the
@@ -30,7 +30,7 @@ use motor::state::Locale;
 use crate::catalog::{Catalog, Key, Strings, Table, fill};
 
 /// How many words the framework owns — the length of every table.
-pub const WORDS: usize = 23;
+pub const WORDS: usize = 25;
 
 /// One of the framework's own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,6 +78,10 @@ pub enum Word {
     Search,
     /// The button that empties a field.
     Clear,
+    /// The button of a calendar that shows the month before.
+    PreviousMonth,
+    /// The button of a calendar that shows the month after.
+    NextMonth,
 }
 
 impl Word {
@@ -106,6 +110,8 @@ impl Word {
         Self::No,
         Self::Search,
         Self::Clear,
+        Self::PreviousMonth,
+        Self::NextMonth,
     ];
 
     /// Does the word name the app — is its entry a template with `{app}`?
@@ -125,13 +131,14 @@ impl Key for Word {
 /// One language's words.
 pub type WordTable = Table<WORDS>;
 
-// Every table lists the words in this order, on these five lines:
+// Every table lists the words in this order, on these six lines:
 //   About, Settings, Services, Hide, HideOthers, ShowAll, Quit
 //   Window, Minimize, Zoom, BringAllToFront
 //   Undo, Redo, Cut, Copy, Paste, SelectAll
 //   Open, Notifications
 //   Yes, No
 //   Search, Clear
+//   PreviousMonth, NextMonth
 #[rustfmt::skip]
 const EN: WordTable = Table { tag: "en", entries: [
     "About {app}", "Settings…", "Services", "Hide {app}", "Hide Others", "Show All", "Quit {app}",
@@ -140,6 +147,7 @@ const EN: WordTable = Table { tag: "en", entries: [
     "Open", "Notifications",
     "Yes", "No",
     "Search", "Clear",
+    "Previous month", "Next month",
 ]};
 
 /// Brazilian Portuguese, tagged `pt`: `pt-BR` and bare `pt` both land
@@ -152,6 +160,7 @@ const PT: WordTable = Table { tag: "pt", entries: [
     "Abrir", "Notificações",
     "Sim", "Não",
     "Buscar", "Limpar",
+    "Mês anterior", "Próximo mês",
 ]};
 
 #[rustfmt::skip]
@@ -162,6 +171,7 @@ const PT_PT: WordTable = Table { tag: "pt-PT", entries: [
     "Abrir", "Notificações",
     "Sim", "Não",
     "Pesquisar", "Limpar",
+    "Mês anterior", "Mês seguinte",
 ]};
 
 #[rustfmt::skip]
@@ -172,6 +182,7 @@ const ES: WordTable = Table { tag: "es", entries: [
     "Abrir", "Notificaciones",
     "Sí", "No",
     "Buscar", "Borrar",
+    "Mes anterior", "Mes siguiente",
 ]};
 
 #[rustfmt::skip]
@@ -182,6 +193,7 @@ const FR: WordTable = Table { tag: "fr", entries: [
     "Ouvrir", "Notifications",
     "Oui", "Non",
     "Rechercher", "Effacer",
+    "Mois précédent", "Mois suivant",
 ]};
 
 #[rustfmt::skip]
@@ -192,6 +204,7 @@ const DE: WordTable = Table { tag: "de", entries: [
     "Öffnen", "Mitteilungen",
     "Ja", "Nein",
     "Suchen", "Löschen",
+    "Vorheriger Monat", "Nächster Monat",
 ]};
 
 #[rustfmt::skip]
@@ -202,6 +215,7 @@ const IT: WordTable = Table { tag: "it", entries: [
     "Apri", "Notifiche",
     "Sì", "No",
     "Cerca", "Cancella",
+    "Mese precedente", "Mese successivo",
 ]};
 
 #[rustfmt::skip]
@@ -212,6 +226,7 @@ const JA: WordTable = Table { tag: "ja", entries: [
     "開く", "通知",
     "はい", "いいえ",
     "検索", "消去",
+    "前の月", "次の月",
 ]};
 
 #[rustfmt::skip]
@@ -222,6 +237,7 @@ const ZH_HANS: WordTable = Table { tag: "zh-Hans", entries: [
     "打开", "通知",
     "是", "否",
     "搜索", "清除",
+    "上个月", "下个月",
 ]};
 
 #[rustfmt::skip]
@@ -232,6 +248,7 @@ const ZH_HANT: WordTable = Table { tag: "zh-Hant", entries: [
     "打開", "通知",
     "是", "否",
     "搜尋", "清除",
+    "上個月", "下個月",
 ]};
 
 #[rustfmt::skip]
@@ -242,6 +259,7 @@ const KO: WordTable = Table { tag: "ko", entries: [
     "열기", "알림",
     "예", "아니요",
     "검색", "지우기",
+    "이전 달", "다음 달",
 ]};
 
 #[rustfmt::skip]
@@ -252,6 +270,7 @@ const NL: WordTable = Table { tag: "nl", entries: [
     "Open", "Meldingen",
     "Ja", "Nee",
     "Zoek", "Wis",
+    "Vorige maand", "Volgende maand",
 ]};
 
 #[rustfmt::skip]
@@ -262,6 +281,7 @@ const RU: WordTable = Table { tag: "ru", entries: [
     "Открыть", "Уведомления",
     "Да", "Нет",
     "Поиск", "Очистить",
+    "Предыдущий месяц", "Следующий месяц",
 ]};
 
 /// Turkish inflects what it attaches to, and a suffix cannot attach to
@@ -275,6 +295,7 @@ const TR: WordTable = Table { tag: "tr", entries: [
     "Aç", "Bildirimler",
     "Evet", "Hayır",
     "Ara", "Temizle",
+    "Önceki ay", "Sonraki ay",
 ]};
 
 #[rustfmt::skip]
@@ -285,6 +306,7 @@ const PL: WordTable = Table { tag: "pl", entries: [
     "Otwórz", "Powiadomienia",
     "Tak", "Nie",
     "Szukaj", "Wyczyść",
+    "Poprzedni miesiąc", "Następny miesiąc",
 ]};
 
 #[rustfmt::skip]
@@ -295,6 +317,7 @@ const SV: WordTable = Table { tag: "sv", entries: [
     "Öppna", "Notiser",
     "Ja", "Nej",
     "Sök", "Rensa",
+    "Föregående månad", "Nästa månad",
 ]};
 
 /// The sixteen tables, English first — the source every other falls to.

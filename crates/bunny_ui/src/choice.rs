@@ -251,7 +251,7 @@ impl<T: Clone + PartialEq + 'static> Bar<'_, T> {
         let lead = selected.filter(|index| *index > 0).map(|index| empty().span(index, 1));
         let mark = |height: f64| empty().frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center).frame_height(height);
         let opacity = if self.disabled { 0.5 } else { 1.0 };
-        let spec = GroupSpec { columns: u8::try_from(count).unwrap_or(u8::MAX), selects: true };
+        let spec = GroupSpec { columns: u8::try_from(count).unwrap_or(u8::MAX), selects: true, leads: false, round: true };
         if self.tabs {
             let line = selected.map(|_| mark(TAB_RULE).background_color(theme.accent).animated(Spring::snappy()));
             let bar = grid(members)

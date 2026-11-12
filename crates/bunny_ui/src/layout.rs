@@ -1482,6 +1482,15 @@ pub(crate) struct GroupSpec {
     /// radio buttons, where the focused one is the selected one. `false`
     /// for a list that selects on Space or Enter.
     pub selects: bool,
+    /// A layer that opens with this group in it opens with the keyboard
+    /// on the group, also when other controls stand before it: the days
+    /// of a calendar's list, under the two buttons that change the month.
+    pub leads: bool,
+    /// A group of one row or one column goes round at its ends, as a set
+    /// of radio buttons does. `false` for a group that is a window on a
+    /// longer line — the days of one month: the arrows stop at its ends,
+    /// and the vertical arrows move by a row also when it has one row.
+    pub round: bool,
 }
 
 /// A group as the last layout placed it: its members are the focus stops

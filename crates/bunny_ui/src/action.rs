@@ -90,6 +90,27 @@ pub const ALERT_CANCEL: ActionId = ActionId("bunny.alert.cancel");
 /// must not become a decision.
 pub const ALERT_DEFAULT: ActionId = ActionId("bunny.alert.default");
 
+/// The key context the days of a calendar declare while the keyboard is
+/// on one of them. The runtime pre-binds here the keys that leave the
+/// month: an arrow at the edge of the days, Page Up and Page Down. An
+/// arrow inside the month never reaches the keymap; the days are a group
+/// and the group moves it.
+pub const CALENDAR_CONTEXT: &str = "bunny.calendar";
+
+/// An arrow that left the days of a calendar by an edge: the date moves
+/// one week or one day, into the month before or after.
+pub const CALENDAR_UP: ActionId = ActionId("bunny.calendar.up");
+/// See [`CALENDAR_UP`].
+pub const CALENDAR_DOWN: ActionId = ActionId("bunny.calendar.down");
+/// See [`CALENDAR_UP`].
+pub const CALENDAR_LEFT: ActionId = ActionId("bunny.calendar.left");
+/// See [`CALENDAR_UP`].
+pub const CALENDAR_RIGHT: ActionId = ActionId("bunny.calendar.right");
+/// Page Up on a day of a calendar: the same day of the month before.
+pub const CALENDAR_PREVIOUS_MONTH: ActionId = ActionId("bunny.calendar.previous-month");
+/// Page Down on a day of a calendar: the same day of the month after.
+pub const CALENDAR_NEXT_MONTH: ActionId = ActionId("bunny.calendar.next-month");
+
 /// The prefix the framework keeps for itself. A key context under it
 /// belongs to the house: an app never declares one, and emptying the
 /// key table leaves them standing.
