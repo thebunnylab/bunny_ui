@@ -240,6 +240,41 @@ pub fn glyphs_entry() -> &'static PreviewEntry {
     &GLYPHS
 }
 
+thread_local! {
+    /// The live picture the `camera` preview paints — the tests push it,
+    /// as an app's capture callback would.
+    static FEED: ImageFeed = ImageFeed::new();
+}
+
+/// An app's camera view: a box that paints the feed where it stands.
+struct FeedBox;
+
+impl CustomElement for FeedBox {
+    fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+        let rect = Rect { origin: Point::default(), size: ctx.frame.size };
+        FEED.with(|feed| painter.image(rect, feed));
+    }
+}
+
+#[derive(Clone)]
+struct Camera;
+impl Component for Camera {
+    fn body(self) -> impl View {
+        custom(FeedBox).frame(40.0, 30.0)
+    }
+}
+
+fn make_camera() -> Output {
+    Output::of(Camera)
+}
+static CAMERA: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "camera", name: "Camera", scope: "Images", example: "camera", module: "host", file: "src/lib.rs", line: 29 }, make_camera,
+);
+#[unsafe(export_name = "bunny_preview__camera")]
+pub fn camera_entry() -> &'static PreviewEntry {
+    &CAMERA
+}
+
 /// A manifest directory whose `src/lib.rs` the scan reads: the previews
 /// above, and one the binary does not export. Written ONCE per process:
 /// every test in this binary reads it, and the tests run in parallel, so a
@@ -252,7 +287,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n\n#[preview]\nfn glyphs() -> impl View { text(\"\") }\n\nbunny_ui::app!(root);\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n\n#[preview]\nfn glyphs() -> impl View { text(\"\") }\n\n#[preview]\nfn camera() -> impl View { text(\"\") }\n\nbunny_ui::app!(root);\n",
     )
     .unwrap();
     dir
@@ -316,7 +351,8 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
                     "page",
                     "placed",
                     "grid_card",
-                    "glyphs"
+                    "glyphs",
+                    "camera"
                 ]
             );
             assert_eq!(previews[1].id, "src/lib.rs#card");
@@ -618,6 +654,93 @@ fn a_glyph_no_single_path_draws_goes_by_name_then_whole_before_its_frame() {
     );
     let ToIde::Frame(frame) = &messages[frame_at] else { unreachable!() };
     assert!(frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { image, .. } if image.key == named.key)));
+}
+
+/// What a tool hears about a live picture: a generation of a slot's
+/// bytes, and the frames that show it.
+#[derive(Debug, PartialEq)]
+enum Heard {
+    Feed { slot: u64, generation: u64 },
+    Frame,
+}
+
+fn heard(seen: &Rc<RefCell<Vec<ToIde>>>) -> Vec<Heard> {
+    seen.borrow_mut()
+        .drain(..)
+        .filter_map(|message| match message {
+            ToIde::Resource(wire::Resource { key, kind: wire::ResourceKind::Feed { generation, .. } }) => {
+                Some(Heard::Feed { slot: key, generation })
+            }
+            ToIde::Frame(_) => Some(Heard::Frame),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The next picture of the feed, and the frame an app's task asks for
+/// after it — the engine cannot see a feed's bytes move.
+fn push_frame(shade: u8) -> u64 {
+    let generation = FEED.with(|feed| feed.push((2, 2), vec![shade; 16]));
+    bunny_ui::request_frame();
+    generation
+}
+
+/// The slot the feed's first frame travelled under.
+fn feed_slot(first: &[Heard]) -> u64 {
+    match first.first() {
+        Some(Heard::Feed { slot, generation: 1 }) => *slot,
+        other => panic!("the feed's first generation first: {other:?}"),
+    }
+}
+
+#[test]
+fn a_live_feed_reaches_the_tool_at_every_generation() {
+    push_frame(200);
+    let (mut host, seen) = host();
+    host.handle(select("camera", fixed(60.0, 40.0)));
+    assert!(host.tick());
+    let first = heard(&seen);
+    let slot = feed_slot(&first);
+    assert_eq!(first, [Heard::Feed { slot, generation: 1 }, Heard::Frame]);
+    // the tool keeps its picture by the frame it came with: a new
+    // generation is the slot's bytes again AND the frame again
+    assert_eq!(push_frame(40), 2);
+    assert!(host.tick(), "a feed that moved is a frame to send");
+    assert_eq!(heard(&seen), [Heard::Feed { slot, generation: 2 }, Heard::Frame]);
+    // a frame asked for with nothing moved sends nothing
+    bunny_ui::request_frame();
+    assert!(!host.tick());
+    assert_eq!(heard(&seen), []);
+}
+
+#[test]
+fn every_scene_on_a_feed_moves_and_its_bytes_travel_once() {
+    push_frame(200);
+    let (mut host, seen) = host();
+    host.handle(select("camera", Traits { scheme: wire::Scheme::Both, ..fixed(60.0, 40.0) }));
+    assert!(host.tick());
+    let first = heard(&seen);
+    let slot = feed_slot(&first);
+    assert_eq!(first, [Heard::Feed { slot, generation: 1 }, Heard::Frame, Heard::Frame]);
+    // one request on the thread wakes both scenes, and the bytes go once
+    push_frame(40);
+    assert!(host.tick());
+    assert_eq!(heard(&seen), [Heard::Feed { slot, generation: 2 }, Heard::Frame, Heard::Frame]);
+}
+
+#[test]
+fn a_forgotten_feed_is_sent_again_at_the_generation_it_shows() {
+    push_frame(200);
+    let (mut host, seen) = host();
+    host.handle(select("camera", fixed(60.0, 40.0)));
+    assert!(host.tick());
+    let slot = feed_slot(&heard(&seen));
+    // the tool dropped the slot: the next frame brings its bytes back,
+    // though nothing it draws moved
+    host.handle(ToHost::Forget { keys: vec![slot] });
+    bunny_ui::request_frame();
+    assert!(host.tick());
+    assert_eq!(heard(&seen), [Heard::Feed { slot, generation: 1 }, Heard::Frame]);
 }
 
 /// Boxes by scene and path, as the host names them to a door.

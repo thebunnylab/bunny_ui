@@ -49,6 +49,11 @@ pub fn forget_geometry(window: usize, id: WindowId) {
     });
 }
 
+/// The lifetime a native window answers for, while the app holds it open.
+pub(super) fn lifetime(window: usize) -> Option<WindowId> {
+    SOURCES.with(|sources| sources.borrow().get(&window).map(|events| events.id()))
+}
+
 /// Reads configured/committed facts, never an uncommitted size request.
 pub fn window_geometry(window: usize) -> Result<WindowGeometry, WindowError> {
     if is_x11() {

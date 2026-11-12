@@ -981,15 +981,35 @@ pub(crate) fn apply(
     mark: usize,
 ) {
     match modifier {
-        Modifier::AccessibilityLabel(source) if crate::accessibility::capturing() => {
+        // with no capture the name still reaches a field below — and only
+        // a field, so a view that left no node keeps leaving none
+        Modifier::AccessibilityLabel(source)
+            if crate::accessibility::capturing() || out.layout_mark() > mark =>
+        {
+            let capturing = crate::accessibility::capturing();
             let label = {
                 let _scope = motor::identity::enter("#accessibility-label");
-                source.place()
+                // a capture places the source, so the name follows its
+                // binding without the body; with no capture nothing reads
+                // a binding, and the name is this pass's
+                if capturing { source.place() } else { source.clone() }
             };
-            out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
-                semantics: crate::accessibility::Semantics::Label(label.clone()),
-                child: Box::new(node),
+            // a field keeps its name on its own node: the element lowering
+            // has no accessibility tree to ask, and says the name as the
+            // input's `aria-label`
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Field { label: name, .. } => {
+                    *name = Some(label.get());
+                    true
+                }
+                _ => false,
             });
+            if capturing {
+                out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
+                    semantics: crate::accessibility::Semantics::Label(label.clone()),
+                    child: Box::new(node),
+                });
+            }
         }
         Modifier::AccessibilityHidden if crate::accessibility::capturing() => out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
             semantics: crate::accessibility::Semantics::Hidden,

@@ -1081,6 +1081,8 @@ impl Walk<'_> {
                 // record is honoured on the pixel path and ignored here.
                 highlights: _,
                 secret,
+                autocomplete,
+                label,
             } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
@@ -1089,6 +1091,8 @@ impl Walk<'_> {
                     content: content.clone(),
                     placeholder: placeholder.clone(),
                     secret: *secret,
+                    autocomplete: *autocomplete,
+                    label: label.clone(),
                     font: self.font,
                     color: self.current_ink(),
                     multiline: *multiline,

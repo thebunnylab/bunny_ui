@@ -139,6 +139,16 @@ pub fn forget_geometry(window: usize, id: WindowId) {
     });
 }
 
+/// The lifetime a top-level window answers for, while the app holds it open.
+pub(super) fn lifetime(hwnd: Hwnd) -> Option<WindowId> {
+    SOURCES.with(|sources| {
+        sources
+            .borrow()
+            .get(&usize::from_ne_bytes(hwnd.to_ne_bytes()))
+            .map(|events| events.id())
+    })
+}
+
 fn live(window: usize) -> Result<Hwnd, WindowError> {
     let hwnd = Hwnd::from_ne_bytes(window.to_ne_bytes());
     is_top_level(hwnd)

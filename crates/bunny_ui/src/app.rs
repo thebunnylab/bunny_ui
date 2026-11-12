@@ -22,6 +22,7 @@
 //!         AppEvent::DidWake => sync(),
 //!         AppEvent::NotificationActivated { id, action } => open(id, action),
 //!         AppEvent::Reopened { arguments } => route(arguments),
+//!         AppEvent::WindowActive { window, active } => attend(window, active),
 //!         AppEvent::WillSleep => {}
 //!     }
 //! }
@@ -39,6 +40,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::task::Sender;
+use crate::window::WindowId;
 
 /// What the platform tells the app about its life outside the window.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +61,49 @@ pub enum AppEvent {
     /// an argument — and a bundled app on macOS reports a plain
     /// reopen (the Dock icon, clicked) with no arguments at all.
     Reopened { arguments: Vec<String> },
+    /// A window became the active one, or stopped being it. The active
+    /// window is the one the person is working in: in front, with the
+    /// keyboard. One that is not active is a window they are away
+    /// from — behind another app or another window of this one,
+    /// minimized, hidden, closed. One event per change and never a
+    /// repeat; when the place passes from one window of the app to
+    /// another, the one that lost it is told first. A window is born
+    /// inactive and is not told so, and [`window_active`] answers for
+    /// whoever subscribed after the fact.
+    ///
+    /// What "active" is made of, shell by shell:
+    ///
+    /// - **macOS** — the app is the active application AND its key
+    ///   window is this one, or a dialog or a sheet of this one. AppKit
+    ///   takes the key from a window as its app steps back, so there
+    ///   is no key window in an app in the background. Said on the
+    ///   main loop's next turn, once AppKit has finished moving the
+    ///   key: handing it to the window's own dialog and back is no
+    ///   event. A panel that hangs from no window (a file panel run
+    ///   for the whole app) is nobody's, and while it holds the key no
+    ///   window is active.
+    /// - **Windows** — the foreground window is this one, or a dialog
+    ///   or a message box it owns. `WM_ACTIVATE` says a window was
+    ///   activated and `GetForegroundWindow` must agree: a window shown
+    ///   by a process in the background is activated in its own thread
+    ///   and is still not in front.
+    /// - **Linux** — the keyboard is on this window, or on a dialog or
+    ///   a popover of its own: `FocusIn` / `FocusOut` under X11,
+    ///   `wl_keyboard`'s `enter` / `leave` under Wayland, said once at
+    ///   the end of the turn that moved it. Two limits. Under X11 a
+    ///   keyboard grab — the window manager's switcher, a global
+    ///   shortcut held down — reads as leaving and coming back. Under
+    ///   Wayland the compositor's own `activated` state is not read,
+    ///   so a seat with no keyboard never makes a window active.
+    /// - **iOS, Android, the web** — never sent. A phone's screen is
+    ///   its one window, and leaving it is [`AppEvent::WillSleep`] and
+    ///   coming back [`AppEvent::DidWake`]; the web shell answers none
+    ///   of this module's doors yet.
+    ///
+    /// Active is not visible. A window beside the one being typed in
+    /// is inactive and in plain sight, and an active window is no
+    /// proof of eyes on it.
+    WindowActive { window: WindowId, active: bool },
 }
 
 /// One button on a notification: what comes back (`key`) and what the
@@ -151,6 +196,41 @@ pub fn emit(event: AppEvent) -> usize {
     let mut subscribers = SUBSCRIBERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     subscribers.retain(|sender| sender.send(event.clone()).is_ok());
     subscribers.len()
+}
+
+/// The window the shell last reported as the active one — `None`
+/// while it is none of the app's.
+static ACTIVE: Mutex<Option<WindowId>> = Mutex::new(None);
+
+/// Is `window` the active one now? The answer is what the last
+/// [`AppEvent::WindowActive`] about it said, and `false` for a window
+/// no event ever named: one just opened, one already closed, any
+/// window on a shell that does not say. One lock and one comparison,
+/// from any thread — what an app asks when it subscribed after its
+/// window was up, or when it wants no state of its own.
+pub fn window_active(window: WindowId) -> bool {
+    *ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) == Some(window)
+}
+
+/// The shell reports which of the app's windows is the active one
+/// now — `None` when none of them is. Subscribers hear the window that
+/// stopped being it and then the one that became it, as
+/// [`AppEvent::WindowActive`]; a report that changes nothing says
+/// nothing, so a platform that repeats itself costs the app no event.
+pub fn observe_active_window(now: Option<WindowId>) {
+    // held across the sends: two reports never reach a subscriber in
+    // another order than the one `window_active` saw them in
+    let mut held = ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let was = std::mem::replace(&mut *held, now);
+    if was == now {
+        return;
+    }
+    if let Some(window) = was {
+        emit(AppEvent::WindowActive { window, active: false });
+    }
+    if let Some(window) = now {
+        emit(AppEvent::WindowActive { window, active: true });
+    }
 }
 
 type Notifier = Box<dyn Fn(&Notification) -> Result<(), String>>;

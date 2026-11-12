@@ -3671,6 +3671,8 @@ pub(crate) fn run() {
         crate::webview::deliver_pending();
         // a window a verb or the manager asked to close, now
         settle_closes();
+        // …and the window the keyboard came to rest on, once the turn is over
+        crate::ffi::active::settle(with_x(|client| client.keyboard_focus) as usize);
         crate::ffi::accessibility::pump();
     }
     teardown();

@@ -18,6 +18,7 @@
 let glWasm = null;
 let glMemory = null;
 let glSurface = null;
+let glIsland = null;
 let gl = null;
 let glKind = 0;
 let glLastLog = "";
@@ -104,12 +105,16 @@ function glText(pointer, length) {
 }
 
 /// The page hands over what the verbs need: the instance (for the
-/// context-loss callbacks), the memory (uploads read it) and the door
-/// to the presentation surface (`surface("gl")` in bunny.js).
-export function attach(exports, memory, surface) {
+/// context-loss callbacks), the memory (uploads read it), the door to
+/// the presentation surface (`surface("gl")` in bunny.js) and, on an
+/// element page, the door to an island's canvas by its id. A canvas
+/// page has no islands and lends no fourth; an element page has no
+/// presentation surface and lends no third.
+export function attach(exports, memory, surface, island) {
   glWasm = exports;
   glMemory = memory;
   glSurface = surface;
+  glIsland = island || null;
 }
 
 function gpuLoseContext() {
@@ -125,7 +130,9 @@ function gpuLoseContext() {
 // MAX_TEXTURE_SIZE, which the atlas needs before it decides how far it
 // may grow.
 export function gl_init(kind, width, height) {
-  if (!glSurface || typeof document === "undefined") return 0;
+  if (!glWasm || typeof document === "undefined") return 0;
+  // the page's own surface, on a page that lent none: an element page
+  if (kind === 0 && !glSurface) return 0;
   const forced = new URLSearchParams(location.search).get("present");
   if (forced === "cpu") return 0;
   const target =
@@ -191,10 +198,10 @@ export function gl_log(pointer, length) {
 
 // One island, copied out of the shared surface into its own element.
 // The canvas page has no islands (that is the Dom lowering's road), so
-// without an element map there is nothing to copy into.
+// without the element shell's door there is nothing to copy into.
 export function gl_island_blit(id, width, height) {
   if (!gl) return;
-  const element = typeof elements !== "undefined" ? elements.get(id >>> 0) : null;
+  const element = glIsland ? glIsland(id >>> 0) : null;
   if (!element) return;
   if (element.width !== (width >>> 0) || element.height !== (height >>> 0)) {
     element.width = width >>> 0;
