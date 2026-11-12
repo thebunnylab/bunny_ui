@@ -97,6 +97,7 @@ pub mod text_value;
 pub mod text_input;
 mod field_history;
 mod grapheme;
+pub mod picker;
 pub mod tabs;
 pub mod theme;
 pub mod toggle;
@@ -210,6 +211,7 @@ pub mod prelude {
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::beat::Beat;
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
+    pub use crate::picker::{Picker, picker};
     pub use crate::tabs::{TabItem, TabPages, TabView, Tabs, tab, tab_view, tabs};
     pub use crate::toggle::{Toggle, toggle};
     // the app's strings: `catalog::Table` and `catalog::Key` stay

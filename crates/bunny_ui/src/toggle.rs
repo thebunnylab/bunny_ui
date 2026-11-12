@@ -107,6 +107,7 @@ impl<L: View + Clone> View for Toggle<L> {
                     disabled: self.disabled,
                     plain: true,
                     site: self.site,
+                    shows: None,
                 },
             )
             .render_unsited(ctx, out);

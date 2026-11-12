@@ -296,6 +296,10 @@ pub struct Button<L, F> {
     /// What the control is: the keys that activate it and the role
     /// assistive technology hears follow from it.
     kind: crate::layout::ControlKind,
+    /// The choice a pop-up button shows, for assistive technology.
+    value: Option<Arc<str>>,
+    /// Whether the list of a pop-up button is open.
+    expanded: Option<bool>,
     chrome: ButtonChrome,
     site: crate::provenance::Site,
 }
@@ -348,8 +352,8 @@ where
                 enabled: !self.disabled,
                 checked: self.checked,
                 role: self.kind.role(),
-                value: None,
-                expanded: None,
+                value: self.value.clone(),
+                expanded: self.expanded,
             }
         ));
         let content = wrap_layout(layouts);
@@ -446,6 +450,8 @@ where
         disabled: false,
         checked: None,
         kind: crate::layout::ControlKind::Button,
+        value: None,
+        expanded: None,
         chrome: ButtonChrome::Standard,
         site: crate::provenance::here(),
     }
@@ -460,6 +466,8 @@ pub(crate) struct ControlSpec {
     /// The label draws everything: no padding and no chrome are added.
     pub plain: bool,
     pub site: crate::provenance::Site,
+    /// The choice a pop-up button shows, and whether its list is open.
+    pub shows: Option<(Arc<str>, bool)>,
 }
 
 /// The one place a built-in activation control is made. A switch, a
@@ -471,12 +479,15 @@ where
     L: View,
     F: Fn() + Clone + 'static,
 {
+    let (value, expanded) = spec.shows.map_or((None, None), |(value, open)| (Some(value), Some(open)));
     Button {
         label,
         action,
         disabled: spec.disabled,
         checked: spec.checked,
         kind: spec.kind,
+        value,
+        expanded,
         chrome: if spec.plain { ButtonChrome::Plain } else { ButtonChrome::Standard },
         site: spec.site,
     }
@@ -516,6 +527,8 @@ impl<L: View + Clone> View for Checkbox<L> {
             disabled: self.disabled,
             checked: Some(checked),
             kind: crate::layout::ControlKind::Checkbox,
+            value: None,
+            expanded: None,
             chrome: ButtonChrome::Standard,
             site: self.site,
         }

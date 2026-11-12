@@ -2745,7 +2745,9 @@ impl Runtime {
             };
             if let Some((path, state)) = control
                 && (pattern.key == crate::action::Key::Char(' ')
-                    || (pattern.key == crate::action::Key::Enter && state.kind.enter_activates()))
+                    || (pattern.key == crate::action::Key::Enter && state.kind.enter_activates())
+                    || (matches!(pattern.key, crate::action::Key::Down | crate::action::Key::Up)
+                        && state.kind.arrows_activate()))
                 && reconciler::run_action(&path, 1)
             {
                 self.frame_asked.set(true);

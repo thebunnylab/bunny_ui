@@ -80,6 +80,11 @@ impl<T> Choice<T> {
     pub fn label(&self) -> &str {
         &self.label
     }
+
+    /// Whether the choice is shown and cannot be selected.
+    pub const fn is_disabled(&self) -> bool {
+        self.disabled
+    }
 }
 
 impl<T, S: Into<Arc<str>>> From<(T, S)> for Choice<T> {
@@ -235,6 +240,7 @@ impl<T: Clone + PartialEq + 'static> Bar<'_, T> {
                         disabled: self.disabled || choice.disabled,
                         plain: true,
                         site: self.site,
+                        shows: None,
                     },
                 )
             })

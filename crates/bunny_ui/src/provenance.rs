@@ -290,6 +290,8 @@ pub enum NodeKind {
     Tabs,
     /// `tab_view(…)`.
     TabView,
+    /// `picker(…)`.
+    Picker,
 }
 
 impl NodeKind {
@@ -319,6 +321,7 @@ impl NodeKind {
             Self::Segmented => "segmented",
             Self::Tabs => "tabs",
             Self::TabView => "tab_view",
+            Self::Picker => "picker",
         }
     }
 }
@@ -396,6 +399,20 @@ pub(crate) fn quiet<R>(render: impl FnOnce() -> R) -> R {
     let was = RECORDING.with(|recording| recording.replace(false));
     let _scope = RecordingScope { recording: was, outside: OUTSIDE_QUIET.with(|outside| outside.replace(was)) };
     render()
+}
+
+/// A view the framework composed, rendered in a [`quiet`] scope wherever
+/// it renders — also when a body inside a control runs again alone,
+/// after the control's own render has ended.
+#[derive(Clone)]
+pub(crate) struct Quiet<V>(pub V);
+
+impl<V: crate::view::View> crate::view::View for Quiet<V> {
+    type Arity = V::Arity;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        quiet(|| self.0.render_into(ctx, out));
+    }
 }
 
 /// A view the APP wrote, standing inside a control the framework

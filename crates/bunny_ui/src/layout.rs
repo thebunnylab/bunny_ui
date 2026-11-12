@@ -1397,6 +1397,9 @@ pub(crate) enum ControlKind {
     Radio,
     /// One of a set of pages: a press shows its page.
     Tab,
+    /// A press opens a list of choices. Space, Enter and the vertical
+    /// arrows open it.
+    PopUp,
 }
 
 impl ControlKind {
@@ -1409,6 +1412,7 @@ impl ControlKind {
             ControlKind::Switch => Role::Switch,
             ControlKind::Radio => Role::RadioButton,
             ControlKind::Tab => Role::Tab,
+            ControlKind::PopUp => Role::PopUpButton,
         }
     }
 
@@ -1420,7 +1424,14 @@ impl ControlKind {
             ControlKind::Switch => "Toggle",
             ControlKind::Radio => "Choice",
             ControlKind::Tab => "Tab",
+            ControlKind::PopUp => "PopUp",
         }
+    }
+
+    /// Do the bare vertical arrows activate it? They open a list of
+    /// choices, as on a native pop-up button.
+    pub(crate) const fn arrows_activate(self) -> bool {
+        matches!(self, ControlKind::PopUp)
     }
 
     /// Does a bare Enter activate it? A two-state control leaves Enter to
