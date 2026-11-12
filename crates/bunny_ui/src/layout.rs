@@ -2273,6 +2273,7 @@ impl Glass {
             spot_radius,
             spot_alpha: spot_alpha.clamp(0.0, 1.0),
             opacity: self.opacity.map_or(1.0, |opacity| opacity.clamp(0.0, 1.0)),
+            shares: false,
         }
     }
 }
@@ -2302,6 +2303,15 @@ pub struct GlassPaint {
     /// its blur alone stops clearing at the pyramid's floor, 5.2 device
     /// px, and then vanishes in one frame (T2-BUNNY-394).
     pub opacity: f64,
+    /// The pane reads the scene its ENCLOSING pane read, not the scene
+    /// as it stands: the capture the pane around it took, before that
+    /// pane and everything in it were painted. It is what
+    /// [`BackgroundBlend::Replace`] means on glass — one blur and one
+    /// tint at any depth, where a pane in a pane otherwise blurs the blur
+    /// and lays its tint over the other. Set by the placement pass only
+    /// where the enclosing pane's capture is still the last one taken;
+    /// a renderer with no capture to share reads the scene as it stands.
+    pub shares: bool,
 }
 
 impl GlassPaint {
@@ -4470,6 +4480,12 @@ pub struct Placement {
     /// The native hosts, in paint order — where the shell mounts the
     /// platform views that composite above the scene.
     pub hosts: Vec<HostPlacement>,
+    /// How many panes have captured the scene so far in this pass.
+    captures: usize,
+    /// Stack of the open panes: for each, the count of captures at the
+    /// moment its own was taken. A pane inside finds the enclosing
+    /// capture still live when the count has not moved since.
+    panes: Vec<usize>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
@@ -9166,9 +9182,20 @@ impl LayoutNode {
                     // a spot anchored to a leading corner sits at the
                     // right one in a right-to-left scene, like a gradient
                     let glass = if env.rtl() { glass.flipped() } else { glass };
+                    // a pane that REPLACES reads what the pane around it
+                    // read, while that capture is still the last one
+                    // taken: a pane that captured in between left a newer
+                    // scene in its place, and this one then reads the
+                    // scene as it stands, like any pane
+                    let shares = props.blend == Some(BackgroundBlend::Replace)
+                        && out.panes.last().is_some_and(|taken| *taken == out.captures);
+                    if !shares {
+                        out.captures += 1;
+                    }
+                    out.panes.push(out.captures);
                     out.draw(DrawCommand::Backdrop {
                         rect: frame,
-                        glass: glass.resolve(frame),
+                        glass: GlassPaint { shares, ..glass.resolve(frame) },
                         corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
@@ -9270,6 +9297,9 @@ impl LayoutNode {
                 child.place(frame, fit, &env, out);
                 if props.clip {
                     out.pop_clip();
+                }
+                if props.glass.is_some() {
+                    out.panes.pop();
                 }
                 if ink.is_some() {
                     out.foreground.pop();

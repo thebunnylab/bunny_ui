@@ -41,6 +41,11 @@ pub struct Bitmap {
     /// samples transparency and shows nothing. The host seeds this with the
     /// window under the panel, and the pane reads it instead.
     beneath: Option<Vec<u32>>,
+    /// The scene as it stood when the last pane that captures read it,
+    /// kept only while a pane that shares that capture is still to come
+    /// ([`GlassPaint::shares`]). A GPU tier keeps its blur pyramid for
+    /// this; the raster keeps the pixels the pyramid is built from.
+    captured: Option<Vec<u32>>,
     /// The ground a knockout returns a shape to. `Some` is a solid
     /// canvas: the surface is opaque and the canvas is what lies behind
     /// every paint. `None` is a surface with nothing of its own behind
@@ -322,6 +327,7 @@ impl Bitmap {
             height,
             pixels: vec![pack(background); width * height],
             beneath: None,
+            captured: None,
             floor: solid_floor(background),
             clip: Vec::new(),
             top_cut: OPEN_CUT,
@@ -340,6 +346,7 @@ impl Bitmap {
             height,
             pixels: vec![premultiplied(canvas); width * height],
             beneath: None,
+            captured: None,
             floor: None,
             clip: Vec::new(),
             top_cut: OPEN_CUT,
@@ -557,8 +564,11 @@ impl Bitmap {
         };
         // The scene the pane bends: this bitmap, or what the host said is
         // under it. A pane over nothing shows nothing, and a panel that
-        // carries only its own commands IS nothing.
-        let source = self.beneath.as_ref().unwrap_or(&self.pixels);
+        // carries only its own commands IS nothing. A pane that shares
+        // bends the scene the pane around it bent: the pixels kept from
+        // that moment (what a host said is under a panel never moved)
+        let kept = if glass.shares { self.captured.as_ref() } else { None };
+        let source = self.beneath.as_ref().or(kept).unwrap_or(&self.pixels);
         let (bx0, by0) = (x0.max(cx0), y0.max(cy0));
         let (bx1, by1) = (x1.min(cx1), y1.min(cy1));
         // What the composite answers depends on the LENS and on the scene
@@ -589,7 +599,17 @@ impl Bitmap {
                 let (color, coverage) = shaded[at];
                 at += 1;
                 if coverage > 0.0 {
-                    self.set_covered(x, y, unpack(color), f64::from(coverage) * opacity);
+                    let color = unpack(color);
+                    if color.a == 255 {
+                        self.set_covered(x, y, color, f64::from(coverage) * opacity);
+                    } else {
+                        // the scene it read was not solid there: the
+                        // answer is a premultiplied pixel with an alpha of
+                        // its own, and it takes the PLACE of what the pane
+                        // covers. Laid over it, the sharp scene would show
+                        // through the pane by what the alpha leaves
+                        self.set_replaced(x, y, color, f64::from(coverage) * opacity);
+                    }
                 }
             }
         }
@@ -702,6 +722,39 @@ impl Bitmap {
         }
     }
 
+    /// One pixel of a pane over a ground that is not solid: `color` is a
+    /// PREMULTIPLIED pixel, and the pixel under it gives way to it by
+    /// `coverage`, colour and alpha alike. With an alpha of 255 this is
+    /// what [`Bitmap::set_covered`] writes, which is why only a pane over
+    /// a clear ground comes here.
+    fn set_replaced(&mut self, x: i64, y: i64, color: Color, coverage: f64) {
+        if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.top_cut;
+        if x < cx0 || y < cy0 || x >= cx1 || y >= cy1 {
+            return;
+        }
+        let mut strength = (255.0 * coverage).round() as u32;
+        if let Some(round) = &self.top_round {
+            let clip = round.coverage(x, y);
+            if clip < 1.0 {
+                strength = (strength as f64 * clip).round() as u32;
+            }
+        }
+        let strength = strength.min(255);
+        if strength == 0 {
+            return;
+        }
+        let keep = 255 - strength;
+        let index = y as usize * self.width + x as usize;
+        let (under, over) = (self.pixels[index], pack(color));
+        let channel = |shift: u32| {
+            div255(((over >> shift) & 0xFF) * strength + ((under >> shift) & 0xFF) * keep)
+        };
+        self.pixels[index] = (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0);
+    }
+
     /// One anti-aliased pixel: `coverage` scales the color's alpha.
     fn set_covered(&mut self, x: i64, y: i64, color: Color, coverage: f64) {
         let alpha = (color.a as f64 * coverage).round() as u32;
@@ -713,6 +766,26 @@ impl Bitmap {
             | ((color.b as u32) << 8)
             | alpha;
         self.set(x, y, packed);
+    }
+
+    /// Before the command at `index` paints: a pane that captures keeps
+    /// the scene as it stands when the next pane shares its capture, and
+    /// lets the kept one go when none does. A pane that shares leaves it
+    /// for the next one. Every other command leaves it alone.
+    fn keep_capture(&mut self, commands: &[DrawCommand], index: usize) {
+        let DrawCommand::Backdrop { glass, .. } = &commands[index] else { return };
+        if glass.shares {
+            return;
+        }
+        let shared_next = commands[index + 1..]
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Backdrop { glass, .. } => Some(glass.shares),
+                _ => None,
+            })
+            .unwrap_or(false);
+        // what a host said is under a panel is the capture already
+        self.captured = (shared_next && self.beneath.is_none()).then(|| self.pixels.clone());
     }
 
     /// Returns the shape [`Bitmap::fill_rect`] covers to the ground of
@@ -1545,7 +1618,9 @@ fn paint(
     images: &dyn ImageEngine,
 ) {
     let factor = scale as f64;
-    for command in display.iter() {
+    let commands = display.as_slice();
+    for (index, command) in commands.iter().enumerate() {
+        bitmap.keep_capture(commands, index);
         match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
@@ -2058,6 +2133,7 @@ impl Surface {
                 if !hits {
                     continue;
                 }
+                self.bitmap.keep_capture(new, index);
                 match command {
                     DrawCommand::FillRect { rect, color, corner_radius } => self
                         .bitmap
@@ -3763,5 +3839,81 @@ mod tests {
             solid.frame(frame, &PixelFont, &RawImages::default());
             assert_eq!(solid.bitmap().pixels(), oracle.pixels(), "over a solid canvas");
         }
+    }
+
+    /// A pane that shares reads the scene the pane around it read. The
+    /// outer pane here is tinted solid red; a clear pane inside it that
+    /// reads the scene as it stands is red through and through, and the
+    /// same pane sharing is the stripes it would have shown alone.
+    #[test]
+    fn a_pane_that_shares_reads_the_scene_the_pane_around_it_read() {
+        let outer = box_at(10.0, 10.0, 100.0, 60.0);
+        let inner = box_at(30.0, 25.0, 60.0, 30.0);
+        let red = Glass::frosted().tint(Color::rgb(220, 20, 20));
+        let clear = Glass::frosted().tint(Color::rgba(0, 0, 0, 0));
+        let scene = |shares: bool| {
+            let mut display = stripes(120, 80, 8);
+            display.push(pane(outer, red, 0.0));
+            display.push(DrawCommand::Backdrop {
+                rect: inner,
+                glass: crate::layout::GlassPaint { shares, ..clear.resolve(inner) },
+                corner_radius: Corners::ZERO,
+            });
+            rasterize(&display, 120, 80, Color::WHITE)
+        };
+        let red_of = |bitmap: &Bitmap, x: usize, y: usize| {
+            let [r, g, _, _] = bitmap.pixel(x, y).expect("pixel").to_be_bytes();
+            r as i32 - g as i32
+        };
+        let (stacked, shared) = (scene(false), scene(true));
+        assert!(red_of(&stacked, 60, 40) > 150, "read as it stands, the inner pane is the red one blurred");
+        assert!(red_of(&shared, 60, 40).abs() < 12, "sharing, it is the grey the stripes blur to");
+        // beside the inner pane the outer one is as red either way
+        assert_eq!(stacked.pixel(15, 15), shared.pixel(15, 15));
+
+        // and it is the pane the inner one would have been with no pane around it
+        let mut alone = stripes(120, 80, 8);
+        alone.push(pane(inner, clear, 0.0));
+        let alone = rasterize(&alone, 120, 80, Color::WHITE);
+        assert_eq!(shared.pixel(60, 40), alone.pixel(60, 40));
+    }
+
+    /// A pane with no pane before it has no capture to share: it reads
+    /// the scene as it stands, like any pane.
+    #[test]
+    fn a_pane_with_no_capture_to_share_reads_the_scene_as_it_stands() {
+        let rect = box_at(30.0, 20.0, 60.0, 40.0);
+        let scene = |shares: bool| {
+            let mut display = stripes(120, 80, 8);
+            display.push(DrawCommand::Backdrop {
+                rect,
+                glass: crate::layout::GlassPaint { shares, ..Glass::frosted().resolve(rect) },
+                corner_radius: Corners::ZERO,
+            });
+            rasterize(&display, 120, 80, Color::WHITE)
+        };
+        assert_eq!(scene(true).pixels(), scene(false).pixels());
+    }
+
+    /// Over a ground that is not solid a pane takes the PLACE of what it
+    /// covers: its pixel is the tint over the blurred ground, with the
+    /// alpha that makes, and not a grain more. Laid over the ground
+    /// instead, the pane would add its alpha to the ground's a second
+    /// time and let the sharp scene show through what was left.
+    #[test]
+    fn a_pane_over_a_clear_ground_takes_its_place() {
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let rect = box_at(20.0, 20.0, 80.0, 40.0);
+        let mut display = DisplayList::default();
+        display.push(pane(rect, Glass::frosted().tint(Color::rgba(255, 255, 255, 51)), 0.0));
+        let bitmap =
+            rasterize_translucent(&display, 120, 80, 1, canvas, &PixelFont, &RawImages::default());
+        let [r, _, _, alpha] = bitmap.pixel(60, 40).expect("pixel").to_be_bytes();
+        // 51 over 153: 51 + 153 × 204 / 255 = 173, a step either way
+        assert!((172..=175).contains(&alpha), "the tint over the ground, once: {alpha}");
+        // and the colour is the premultiplied tint over the premultiplied
+        // ground, 51 + 10 × 0.8, with the material's own lift on top
+        assert!((55..=68).contains(&r), "white at a fifth over the dark ground: {r}");
+        assert_eq!(bitmap.pixel(5, 5).expect("pixel").to_be_bytes()[3], 153, "the ground beside it");
     }
 }

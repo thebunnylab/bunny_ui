@@ -75,6 +75,7 @@ fn frame() -> Frame {
                     spot_radius: 40.0,
                     spot_alpha: 0.25,
                     opacity: 1.0,
+                    shares: false,
                 },
                 corners: corners(16.0),
             },
@@ -336,6 +337,28 @@ fn a_knockout_rides_a_tag_of_its_own() {
     let mut reader = Reader::new();
     reader.feed(&with);
     assert_eq!(reader.pull().unwrap(), Some(Received::Message(message)), "and it decodes to itself");
+}
+
+#[test]
+fn a_pane_that_shares_rides_a_tag_of_its_own() {
+    // the golden frame's one pane, reading the capture of the pane around it
+    let with = |shares: bool| {
+        let mut framed = frame();
+        for command in &mut framed.commands {
+            if let Draw::Backdrop { glass, .. } = command {
+                glass.shares = shares;
+            }
+        }
+        Message::ToIde(ToIde::Frame(framed))
+    };
+    let (whole, shared) = (encode(&with(false)), encode(&with(true)));
+    // tag 12, the same bytes, and the opacity it always carries
+    assert_eq!(shared.len(), whole.len() + 8);
+    let first = whole[4..].iter().zip(&shared[4..]).find(|(a, b)| a != b).map(|(a, b)| (*a, *b));
+    assert_eq!(first, Some((2, 12)));
+    let mut reader = Reader::new();
+    reader.feed(&shared);
+    assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(true))), "and it decodes to itself");
 }
 
 #[test]

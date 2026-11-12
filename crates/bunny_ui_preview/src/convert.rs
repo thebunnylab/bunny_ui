@@ -223,6 +223,7 @@ impl From<layout::GlassPaint> for wire::Glass {
             spot_radius: g.spot_radius,
             spot_alpha: g.spot_alpha,
             opacity: g.opacity,
+            shares: g.shares,
         }
     }
 }
@@ -245,6 +246,7 @@ impl From<wire::Glass> for layout::GlassPaint {
             spot_radius: g.spot_radius,
             spot_alpha: g.spot_alpha,
             opacity: g.opacity,
+            shares: g.shares,
         }
     }
 }

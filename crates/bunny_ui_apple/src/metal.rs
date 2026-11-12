@@ -216,6 +216,8 @@ const BLEND_ONE: u64 = 1;
 const BLEND_SOURCE_ALPHA: u64 = 4;
 const BLEND_ONE_MINUS_SOURCE_ALPHA: u64 = 5;
 const BLEND_ZERO: u64 = 0;
+/// `MTLBlendFactorSource1Alpha`: the alpha of a fragment's second output.
+const BLEND_SOURCE1_ALPHA: u64 = 17;
 const STORAGE_MODE_SHARED: u64 = 0;
 const STORAGE_MODE_PRIVATE: u64 = 2;
 const TEXTURE_USAGE_SHADER_READ: u64 = 1;
@@ -730,11 +732,22 @@ vertex GlassVary glass_vertex(uint vid [[vertex_id]],
     return out;
 }
 
-fragment float4 glass_fragment(GlassVary in [[stage_in]],
-                               device const GlassInstance* panes [[buffer(0)]],
-                               constant ClipRound& round [[buffer(1)]],
-                               constant Uniforms& uniforms [[buffer(2)]],
-                               texture2d<float> pyramid [[texture(0)]]) {
+// What a pane writes: its pixel, and how solid that pixel is. The scene a
+// pane reads may not be solid, in a window that stands on a blur, and the
+// pixel it answers is then premultiplied with an alpha of its own. It takes
+// the PLACE of what the pane covers: the first alpha is how much of the
+// destination gives way, the second is the alpha the new pixel brings.
+// Over a solid scene the second is 1 and this is source-over, bit for bit.
+struct PaneOut {
+    float4 color [[color(0), index(0)]];
+    float4 solid [[color(0), index(1)]];
+};
+
+fragment PaneOut glass_fragment(GlassVary in [[stage_in]],
+                                device const GlassInstance* panes [[buffer(0)]],
+                                constant ClipRound& round [[buffer(1)]],
+                                constant Uniforms& uniforms [[buffer(2)]],
+                                texture2d<float> pyramid [[texture(0)]]) {
     // trilinear, so a blur that crosses a level slides instead of
     // snapping
     constexpr sampler s(mag_filter::linear, min_filter::linear,
@@ -751,7 +764,7 @@ fragment float4 glass_fragment(GlassVary in [[stage_in]],
                 min(max(corner_center.x, corner_center.y), 0.0) - radius;
     float coverage = clamp(0.5 - sdf, 0.0, 1.0);
     if (coverage <= 0.0) {
-        return float4(0.0);
+        return PaneOut{float4(0.0), float4(0.0)};
     }
     float depth = max(-sdf, 0.0);
 
@@ -825,9 +838,13 @@ fragment float4 glass_fragment(GlassVary in [[stage_in]],
         color = float4(saturate(color.rgb + touch), color.a);
     }
 
-    // straight alpha out — the blend state premultiplies, exactly as it
-    // does for a rect
-    return float4(color.rgb, color.a * coverage * pane.opacity * clip_cov(point, round));
+    // the pane's own blend (`PassBlend::Pane`): the colour lands by the
+    // coverage, the destination keeps the rest, and the alpha that lands
+    // is the pixel's own
+    PaneOut out;
+    out.color = float4(color.rgb, coverage * pane.opacity * clip_cov(point, round));
+    out.solid = float4(0.0, 0.0, 0.0, color.a);
+    return out;
 }
 "#;
 
@@ -1050,7 +1067,7 @@ impl MetalStack {
             // blur and the blit REPLACE what they write (a pass that
             // covers its whole destination has nothing to keep)
             let glass_pipeline = build_pipeline(
-                device, library, "glass_vertex", "glass_fragment", format, PassBlend::Over,
+                device, library, "glass_vertex", "glass_fragment", format, PassBlend::Pane,
             )?;
             let blur_pipeline = build_pipeline(
                 device,
@@ -1167,7 +1184,11 @@ impl MetalStack {
                 let Some(&run) = frame.runs.get(index) else { break };
                 feed_uploads_encoded = false;
                 if let Some(pyramid) = frame.pyramid {
-                    self.build_pyramid(command, pyramid, frame.target, frame.viewport, run);
+                    // a batch that shares reads the pyramid the pane
+                    // around it had built: the scene of that moment
+                    if !run.reuse {
+                        self.build_pyramid(command, pyramid, frame.target, frame.viewport, run);
+                    }
                     lead = Some((run, pyramid));
                 }
                 index += 1;
@@ -1666,6 +1687,12 @@ enum PassBlend {
     /// Nothing is painted: the target keeps `1 - alpha` of itself, colour
     /// and alpha alike. A knockout over a clear ground.
     Erase,
+    /// A pane of glass: the pixel it answers takes the place of what it
+    /// covers, by the coverage in the first alpha, and brings the alpha
+    /// in the SECOND output's — the raster's `Bitmap::set_replaced`. Where
+    /// that alpha is 1, every scene an opaque window paints, this is
+    /// [`PassBlend::Over`].
+    Pane,
 }
 
 unsafe fn build_pipeline(
@@ -1703,6 +1730,7 @@ unsafe fn build_pipeline(
         // channel is d·(1−sa), the raster's `Bitmap::take`.
         let (source_rgb, source_alpha) = match blend {
             PassBlend::Erase => (BLEND_ZERO, BLEND_ZERO),
+            PassBlend::Pane => (BLEND_SOURCE_ALPHA, BLEND_SOURCE1_ALPHA),
             PassBlend::Off | PassBlend::Over => (BLEND_SOURCE_ALPHA, BLEND_ONE),
         };
         msg_void_bool(attachment, sel("setBlendingEnabled:"), i8::from(blend != PassBlend::Off));
@@ -5985,6 +6013,87 @@ mod tests {
             // gap by how steep the scene is where it samples
             assert_glass_close(&gpu, &cpu, 3, 0.005, label);
         }
+    }
+
+    /// A pane inside a pane, over a ramp. `blend` on the inner one says
+    /// whether it reads the scene as it stands or shares the outer one's
+    /// capture.
+    fn pane_in_a_pane(blend: bunny_ui::layout::BackgroundBlend) -> impl View {
+        use bunny_ui::layout::Glass;
+        let inner = empty()
+            .frame(90.0, 60.0)
+            .corner_radius(18.0)
+            .glass(Glass::regular().tint(Color::rgba(40, 90, 255, 70)))
+            .background_blend(blend);
+        zstack!((
+            empty()
+                .frame_width(240.0)
+                .frame_height(160.0)
+                .background_gradient(bunny_ui::layout::Gradient::linear(
+                    Color::hex(0x102A64),
+                    Color::hex(0xE8D14A),
+                )),
+            zstack!((empty().frame(180.0, 110.0), inner))
+                .corner_radius(28.0)
+                .glass(Glass::regular().tint(Color::rgba(255, 60, 40, 110))),
+        ))
+    }
+
+    /// A pane that shares draws from the pyramid the pane around it had
+    /// built, and no new one: the GPU and the raster agree on what that
+    /// scene was, and it is not the scene a pane over a pane compounds.
+    #[test]
+    fn a_pane_that_shares_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 240.0, height: 160.0 };
+        let (gpu, cpu) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Replace), size, 2, Color::CANVAS);
+        assert_glass_close(&gpu, &cpu, 6, 0.015, "a pane that shares");
+        let (stacked, _) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Over), size, 2, Color::CANVAS);
+        // at the centre the shared pane has the outer one's red tint under
+        // it no longer: the two pictures are far apart there
+        let centre = (160 * 480 + 240) * 4;
+        let apart = gpu[centre].abs_diff(stacked[centre]);
+        assert!(apart > 30, "the outer tint is gone from under the pane that shares: {apart}");
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on the GPU by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        assert_glass_close(&gpu, &cpu, 6, 0.02, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(gpu[end].abs_diff(cpu[end]) <= 6, "and it is the raster's: {} vs {}", gpu[end], cpu[end]);
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]

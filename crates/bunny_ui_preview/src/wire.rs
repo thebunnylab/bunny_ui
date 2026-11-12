@@ -214,6 +214,9 @@ pub struct Glass {
     /// travels outside the glass's own bytes: a whole pane is a
     /// `Backdrop` as it always was, and only a faded one carries it.
     pub opacity: f64,
+    /// The pane reads the capture of the pane around it. It travels
+    /// outside the glass's own bytes too, as a tag of its own (12).
+    pub shares: bool,
 }
 
 /// A font weight.
@@ -1322,6 +1325,7 @@ impl Wire for Glass {
             spot_radius: c.f64()?,
             spot_alpha: c.f64()?,
             opacity: 1.0,
+            shares: false,
         })
     }
 }
@@ -1375,11 +1379,13 @@ impl Wire for Draw {
             }
             Draw::Backdrop { rect, glass, corners } => {
                 let faded = glass.opacity < 1.0;
-                out.u8(if faded { 10 } else { 2 });
+                // a pane that shares a capture is tag 12 and always
+                // carries its opacity; the other two are the bytes they were
+                out.u8(if glass.shares { 12 } else if faded { 10 } else { 2 });
                 rect.put(out);
                 glass.put(out);
                 corners.put(out);
-                if faded {
+                if faded || glass.shares {
                     out.f64(glass.opacity);
                 }
             }
@@ -1449,6 +1455,12 @@ impl Wire for Draw {
                 Draw::Backdrop { rect, glass, corners }
             }
             11 => Draw::Knockout { rect: Rect::get(c)?, corners: Corners::get(c)?, opacity: c.f64()? },
+            12 => {
+                let (rect, mut glass, corners) = (Rect::get(c)?, Glass::get(c)?, Corners::get(c)?);
+                glass.opacity = c.f64()?;
+                glass.shares = true;
+                Draw::Backdrop { rect, glass, corners }
+            }
             tag => return Err(Malformed::BadTag { what: "Draw", tag }),
         })
     }

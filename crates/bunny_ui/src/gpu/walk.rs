@@ -1133,6 +1133,10 @@ pub struct DrawRun {
     /// Glass only: how deep the blur pyramid must go for this batch —
     /// the deepest blur any pane in it asked for.
     pub levels: u32,
+    /// Glass only: the batch reads the capture ALREADY taken, by the run
+    /// of the pane around it, and the tier builds no pyramid for it. That
+    /// run was raised to dig as deep and read as wide as this one needs.
+    pub reuse: bool,
     /// The pixels the run's instances may touch, clipped: what decides
     /// whether a later instance may join it past runs painted after it.
     pub bounds: Box4,
@@ -1197,7 +1201,7 @@ fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize, bo
             break;
         }
     }
-    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, bounds, reads: NO_READS });
+    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, reuse: false, bounds, reads: NO_READS });
 }
 
 /// What a run that is not glass reads of the scene beneath it: nothing.
@@ -1262,7 +1266,7 @@ fn note_glass(
         run.reads = box_union(run.reads, reads);
         *batch = batch.map(|acc| box_union(acc, bounds));
     } else {
-        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, bounds, reads });
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, reuse: false, bounds, reads });
         *batch = Some(bounds);
     }
 }
@@ -1333,6 +1337,9 @@ pub fn build_frame(
     // the boxes the open glass batch already holds — a pane that
     // touches one of them starts a batch of its own
     let mut glass_batch: Option<Box4> = None;
+    // the run that took the last capture of the scene: what a pane that
+    // shares reads
+    let mut capture: Option<usize> = None;
     for command in display.iter() {
         match command {
             // paint that paints nothing is no instance: it would only
@@ -1429,15 +1436,41 @@ pub fn build_frame(
                     (visible.0 as f64, visible.1 as f64, visible.2 as f64, visible.3 as f64),
                     &paint,
                 );
-                note_glass(
-                    &mut batches.runs,
-                    round_of(&clips),
-                    batches.glass.len() - 1,
-                    visible,
-                    reads,
-                    crate::glass::levels_for(paint.blur) as u32,
-                    &mut glass_batch,
-                );
+                let levels = crate::glass::levels_for(paint.blur) as u32;
+                if paint.shares
+                    && let Some(taken) = capture
+                {
+                    // the capture is the one the pane around this one
+                    // took: that run digs as deep and reads as wide as
+                    // this pane needs, and this pane's run rebuilds
+                    // nothing. It stands alone, after everything painted
+                    // since the capture, which it covers
+                    let run = &mut batches.runs[taken];
+                    run.levels = run.levels.max(levels);
+                    run.reads = box_union(run.reads, reads);
+                    batches.runs.push(DrawRun {
+                        kind: RunKind::Glass,
+                        base: (batches.glass.len() - 1) as u32,
+                        count: 1,
+                        round: round_of(&clips),
+                        levels,
+                        reuse: true,
+                        bounds: visible,
+                        reads,
+                    });
+                    glass_batch = None;
+                } else {
+                    note_glass(
+                        &mut batches.runs,
+                        round_of(&clips),
+                        batches.glass.len() - 1,
+                        visible,
+                        reads,
+                        levels,
+                        &mut glass_batch,
+                    );
+                    capture = Some(batches.runs.len() - 1);
+                }
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -2799,6 +2832,66 @@ mod tests {
             "paint order holds: under, taken away, replaced"
         );
         assert_eq!(batches.rects[1].color, [0, 0, 0, 128]);
+    }
+
+    /// A pane that shares takes a run of its own that rebuilds nothing,
+    /// and the run that took the capture is raised to hold what it reads:
+    /// as deep as the deeper of the two, as wide as both.
+    #[test]
+    fn a_pane_that_shares_rides_the_capture_already_taken() {
+        let outer = at(40.0, 40.0, 200.0, 160.0);
+        let inner = at(60.0, 60.0, 120.0, 80.0);
+        let shared = |shares: bool| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::Backdrop {
+                rect: outer,
+                glass: crate::layout::Glass::regular().blur(2.0).resolve(outer),
+                corner_radius: Corners::ZERO,
+            });
+            display.push(DrawCommand::Backdrop {
+                rect: inner,
+                glass: crate::layout::GlassPaint {
+                    shares,
+                    ..crate::layout::Glass::frosted().resolve(inner)
+                },
+                corner_radius: Corners::ZERO,
+            });
+            let mut ground = RecordingGround::default();
+            let mut atlas = RunAtlas::new();
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut ground,
+                &display,
+                1,
+                (400, 400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut atlas,
+                &mut batches,
+                Some(Color::CANVAS),
+            )
+            .expect("the scene fits the atlas");
+            batches.runs
+        };
+        let (apart, together) = (shared(false), shared(true));
+        assert_eq!(apart.iter().map(|run| run.reuse).collect::<Vec<_>>(), vec![false, false]);
+        assert_eq!(together.iter().map(|run| run.reuse).collect::<Vec<_>>(), vec![false, true]);
+        assert_eq!(
+            together[0].levels,
+            apart[0].levels.max(apart[1].levels),
+            "the capture digs as deep as the pane that shares it needs"
+        );
+        assert_eq!(together[0].reads, box_union(apart[0].reads, apart[1].reads));
+        assert_eq!((together[1].base, together[1].count), (1, 1));
+
+        // a pane that shares with no capture before it takes its own
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Backdrop {
+            rect: inner,
+            glass: crate::layout::GlassPaint { shares: true, ..crate::layout::Glass::frosted().resolve(inner) },
+            corner_radius: Corners::ZERO,
+        });
+        assert_eq!(glass_batches(&display), vec![1]);
     }
 
     /// The glass batches of a display list: each one's pane count.

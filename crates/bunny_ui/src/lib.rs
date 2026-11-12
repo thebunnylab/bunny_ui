@@ -6197,6 +6197,50 @@ mod tests {
         assert_eq!(box_paint(&result), vec!["pane", "fill"]);
     }
 
+    /// Which panes of a scene share the capture of the pane around them,
+    /// in paint order.
+    fn pane_shares(view: &impl View) -> Vec<bool> {
+        use crate::layout::{DrawCommand, Proposal};
+        Runtime::new()
+            .layout(view, Proposal::unspecified())
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Backdrop { glass, .. } => Some(glass.shares),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On glass, replacing means one blur and one tint at any depth: a
+    /// pane inside a pane reads the scene the pane around it read. It
+    /// shares only while that capture is the last one taken.
+    #[test]
+    fn a_pane_that_replaces_shares_the_capture_of_the_pane_around_it() {
+        use crate::layout::{BackgroundBlend, Glass};
+
+        let pane = |blend: BackgroundBlend| {
+            text("ab").glass(Glass::clear()).background_blend(blend)
+        };
+        let around = |inside: Vec<BackgroundBlend>| {
+            let panes: Vec<_> = inside.into_iter().enumerate().collect();
+            for_each(panes, |(index, _)| index.to_string(), move |(_, blend)| pane(*blend))
+                .vertical()
+                .glass(Glass::regular())
+        };
+        use BackgroundBlend::{Over, Replace};
+        // two panes that replace, in one pane: both share its capture
+        assert_eq!(pane_shares(&around(vec![Replace, Replace])), vec![false, true, true]);
+        // the default reads the scene as it stands
+        assert_eq!(pane_shares(&around(vec![Over, Over])), vec![false, false, false]);
+        // a pane that captured in between left a newer scene: the next
+        // one has nothing of the outer pane's to share
+        assert_eq!(pane_shares(&around(vec![Over, Replace])), vec![false, false, false]);
+        assert_eq!(pane_shares(&around(vec![Replace, Over, Replace])), vec![false, true, false, false]);
+        // and a pane with no pane around it shares nothing
+        assert_eq!(pane_shares(&pane(Replace)), vec![false]);
+    }
+
     /// A knockout has no colour to fade, so a fade scales how much it
     /// takes away: a view at half opacity leaves half the scene under it,
     /// and one at zero leaves all of it.
