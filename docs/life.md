@@ -6,17 +6,22 @@ to the window it arrived at); `cargo run -p bunny-ui-macos --example
 two_windows -- --drive` and `cargo run -p bunny-ui-linux --example
 two_windows_linux -- --drive` are the proofs. The doors are standing in `bunny_ui::app` — the events
 (sleep, wake, a notification activated, a second launch with its
-arguments), the notifier, and the single instance — and each shell
-answers them: macOS and iOS by the application delegate and
+arguments, a window becoming the active one or ceasing to be), the
+notifier, and the single instance — and each shell answers them:
+macOS and iOS by the application delegate and
 UserNotifications, the one module of the Apple half both shells share
 (the Mac adds the workspace's sleep and wake); Windows by the power
 broadcast and WinRT toasts over hand-written COM (type-checked, not
 run); Linux by libdbus on one thread, `org.freedesktop.Notifications`
 and `org.freedesktop.login1` (type-checked, not run); Android by the
 notification manager over JNI, the tap coming back as the activity
-re-created with the intent (proven on the emulator). The single
-instance is one mechanism on every platform, in core, with nothing
-but std. `cargo run -p bunny-ui-macos --example life_window -- --drive`
+re-created with the intent (proven on the emulator). The active
+window is the desktop shells' alone: AppKit's key read at the wake
+(proven by `cargo test -p bunny-ui-macos --test window_active`),
+`WM_ACTIVATE` against the foreground window on Windows and the
+keyboard's resting place on Linux (both type-checked, not run). The
+single instance is one mechanism on every platform, in core, with
+nothing but std. `cargo run -p bunny-ui-macos --example life_window -- --drive`
 is the proof of the spool and of the refusal by name; wrapped in an
 `.app` it is the proof of the notification, and
 `crates/bunny_ui_ios/simulator/run-sim.sh life_window_ios` and
@@ -48,12 +53,15 @@ while let Some(event) = life.recv().await {
         AppEvent::WillSleep => save(),
         AppEvent::NotificationActivated { id, action } => open(id, action),
         AppEvent::Reopened { arguments } => route(arguments),
+        AppEvent::WindowActive { window, active } => attend(window, active),
     }
 }
-// …when a letter arrives:
-app::notify(&Notification::new(thread_id, from, subject)
-    .action("reply", "Reply")
-    .action("archive", "Archive"))?;
+// …when a letter arrives, and the person is away from the window:
+if !app::window_active(main) {
+    app::notify(&Notification::new(thread_id, from, subject)
+        .action("reply", "Reply")
+        .action("archive", "Archive"))?;
+}
 ```
 
 The events ride the channel discipline `.task` already uses: the app
@@ -70,6 +78,20 @@ notification itself, clicked, comes back as `None`. `notify` answers
 the desktop does not know, a person who said no — and never a quiet
 nothing. Where the platform asks the person first, a notification
 posted before they answer is held, and posted the moment they allow.
+
+**The active window** is the one the person is working in — in front,
+with the keyboard — and an app asks about it for one reason above all:
+a letter that arrives while they are away from the window deserves the
+desktop's notification, and one that arrives under their eyes does not.
+`WindowActive { window, active }` is sent once per change and never
+repeated, the window that lost the place before the one that took it,
+and `app::window_active(id)` answers at any time, from any thread — for
+the app that subscribed after its window was up, or keeps no state of
+its own. A window is born inactive and is not told so; a closed one's
+last word is that it is not active. The key passing to a window's own
+dialog or sheet, and back, is no event. Active is not visible: a window
+beside the one being typed in is inactive in plain sight, and an active
+one is no proof of eyes on it.
 
 **The single instance** is a lock in the person's own runtime
 directory (`XDG_RUNTIME_DIR`, `LOCALAPPDATA`, or the temp dir), held
@@ -213,6 +235,7 @@ interaction or human assistive-technology testing.
 | activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
 | a url handed over | `application:openURLs:` or a web browsing activity → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
+| the active window | the app is active and its key window is this one, or a dialog or a sheet of its own — read at the wake after AppKit moved the key | the foreground window is this one, or a dialog or message box it owns: leaving by `WM_ACTIVATE` and `WM_ACTIVATEAPP`, arriving by those and the caption going active, an arrival confirmed by `GetForegroundWindow` | the keyboard on this window or a dialog of its own: `FocusIn` / `FocusOut` under X11, `wl_keyboard` `enter` / `leave` under Wayland, read at the end of the pump's turn | never sent — the screen is the window, and `WillSleep` / `DidWake` are its background and foreground | never sent — the same |
 | languages | `NSLocale.preferredLanguages`, and `NSCurrentLocaleDidChangeNotification` while running | `GetUserPreferredUILanguages`, read again on `WM_SETTINGCHANGE` | `LANGUAGE`, else `LC_ALL`, `LC_MESSAGES`, `LANG` — once; the environment does not move | `NSLocale.preferredLanguages`; a change relaunches the app | the configuration's `LocaleList`, read again on every configuration change |
 
 Five honest edges. macOS shows notifications for a BUNDLE, never a
@@ -234,6 +257,40 @@ that id gives it the app's name and icon, and a click on a toast of an
 app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
+
+The active window has edges of its own. On macOS it is said one turn
+of the main loop after AppKit moved the key and never inside the move —
+AppKit resigns one window before it gives the key to the next, and a
+report made between the two would leave and find the window again
+within one call. A panel that hangs from no window (a file panel run
+for the whole app) is nobody's: while it holds the key, no window is
+active. On Windows a window shown by a process in the background is
+activated in its own thread and is not active here until it is the
+foreground window; and while a message box holds the activation, the
+app leaving and coming back is heard through `WM_ACTIVATEAPP`, the one
+message that still reaches the shell's own procedure. On Linux the
+shell follows the keyboard it already tracks: under X11 a grab — the
+window manager's switcher, a global shortcut held down — reads as
+leaving and coming back, and under Wayland the compositor's `activated`
+state is not read, so a seat with no keyboard never makes a window
+active. The phones and the web shell send nothing.
+
+`cargo test -p bunny-ui-macos --test window_active` opens windows
+through the public `App` API on the process main thread, reads
+`NSApplication.isActive` and `keyWindow` itself, and requires the query
+and the event stream to say the same, once per change, as the key
+travels: `focus`, `hide` and `show` (which run with the scene's ears
+closed), a confirmation sheet and then a dialog of the window's own
+taking the key and handing it back, a window opened in front and
+closed, and at last the front handed back to the application that held
+it before. It sends no keyboard or mouse input. Whether the window system brings the fixture to the front, and
+lets it keep the front, is not the fixture's to decide: a stage it was
+not granted prints `Not qualified` and proves nothing. What a locked
+screen or a sleeping display does to the key window was not exercised,
+on any shell. `cargo test -p bunny-ui-core --test window_active` covers
+the door itself. How Windows reads its three messages, and how Linux
+names the window the keyboard rests on, have unit tests that run on
+their own platforms only.
 
 ## Persistent dialog placement
 
