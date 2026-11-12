@@ -5367,10 +5367,10 @@ mod tests {
         );
         assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
         assert!(
-            gpu.chunks_exact(4).any(|pixel| pixel[3] == 153),
+            gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 153),
             "the bare ground keeps the canvas's own alpha"
         );
-        assert!(gpu.chunks_exact(4).any(|pixel| pixel[3] == 255), "a solid fill is solid");
+        assert!(gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255), "a solid fill is solid");
     }
 
     /// One veil around `inside`: rounded, with a halo, meeting what is
@@ -5411,8 +5411,9 @@ mod tests {
         let canvas = Color::rgba(16, 16, 20, 153);
         let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
         assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
-        let deepest = |bytes: &[u8]| bytes.chunks_exact(4).map(|pixel| pixel[3]).max().unwrap_or(0);
-        let at_the_veil = gpu.chunks_exact(4).filter(|pixel| pixel[3] == 110).count();
+        let deepest =
+            |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.as_chunks::<4>().0.iter().filter(|pixel| pixel[3] == 110).count();
         // every veil reads back at its own alpha, 110, at all three depths:
         // together they are most of the picture
         assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");

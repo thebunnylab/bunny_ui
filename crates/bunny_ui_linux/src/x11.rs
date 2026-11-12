@@ -4086,7 +4086,7 @@ mod tests {
         let rects = crate::ffi::blur_rects(800, 600, 16.0);
         assert_eq!(words.len(), rects.len() * 4, "four words a rect");
         assert_eq!(&words[..4], &[12, 0, 776, 1], "the first row starts where a 16-pixel curve does");
-        assert!(words.chunks_exact(4).any(|rect| rect == [0, 12, 800, 576]), "{words:?}");
+        assert!(words.as_chunks::<4>().0.contains(&[0, 12, 800, 576]), "{words:?}");
     }
 
     #[test]

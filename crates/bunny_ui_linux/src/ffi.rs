@@ -3878,7 +3878,9 @@ pub(crate) fn copy_box(
         let source = &rgba[start..start + w * 4];
         let target = unsafe { std::slice::from_raw_parts_mut(map.add(start), w * 4) };
         if keep_alpha {
-            for (source_px, target_px) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+            for (source_px, target_px) in
+                source.as_chunks::<4>().0.iter().zip(target.as_chunks_mut::<4>().0)
+            {
                 target_px[0] = source_px[2];
                 target_px[1] = source_px[1];
                 target_px[2] = source_px[0];
