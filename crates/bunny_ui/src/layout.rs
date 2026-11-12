@@ -8104,7 +8104,7 @@ impl LayoutNode {
                         expanded: None,
                         range: Some(range),
                         path: Rc::from(path.as_str()),
-                        role: crate::accessibility::Role::Slider,
+                        role: element.element().accessibility_role(),
                         label: Arc::from(""),
                         value: None,
                         bounds: out.accessible_bounds(frame),

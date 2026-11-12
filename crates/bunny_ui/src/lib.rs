@@ -88,6 +88,8 @@ pub use shapes::{BorderStyle, Stripes};
 pub mod runtime;
 #[cfg(feature = "canvas")]
 pub mod slider;
+#[cfg(feature = "canvas")]
+pub mod stepper;
 pub mod ssr;
 pub mod state_ext;
 pub mod stats;

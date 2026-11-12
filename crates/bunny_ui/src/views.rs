@@ -34,6 +34,8 @@ pub use crate::line_chart::{
 };
 #[cfg(feature = "canvas")]
 pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
+#[cfg(feature = "canvas")]
+pub use crate::stepper::{StepValue, Stepper, stepper};
 
 use std::collections::HashSet;
 use std::fmt::Debug;
