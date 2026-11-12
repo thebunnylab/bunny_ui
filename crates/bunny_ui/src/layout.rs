@@ -1524,6 +1524,82 @@ impl LayoutNode {
     pub(crate) fn is_bare(&self) -> bool {
         self.carried_hints().is_none_or(ElementHints::is_empty) && self.carried_action().is_none()
     }
+
+    /// The one child a wrapper stands around while both are still the
+    /// SAME view — `None` for a leaf, for a container, and for a wrapper
+    /// a modifier does not cross.
+    ///
+    /// A leaf modifier (`.auto_focus()`, `.truncation_mode(…)`,
+    /// `.scroll_target(…)`, `.resizable()`) changes the leaf of the view
+    /// it is written on, whatever stands between the two. This is the
+    /// one place that says which nodes stand between. The match names
+    /// every variant on purpose: a new node does not compile until it is
+    /// classified here, so a new wrapper can never stop a leaf modifier
+    /// in silence.
+    pub(crate) fn seen_through_mut(&mut self) -> Option<&mut LayoutNode> {
+        match self {
+            // one child, and still the same view
+            LayoutNode::Measured { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Spanned { child, .. }
+            | LayoutNode::Padding { child, .. }
+            | LayoutNode::Frame { child, .. }
+            | LayoutNode::MaxFrame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::Hug { child, .. }
+            | LayoutNode::Animated { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
+            | LayoutNode::Island { child, .. }
+            | LayoutNode::Live { child, .. }
+            | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
+            | LayoutNode::ControlRegion { child, .. }
+            | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::ExactLayout { child }
+            | LayoutNode::Turned { child, .. }
+            // the base is the view; the layer, the sheet and the popover
+            // are views of their own and are never descended into
+            | LayoutNode::Overlay { child, .. }
+            | LayoutNode::Sheet { child, .. }
+            | LayoutNode::Anchored { child, .. } => Some(&mut **child),
+            // a style is a wrapper until it carries hints or an action:
+            // from there it is a target of its own, as a button's chrome
+            LayoutNode::Styled { child, hints, action, .. } => {
+                if hints.is_empty() && action.is_none() { Some(&mut **child) } else { None }
+            }
+            // these two stand in for a node that could not carry the
+            // action or the hints itself, and stop a rewrite as it does
+            LayoutNode::Interactive { .. } | LayoutNode::Hinted { .. } => None,
+            // leaves
+            LayoutNode::Text { .. }
+            | LayoutNode::Spacer
+            | LayoutNode::Leaf { .. }
+            | LayoutNode::Image { .. }
+            | LayoutNode::Icon { .. }
+            | LayoutNode::Fill
+            | LayoutNode::Rectangle
+            | LayoutNode::Ellipse
+            | LayoutNode::Field { .. }
+            | LayoutNode::BoundaryHint { .. }
+            | LayoutNode::Custom { .. }
+            | LayoutNode::Host { .. }
+            // containers and boundaries: other views live inside
+            | LayoutNode::Stack { .. }
+            | LayoutNode::Flow { .. }
+            | LayoutNode::Grid { .. }
+            | LayoutNode::Layered { .. }
+            | LayoutNode::Scroll { .. }
+            | LayoutNode::Split { .. }
+            | LayoutNode::VirtualStack { .. }
+            | LayoutNode::Boundary { .. }
+            | LayoutNode::BoundaryRef { .. } => None,
+        }
+    }
 }
 
 /// How the element lowering lays a subtree out: the browser's flow

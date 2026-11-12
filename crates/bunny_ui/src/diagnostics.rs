@@ -1,4 +1,13 @@
-//! Bounded debug hints for eager text snapshots.
+//! Bounded debug hints: eager text snapshots, and field modifiers that
+//! reach no field.
+//!
+//! ## Field modifiers
+//! `.auto_focus()`, `.auto_focus_beat(…)` and `.select_on_beat(…)` change
+//! the field of the view they are written on. A view with no field of its
+//! own (a component, a stack, a button, a view that already carries an
+//! action or element hints) loses the ask. A debug build says so once for
+//! each source line. Release builds retain no observations and print no
+//! hints.
 //!
 //! ## Wiring
 //! A hint is emitted once per text callsite after a component repeats a state
@@ -32,6 +41,49 @@ pub fn take_eager_text() -> Vec<EagerText> {
     }
 }
 
+/// A field modifier that found no field under the view it was written on.
+#[derive(Clone, Debug)]
+pub struct UnreachedField {
+    /// The modifier, by the name of its method.
+    pub modifier: &'static str,
+    /// Where the modifier was written.
+    pub site: &'static Location<'static>,
+}
+
+/// Takes the pending field hints on this thread (at most 128); empty in release.
+pub fn take_unreached_fields() -> Vec<UnreachedField> {
+    #[cfg(debug_assertions)]
+    {
+        debug::take_fields()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Vec::new()
+    }
+}
+
+/// A field modifier found no field in this pass. The modifier that asked
+/// reports it with its own site ([`field_report`]).
+pub(crate) fn field_unreached() {
+    #[cfg(debug_assertions)]
+    debug::field_unreached();
+}
+
+/// A modifier finished: when its field ask was lost, say so once for the
+/// line that wrote it.
+pub(crate) fn field_report(site: crate::provenance::Site, modifier: &'static str) {
+    #[cfg(debug_assertions)]
+    debug::field_report(site, modifier);
+    #[cfg(not(debug_assertions))]
+    let _ = (site, modifier);
+}
+
+/// Forgets a lost ask that no line of the app wrote (a tool's override).
+pub(crate) fn field_forget() {
+    #[cfg(debug_assertions)]
+    debug::field_forget();
+}
+
 pub(crate) fn body<R>(component: &'static str, run: impl FnOnce() -> R) -> R {
     #[cfg(debug_assertions)]
     let _guard = debug::enter(component);
@@ -56,8 +108,8 @@ pub(crate) fn text(content: &crate::bind::TextSource) {
 
 #[cfg(debug_assertions)]
 mod debug {
-    use super::EagerText;
-    use std::cell::RefCell;
+    use super::{EagerText, UnreachedField};
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use std::panic::Location;
 
@@ -70,6 +122,8 @@ mod debug {
         seen: HashMap<(String, Site), u64>,
         warned: HashSet<Site>,
         pending: Vec<EagerText>,
+        fields_warned: HashSet<Site>,
+        fields_pending: Vec<UnreachedField>,
     }
     struct Body {
         component: &'static str,
@@ -77,6 +131,9 @@ mod debug {
     }
     thread_local! {
         static STATE: RefCell<State> = RefCell::new(State::default());
+        /// Raised by a field ask that reached no field, lowered by the
+        /// modifier that made the ask.
+        static FIELD_MISS: Cell<bool> = const { Cell::new(false) };
     }
     pub(super) struct Guard(Option<Body>);
     impl Drop for Guard {
@@ -145,5 +202,35 @@ mod debug {
     }
     pub(super) fn take() -> Vec<EagerText> {
         STATE.with(|state| std::mem::take(&mut state.borrow_mut().pending))
+    }
+    pub(super) fn field_unreached() {
+        FIELD_MISS.with(|miss| miss.set(true));
+    }
+    pub(super) fn field_forget() {
+        FIELD_MISS.with(|miss| miss.set(false));
+    }
+    pub(super) fn field_report(site: crate::provenance::Site, modifier: &'static str) {
+        if !FIELD_MISS.with(|miss| miss.replace(false)) {
+            return;
+        }
+        let crate::provenance::Site::Caller(site) = site else {
+            return;
+        };
+        let fresh = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.fields_warned.len() >= LIMIT || !state.fields_warned.insert(site) {
+                return false;
+            }
+            state.fields_pending.push(UnreachedField { modifier, site });
+            true
+        });
+        if fresh {
+            eprintln!(
+                "bunny_ui: .{modifier}() at {site} reached no text field. Write it on the field itself; a component, a stack, a button, or a view that already has .on_click or .element is a different view."
+            );
+        }
+    }
+    pub(super) fn take_fields() -> Vec<UnreachedField> {
+        STATE.with(|state| std::mem::take(&mut state.borrow_mut().fields_pending))
     }
 }

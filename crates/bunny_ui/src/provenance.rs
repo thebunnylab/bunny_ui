@@ -377,6 +377,8 @@ pub(crate) fn seal(ctx: &Context, out: &mut NodeList, mark: usize, site: Site, k
                 Override::Hide => crate::modifier::apply(&Modifier::Hidden, ctx, ctx, out, mark),
             }
         }
+        // an override is a tool's own ask: no line of the app wrote it
+        crate::diagnostics::field_forget();
     }
     if !recording() {
         return;
