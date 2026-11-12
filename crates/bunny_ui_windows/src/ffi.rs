@@ -18,6 +18,9 @@ use std::sync::{Condvar, Mutex, OnceLock};
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 
+#[path = "active.rs"]
+mod active;
+
 #[path = "confirmation.rs"]
 mod confirmation;
 #[path = "window_ops.rs"]
@@ -435,6 +438,7 @@ const WM_CREATE: u32 = 0x0001;
 const WM_DESTROY: u32 = 0x0002;
 const WM_SIZE: u32 = 0x0005;
 const WM_ACTIVATE: u32 = 0x0006;
+const WM_ACTIVATEAPP: u32 = 0x001C;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -470,6 +474,7 @@ const MA_NOACTIVATE: isize = 3;
 // scene chrome: the non-client conversation
 const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_NCHITTEST: u32 = 0x0084;
+const WM_NCACTIVATE: u32 = 0x0086;
 const WM_NCMOUSEMOVE: u32 = 0x00A0;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_NCLBUTTONUP: u32 = 0x00A2;
@@ -2996,8 +3001,15 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             if (wparam & 0xFFFF) == WA_INACTIVE && owner != 0 && scene_owner(lparam) == owner {
                 return 0;
             }
+            active::observe(msg, wparam);
             dispatch_at(hwnd, activation(wparam));
             0
+        }
+        // the two other messages that speak of activation — the app as a
+        // whole, and the caption (see `active`); both stay the system's
+        WM_ACTIVATEAPP | WM_NCACTIVATE => {
+            active::observe(msg, wparam);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_GETMINMAXINFO => {
             let Some((min_width, min_height)) = content_floor(hwnd) else {
