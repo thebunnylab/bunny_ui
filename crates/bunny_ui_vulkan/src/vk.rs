@@ -3612,7 +3612,11 @@ fn record_frame(
                         // the pyramid needs the scene resolved, so the
                         // pass closes before it and opens again after
                         (fns.cmd_end_render_pass)(command);
-                        build_pyramid(stack, command, targets, extent, runs[index].levels);
+                        // a batch that shares reads the pyramid the pane
+                        // around it had built: the scene of that moment
+                        if !runs[index].reuse {
+                            build_pyramid(stack, command, targets, extent, runs[index].levels);
+                        }
                         open_pass(stack.scene_pass, targets.scene_framebuffer, extent);
                         push_all(command, &push);
                         draw_glass(stack, command, slot, batches, targets, runs[index], &mut push);
@@ -6089,6 +6093,51 @@ mod tests {
             let (worst, share) = glass_gate((3, 0.005), (12, 0.10));
             assert_glass_close(&gpu, &cpu, worst, share, label);
         }
+    }
+
+    /// A pane inside a pane, over a ramp. `blend` on the inner one says
+    /// whether it reads the scene as it stands or shares the outer one's
+    /// capture.
+    fn pane_in_a_pane(blend: bunny_ui::layout::BackgroundBlend) -> impl View {
+        use bunny_ui::layout::Glass;
+        let inner = empty()
+            .frame(90.0, 60.0)
+            .corner_radius(18.0)
+            .glass(Glass::regular().tint(Color::rgba(40, 90, 255, 70)))
+            .background_blend(blend);
+        zstack!((
+            empty()
+                .frame_width(240.0)
+                .frame_height(160.0)
+                .background_gradient(bunny_ui::layout::Gradient::linear(
+                    Color::hex(0x102A64),
+                    Color::hex(0xE8D14A),
+                )),
+            zstack!((empty().frame(180.0, 110.0), inner))
+                .corner_radius(28.0)
+                .glass(Glass::regular().tint(Color::rgba(255, 60, 40, 110))),
+        ))
+    }
+
+    /// A pane that shares draws from the pyramid the pane around it had
+    /// built, and no new one: the tier and the raster agree on what that
+    /// scene was, and it is not the scene a pane over a pane compounds.
+    #[test]
+    fn a_pane_that_shares_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 240.0, height: 160.0 };
+        let (gpu, cpu) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Replace), size, 2, Color::CANVAS);
+        let (worst, share) = glass_gate((6, 0.015), (16, 0.15));
+        assert_glass_close(&gpu, &cpu, worst, share, "a pane that shares");
+        let (stacked, _) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Over), size, 2, Color::CANVAS);
+        // at the centre the shared pane has the outer one's red tint under
+        // it no longer: the two pictures are far apart there
+        let centre = (160 * 480 + 240) * 4;
+        let apart = gpu[centre].abs_diff(stacked[centre]);
+        assert!(apart > 30, "the outer tint is gone from under the pane that shares: {apart}");
     }
 
     #[test]

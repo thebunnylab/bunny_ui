@@ -1943,7 +1943,11 @@ impl D3dStack {
                     // the panes over it. Both leave the target and the
                     // curve behind them, so the next run rebinds
                     if let Some(targets) = glass {
-                        self.build_pyramid(targets, viewport, run.levels);
+                        // a batch that shares reads the pyramid the pane
+                        // around it had built: the scene of that moment
+                        if !run.reuse {
+                            self.build_pyramid(targets, viewport, run.levels);
+                        }
                         self.draw_glass(targets, glass_srv, *run, rounds, viewport);
                     }
                     bound = None;
