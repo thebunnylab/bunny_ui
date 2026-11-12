@@ -177,59 +177,99 @@ impl<T: Clone + PartialEq + 'static> View for Segmented<T> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         crate::provenance::quiet(|| {
-            let current = self.selection.wrappedValue();
-            let selected = self.choices.iter().position(|choice| choice.value == current);
-            let count = self.choices.len().max(1);
-            let theme = crate::theme::current();
-            let segments: Vec<_> = self
-                .choices
-                .iter()
-                .enumerate()
-                .map(|(index, choice)| {
-                    let on = selected == Some(index);
-                    let selection = self.selection.clone();
-                    let value = choice.value.clone();
-                    let label = text(&*choice.label)
-                        .foreground_color(if on { theme.fg } else { theme.fg_secondary })
-                        .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center)
-                        .frame_height(SEGMENT_HEIGHT);
-                    control(
-                        label,
-                        move || selection.set(value.clone()),
-                        ControlSpec {
-                            kind: ControlKind::Radio,
-                            checked: Some(on),
-                            disabled: self.disabled || choice.disabled,
-                            plain: true,
-                            site: self.site,
-                        },
-                    )
-                })
-                .collect();
-            // the thumb stands in the selected track of a grid with the
-            // same tracks; it keeps its place in the tuple, so it is the
-            // same view from one selection to the next and the spring
-            // carries it there
-            let lead = selected.filter(|index| *index > 0).map(|index| empty().span(index, 1));
-            let thumb = selected.map(|_| {
-                empty()
+            Bar {
+                selection: &self.selection,
+                choices: &self.choices,
+                disabled: self.disabled,
+                tabs: false,
+                site: self.site,
+            }
+            .render(ctx, out);
+        });
+        crate::provenance::seal(ctx, out, mark, self.site, NodeKind::Segmented, None);
+    }
+}
+
+/// A tab, from edge to edge.
+const TAB_HEIGHT: f64 = 32.0;
+/// The line under the selected tab.
+const TAB_RULE: f64 = 2.0;
+
+/// The row a segmented control and a tab bar are both made of: members
+/// of equal width in a grid, one of them selected, and a mark that slides
+/// to the selected track.
+pub(crate) struct Bar<'a, T: 'static> {
+    pub selection: &'a Binding<T>,
+    pub choices: &'a [Choice<T>],
+    pub disabled: bool,
+    /// Tabs wear a line under the selected member; segments a thumb behind it.
+    pub tabs: bool,
+    pub site: Site,
+}
+
+impl<T: Clone + PartialEq + 'static> Bar<'_, T> {
+    pub(crate) fn render(&self, ctx: &Context, out: &mut NodeList) {
+        let current = self.selection.wrappedValue();
+        let selected = self.choices.iter().position(|choice| choice.value == current);
+        let count = self.choices.len().max(1);
+        let theme = crate::theme::current();
+        let height = if self.tabs { TAB_HEIGHT } else { SEGMENT_HEIGHT };
+        let members: Vec<_> = self
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let on = selected == Some(index);
+                let selection = self.selection.clone();
+                let value = choice.value.clone();
+                let label = text(&*choice.label)
+                    .foreground_color(if on { theme.fg } else { theme.fg_secondary })
                     .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center)
-                    .frame_height(SEGMENT_HEIGHT)
+                    .frame_height(height);
+                control(
+                    label,
+                    move || selection.set(value.clone()),
+                    ControlSpec {
+                        kind: if self.tabs { ControlKind::Tab } else { ControlKind::Radio },
+                        checked: Some(on),
+                        disabled: self.disabled || choice.disabled,
+                        plain: true,
+                        site: self.site,
+                    },
+                )
+            })
+            .collect();
+        // the mark stands in the selected track of a grid with the same
+        // tracks; it keeps its place in the tuple, so it is the same view
+        // from one selection to the next and the spring carries it there
+        let lead = selected.filter(|index| *index > 0).map(|index| empty().span(index, 1));
+        let mark = |height: f64| empty().frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center).frame_height(height);
+        let opacity = if self.disabled { 0.5 } else { 1.0 };
+        let spec = GroupSpec { columns: u8::try_from(count).unwrap_or(u8::MAX), selects: true };
+        if self.tabs {
+            let line = selected.map(|_| mark(TAB_RULE).background_color(theme.accent).animated(Spring::snappy()));
+            let bar = grid(members)
+                .columns(count)
+                .background(UnitPoint::BOTTOM, mark(1.0).background_color(theme.divider))
+                .overlay(UnitPoint::BOTTOM, grid((lead, line)).columns(count))
+                .opacity(opacity);
+            Grouped { content: bar, spec }.render_into(ctx, out);
+        } else {
+            let thumb = selected.map(|_| {
+                mark(SEGMENT_HEIGHT)
                     .background_color(theme.panel)
                     .corner_radius(RADIUS - INSET)
                     .animated(Spring::snappy())
             });
-            let bar = grid(segments)
+            let bar = grid(members)
                 .columns(count)
                 .background(UnitPoint::CENTER, grid((lead, thumb)).columns(count))
                 .padding_length(INSET)
                 .background_color(theme.control)
                 .corner_radius(RADIUS)
-                .opacity(if self.disabled { 0.5 } else { 1.0 });
-            let columns = u8::try_from(count).unwrap_or(u8::MAX);
-            Grouped { content: bar, spec: GroupSpec { columns, selects: true } }.render_into(ctx, out);
-        });
-        crate::provenance::seal(ctx, out, mark, self.site, NodeKind::Segmented, None);
+                .opacity(opacity);
+            Grouped { content: bar, spec }.render_into(ctx, out);
+        }
     }
 }
 

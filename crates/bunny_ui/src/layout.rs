@@ -1395,6 +1395,8 @@ pub(crate) enum ControlKind {
     Switch,
     /// One of a set: a press selects it. Space and Enter select it.
     Radio,
+    /// One of a set of pages: a press shows its page.
+    Tab,
 }
 
 impl ControlKind {
@@ -1406,6 +1408,7 @@ impl ControlKind {
             ControlKind::Checkbox => Role::Checkbox,
             ControlKind::Switch => Role::Switch,
             ControlKind::Radio => Role::RadioButton,
+            ControlKind::Tab => Role::Tab,
         }
     }
 
@@ -1416,6 +1419,7 @@ impl ControlKind {
             ControlKind::Checkbox => "Checkbox",
             ControlKind::Switch => "Toggle",
             ControlKind::Radio => "Choice",
+            ControlKind::Tab => "Tab",
         }
     }
 

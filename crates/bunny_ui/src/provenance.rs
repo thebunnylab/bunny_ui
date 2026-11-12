@@ -286,6 +286,10 @@ pub enum NodeKind {
     Toggle,
     /// `segmented(…)`.
     Segmented,
+    /// `tabs(…)`.
+    Tabs,
+    /// `tab_view(…)`.
+    TabView,
 }
 
 impl NodeKind {
@@ -313,6 +317,8 @@ impl NodeKind {
             Self::Modifier => "modifier",
             Self::Toggle => "toggle",
             Self::Segmented => "segmented",
+            Self::Tabs => "tabs",
+            Self::TabView => "tab_view",
         }
     }
 }
@@ -402,10 +408,16 @@ impl<V: crate::view::View> crate::view::View for Written<V> {
     type Arity = V::Arity;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let outside = OUTSIDE_QUIET.with(Cell::get);
-        let _scope = RecordingScope { recording: RECORDING.with(|recording| recording.replace(outside)), outside };
-        self.0.render_into(ctx, out);
+        written(|| self.0.render_into(ctx, out));
     }
+}
+
+/// Runs `render` with sites recorded as they were outside the [`quiet`]
+/// scope under way: what it renders is the app's own.
+pub(crate) fn written<R>(render: impl FnOnce() -> R) -> R {
+    let outside = OUTSIDE_QUIET.with(Cell::get);
+    let _scope = RecordingScope { recording: RECORDING.with(|recording| recording.replace(outside)), outside };
+    render()
 }
 
 /// The site of whoever called the `#[track_caller]` function that called
