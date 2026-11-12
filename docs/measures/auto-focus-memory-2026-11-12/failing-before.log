@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/auto_focus_memory.rs (target/debug/deps/auto_focus_memory-752fd5abed008335)
+
+running 3 tests
+test a_field_that_returns_is_a_first_appearance_again ... ok
+test a_beat_at_a_position_is_answered_once ... ok
+test a_first_appearance_at_a_position_respects_blur ... FAILED
+
+failures:
+
+---- a_first_appearance_at_a_position_respects_blur stdout ----
+bunny_ui: possible eager text in auto_focus_memory::Form at crates/bunny_ui/tests/auto_focus_memory.rs:40:13 (state read at crates/bunny_ui/tests/auto_focus_memory.rs:40:49); if this should bind directly, use text(state), text(binding), or text! instead of text(state.get()). Intentional snapshots are valid.
+
+thread 'a_first_appearance_at_a_position_respects_blur' (15763934) panicked at crates/bunny_ui/tests/auto_focus_memory.rs:62:9:
+assertion `left == right` failed: a blur is final; pass 1 gave the keyboard back to the field
+  left: Some("Form/#0")
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_first_appearance_at_a_position_respects_blur
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p bunny-ui-core --test auto_focus_memory`

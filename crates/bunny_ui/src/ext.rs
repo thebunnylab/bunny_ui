@@ -1152,9 +1152,10 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::ScrollTarget(id.into(), Some(anchor.y)))
     }
 
-    /// The field receives focus on its FIRST appearance — and never
-    /// again (a user blur is final; remount under the same identity
-    /// does not re-focus).
+    /// The field receives focus on its FIRST appearance, when nobody
+    /// holds the keyboard — and not again while it stays on screen: a
+    /// blur by the reader is final. A field that leaves the scene and
+    /// comes back is a first appearance again.
     #[track_caller]
     fn auto_focus(self) -> Modified<Self> {
         Modified::new(self, Modifier::AutoFocus)

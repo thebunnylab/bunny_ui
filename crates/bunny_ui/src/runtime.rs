@@ -467,9 +467,9 @@ pub struct Runtime {
     /// The last APPLIED reveal per app box — the same "only on change"
     /// door the targets above keep, so the wheel is never fought.
     element_reveals: RefCell<HashMap<String, crate::layout::Rect>>,
-    /// Fields whose `.auto_focus()` already fired — first appearance
-    /// only; a user blur is final.
-    auto_focused: RefCell<std::collections::HashSet<String>>,
+    /// What each input already answered — a first appearance, a beat,
+    /// an alert's opening — so each takes the keyboard once ([`Answered`]).
+    answered: RefCell<Answered>,
     /// Who lent the keyboard to a field's beat — the road home when the
     /// field leaves still holding it (`crate::loans`).
     loans: RefCell<crate::loans::Loans>,
@@ -1824,7 +1824,7 @@ impl Runtime {
             scroll_commands: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
             element_reveals: RefCell::new(HashMap::default()),
-            auto_focused: RefCell::new(std::collections::HashSet::default()),
+            answered: RefCell::new(Answered::default()),
             loans: RefCell::new(crate::loans::Loans::default()),
             focus_returns: RefCell::new(crate::loans::Returns::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
@@ -7737,8 +7737,9 @@ impl Runtime {
     /// an auto-focus memory or the focus itself whose path has no
     /// editor belongs to an unmounted field. (The identity sweeps
     /// cannot see these — a field row owns no state and is no
-    /// component boundary.) A remounted field's `.auto_focus()` fires
-    /// again: the identity is genuinely new, deliberately.
+    /// component boundary.) A field that left and came back is a first
+    /// appearance again, and its `.auto_focus()` fires again: the
+    /// memory left with it, deliberately.
     fn release_dead_input(&self) {
         // FIRST the migration, then the sweep: an input that moved must
         // take its caret and its once-per-identity memory with it, and
@@ -7753,21 +7754,7 @@ impl Runtime {
             self.hand_keyboard(&path, None);
         }
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
-        self.auto_focused.borrow_mut().retain(|key| {
-            // a once-per-beat memory is keyed `path#beat`, a box's or a
-            // field's: keep it while that input lives — sweeping it would
-            // re-arm the beat every pass and the input would steal focus
-            // forever
-            match key.rsplit_once('#') {
-                Some((path, beat)) if beat.bytes().all(|b| b.is_ascii_digit()) => {
-                    reconciler::has_custom(path) || reconciler::has_editor(path)
-                }
-                // an alert's claim, for as long as the alert stands: a
-                // reopen is a new question, and claims again
-                Some((path, "alert")) => reconciler::declares(path, ALERT_CONTEXT),
-                _ => reconciler::has_editor(key),
-            }
-        });
+        self.answered.borrow_mut().release_dead();
         // the app's own box counts as a live input too: it registers
         // itself every pass it renders, exactly like a field's editor
         let died = self.focus.borrow().clone().filter(|path| !input_lives(path));
@@ -7852,22 +7839,7 @@ impl Runtime {
             carets.entry(to.to_string()).or_insert(state);
         }
         drop(carets);
-        let mut seen = self.auto_focused.borrow_mut();
-        if seen.remove(from) {
-            seen.insert(to.to_string());
-        }
-        // the beats it already answered move with it, or the new house
-        // would answer them again
-        let beats: Vec<String> = seen
-            .iter()
-            .filter(|key| key.strip_prefix(from).is_some_and(|rest| rest.starts_with('#')))
-            .cloned()
-            .collect();
-        for key in beats {
-            seen.remove(&key);
-            seen.insert(format!("{to}{}", &key[from.len()..]));
-        }
-        drop(seen);
+        self.answered.borrow_mut().follow(from, to);
         self.loans.borrow_mut().follow(from, to);
     }
 
@@ -7879,12 +7851,12 @@ impl Runtime {
     /// when the keyboard moved.
     fn claim_auto_focus(&self, path: &str, ask: crate::layout::AutoFocus) -> bool {
         use crate::layout::AutoFocus;
-        let key = match ask {
+        let fresh = match ask {
             AutoFocus::Off => return false,
-            AutoFocus::First => path.to_string(),
-            AutoFocus::Beat(beat) | AutoFocus::Selecting(beat) => format!("{path}#{beat}"),
+            AutoFocus::First => self.answered.borrow_mut().first(path),
+            AutoFocus::Beat(beat) | AutoFocus::Selecting(beat) => self.answered.borrow_mut().beat(path, beat),
         };
-        if !self.auto_focused.borrow_mut().insert(key) {
+        if !fresh {
             return false;
         }
         let beat = matches!(ask, AutoFocus::Beat(_) | AutoFocus::Selecting(_));
@@ -7918,10 +7890,10 @@ impl Runtime {
         self.frame_asked.set(true);
     }
 
-    /// Focuses the first field whose ask is new — once per identity for
-    /// `.auto_focus()` (blur is final, remounting does not re-focus), once
-    /// per beat for `.auto_focus_beat` — then the boxes' beats. An alert
-    /// that just opened comes before all of them.
+    /// Focuses the first field whose ask is new — once per appearance for
+    /// `.auto_focus()` (a blur is final while the field stays), once per
+    /// beat for `.auto_focus_beat` — then the boxes' beats. An alert that
+    /// just opened comes before all of them.
     fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
         // An alert takes the keyboard the pass it opens, from whoever
         // holds it, and on LOAN (`crate::loans`): answering it gives the
@@ -7934,7 +7906,7 @@ impl Runtime {
             if !matches!(overlay.surface, crate::layout::OverlaySurface::Alert(_)) {
                 continue;
             }
-            if !self.auto_focused.borrow_mut().insert(format!("{}#alert", overlay.path)) {
+            if !self.answered.borrow_mut().alert(&overlay.path) {
                 continue;
             }
             let lender = self.focus.borrow().clone();
@@ -7987,11 +7959,9 @@ impl Runtime {
             let Some(beat) = placement.element.auto_focus_beat() else {
                 continue;
             };
-            let key = format!("{}#{beat}", placement.path);
-            if self.auto_focused.borrow().contains(&key) {
+            if !self.answered.borrow_mut().beat(&placement.path, beat) {
                 continue;
             }
-            self.auto_focused.borrow_mut().insert(key);
             if self.focus.borrow().as_deref() != Some(placement.path.as_str()) {
                 // a box that BORROWS (`CustomView::borrow_focus`) — a menu's
                 // keys, a picker's — hands them home when it leaves still
@@ -8699,6 +8669,82 @@ impl FrameNeed {
             || self.insets
             || self.webview
             || self.bindings
+    }
+}
+
+/// What each input has already answered, so that it takes the keyboard
+/// once: a field's first appearance, the beats a field or a box was
+/// handed, an alert's opening.
+///
+/// The three are kept apart, each under the input's own path. They were
+/// one set of strings — `path`, `path#beat`, `path#alert` — read back by
+/// splitting at the last `#`. A path also ends in `#` and digits when the
+/// input stands at a position (`Form/#0`), so a first appearance there
+/// was read as a beat of `Form/`, found no such input, and was forgotten
+/// on every pass: the field took a free keyboard again after a blur.
+/// Nothing is parsed now, and a pass that asks about a beat already
+/// answered builds no string to ask it.
+#[derive(Default)]
+struct Answered {
+    /// Fields whose first appearance took (or declined) the keyboard.
+    first: std::collections::HashSet<String>,
+    /// The beats each field or box has answered.
+    beats: HashMap<String, Vec<u64>>,
+    /// Alerts that took the keyboard for this opening.
+    alerts: std::collections::HashSet<String>,
+}
+
+impl Answered {
+    /// Is this the field's first appearance? Asked once, it is not again.
+    fn first(&mut self, path: &str) -> bool {
+        !self.first.contains(path) && self.first.insert(path.to_string())
+    }
+
+    /// Is `beat` new to the input at `path`? Asked once, it is not again.
+    fn beat(&mut self, path: &str, beat: u64) -> bool {
+        match self.beats.get_mut(path) {
+            Some(beats) if beats.contains(&beat) => false,
+            Some(beats) => {
+                beats.push(beat);
+                true
+            }
+            None => {
+                self.beats.insert(path.to_string(), vec![beat]);
+                true
+            }
+        }
+    }
+
+    /// Is this the alert's opening? Asked once, it is not again.
+    fn alert(&mut self, path: &str) -> bool {
+        !self.alerts.contains(path) && self.alerts.insert(path.to_string())
+    }
+
+    /// Forgets what an input that left had answered. A memory is kept
+    /// while its input lives: forgetting a beat sooner would arm it again
+    /// on every pass, and the input would take the keyboard forever. An
+    /// alert's memory lasts as long as the alert stands: a reopening is a
+    /// new question.
+    fn release_dead(&mut self) {
+        self.first.retain(|path| reconciler::has_editor(path));
+        self.beats.retain(|path, _| reconciler::has_custom(path) || reconciler::has_editor(path));
+        self.alerts.retain(|path| reconciler::declares(path, ALERT_CONTEXT));
+    }
+
+    /// An input moved house: what it answered moves with it, or the new
+    /// house would answer it all again.
+    fn follow(&mut self, from: &str, to: &str) {
+        if self.first.remove(from) {
+            self.first.insert(to.to_string());
+        }
+        if let Some(moved) = self.beats.remove(from) {
+            let beats = self.beats.entry(to.to_string()).or_default();
+            for beat in moved {
+                if !beats.contains(&beat) {
+                    beats.push(beat);
+                }
+            }
+        }
     }
 }
 
