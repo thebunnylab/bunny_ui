@@ -292,6 +292,10 @@ pub enum NodeKind {
     TabView,
     /// `picker(…)`.
     Picker,
+    /// `form(…)` / `form!`.
+    Form,
+    /// `labeled(…)`.
+    Labeled,
 }
 
 impl NodeKind {
@@ -322,6 +326,8 @@ impl NodeKind {
             Self::Tabs => "tabs",
             Self::TabView => "tab_view",
             Self::Picker => "picker",
+            Self::Form => "form",
+            Self::Labeled => "labeled",
         }
     }
 }

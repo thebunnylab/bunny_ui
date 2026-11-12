@@ -59,6 +59,7 @@ pub mod effects;
 pub mod erased;
 pub mod ext;
 pub mod font_file;
+pub mod form;
 pub mod glass;
 pub mod app;
 pub mod window;
@@ -174,6 +175,15 @@ macro_rules! zstack {
     };
 }
 
+/// `form!(a, b, c)` — the rows of a form without the tuple's doubled
+/// parentheses; see [`form`](crate::form).
+#[macro_export]
+macro_rules! form {
+    ($($row:expr),* $(,)?) => {
+        $crate::form::form($crate::__bunny_children!($($row),*))
+    };
+}
+
 /// `grid!(a, b, c)` — equal columns, optional per-child spans.
 #[macro_export]
 macro_rules! grid {
@@ -207,7 +217,8 @@ pub mod task {
 }
 
 pub mod prelude {
-    pub use crate::{grid, hstack, text, vstack, zstack};
+    pub use crate::{form, grid, hstack, text, vstack, zstack};
+    pub use crate::form::{Form, Labeled, labeled};
     pub use crate::ext::ViewExt;
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};

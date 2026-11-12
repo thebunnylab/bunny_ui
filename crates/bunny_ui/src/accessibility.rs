@@ -257,6 +257,10 @@ pub enum Semantics {
     },
     /// Overrides the name when exactly one semantic element is below it.
     Label(TextSource),
+    /// A row of words and one control: the words become the control's
+    /// name and are not heard a second time as a text. A row whose
+    /// control is several elements keeps the words as a text before them.
+    Labeled,
     /// Excludes decorative descendants from assistive technology.
     Hidden,
 }
@@ -291,6 +295,16 @@ impl Semantics {
             Self::Label(label) => {
                 if let [node] = &mut nodes[start..] {
                     node.label = label.get();
+                }
+            }
+            Self::Labeled => {
+                if let [words, control] = &nodes[start..]
+                    && words.role == Role::Text
+                    && control.role != Role::Text
+                {
+                    let name = Arc::clone(&words.label);
+                    nodes[start + 1].label = name;
+                    nodes.remove(start);
                 }
             }
             Self::Text { path, content } => {
