@@ -73,6 +73,33 @@ fn it_is_a_small_box_of_its_own_size() {
     assert_eq!(frame.size, Size { width: 72.0, height: 26.0 }, "it does not stretch with the room it is given");
 }
 
+/// A row and a column with room to spare, the stepper in both.
+#[derive(Clone, Copy)]
+struct Roomy {
+    guests: State<u32>,
+}
+
+impl Component for Roomy {
+    fn body(self) -> impl View {
+        vstack!(
+            hstack!(text("Guests"), stepper(self.guests.binding(), 1..=8).id("in-a-row")),
+            stepper(self.guests.binding(), 1..=8).id("in-a-column"),
+            text("below"),
+        )
+    }
+}
+
+#[test]
+fn it_takes_no_leftover_room_from_the_stack_that_holds_it() {
+    let runtime = Runtime::new();
+    let roomy = Roomy { guests: State::new(2) };
+    let layout = runtime.layout(&roomy, Proposal::exact(Size { width: 400.0, height: 400.0 }));
+    for name in ["[in-a-row]", "[in-a-column]"] {
+        let frame = layout.customs.iter().find(|placement| placement.path.contains(name)).expect("placed").frame;
+        assert_eq!(frame.size, Size { width: 72.0, height: 26.0 }, "{name} keeps its size in a 400 by 400 window");
+    }
+}
+
 #[test]
 fn the_two_halves_take_one_step_and_stop_at_the_bounds() {
     let runtime = Runtime::new();

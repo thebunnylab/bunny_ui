@@ -44,7 +44,7 @@ use motor::state::{Binding, LayoutDirection};
 use crate::action::Key;
 use crate::custom::{CustomElement, ElementEvent, EventCtx, Metrics, PaintCtx, Painter, Response};
 use crate::icon::house as symbol;
-use crate::layout::{Point, Proposal, Rect, Size};
+use crate::layout::{Axis, Point, Proposal, Rect, Size};
 use crate::slider::SliderRange;
 use crate::view::{Component, View};
 
@@ -209,6 +209,11 @@ impl CustomElement for StepperElement {
     }
     fn stable_measure(&self) -> bool {
         true
+    }
+    // a box takes the leftover room of its stack unless it says no, and a
+    // stepper is a small control of one size
+    fn flexible(&self, _axis: Axis) -> bool {
+        false
     }
     fn measure(&self, _proposal: Proposal, _metrics: &Metrics<'_>) -> Size {
         Size { width: WIDTH, height: HEIGHT }
