@@ -136,7 +136,7 @@ impl SliderRange {
     const fn fraction(self, value: f64) -> f64 {
         (self.bound(value) - self.lower) / self.span()
     }
-    fn snap(self, value: f64) -> f64 {
+    pub(crate) fn snap(self, value: f64) -> f64 {
         let value = self.bound(value);
         let Some(step) = self.step else {
             return value;
@@ -152,7 +152,7 @@ impl SliderRange {
             grid
         }
     }
-    fn advance(self, value: f64, increasing: bool, count: f64) -> f64 {
+    pub(crate) fn advance(self, value: f64, increasing: bool, count: f64) -> f64 {
         let value = self.bound(value);
         let next = self.step.map_or_else(
             || {

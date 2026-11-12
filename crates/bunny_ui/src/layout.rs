@@ -1391,11 +1391,73 @@ pub struct ElementHints {
     pub(crate) address: Option<Rc<Address>>,
 }
 
+/// What a built-in activation control IS — said by the control, never
+/// guessed from the state it happens to carry. The keyboard reads it (which
+/// keys activate) and assistive technology reads it (which role it has).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ControlKind {
+    /// A press runs it. Space and Enter activate it.
+    #[default]
+    Button,
+    /// Two states behind a mark. Space toggles it; Enter is left to the
+    /// form around it.
+    Checkbox,
+    /// Two states behind a switch. Keys as a checkbox.
+    Switch,
+    /// One of a set: a press selects it. Space and Enter select it.
+    Radio,
+    /// One of a set of pages: a press shows its page.
+    Tab,
+    /// A press opens a list of choices. Space, Enter and the vertical
+    /// arrows open it.
+    PopUp,
+}
+
+impl ControlKind {
+    /// The role assistive technology hears.
+    pub(crate) const fn role(self) -> crate::accessibility::Role {
+        use crate::accessibility::Role;
+        match self {
+            ControlKind::Button => Role::Button,
+            ControlKind::Checkbox => Role::Checkbox,
+            ControlKind::Switch => Role::Switch,
+            ControlKind::Radio => Role::RadioButton,
+            ControlKind::Tab => Role::Tab,
+            ControlKind::PopUp => Role::PopUpButton,
+        }
+    }
+
+    /// The name the control prints by.
+    pub(crate) const fn print_name(self) -> &'static str {
+        match self {
+            ControlKind::Button => "Button",
+            ControlKind::Checkbox => "Checkbox",
+            ControlKind::Switch => "Toggle",
+            ControlKind::Radio => "Choice",
+            ControlKind::Tab => "Tab",
+            ControlKind::PopUp => "PopUp",
+        }
+    }
+
+    /// Do the bare vertical arrows activate it? They open a list of
+    /// choices, as on a native pop-up button.
+    pub(crate) const fn arrows_activate(self) -> bool {
+        matches!(self, ControlKind::PopUp)
+    }
+
+    /// Does a bare Enter activate it? A two-state control leaves Enter to
+    /// the form around it, as a native checkbox does.
+    pub(crate) const fn enter_activates(self) -> bool {
+        !matches!(self, ControlKind::Checkbox | ControlKind::Switch)
+    }
+}
+
 /// State shared by built-in activation controls, keyboard navigation and AT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ControlState {
     pub enabled: bool,
     pub checked: Option<bool>,
+    pub kind: ControlKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1406,9 +1468,45 @@ pub(crate) struct FocusStop {
     pub control: Option<ControlState>,
 }
 
+/// The controls under one node travel as ONE group: Tab enters the group
+/// and leaves it, and the arrows move inside it. It is how the segments
+/// of a choice, the tabs of a bar, the rows of a list of choices and the
+/// days of a month are reached — one Tab stop each, as the native ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GroupSpec {
+    /// The members in one row. The vertical arrows move by this many, so
+    /// a month is seven and a list is one. A group of ONE row moves by
+    /// one on the vertical arrows too.
+    pub columns: u8,
+    /// Moving onto a member also activates it — the rule of a set of
+    /// radio buttons, where the focused one is the selected one. `false`
+    /// for a list that selects on Space or Enter.
+    pub selects: bool,
+}
+
+/// A group as the last layout placed it: its members are the focus stops
+/// `start..end`, in reading order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusGroup {
+    pub start: usize,
+    pub end: usize,
+    pub spec: GroupSpec,
+    /// The group reads right to left: the horizontal arrows swap.
+    pub rtl: bool,
+}
+
+impl FocusGroup {
+    pub(crate) const fn holds(&self, stop: usize) -> bool {
+        self.start <= stop && stop < self.end
+    }
+}
+
 impl ElementHints {
     pub(crate) fn control(&self) -> Option<ControlState> {
         self.address.as_ref().and_then(|address| address.control)
+    }
+    pub(crate) fn group(&self) -> Option<GroupSpec> {
+        self.address.as_ref().and_then(|address| address.group)
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
@@ -1421,6 +1519,8 @@ impl ElementHints {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Address {
     pub(crate) control: Option<ControlState>,
+    /// The controls under this node travel as one group ([`GroupSpec`]).
+    pub(crate) group: Option<GroupSpec>,
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
 }
@@ -1534,6 +1634,82 @@ impl LayoutNode {
     /// there.
     pub(crate) fn is_bare(&self) -> bool {
         self.carried_hints().is_none_or(ElementHints::is_empty) && self.carried_action().is_none()
+    }
+
+    /// The one child a wrapper stands around while both are still the
+    /// SAME view — `None` for a leaf, for a container, and for a wrapper
+    /// a modifier does not cross.
+    ///
+    /// A leaf modifier (`.auto_focus()`, `.truncation_mode(…)`,
+    /// `.scroll_target(…)`, `.resizable()`) changes the leaf of the view
+    /// it is written on, whatever stands between the two. This is the
+    /// one place that says which nodes stand between. The match names
+    /// every variant on purpose: a new node does not compile until it is
+    /// classified here, so a new wrapper can never stop a leaf modifier
+    /// in silence.
+    pub(crate) fn seen_through_mut(&mut self) -> Option<&mut LayoutNode> {
+        match self {
+            // one child, and still the same view
+            LayoutNode::Measured { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Spanned { child, .. }
+            | LayoutNode::Padding { child, .. }
+            | LayoutNode::Frame { child, .. }
+            | LayoutNode::MaxFrame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::Hug { child, .. }
+            | LayoutNode::Animated { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
+            | LayoutNode::Island { child, .. }
+            | LayoutNode::Live { child, .. }
+            | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
+            | LayoutNode::ControlRegion { child, .. }
+            | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::ExactLayout { child }
+            | LayoutNode::Turned { child, .. }
+            // the base is the view; the layer, the sheet and the popover
+            // are views of their own and are never descended into
+            | LayoutNode::Overlay { child, .. }
+            | LayoutNode::Sheet { child, .. }
+            | LayoutNode::Anchored { child, .. } => Some(&mut **child),
+            // a style is a wrapper until it carries hints or an action:
+            // from there it is a target of its own, as a button's chrome
+            LayoutNode::Styled { child, hints, action, .. } => {
+                if hints.is_empty() && action.is_none() { Some(&mut **child) } else { None }
+            }
+            // these two stand in for a node that could not carry the
+            // action or the hints itself, and stop a rewrite as it does
+            LayoutNode::Interactive { .. } | LayoutNode::Hinted { .. } => None,
+            // leaves
+            LayoutNode::Text { .. }
+            | LayoutNode::Spacer
+            | LayoutNode::Leaf { .. }
+            | LayoutNode::Image { .. }
+            | LayoutNode::Icon { .. }
+            | LayoutNode::Fill
+            | LayoutNode::Rectangle
+            | LayoutNode::Ellipse
+            | LayoutNode::Field { .. }
+            | LayoutNode::BoundaryHint { .. }
+            | LayoutNode::Custom { .. }
+            | LayoutNode::Host { .. }
+            // containers and boundaries: other views live inside
+            | LayoutNode::Stack { .. }
+            | LayoutNode::Flow { .. }
+            | LayoutNode::Grid { .. }
+            | LayoutNode::Layered { .. }
+            | LayoutNode::Scroll { .. }
+            | LayoutNode::Split { .. }
+            | LayoutNode::VirtualStack { .. }
+            | LayoutNode::Boundary { .. }
+            | LayoutNode::BoundaryRef { .. } => None,
+        }
     }
 }
 
@@ -4384,6 +4560,7 @@ pub struct Placement {
     /// The enclosing component boundaries, by path — what a site names.
     boundary_stack: Vec<Rc<str>>,
     pub(crate) focus_order: Vec<FocusStop>,
+    pub(crate) focus_groups: Vec<FocusGroup>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
     accessibility_viewport: Option<Rect>,
@@ -4930,6 +5107,8 @@ pub struct LayoutResult {
     /// frame; empty unless the runtime recorded sites.
     pub sites: Vec<crate::provenance::SitePlacement>,
     pub(crate) focus_order: Vec<FocusStop>,
+    /// The groups of `focus_order` that travel as one stop each.
+    pub(crate) focus_groups: Vec<FocusGroup>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
@@ -5164,6 +5343,7 @@ pub(crate) fn layout_placing(
         accessibility: out.accessibility,
         sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+        focus_groups: out.focus_groups,
         frames: out.frames,
         display: out.display,
         hits: out.hits,
@@ -5212,6 +5392,7 @@ fn assert_seen_placement(full: &Placement, cut: &Placement) {
             && full.scrolls.len() == cut.scrolls.len()
             && full.fields.len() == cut.fields.len()
             && full.focus_order == cut.focus_order
+            && full.focus_groups == cut.focus_groups
             && full.focus_floor == cut.focus_floor
             && full.focus_scope == cut.focus_scope
             && full.customs.len() == cut.customs.len()
@@ -5655,6 +5836,7 @@ pub fn layout_dom(
             accessibility: out.accessibility,
             sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+            focus_groups: out.focus_groups,
             frames: out.frames,
             display: out.display,
             hits: out.hits,
@@ -7274,6 +7456,8 @@ impl LayoutNode {
         out.passive += u32::from(passive);
         let semantic_start = out.accessibility.len();
         let control = self.carried_hints().and_then(ElementHints::control);
+        // the focus stops this node's subtree adds are one group
+        let group = self.carried_hints().and_then(ElementHints::group).map(|spec| (spec, out.focus_order.len()));
         let target = self.carried_action();
         if let (Some(state), Some(path)) = (control, target)
             && state.enabled && out.can_reveal_focus(frame)
@@ -7291,6 +7475,11 @@ impl LayoutNode {
                 place_target(path, frame, env, out, |out| self.place_node(frame, fit, env, out));
             }
             None => self.place_node(frame, fit, env, out),
+        }
+        if let Some((spec, start)) = group
+            && out.focus_order.len() > start
+        {
+            out.focus_groups.push(FocusGroup { start, end: out.focus_order.len(), spec, rtl: env.rtl() });
         }
         // the ring is for the reader who travels by keys: a control the
         // mouse pressed holds focus and shows none, as in a browser
@@ -7457,6 +7646,7 @@ impl LayoutNode {
                         out.accessibility.push(crate::accessibility::Placed {
                             enabled: true,
                             checked: None,
+                            expanded: None,
                             range: None,
                             path: Rc::from(path.as_str()),
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
@@ -7929,9 +8119,10 @@ impl LayoutNode {
                     out.accessibility.push(crate::accessibility::Placed {
                         enabled: element.element().accepts_keys(),
                         checked: None,
+                        expanded: None,
                         range: Some(range),
                         path: Rc::from(path.as_str()),
-                        role: crate::accessibility::Role::Slider,
+                        role: element.element().accessibility_role(),
                         label: Arc::from(""),
                         value: None,
                         bounds: out.accessible_bounds(frame),

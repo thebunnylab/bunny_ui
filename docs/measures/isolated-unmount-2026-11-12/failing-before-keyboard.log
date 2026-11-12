@@ -1,0 +1,23 @@
+   Compiling bunny-ui-core v0.5.0 (/Users/deco/Code/bunnylab/worktrees/bunny_ui-next/crates/bunny_ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.86s
+     Running tests/isolated_unmount.rs (target/debug/deps/isolated_unmount-d2fd9fef743c9b76)
+
+running 2 tests
+test a_bar_closed_inside_a_kept_row_while_its_list_runs_gives_the_keys_back ... FAILED
+test a_bar_closed_while_its_parent_re_runs_alone_gives_the_keys_back ... ok
+
+failures:
+
+---- a_bar_closed_inside_a_kept_row_while_its_list_runs_gives_the_keys_back stdout ----
+
+thread 'a_bar_closed_inside_a_kept_row_while_its_list_runs_gives_the_keys_back' (15651844) panicked at crates/bunny_ui/tests/isolated_unmount.rs:114:5:
+the bar left, and the keyboard went back to the editor; it is on None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_bar_closed_inside_a_kept_row_while_its_list_runs_gives_the_keys_back
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p bunny-ui-core --test isolated_unmount`

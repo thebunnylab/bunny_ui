@@ -7870,6 +7870,7 @@ mod tests {
                 class: Some(class.into()),
                 address: Some(Rc::new(crate::layout::Address {
                     control: None,
+                    group: None,
                     dom_id: Some(id.into()),
                     href: None,
                 })),

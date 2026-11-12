@@ -31,14 +31,18 @@ pub(crate) const SEEN: u32 = 1 << 4;
 /// The row starts a list whose rows measure themselves keeps instead of
 /// summing them again.
 pub(crate) const ROWS: u32 = 1 << 5;
+/// The sweep that reads who left off the retention in one ordered walk,
+/// instead of asking each entry which boundary above it the pass met.
+pub(crate) const SWEEP: u32 = 1 << 6;
 
-const NAMES: [(&str, u32); 6] = [
+const NAMES: [(&str, u32); 7] = [
     ("assemble", ASSEMBLE),
     ("settle", SETTLE),
     ("hover", HOVER),
     ("memo", MEMO),
     ("seen", SEEN),
     ("rows", ROWS),
+    ("sweep", SWEEP),
 ];
 
 thread_local! {
@@ -64,7 +68,7 @@ fn from_environment() -> u32 {
                     .map(|(_, flag)| *flag)
                     .unwrap_or_else(|| {
                         // a name nobody knows would check nothing, in silence
-                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo, seen, rows)")
+                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo, seen, rows, sweep)")
                     }),
             })
             .fold(0, |flags, flag| flags | flag)

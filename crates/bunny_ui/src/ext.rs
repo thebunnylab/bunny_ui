@@ -1152,9 +1152,10 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::ScrollTarget(id.into(), Some(anchor.y)))
     }
 
-    /// The field receives focus on its FIRST appearance — and never
-    /// again (a user blur is final; remount under the same identity
-    /// does not re-focus).
+    /// The field receives focus on its FIRST appearance, when nobody
+    /// holds the keyboard — and not again while it stays on screen: a
+    /// blur by the reader is final. A field that leaves the scene and
+    /// comes back is a first appearance again.
     #[track_caller]
     fn auto_focus(self) -> Modified<Self> {
         Modified::new(self, Modifier::AutoFocus)
@@ -1187,6 +1188,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// so the reader can click away and stay away until the app beats
     /// again. A field that leaves the scene forgets its beats, so a popup
     /// whose field is born on each open can wear one constant beat.
+    ///
+    /// The other side of that rule: a field that leaves and comes back
+    /// answers the same number again. A find bar in a tab must not — the
+    /// reader changes tab and returns, and a shortcut pressed long ago
+    /// would take the keyboard. For that, the app keeps a
+    /// [`Beat`](crate::beat::Beat) and the field wears it with
+    /// [`TextField::focus_on`](crate::views::TextField::focus_on): the
+    /// beat itself remembers how far it was answered. Do not write both
+    /// on one field; the number written last would replace the beat.
     ///
     /// The beat BORROWS the keyboard. When the field leaves the scene still
     /// holding it — the picker closed on Escape, the pick ran and the popup

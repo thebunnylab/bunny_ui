@@ -630,11 +630,11 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
         ptr::from_ref(&value.fragment).cast_mut().cast()
     } else if iid == ROOT && value.key == Key::Root {
         ptr::from_ref(&value.root).cast_mut().cast()
-    } else if iid == INVOKE && value.role == Some(Role::Button) {
+    } else if iid == INVOKE && value.role.is_some_and(invokes) {
         ptr::from_ref(&value.invoke).cast_mut().cast()
-    } else if iid == TOGGLE && value.role == Some(Role::Checkbox) {
+    } else if iid == TOGGLE && value.role.is_some_and(toggles) {
         ptr::from_ref(&value.toggle).cast_mut().cast()
-    } else if iid == RANGE && value.role == Some(Role::Slider) {
+    } else if iid == RANGE && value.role.is_some_and(ranges) {
         ptr::from_ref(&value.range).cast_mut().cast()
     } else if iid == VALUE && matches!(value.role, Some(Role::TextField | Role::PasswordField)) {
         ptr::from_ref(&value.value).cast_mut().cast()
@@ -646,6 +646,21 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
         *out = port;
     }
     OK
+}
+/// The roles a press runs: they answer the Invoke pattern. A radio
+/// button, a tab and a pop-up button are selected or opened by the same
+/// press a button takes.
+fn invokes(role: Role) -> bool {
+    matches!(role, Role::Button | Role::RadioButton | Role::Tab | Role::PopUpButton)
+}
+/// The two-state roles: they answer the Toggle pattern. UI Automation
+/// has no switch of its own; a switch is a button that toggles.
+fn toggles(role: Role) -> bool {
+    matches!(role, Role::Checkbox | Role::Switch)
+}
+/// The numeric roles: they answer the RangeValue pattern.
+fn ranges(role: Role) -> bool {
+    matches!(role, Role::Slider | Role::Stepper)
 }
 unsafe extern "system" fn retain(this: Object) -> u32 {
     let old = unsafe { provider(this) }
@@ -701,9 +716,9 @@ unsafe extern "system" fn pattern(this: Object, pattern: i32, out: *mut Object) 
         let value = unsafe { provider(this) };
         let (_, _, node) = state(value)?;
         let iid = match pattern {
-            RANGE_PATTERN if value.role == Some(Role::Slider) => &RANGE,
-            INVOKE_PATTERN if value.role == Some(Role::Button) => &INVOKE,
-            TOGGLE_PATTERN if value.role == Some(Role::Checkbox) => &TOGGLE,
+            RANGE_PATTERN if value.role.is_some_and(ranges) => &RANGE,
+            INVOKE_PATTERN if value.role.is_some_and(invokes) => &INVOKE,
+            TOGGLE_PATTERN if value.role.is_some_and(toggles) => &TOGGLE,
             VALUE_PATTERN
                 if matches!(value.role, Some(Role::TextField | Role::PasswordField))
                     && node.is_some_and(|node| !node.multiline) =>
@@ -739,9 +754,15 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                     })),
                     CONTROL_TYPE => Ok(Variant::integer(match node.role {
                         Role::Text => 50020,
-                        Role::Button => 50000,
+                        // a switch is a Button that toggles: UI Automation
+                        // has no control type for it
+                        Role::Button | Role::Switch => 50000,
                         Role::Checkbox => 50002,
+                        Role::PopUpButton => 50003, // ComboBox
+                        Role::RadioButton => 50013,
                         Role::Slider => 50015,
+                        Role::Stepper => 50016, // Spinner
+                        Role::Tab => 50019,     // TabItem
                         Role::TextField | Role::PasswordField => 50004,
                     })),
                     AUTOMATION_ID => Variant::string(&format!("bunny:{}", node.id.get())),
@@ -749,15 +770,15 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                         node.focused && window_has_focus(surface.window),
                     )),
                     FOCUSABLE => Ok(Variant::boolean(node.enabled && node.role != Role::Text)),
-                    TOGGLE_STATE if node.role == Role::Checkbox => {
+                    TOGGLE_STATE if toggles(node.role) => {
                         Ok(Variant::integer(i32::from(node.checked.unwrap_or(false))))
                     }
-                    RANGE_READ_ONLY if node.role == Role::Slider => {
+                    RANGE_READ_ONLY if ranges(node.role) => {
                         Ok(Variant::boolean(!node.enabled))
                     }
                     RANGE_VALUE | RANGE_MINIMUM | RANGE_MAXIMUM | RANGE_LARGE_CHANGE
                     | RANGE_SMALL_CHANGE
-                        if node.role == Role::Slider =>
+                        if ranges(node.role) =>
                     {
                         range_property(node.range.ok_or(UNSUPPORTED)?, property).map(Variant::real)
                     }
@@ -876,13 +897,20 @@ fn enqueue(value: &Provider, action: Action) -> Hresult {
     let supported = matches!(
         (value.role, &action),
         (
-            Some(Role::Button | Role::Checkbox),
+            Some(
+                Role::Button
+                    | Role::Checkbox
+                    | Role::Switch
+                    | Role::RadioButton
+                    | Role::Tab
+                    | Role::PopUpButton
+            ),
             Action::Activate | Action::Focus
         ) | (
             Some(Role::TextField | Role::PasswordField),
             Action::Focus | Action::SetText(_)
         ) | (
-            Some(Role::Slider),
+            Some(Role::Slider | Role::Stepper),
             Action::Focus | Action::Increment | Action::Decrement | Action::SetValue(_)
         ) | (None, Action::Focus)
     );

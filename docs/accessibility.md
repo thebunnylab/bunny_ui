@@ -57,6 +57,27 @@ semantic nodes with `enabled = false` and reject actions. Checkboxes expose
 unavailable requests return distinct errors. Successful actions request a
 frame. Snapshots report current keyboard focus without requesting a frame.
 
+A control says its own role. Five roles go with the built-in controls that are
+not a plain button, a checkbox or a slider:
+
+| Role | Published state | Actions |
+|---|---|---|
+| `Switch` | `checked: Some(bool)` | `Activate` (toggle), `Focus` |
+| `RadioButton` | `checked: Some(bool)`: whether it is the one selected | `Activate` (select), `Focus` |
+| `Tab` | `checked: Some(bool)`: whether its page is shown | `Activate` (show), `Focus` |
+| `PopUpButton` | `value`: the choice it shows; `expanded: Some(bool)`: whether its list is open | `Activate` (open), `Focus` |
+| `Stepper` | `range`, as a slider | `Focus`, `Increment`, `Decrement`, `SetValue(f64)` |
+
+Each desktop adapter maps them to the role of the native control:
+
+| Role | macOS | Windows UI Automation | Linux AT-SPI |
+|---|---|---|---|
+| `Switch` | `AXCheckBox`, subrole `AXSwitch` | Button, Toggle pattern | toggle button, CHECKABLE/CHECKED, action `toggle` |
+| `RadioButton` | `AXRadioButton` | RadioButton, Invoke pattern | radio button, CHECKABLE/CHECKED, action `click` |
+| `Tab` | `AXRadioButton`, subrole `AXTabButton` | TabItem, Invoke pattern | page tab, SELECTABLE/SELECTED, action `click` |
+| `PopUpButton` | `AXPopUpButton`, `isAccessibilityExpanded` | ComboBox, Invoke pattern | combo box, EXPANDABLE/EXPANDED, action `press` |
+| `Stepper` | `AXIncrementor` | Spinner, RangeValue pattern | spin button, Value interface |
+
 Successful `Activate` follows the pointer's keyboard-ownership rule after the
 callback: a focusable control receives focus, including its containing editor's
 standard edit commands. Explicit `.leaves_keyboard()` chrome preserves the

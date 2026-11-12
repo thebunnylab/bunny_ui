@@ -1,0 +1,50 @@
+warning: field `answered` is never read
+  --> crates/bunny_ui/src/reconciler.rs:72:9
+   |
+68 | pub(crate) struct EditorFn {
+   |                   -------- field in this struct
+...
+72 |     pub answered: Option<Rc<std::cell::Cell<u64>>>,
+   |         ^^^^^^^^
+   |
+   = note: `EditorFn` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `field_answered` is never used
+    --> crates/bunny_ui/src/reconciler.rs:3237:15
+     |
+3237 | pub(crate) fn field_answered(path: &str) -> Option<Rc<std::cell::Cell<u64>>> {
+     |               ^^^^^^^^^^^^^^
+
+warning: `bunny-ui-core` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/beat_memory.rs (target/debug/deps/beat_memory-bab3e3d62fa5bcea)
+
+running 5 tests
+test a_beat_that_never_rang_summons_nobody ... ok
+test two_fields_wearing_one_beat_answer_a_ring_once ... FAILED
+test a_ring_nobody_answered_is_still_pending_on_return ... ok
+test a_summoned_query_does_not_take_the_keys_again_when_its_tab_returns ... FAILED
+test a_thousand_returns_keep_no_memory ... ok
+
+failures:
+
+---- two_fields_wearing_one_beat_answer_a_ring_once stdout ----
+
+thread 'two_fields_wearing_one_beat_answer_a_ring_once' (16120218) panicked at crates/bunny_ui/tests/beat_memory.rs:192:5:
+the first field in reading order answers
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_summoned_query_does_not_take_the_keys_again_when_its_tab_returns stdout ----
+
+thread 'a_summoned_query_does_not_take_the_keys_again_when_its_tab_returns' (16120216) panicked at crates/bunny_ui/tests/beat_memory.rs:134:5:
+the bar came back with its tab; the ring it answered before it left is not answered again
+
+
+failures:
+    a_summoned_query_does_not_take_the_keys_again_when_its_tab_returns
+    two_fields_wearing_one_beat_answer_a_ring_once
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+
+error: test failed, to rerun pass `-p bunny-ui-core --test beat_memory`

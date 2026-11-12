@@ -6,9 +6,10 @@
 //! and control roles. Actions return through the runtime's existing input
 //! paths. Collection is demand driven and schedules no timer.
 //!
-//! This projection covers text, buttons, checkboxes, sliders and editable fields. It is not
-//! a native accessibility adapter: custom controls, virtualized offscreen
-//! navigation and platform protocols need their own integration.
+//! This projection covers text, buttons, checkboxes, switches, radio
+//! buttons, tabs, pop-up buttons, sliders, steppers and editable fields.
+//! It is not a native accessibility adapter: custom controls, virtualized
+//! offscreen navigation and platform protocols need their own integration.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -37,8 +38,21 @@ pub enum Role {
     Button,
     /// A two-state control with a toggle action.
     Checkbox,
+    /// A two-state control drawn as a switch. It toggles as a checkbox does.
+    Switch,
+    /// One choice of a set. Its checked state says whether it is the one
+    /// selected; activation selects it.
+    RadioButton,
+    /// One page of a set. Its checked state says whether its page is
+    /// shown; activation shows it.
+    Tab,
+    /// A button that opens a list of choices. Its value is the choice it
+    /// shows, and its expanded state says whether the list is open.
+    PopUpButton,
     /// A bounded numeric control.
     Slider,
+    /// A bounded numeric control moved one step at a time.
+    Stepper,
     /// An editable text value.
     TextField,
     /// An editable secret whose value is never exported.
@@ -157,7 +171,8 @@ pub struct Node {
     pub role: Role,
     /// Accessible name; a field defaults to its placeholder.
     pub label: Arc<str>,
-    /// Current field value. Always absent for passwords and other roles.
+    /// Current field value, or the choice a pop-up button shows. Always
+    /// absent for passwords and other roles.
     pub value: Option<Arc<str>>,
     /// Visible bounds in runtime layout coordinates (points, top-left origin).
     pub bounds: Rect,
@@ -168,9 +183,12 @@ pub struct Node {
     pub focused: bool,
     /// Whether the control can be operated.
     pub enabled: bool,
-    /// The checkbox's value; absent for other roles.
+    /// The value of a checkbox or a switch, or whether a radio button or
+    /// a tab is the one selected; absent for other roles.
     pub checked: Option<bool>,
-    /// Numeric state for a slider; absent for other roles.
+    /// Whether the list of a pop-up button is open; absent for other roles.
+    pub expanded: Option<bool>,
+    /// Numeric state for a slider or a stepper; absent for other roles.
     pub range: Option<RangeValue>,
     /// Whether a text field accepts multiple lines.
     pub multiline: bool,
@@ -184,10 +202,15 @@ impl Node {
             && matches!(
                 (self.role, action),
                 (
-                    Role::Button | Role::Checkbox,
+                    Role::Button
+                        | Role::Checkbox
+                        | Role::Switch
+                        | Role::RadioButton
+                        | Role::Tab
+                        | Role::PopUpButton,
                     Action::Activate | Action::Focus
                 ) | (
-                    Role::Slider,
+                    Role::Slider | Role::Stepper,
                     Action::Focus | Action::Increment | Action::Decrement | Action::SetValue(_)
                 ) | (
                     Role::TextField | Role::PasswordField,
@@ -221,10 +244,23 @@ pub enum Semantics {
     Text { path: Rc<str>, content: TextSource },
     /// A button whose default name comes from its text descendants.
     Button { path: Rc<str> },
-    /// Built-in button or checkbox state. A checked value identifies a checkbox.
-    Control { path: Rc<str>, enabled: bool, checked: Option<bool> },
+    /// A built-in activation control. The control says its own role; a
+    /// checked value, a shown value and an expanded state are published
+    /// for the roles that have them.
+    Control {
+        path: Rc<str>,
+        enabled: bool,
+        checked: Option<bool>,
+        role: Role,
+        value: Option<Arc<str>>,
+        expanded: Option<bool>,
+    },
     /// Overrides the name when exactly one semantic element is below it.
     Label(TextSource),
+    /// A row of words and one control: the words become the control's
+    /// name and are not heard a second time as a text. A row whose
+    /// control is several elements keeps the words as a text before them.
+    Labeled,
     /// Excludes decorative descendants from assistive technology.
     Hidden,
 }
@@ -233,6 +269,7 @@ pub enum Semantics {
 pub(crate) struct Placed {
     pub enabled: bool,
     pub checked: Option<bool>,
+    pub expanded: Option<bool>,
     pub range: Option<RangeValue>,
     pub path: Rc<str>,
     pub role: Role,
@@ -260,10 +297,21 @@ impl Semantics {
                     node.label = label.get();
                 }
             }
+            Self::Labeled => {
+                if let [words, control] = &nodes[start..]
+                    && words.role == Role::Text
+                    && control.role != Role::Text
+                {
+                    let name = Arc::clone(&words.label);
+                    nodes[start + 1].label = name;
+                    nodes.remove(start);
+                }
+            }
             Self::Text { path, content } => {
                 nodes.push(Placed {
                     enabled: true,
                     checked: None,
+                    expanded: None,
                     range: None,
                     path: Rc::clone(path),
                     role: Role::Text,
@@ -275,9 +323,11 @@ impl Semantics {
                 });
             }
             Self::Button { path } | Self::Control { path, .. } => {
-                let (enabled, checked) = match self {
-                    Self::Control { enabled, checked, .. } => (*enabled, *checked),
-                    _ => (true, None),
+                let (enabled, checked, role, value, expanded) = match self {
+                    Self::Control { enabled, checked, role, value, expanded, .. } => {
+                        (*enabled, *checked, *role, value.clone(), *expanded)
+                    }
+                    _ => (true, None, Role::Button, None, None),
                 };
                 let label = match &nodes[start..] {
                     [only] => Arc::clone(&only.label),
@@ -294,11 +344,12 @@ impl Semantics {
                     nodes.push(Placed {
                         enabled,
                         checked,
+                        expanded,
                         range: None,
                         path: Rc::clone(path),
-                        role: if checked.is_some() { Role::Checkbox } else { Role::Button },
+                        role,
                         label,
-                        value: None,
+                        value,
                         bounds,
                         surface: surface.clone(),
                         multiline: false,
@@ -353,6 +404,7 @@ impl State {
                 Some(Node {
                     enabled: placed.enabled,
                     checked: placed.checked,
+                    expanded: placed.expanded,
                     range: placed.range,
                     id,
                     path: Rc::clone(&placed.path),
@@ -392,4 +444,98 @@ impl Drop for CaptureScope {
 }
 pub(crate) fn capturing() -> bool {
     CAPTURING.with(Cell::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A control over one text: the control takes the text as its name
+    /// and stands alone.
+    fn collected(control: Semantics) -> Placed {
+        let mut nodes = Vec::new();
+        Semantics::Text { path: Rc::from("page/label"), content: TextSource::Fixed(Arc::from("Wi-Fi")) }
+            .collect(0, None, &None, &mut nodes);
+        control.collect(0, None, &None, &mut nodes);
+        assert_eq!(nodes.len(), 1, "the control replaced its label");
+        nodes.remove(0)
+    }
+
+    fn control(role: Role, checked: Option<bool>) -> Semantics {
+        Semantics::Control { path: Rc::from("page"), enabled: true, checked, role, value: None, expanded: None }
+    }
+
+    /// The role is the one the control says. It was once guessed from a
+    /// checked value, which made every two-state control a checkbox.
+    #[test]
+    fn a_control_has_the_role_it_says() {
+        for (role, checked) in [
+            (Role::Button, None),
+            (Role::Checkbox, Some(true)),
+            (Role::Switch, Some(false)),
+            (Role::RadioButton, Some(true)),
+            (Role::Tab, Some(false)),
+            (Role::PopUpButton, None),
+        ] {
+            let placed = collected(control(role, checked));
+            assert_eq!(placed.role, role);
+            assert_eq!(placed.checked, checked, "{role:?}");
+            assert_eq!(&*placed.label, "Wi-Fi", "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_pop_up_button_publishes_its_choice_and_whether_it_is_open() {
+        let placed = collected(Semantics::Control {
+            path: Rc::from("page"),
+            enabled: true,
+            checked: None,
+            role: Role::PopUpButton,
+            value: Some(Arc::from("Dark")),
+            expanded: Some(true),
+        });
+        assert_eq!(placed.value.as_deref(), Some("Dark"));
+        assert_eq!(placed.expanded, Some(true));
+        // a plain button publishes neither
+        let button = collected(Semantics::Button { path: Rc::from("page") });
+        assert_eq!((button.role, button.value, button.expanded), (Role::Button, None, None));
+    }
+
+    fn node(role: Role, enabled: bool) -> Node {
+        Node {
+            id: NodeId(1),
+            role,
+            label: Arc::from(""),
+            value: None,
+            bounds: Rect::default(),
+            surface: None,
+            focused: false,
+            enabled,
+            checked: None,
+            expanded: None,
+            range: None,
+            multiline: false,
+            path: Rc::from("page"),
+        }
+    }
+
+    #[test]
+    fn each_role_supports_the_actions_of_its_kind() {
+        let press = [Role::Button, Role::Checkbox, Role::Switch, Role::RadioButton, Role::Tab, Role::PopUpButton];
+        for role in press {
+            let node = node(role, true);
+            assert!(node.supports(&Action::Activate) && node.supports(&Action::Focus), "{role:?}");
+            assert!(!node.supports(&Action::Increment) && !node.supports(&Action::SetText(String::new())), "{role:?}");
+        }
+        for role in [Role::Slider, Role::Stepper] {
+            let node = node(role, true);
+            assert!(node.supports(&Action::Increment) && node.supports(&Action::Decrement), "{role:?}");
+            assert!(node.supports(&Action::SetValue(1.0)) && node.supports(&Action::Focus), "{role:?}");
+            assert!(!node.supports(&Action::Activate), "{role:?}");
+        }
+        for role in press.into_iter().chain([Role::Slider, Role::Stepper, Role::TextField]) {
+            assert!(!node(role, false).supports(&Action::Focus), "a disabled {role:?} supports nothing");
+        }
+        assert!(!node(Role::Text, true).supports(&Action::Focus));
+    }
 }

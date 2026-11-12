@@ -51,6 +51,27 @@ Its label and current value remain visible to assistive technology, with
 `enabled = false`. Changing the application's binding updates both rendering
 and the checkbox's native value.
 
+A toggle is a checkbox drawn as a switch: one Tab stop, Space flips it, and
+Enter is left to the form around it.
+
+### Controls that travel as a group
+
+Some controls are several targets and one Tab stop. A segmented control is the
+first: `segmented(mode.binding(), [(Mode::List, "List"), (Mode::Grid, "Grid")])`.
+
+| Key | Inside a group |
+| --- | --- |
+| Tab, Shift+Tab | Leaves the group whole. Arriving, it lands on the selected member, or on the first when none is selected. |
+| Left, Right | Moves by one member. The two swap in a right-to-left scene. |
+| Up, Down | Moves by one member in a group of one row or one column; moves by one row in a grid. |
+| Home, End | Jumps to the first or the last member. |
+| Space, Enter | Selects the member that has the keyboard. |
+
+A group of one row or one column goes round at its ends. A grid stops at its
+edges. In a segmented control the member the arrows reach is selected as they
+reach it, as in a set of radio buttons. A key that has nowhere to go is not
+handled, so the app's own bindings can take it.
+
 These contracts have runtime and native protocol regression tests. They do not
 establish human screen-reader or operating-system keyboard qualification.
 

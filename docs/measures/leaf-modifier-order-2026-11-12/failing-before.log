@@ -1,0 +1,189 @@
+   Compiling bunny-ui-core v0.5.0 (/Users/deco/Code/bunnylab/worktrees/bunny_ui-next/crates/bunny_ui)
+warning: function `field_unreached` is never used
+  --> crates/bunny_ui/src/diagnostics.rs:67:15
+   |
+67 | pub(crate) fn field_unreached() {
+   |               ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `field_report` is never used
+  --> crates/bunny_ui/src/diagnostics.rs:74:15
+   |
+74 | pub(crate) fn field_report(site: crate::provenance::Site, modifier: &'static str) {
+   |               ^^^^^^^^^^^^
+
+warning: function `field_forget` is never used
+  --> crates/bunny_ui/src/diagnostics.rs:82:15
+   |
+82 | pub(crate) fn field_forget() {
+   |               ^^^^^^^^^^^^
+
+warning: field `fields_warned` is never read
+   --> crates/bunny_ui/src/diagnostics.rs:125:9
+    |
+119 |     struct State {
+    |            ----- field in this struct
+...
+125 |         fields_warned: HashSet<Site>,
+    |         ^^^^^^^^^^^^^
+
+warning: function `field_unreached` is never used
+   --> crates/bunny_ui/src/diagnostics.rs:206:19
+    |
+206 |     pub(super) fn field_unreached() {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `field_forget` is never used
+   --> crates/bunny_ui/src/diagnostics.rs:209:19
+    |
+209 |     pub(super) fn field_forget() {
+    |                   ^^^^^^^^^^^^
+
+warning: function `field_report` is never used
+   --> crates/bunny_ui/src/diagnostics.rs:212:19
+    |
+212 |     pub(super) fn field_report(site: crate::provenance::Site, modifier: &'static str) {
+    |                   ^^^^^^^^^^^^
+
+warning: `bunny-ui-core` (lib) generated 7 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.40s
+     Running tests/leaf_modifier_order.rs (target/debug/deps/leaf_modifier_order-e5906308f839575f)
+
+running 18 tests
+test a_field_beat_written_after_a_drag_region_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_a_tooltip_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_a_context_menu_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_a_hover_group_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_ignores_safe_area_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_a_frame_takes_the_keyboard ... ok
+test a_field_beat_written_after_a_drop_target_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_hug_height_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_exact_layout_takes_the_keyboard ... FAILED
+test a_field_ask_that_reaches_no_field_says_so ... FAILED
+test a_highlight_written_after_a_frame_paints_the_same_commands ... FAILED
+test a_field_beat_written_after_on_measure_takes_the_keyboard ... FAILED
+test a_field_beat_written_after_padding_takes_the_keyboard ... ok
+test a_truncation_written_after_a_frame_truncates ... FAILED
+test a_truncation_written_after_padding_truncates ... FAILED
+test recording_sites_keeps_a_text_modifier ... FAILED
+test recording_sites_keeps_a_field_modifier ... FAILED
+test a_hugging_scroll_follows_its_target ... FAILED
+
+failures:
+
+---- a_field_beat_written_after_a_drag_region_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_a_drag_region_takes_the_keyboard' (15527510) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_a_tooltip_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_a_tooltip_takes_the_keyboard' (15527514) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_a_context_menu_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_a_context_menu_takes_the_keyboard' (15527509) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_field_beat_written_after_a_hover_group_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_a_hover_group_takes_the_keyboard' (15527513) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_ignores_safe_area_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_ignores_safe_area_takes_the_keyboard' (15527517) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_a_drop_target_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_a_drop_target_takes_the_keyboard' (15527511) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_hug_height_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_hug_height_takes_the_keyboard' (15527516) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_beat_written_after_exact_layout_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_exact_layout_takes_the_keyboard' (15527515) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_field_ask_that_reaches_no_field_says_so stdout ----
+
+thread 'a_field_ask_that_reaches_no_field_says_so' (15527508) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:227:5:
+assertion `left == right` failed: once for the line, however many passes run
+  left: 0
+ right: 1
+
+---- a_highlight_written_after_a_frame_paints_the_same_commands stdout ----
+
+thread 'a_highlight_written_after_a_frame_paints_the_same_commands' (15527520) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:137:5:
+assertion `left == right` failed
+  left: [TextLine { origin: Point { x: 48.0, y: 0.0 }, content: "needle in hay", range: (0, 13), color: Color { r: 20, g: 20, b: 25, a: 255 }, font: FontSpec { size: 13.0, weight: Regular, design: Default, slant: Upright, family: Family(0), tracking: 0.0 } }]
+ right: [TextLine { origin: Point { x: 48.0, y: 0.0 }, content: "needle in hay", range: (0, 6), color: Color { r: 200, g: 40, b: 40, a: 255 }, font: FontSpec { size: 13.0, weight: Regular, design: Default, slant: Upright, family: Family(0), tracking: 0.0 } }, TextLine { origin: Point { x: 96.0, y: 0.0 }, content: "needle in hay", range: (6, 13), color: Color { r: 20, g: 20, b: 25, a: 255 }, font: FontSpec { size: 13.0, weight: Regular, design: Default, slant: Upright, family: Family(0), tracking: 0.0 } }]
+
+---- a_field_beat_written_after_on_measure_takes_the_keyboard stdout ----
+
+thread 'a_field_beat_written_after_on_measure_takes_the_keyboard' (15527518) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:71:1:
+the beat written after the wrapper must reach the field; the keys are on Some("Scene/#1/[editor]")
+
+---- a_truncation_written_after_a_frame_truncates stdout ----
+
+thread 'a_truncation_written_after_a_frame_truncates' (15527522) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:112:5:
+assertion `left == right` failed: the frame is the same view; the truncation must reach the text
+  left: ["a label ", "that is far ", "too long ", "for the box ", "it was ", "given"]
+ right: ["a label th…"]
+
+---- a_truncation_written_after_padding_truncates stdout ----
+
+thread 'a_truncation_written_after_padding_truncates' (15527523) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:129:5:
+assertion `left == right` failed
+  left: ["a label ", "that is far ", "too long ", "for the box ", "it was ", "given"]
+ right: ["a label th…"]
+
+---- recording_sites_keeps_a_text_modifier stdout ----
+
+thread 'recording_sites_keeps_a_text_modifier' (15527525) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:148:5:
+assertion `left == right` failed: a source site is the same view; recording must not drop the truncation
+  left: ["a label ", "that is far ", "too long ", "for the box ", "it was ", "given"]
+ right: ["a label th…"]
+
+---- recording_sites_keeps_a_field_modifier stdout ----
+
+thread 'recording_sites_keeps_a_field_modifier' (15527524) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:188:5:
+a recorded field must still answer its beat
+
+---- a_hugging_scroll_follows_its_target stdout ----
+
+thread 'a_hugging_scroll_follows_its_target' (15527521) panicked at crates/bunny_ui/tests/leaf_modifier_order.rs:247:5:
+assertion `left == right` failed: a region that hugs its content is the same region; it must follow its target
+  left: 0.0
+ right: 520.0
+
+
+failures:
+    a_field_ask_that_reaches_no_field_says_so
+    a_field_beat_written_after_a_context_menu_takes_the_keyboard
+    a_field_beat_written_after_a_drag_region_takes_the_keyboard
+    a_field_beat_written_after_a_drop_target_takes_the_keyboard
+    a_field_beat_written_after_a_hover_group_takes_the_keyboard
+    a_field_beat_written_after_a_tooltip_takes_the_keyboard
+    a_field_beat_written_after_exact_layout_takes_the_keyboard
+    a_field_beat_written_after_hug_height_takes_the_keyboard
+    a_field_beat_written_after_ignores_safe_area_takes_the_keyboard
+    a_field_beat_written_after_on_measure_takes_the_keyboard
+    a_highlight_written_after_a_frame_paints_the_same_commands
+    a_hugging_scroll_follows_its_target
+    a_truncation_written_after_a_frame_truncates
+    a_truncation_written_after_padding_truncates
+    recording_sites_keeps_a_field_modifier
+    recording_sites_keeps_a_text_modifier
+
+test result: FAILED. 2 passed; 16 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p bunny-ui-core --test leaf_modifier_order`

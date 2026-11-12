@@ -150,6 +150,13 @@ pub trait CustomElement: 'static {
         None
     }
 
+    /// The role a box with [`CustomElement::accessibility_range`] has for
+    /// assistive technology: a slider, unless the box says it is another
+    /// bounded numeric control.
+    fn accessibility_role(&self) -> crate::accessibility::Role {
+        crate::accessibility::Role::Slider
+    }
+
     /// Applies a supported numeric action to the same binding used by input.
     /// The runtime checks exposure and enabled state before calling this hook;
     /// the element must still validate the requested value against its domain.

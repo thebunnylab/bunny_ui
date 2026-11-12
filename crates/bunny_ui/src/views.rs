@@ -34,6 +34,8 @@ pub use crate::line_chart::{
 };
 #[cfg(feature = "canvas")]
 pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
+#[cfg(feature = "canvas")]
+pub use crate::stepper::{StepValue, Stepper, stepper};
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -293,6 +295,13 @@ pub struct Button<L, F> {
     action: F,
     disabled: bool,
     checked: Option<bool>,
+    /// What the control is: the keys that activate it and the role
+    /// assistive technology hears follow from it.
+    kind: crate::layout::ControlKind,
+    /// The choice a pop-up button shows, for assistive technology.
+    value: Option<Arc<str>>,
+    /// Whether the list of a pop-up button is open.
+    expanded: Option<bool>,
     chrome: ButtonChrome,
     site: crate::provenance::Site,
 }
@@ -317,11 +326,11 @@ where
     F: Fn() + Clone + 'static,
 {
     /// The node itself, before its site is sealed over it.
-    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
+    pub(crate) fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut label = NodeList::new();
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
-        out.push(RenderNode::branch(crate::view::print_label(if self.checked.is_some() { "Checkbox" } else { "Button" }), prints));
+        out.push(RenderNode::branch(crate::view::print_label(self.kind.print_name()), prints));
 
         // inside a pass, the button is an interaction target: the frame joins
         // the hit-test under the identity path, and the action stays registered
@@ -341,7 +350,12 @@ where
         let semantics = crate::accessibility::capturing().then_some(target.as_ref())
             .flatten().map(|path| Rc::new(
             crate::accessibility::Semantics::Control {
-                path: Rc::clone(path), enabled: !self.disabled, checked: self.checked,
+                path: Rc::clone(path),
+                enabled: !self.disabled,
+                checked: self.checked,
+                role: self.kind.role(),
+                value: self.value.clone(),
+                expanded: self.expanded,
             }
         ));
         let content = wrap_layout(layouts);
@@ -368,7 +382,11 @@ where
             hints: crate::layout::ElementHints {
                 semantics,
                 address: Some(crate::layout::Address::shared(crate::layout::Address {
-                    control: Some(crate::layout::ControlState { enabled: !self.disabled, checked: self.checked }),
+                    control: Some(crate::layout::ControlState {
+                        enabled: !self.disabled,
+                        checked: self.checked,
+                        kind: self.kind,
+                    }),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -410,6 +428,10 @@ where
     #[must_use]
     pub const fn checked(mut self, checked: bool) -> Self {
         self.checked = Some(checked);
+        // a button that publishes a checked value is a two-state control
+        if matches!(self.kind, crate::layout::ControlKind::Button) {
+            self.kind = crate::layout::ControlKind::Checkbox;
+        }
         self
     }
 
@@ -424,7 +446,53 @@ where
     L: View,
     F: Fn() + Clone + 'static,
 {
-    Button { label, action, disabled: false, checked: None, chrome: ButtonChrome::Standard, site: crate::provenance::here() }
+    Button {
+        label,
+        action,
+        disabled: false,
+        checked: None,
+        kind: crate::layout::ControlKind::Button,
+        value: None,
+        expanded: None,
+        chrome: ButtonChrome::Standard,
+        site: crate::provenance::here(),
+    }
+}
+
+/// What a built-in control asks of the button it is made of.
+pub(crate) struct ControlSpec {
+    pub kind: crate::layout::ControlKind,
+    /// The value a two-state control publishes; `None` for a press.
+    pub checked: Option<bool>,
+    pub disabled: bool,
+    /// The label draws everything: no padding and no chrome are added.
+    pub plain: bool,
+    pub site: crate::provenance::Site,
+    /// The choice a pop-up button shows, and whether its list is open.
+    pub shows: Option<(Arc<str>, bool)>,
+}
+
+/// The one place a built-in activation control is made. A switch, a
+/// segment, a tab and a row of a list of choices are each a label over
+/// this: the target, the focus stop, the keys, the disabled state and
+/// the semantics are the button's own, written once.
+pub(crate) fn control<L, F>(label: L, action: F, spec: ControlSpec) -> Button<L, F>
+where
+    L: View,
+    F: Fn() + Clone + 'static,
+{
+    let (value, expanded) = spec.shows.map_or((None, None), |(value, open)| (Some(value), Some(open)));
+    Button {
+        label,
+        action,
+        disabled: spec.disabled,
+        checked: spec.checked,
+        kind: spec.kind,
+        value,
+        expanded,
+        chrome: if spec.plain { ButtonChrome::Plain } else { ButtonChrome::Standard },
+        site: spec.site,
+    }
 }
 
 /// A labelled two-state control backed by the application's boolean binding.
@@ -460,6 +528,9 @@ impl<L: View + Clone> View for Checkbox<L> {
             action: move || value.set(!value.wrappedValue()),
             disabled: self.disabled,
             checked: Some(checked),
+            kind: crate::layout::ControlKind::Checkbox,
+            value: None,
+            expanded: None,
             chrome: ButtonChrome::Standard,
             site: self.site,
         }
@@ -498,10 +569,49 @@ pub struct TextField {
     paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     focus: Option<Rc<dyn Fn(bool)>>,
     keyboard: crate::text_input::KeyboardType,
+    /// The beat that summons the field ([`TextField::focus_on`]).
+    summon: Option<crate::beat::Summon>,
     autocomplete: Option<crate::text_input::Autocomplete>,
 }
 
 impl TextField {
+    /// The field takes the keyboard each time `beat` rings, from whoever
+    /// holds it, and gives it back to that holder when the field leaves
+    /// the scene still holding it.
+    ///
+    /// ```ignore
+    /// text_field("Filter", self.filter.binding()).focus_on(self.summon)
+    /// ```
+    ///
+    /// A ring is answered once, and the [`Beat`](crate::beat::Beat) keeps
+    /// how far it was answered. A field that leaves the scene and comes
+    /// back does not answer the same ring again — the rule a find bar in
+    /// a tab needs. [`ViewExt::auto_focus_beat`] with a number is the
+    /// other rule: the field forgets the number when it leaves, which is
+    /// right for a popup whose field is made new on each opening.
+    ///
+    /// Write it on the field, before the modifiers. It is a method of the
+    /// field and not a modifier, so a place where it would be lost does
+    /// not compile.
+    ///
+    /// [`ViewExt::auto_focus_beat`]: crate::ext::ViewExt::auto_focus_beat
+    pub fn focus_on(mut self, beat: crate::beat::Beat) -> Self {
+        self.summon = Some(crate::beat::Summon { beat, select: false });
+        self
+    }
+
+    /// [`TextField::focus_on`], and each ring also selects the field's
+    /// whole text, so the next keys REPLACE what it holds — whether the
+    /// ring moved the keyboard to the field or found it there.
+    ///
+    /// ```ignore
+    /// text_field("Find", self.query.binding()).select_on(self.find)
+    /// ```
+    pub fn select_on(mut self, beat: crate::beat::Beat) -> Self {
+        self.summon = Some(crate::beat::Summon { beat, select: true });
+        self
+    }
+
     /// Decorate native editing with a retained policy (for example modal editing).
     pub fn editing_strategy(
         mut self,
@@ -732,6 +842,7 @@ impl TextField {
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     crate::reconciler::EditorFn {
+                    answered: self.summon.map(|summon| summon.beat.answered()),
                     submit_on_enter: self.submit_on_enter,
                     yields_on_submit: self.yields_on_submit,
                     nav_intercept: self.nav_intercept.clone(),
@@ -885,7 +996,13 @@ impl TextField {
                     content: value,
                     placeholder: self.placeholder.clone(),
                     multiline: self.multiline,
-                    auto_focus: crate::layout::AutoFocus::Off,
+                    // the read is recorded: a ring runs this body again.
+                    // A beat that never rang summons nobody
+                    auto_focus: match self.summon.map(|summon| (summon.beat.rung(), summon.select)) {
+                        None | Some((0, _)) => crate::layout::AutoFocus::Off,
+                        Some((rung, false)) => crate::layout::AutoFocus::Beat(rung),
+                        Some((rung, true)) => crate::layout::AutoFocus::Selecting(rung),
+                    },
                     secret: self.secret,
                     autocomplete: self.autocomplete,
                     // a chain writes this too (`.accessibility_label`)
@@ -1182,6 +1299,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        summon: None,
         autocomplete: None,
     }
 }
@@ -1214,6 +1332,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        summon: None,
         autocomplete: None,
     }
 }

@@ -282,6 +282,20 @@ pub enum NodeKind {
     Grid,
     /// `ellipse()`.
     Ellipse,
+    /// `toggle(…)`.
+    Toggle,
+    /// `segmented(…)`.
+    Segmented,
+    /// `tabs(…)`.
+    Tabs,
+    /// `tab_view(…)`.
+    TabView,
+    /// `picker(…)`.
+    Picker,
+    /// `form(…)` / `form!`.
+    Form,
+    /// `labeled(…)`.
+    Labeled,
 }
 
 impl NodeKind {
@@ -307,6 +321,13 @@ impl NodeKind {
             Self::List => "list",
             Self::VirtualList => "virtual_list",
             Self::Modifier => "modifier",
+            Self::Toggle => "toggle",
+            Self::Segmented => "segmented",
+            Self::Tabs => "tabs",
+            Self::TabView => "tab_view",
+            Self::Picker => "picker",
+            Self::Form => "form",
+            Self::Labeled => "labeled",
         }
     }
 }
@@ -352,6 +373,76 @@ pub fn set_recording(on: bool) {
     RECORDING.with(|recording| recording.set(on));
 }
 
+thread_local! {
+    /// Whether sites were recorded outside the quiet scope under way.
+    static OUTSIDE_QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores the recording a quiet or a written scope changed.
+struct RecordingScope {
+    recording: bool,
+    outside: bool,
+}
+
+impl Drop for RecordingScope {
+    fn drop(&mut self) {
+        RECORDING.with(|recording| recording.set(self.recording));
+        OUTSIDE_QUIET.with(|outside| outside.set(self.outside));
+    }
+}
+
+/// Runs `render` with site recording off.
+///
+/// A built-in control is composed of ordinary views — a stack, a spacer,
+/// a painted box — and those are written in THIS crate. A tool that maps
+/// frames to source lines must not show one of those lines as if the app
+/// had written it. The control renders its inside in a quiet scope, and
+/// then seals its own site, the app's line, over the whole.
+///
+/// The views the app handed to the control (its label) are the app's own:
+/// they go inside [`Written`], which records them again.
+pub(crate) fn quiet<R>(render: impl FnOnce() -> R) -> R {
+    let was = RECORDING.with(|recording| recording.replace(false));
+    let _scope = RecordingScope { recording: was, outside: OUTSIDE_QUIET.with(|outside| outside.replace(was)) };
+    render()
+}
+
+/// A view the framework composed, rendered in a [`quiet`] scope wherever
+/// it renders — also when a body inside a control runs again alone,
+/// after the control's own render has ended.
+#[derive(Clone)]
+pub(crate) struct Quiet<V>(pub V);
+
+impl<V: crate::view::View> crate::view::View for Quiet<V> {
+    type Arity = V::Arity;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        quiet(|| self.0.render_into(ctx, out));
+    }
+}
+
+/// A view the APP wrote, standing inside a control the framework
+/// composes: its sites are recorded as they were outside the control's
+/// [`quiet`] scope.
+#[derive(Clone)]
+pub(crate) struct Written<V>(pub V);
+
+impl<V: crate::view::View> crate::view::View for Written<V> {
+    type Arity = V::Arity;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        written(|| self.0.render_into(ctx, out));
+    }
+}
+
+/// Runs `render` with sites recorded as they were outside the [`quiet`]
+/// scope under way: what it renders is the app's own.
+pub(crate) fn written<R>(render: impl FnOnce() -> R) -> R {
+    let outside = OUTSIDE_QUIET.with(Cell::get);
+    let _scope = RecordingScope { recording: RECORDING.with(|recording| recording.replace(outside)), outside };
+    render()
+}
+
 /// The site of whoever called the `#[track_caller]` function that called
 /// this — a builder's or a modifier's own caller.
 #[track_caller]
@@ -377,6 +468,8 @@ pub(crate) fn seal(ctx: &Context, out: &mut NodeList, mark: usize, site: Site, k
                 Override::Hide => crate::modifier::apply(&Modifier::Hidden, ctx, ctx, out, mark),
             }
         }
+        // an override is a tool's own ask: no line of the app wrote it
+        crate::diagnostics::field_forget();
     }
     if !recording() {
         return;

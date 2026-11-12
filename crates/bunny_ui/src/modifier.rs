@@ -579,428 +579,45 @@ impl Modifier {
     }
 }
 
-/// Merge rule for the visual modifiers: styles stacked on the SAME view
-/// fuse into a single `Styled` — on a conflicting field, the modifier
-/// NEAREST the view wins; distinct fields accumulate
-/// (`.background_color(a).corner_radius(r)` = ONE node, and the radius
-/// rounds THIS background). Veil over veil on the same view does not compose
-/// — layers belong to `zstack`. The merge only happens with a literal
-/// `Styled` on top: `.background_color(a).padding().background_color(b)`
-/// truly nests (different geometries, both paint).
-/// Rewrites the TEXT node under the `Styled` chain (if any) — the
-/// `.highlight()`/`.truncationMode()` path, immune to the order of the
-/// visual modifiers in the chain.
-/// Descends through wrappers to the `Scroll` node and rewrites it —
-/// modifier order stays irrelevant (`.scroll_target()` works before or
-/// after visual modifiers). Without a scroll region it is a no-op.
-fn rewrite_scroll_node(
-    node: LayoutNode,
-    rewrite: &impl Fn(
-        Option<String>,
-        crate::layout::ScrollAxes,
-        bool,
-        crate::layout::ScrollIndicators,
-        Option<crate::layout::Point>,
-        Box<LayoutNode>,
-    ) -> LayoutNode,
-) -> LayoutNode {
-    match node {
-        LayoutNode::Spanned {
-            columns,
-            rows,
-            child,
-        } => LayoutNode::Spanned {
-            columns,
-            rows,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Placed { at, child } => LayoutNode::Placed {
-            at,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
-            semantics, child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        // a node that wears hints or an action stood behind their
-        // wrapper, which no rewrite crosses: it is left as it was left
-        marked if !marked.is_bare() => marked,
-        LayoutNode::Scroll { path, axes, fill, indicators, commanded, child, .. } => {
-            rewrite(path, axes, fill, indicators, commanded, child)
+/// Walks down the wrappers of ONE view to its leaf and lets `rewrite`
+/// change that leaf where it stands. It answers whether a leaf took the
+/// change.
+///
+/// This is what makes the order of a leaf modifier and a wrapper not
+/// matter: `.hug_height().auto_focus()` and `.auto_focus().hug_height()`
+/// reach the same field. Which nodes are wrappers of the same view is
+/// decided in one place, [`LayoutNode::seen_through_mut`], for every
+/// leaf modifier at once. A field, a text, a scroll region and a picture
+/// do not each keep a list of their own.
+///
+/// `rewrite` matches the leaf it is for and answers `false` for any
+/// other node, so a leaf modifier on a view with no such leaf does
+/// nothing, on purpose (`.truncation_mode(…)` outside a text). A node
+/// that carries hints or an action is a target of its own and is left as
+/// it is ([`LayoutNode::is_bare`]).
+///
+/// Nothing is boxed again on the way down and nothing moves: the walk
+/// costs one pointer step for each wrapper.
+fn rewrite_leaf(node: &mut LayoutNode, rewrite: &mut dyn FnMut(&mut LayoutNode) -> bool) -> bool {
+    if let Some(child) = node.seen_through_mut() {
+        return rewrite_leaf(child, rewrite);
+    }
+    node.is_bare() && rewrite(node)
+}
+
+/// A field modifier: writes `ask` on the field under the view. When the
+/// view holds no field the ask is lost, and a debug build says so once
+/// for the line that wrote it ([`crate::diagnostics`]).
+fn ask_field(out: &mut NodeList, mark: usize, ask: crate::layout::AutoFocus) {
+    let reached = rewrite_leaf(out.base_from(mark), &mut |node| match node {
+        LayoutNode::Field { auto_focus, .. } => {
+            *auto_focus = ask;
+            true
         }
-        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
-            props,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-            hints,
-            action,
-        },
-        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
-            key,
-            spec,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Island { path, child } => LayoutNode::Island {
-            path,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Live { spec, child } => LayoutNode::Live {
-            spec,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        // the base is what a rewrite looks for; the LAYER is a separate
-        // view and must never be descended into
-        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
-            at,
-            behind,
-            layer,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
-            edges,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
-            width,
-            height,
-            align,
-            vertical,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
-            max_width,
-            max_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
-            min_width,
-            min_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_scroll_node(*child, rewrite)),
-        },
-        other => other,
-    }
-}
-
-/// Descends through wrappers to the `Field` node and rewrites it —
-/// same order-immunity as the text and scroll rewrites.
-/// Everything a `Field` node carries. A modifier changes ONE of these
-/// and hands the rest back untouched — the shape that keeps
-/// `.auto_focus()` from erasing a `.highlight()` written before it.
-struct FieldParts {
-    path: String,
-    content: std::sync::Arc<str>,
-    placeholder: std::sync::Arc<str>,
-    multiline: bool,
-    auto_focus: crate::layout::AutoFocus,
-    bare: bool,
-    inset: Option<Rc<crate::layout::Edges>>,
-    highlights: Option<Rc<TextMarks>>,
-    secret: bool,
-    autocomplete: Option<crate::text_input::Autocomplete>,
-    label: Option<std::sync::Arc<str>>,
-}
-
-impl FieldParts {
-    fn into_node(self) -> LayoutNode {
-        LayoutNode::Field {
-            path: self.path,
-            content: self.content,
-            placeholder: self.placeholder,
-            multiline: self.multiline,
-            auto_focus: self.auto_focus,
-            bare: self.bare,
-            inset: self.inset,
-            highlights: self.highlights,
-            secret: self.secret,
-            autocomplete: self.autocomplete,
-            label: self.label,
-        }
-    }
-}
-
-fn rewrite_field_node(
-    node: LayoutNode,
-    rewrite: &impl Fn(FieldParts) -> LayoutNode,
-) -> LayoutNode {
-    match node {
-        LayoutNode::Spanned {
-            columns,
-            rows,
-            child,
-        } => LayoutNode::Spanned {
-            columns,
-            rows,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Placed { at, child } => LayoutNode::Placed {
-            at,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
-            semantics, child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        // a node that wears hints or an action stood behind their
-        // wrapper, which no rewrite crosses: it is left as it was left
-        marked if !marked.is_bare() => marked,
-        LayoutNode::Field {
-            path,
-            content,
-            placeholder,
-            multiline,
-            auto_focus,
-            bare,
-            inset,
-            highlights,
-            secret,
-            autocomplete,
-            label,
-        } => rewrite(FieldParts {
-            path,
-            content,
-            placeholder,
-            multiline,
-            auto_focus,
-            bare,
-            inset,
-            highlights,
-            secret,
-            autocomplete,
-            label,
-        }),
-        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
-            props,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-            hints,
-            action,
-        },
-        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
-            key,
-            spec,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Island { path, child } => LayoutNode::Island {
-            path,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Live { spec, child } => LayoutNode::Live {
-            spec,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        // the base is what a rewrite looks for; the LAYER is a separate
-        // view and must never be descended into
-        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
-            at,
-            behind,
-            layer,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
-            edges,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
-            width,
-            height,
-            align,
-            vertical,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
-            max_width,
-            max_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
-            min_width,
-            min_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_field_node(*child, rewrite)),
-        },
-        other => other,
-    }
-}
-
-/// Descends through wrappers to the pixel leaf — an `Image` or an
-/// `Icon` — and rewrites it: `.resizable()`/`.aspect_ratio()` work
-/// before or after the visual modifiers; on anything else they are
-/// no-ops on purpose (SwiftUI parity, like truncationMode outside
-/// text). Two closures because the two leaves carry different state.
-fn rewrite_pixel_node(
-    node: LayoutNode,
-    rewrite: &impl Fn(
-        Option<crate::image_engine::ImageSource>,
-        bool,
-        Option<ContentMode>,
-    ) -> LayoutNode,
-    icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
-) -> LayoutNode {
-    match node {
-        // Source sites describe this same view; recording must not turn
-        // a pixel modifier into a no-op or discard its edit provenance.
-        LayoutNode::Sited {
-            site,
-            mounted,
-            reading,
-            kind,
-            modifier,
-            child,
-        } => LayoutNode::Sited {
-            site,
-            mounted,
-            reading,
-            kind,
-            modifier,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Spanned {
-            columns,
-            rows,
-            child,
-        } => LayoutNode::Spanned {
-            columns,
-            rows,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Placed { at, child } => LayoutNode::Placed {
-            at,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
-            semantics, child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        // a node that wears hints or an action stood behind their
-        // wrapper, which no rewrite crosses: it is left as it was left
-        marked if !marked.is_bare() => marked,
-        LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
-        // the closure rebuilds the glyph; its turn rides through untouched
-        LayoutNode::Icon { symbol, resizable, forced, turn } => match icon(symbol, resizable, forced) {
-            LayoutNode::Icon { symbol, resizable, forced, .. } => {
-                LayoutNode::Icon { symbol, resizable, forced, turn }
-            }
-            other => other,
-        },
-        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
-            props,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-            hints,
-            action,
-        },
-        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
-            key,
-            spec,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Island { path, child } => LayoutNode::Island {
-            path,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Live { spec, child } => LayoutNode::Live {
-            spec,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        // the base is what a rewrite looks for; the LAYER is a separate
-        // view and must never be descended into
-        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
-            at,
-            behind,
-            layer,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
-            edges,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
-            width,
-            height,
-            align,
-            vertical,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
-            max_width,
-            max_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
-            min_width,
-            min_height,
-            align,
-            vertical,
-            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
-        },
-        other => other,
-    }
-}
-
-fn rewrite_text_node(
-    node: LayoutNode,
-    rewrite: &impl Fn(
-        crate::bind::TextSource,
-        Option<Rc<TextMarks>>,
-        Option<Truncation>,
-    ) -> LayoutNode,
-) -> LayoutNode {
-    match node {
-        LayoutNode::Spanned {
-            columns,
-            rows,
-            child,
-        } => LayoutNode::Spanned {
-            columns,
-            rows,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        LayoutNode::Placed { at, child } => LayoutNode::Placed {
-            at,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
-            semantics, child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        // a node that wears hints or an action stood behind their
-        // wrapper, which no rewrite crosses: it is left as it was left
-        marked if !marked.is_bare() => marked,
-        LayoutNode::Text { content, highlights, truncation, hints, .. } => {
-            let mut rewritten = rewrite(content, highlights, truncation);
-            if let Some(kept) = rewritten.carried_hints_mut() { kept.semantics = hints.semantics; }
-            rewritten
-        }
-        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
-            props,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-            hints,
-            action,
-        },
-        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
-            key,
-            spec,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        LayoutNode::Island { path, child } => LayoutNode::Island {
-            path,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        LayoutNode::Live { spec, child } => LayoutNode::Live {
-            spec,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        // the base is what a rewrite looks for; the LAYER is a separate
-        // view and must never be descended into
-        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
-            at,
-            behind,
-            layer,
-            child: Box::new(rewrite_text_node(*child, rewrite)),
-        },
-        other => other,
+        _ => false,
+    });
+    if !reached {
+        crate::diagnostics::field_unreached();
     }
 }
 
@@ -1021,6 +638,14 @@ fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
     }
 }
 
+/// Merge rule for the visual modifiers: styles stacked on the SAME view
+/// fuse into a single `Styled` — on a conflicting field, the modifier
+/// NEAREST the view wins; distinct fields accumulate
+/// (`.background_color(a).corner_radius(r)` = ONE node, and the radius
+/// rounds THIS background). Veil over veil on the same view does not compose
+/// — layers belong to `zstack`. The merge only happens with a literal
+/// `Styled` on top: `.background_color(a).padding().background_color(b)`
+/// truly nests (different geometries, both paint).
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
     match out.base_from(mark) {
         // a style that wears hints or an action stood behind their
@@ -1298,6 +923,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Some(replacement) => apply(&replacement, ctx, base_ctx, out, mark),
             None => apply(&self.modifier, ctx, base_ctx, out, mark),
         }
+        crate::diagnostics::field_report(self.site, self.modifier.name());
         crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
     }
 }
@@ -1371,18 +997,19 @@ pub(crate) fn apply(
             // a field keeps its name on its own node: the element lowering
             // has no accessibility tree to ask, and says the name as the
             // input's `aria-label`
-            out.wrap_layout_from(mark, |node| {
-                let node = rewrite_field_node(node, &|parts| {
-                    FieldParts { label: Some(label.get()), ..parts }.into_node()
-                });
-                if !capturing {
-                    return node;
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Field { label: name, .. } => {
+                    *name = Some(label.get());
+                    true
                 }
-                LayoutNode::Accessible {
+                _ => false,
+            });
+            if capturing {
+                out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
                     semantics: crate::accessibility::Semantics::Label(label.clone()),
                     child: Box::new(node),
-                }
-            });
+                });
+            }
         }
         Modifier::AccessibilityHidden if crate::accessibility::capturing() => out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
             semantics: crate::accessibility::Semantics::Hidden,
@@ -1975,48 +1602,40 @@ pub(crate) fn apply(
         // same, and so is the splitter that reads it
         // a highlight replaces the INKS and keeps the rest: a rich
         // paragraph keeps its runs under a finder's match
-        Modifier::Highlight(spans) => out.wrap_layout_from(mark, |node| {
-            let inked = |marks: Option<Rc<TextMarks>>| {
-                let inks = TextMarks::of_inks(spans.iter().copied()).inks;
-                Some(Rc::new(TextMarks { inks, ..marks.as_deref().cloned().unwrap_or_default() }))
-            };
-            let node = rewrite_text_node(node, &|content, highlights, truncation| LayoutNode::Text {
-                content,
-                highlights: inked(highlights),
-                truncation,
-                hints: Default::default(),
-                action: None,
+        Modifier::Highlight(spans) => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Text { highlights, .. } | LayoutNode::Field { highlights, .. } => {
+                    let inks = TextMarks::of_inks(spans.iter().copied()).inks;
+                    let marks = highlights.as_deref().cloned().unwrap_or_default();
+                    *highlights = Some(Rc::new(TextMarks { inks, ..marks }));
+                    true
+                }
+                _ => false,
             });
-            rewrite_field_node(node, &|parts| {
-                let highlights = inked(parts.highlights.clone());
-                FieldParts { highlights, ..parts }.into_node()
-            })
-        }),
+        }
         // the rule the closest modifier names wins, rule by rule: a
         // `.underline()` written on the text stands over one written
         // around it
-        Modifier::TextDecoration(decoration) => out.wrap_layout_from(mark, |node| {
-            rewrite_text_node(node, &|content, highlights, truncation| {
-                let marks = highlights.as_deref().cloned().unwrap_or_default();
-                let decoration = marks.decoration.or(*decoration);
-                LayoutNode::Text {
-                    content,
-                    highlights: Some(Rc::new(TextMarks { decoration, ..marks })),
-                    truncation,
-                    hints: Default::default(),
-                    action: None,
+        Modifier::TextDecoration(decoration) => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Text { highlights, .. } => {
+                    let marks = highlights.as_deref().cloned().unwrap_or_default();
+                    let decoration = marks.decoration.or(*decoration);
+                    *highlights = Some(Rc::new(TextMarks { decoration, ..marks }));
+                    true
                 }
-            })
-        }),
-        Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
-            rewrite_text_node(node, &|content, highlights, _| LayoutNode::Text {
-                content,
-                highlights,
-                truncation: Some(*mode),
-                hints: Default::default(),
-                action: None,
-            })
-        }),
+                _ => false,
+            });
+        }
+        Modifier::TruncationMode(mode) => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Text { truncation, .. } => {
+                    *truncation = Some(*mode);
+                    true
+                }
+                _ => false,
+            });
+        }
         Modifier::OnMeasure(report) => {
             // the probe is addressed by WHERE it sits, with a segment of
             // its own so it can never collide with the identity the
@@ -2031,38 +1650,39 @@ pub(crate) fn apply(
                 child: Box::new(node),
             });
         }
-        Modifier::ScrollTarget(id, anchor) => out.wrap_layout_from(mark, |node| {
-            rewrite_scroll_node(node, &|path, axes, fill, indicators, commanded, child| {
-                LayoutNode::Scroll {
-                    path,
-                    target: Some(crate::layout::ScrollTarget { id: id.clone(), anchor: *anchor }),
-                    axes,
-                    commanded,
-                    fill,
-                    indicators,
-                    child,
+        Modifier::ScrollTarget(id, anchor) => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Scroll { target, .. } => {
+                    *target = Some(crate::layout::ScrollTarget { id: id.clone(), anchor: *anchor });
+                    true
                 }
-            })
-        }),
-        Modifier::Resizable => out.wrap_layout_from(mark, |node| {
-            rewrite_pixel_node(
-                node,
-                &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
-                &|symbol, _, forced| LayoutNode::Icon { symbol, resizable: true, forced, turn: 0.0 },
-            )
-        }),
-        Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
-            rewrite_pixel_node(
-                node,
-                &|source, resizable, _| LayoutNode::Image {
-                    source,
-                    resizable,
-                    fit: Some(*mode),
-                },
+                _ => false,
+            });
+        }
+        // the two below change the pixel leaf — an `Image` or an `Icon` —
+        // before or after the visual modifiers; on anything else they are
+        // no-ops on purpose (SwiftUI parity, like truncationMode outside
+        // text)
+        Modifier::Resizable => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Image { resizable, .. } | LayoutNode::Icon { resizable, .. } => {
+                    *resizable = true;
+                    true
+                }
+                _ => false,
+            });
+        }
+        Modifier::AspectRatio(mode) => {
+            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+                LayoutNode::Image { fit, .. } => {
+                    *fit = Some(*mode);
+                    true
+                }
                 // a glyph is a square — it has its one ratio already
-                &|symbol, resizable, forced| LayoutNode::Icon { symbol, resizable, forced, turn: 0.0 },
-            )
-        }),
+                LayoutNode::Icon { .. } => true,
+                _ => false,
+            });
+        }
         Modifier::Animated(spec) => {
             // the key is captured NOW, at render — the cursor is
             // gone by place time. Sibling views sit in distinct
@@ -2096,28 +1716,10 @@ pub(crate) fn apply(
                 child: Box::new(node),
             });
         }
-        Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
-            rewrite_field_node(node, &|parts| {
-                FieldParts { auto_focus: crate::layout::AutoFocus::First, ..parts }.into_node()
-            })
-        }),
-        Modifier::AutoFocusBeat(beat) => {
-            let beat = *beat;
-            out.wrap_layout_from(mark, move |node| {
-                rewrite_field_node(node, &|parts| {
-                    FieldParts { auto_focus: crate::layout::AutoFocus::Beat(beat), ..parts }
-                        .into_node()
-                })
-            })
-        }
+        Modifier::AutoFocus => ask_field(out, mark, crate::layout::AutoFocus::First),
+        Modifier::AutoFocusBeat(beat) => ask_field(out, mark, crate::layout::AutoFocus::Beat(*beat)),
         Modifier::SelectOnBeat(beat) => {
-            let beat = *beat;
-            out.wrap_layout_from(mark, move |node| {
-                rewrite_field_node(node, &|parts| {
-                    FieldParts { auto_focus: crate::layout::AutoFocus::Selecting(beat), ..parts }
-                        .into_node()
-                })
-            })
+            ask_field(out, mark, crate::layout::AutoFocus::Selecting(*beat));
         }
         Modifier::KeyContext(name) => {
             // declaration, not paint: retained with the entry — the

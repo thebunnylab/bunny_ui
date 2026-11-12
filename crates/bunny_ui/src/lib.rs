@@ -45,9 +45,11 @@ pub mod preview;
 pub mod action;
 pub mod angle;
 pub mod anim;
+pub mod beat;
 pub mod bind;
 mod blur;
 pub mod catalog;
+pub mod choice;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
@@ -57,6 +59,7 @@ pub mod effects;
 pub mod erased;
 pub mod ext;
 pub mod font_file;
+pub mod form;
 pub mod glass;
 pub mod app;
 pub mod window;
@@ -86,6 +89,8 @@ pub use shapes::{BorderStyle, Stripes};
 pub mod runtime;
 #[cfg(feature = "canvas")]
 pub mod slider;
+#[cfg(feature = "canvas")]
+pub mod stepper;
 pub mod ssr;
 pub mod state_ext;
 pub mod stats;
@@ -95,7 +100,10 @@ pub mod text_value;
 pub mod text_input;
 mod field_history;
 mod grapheme;
+pub mod picker;
+pub mod tabs;
 pub mod theme;
+pub mod toggle;
 pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
@@ -167,6 +175,15 @@ macro_rules! zstack {
     };
 }
 
+/// `form!(a, b, c)` — the rows of a form without the tuple's doubled
+/// parentheses; see [`form`](crate::form).
+#[macro_export]
+macro_rules! form {
+    ($($row:expr),* $(,)?) => {
+        $crate::form::form($crate::__bunny_children!($($row),*))
+    };
+}
+
 /// `grid!(a, b, c)` — equal columns, optional per-child spans.
 #[macro_export]
 macro_rules! grid {
@@ -200,10 +217,16 @@ pub mod task {
 }
 
 pub mod prelude {
-    pub use crate::{grid, hstack, text, vstack, zstack};
+    pub use crate::{form, grid, hstack, text, vstack, zstack};
+    pub use crate::form::{Form, Labeled, labeled};
     pub use crate::ext::ViewExt;
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    pub use crate::beat::Beat;
+    pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
+    pub use crate::picker::{Picker, picker};
+    pub use crate::tabs::{TabItem, TabPages, TabView, Tabs, tab, tab_view, tabs};
+    pub use crate::toggle::{Toggle, toggle};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
     // qualified, as the views have a `Table` and the actions a `Key`
     pub use crate::catalog::{self, Catalog, Strings};
