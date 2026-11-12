@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod choice;
 pub mod clipboard;
 pub mod custom;
+pub mod date;
 pub mod dom;
 pub mod diagnostics;
 mod dom_flow;
@@ -225,6 +226,7 @@ pub mod prelude {
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::beat::Beat;
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
+    pub use crate::date::{Date, DateNames, Weekday};
     pub use crate::picker::{Picker, picker};
     pub use crate::search_field::{SearchField, search_field};
     pub use crate::tabs::{TabItem, TabPages, TabView, Tabs, tab, tab_view, tabs};
