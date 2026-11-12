@@ -215,6 +215,7 @@ pub(crate) const GL_TRIANGLES: u32 = 0x0004;
 pub(crate) const GL_SRC_ALPHA: u32 = 0x0302;
 pub(crate) const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
 pub(crate) const GL_ONE: u32 = 1;
+pub(crate) const GL_ZERO: u32 = 0;
 pub(crate) const GL_BLEND: u32 = 0x0BE2;
 pub(crate) const GL_DEPTH_TEST: u32 = 0x0B71;
 pub(crate) const GL_CULL_FACE: u32 = 0x0B44;
@@ -1098,7 +1099,10 @@ pub(crate) fn present_window(
         let mut walked = false;
         for attempt in 0..3 {
             let Tier { ground, atlas, batches, .. } = tier;
-            match build_frame(ground, display, scale, target, text, images, atlas, batches) {
+            // the page is opaque and an island clears to nothing: the one
+            // rule the raster asks answers both
+            let floor = bunny_ui::raster::solid_floor(canvas);
+            match build_frame(ground, display, scale, target, text, images, atlas, batches, floor) {
                 Ok(()) => {
                     walked = true;
                     break;
@@ -1209,7 +1213,10 @@ pub(crate) fn present_window(
                 }
             }
             match run.kind {
-                RunKind::Rects => {
+                // a knockout over a clear ground, which on this tier is
+                // an island over nothing: the rect program, and the erase
+                // blend around its draw below
+                RunKind::Rects | RunKind::Knockout => {
                     if program != tier.pipelines.rect {
                         program = tier.pipelines.rect;
                         unsafe {
@@ -1286,8 +1293,11 @@ pub(crate) fn present_window(
                     let Some(targets) = tier.glass.as_ref() else { continue };
                     // the pyramid is blurred out of the scene AS DRAWN
                     // SO FAR — everything below this pane, and nothing
-                    // above it
-                    build_pyramid(&tier.pipelines, targets, run.levels);
+                    // above it. A batch that shares reads the one the
+                    // pane around it had built
+                    if !run.reuse {
+                        build_pyramid(&tier.pipelines, targets, run.levels);
+                    }
                     program = tier.pipelines.glass;
                     unsafe {
                         // the pyramid re-pointed the shared framebuffer
@@ -1307,7 +1317,21 @@ pub(crate) fn present_window(
                     glass_attribs(run.base as usize * std::mem::size_of::<GlassInstance>());
                 }
             }
+            let erase = run.kind == RunKind::Knockout;
+            if erase {
+                // the target keeps `1 - alpha` of itself, colour and alpha
+                // alike, and nothing is painted
+                unsafe {
+                    gl_blend_func_separate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+                }
+            }
             unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
+            if erase {
+                // the house blend, for every run after it
+                unsafe {
+                    gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                }
+            }
         }
         if let (true, Some(targets)) = (wants_glass, tier.glass.as_ref()) {
             blit_scene(&tier.pipelines, targets, physical);

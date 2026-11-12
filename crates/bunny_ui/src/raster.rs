@@ -41,6 +41,17 @@ pub struct Bitmap {
     /// samples transparency and shows nothing. The host seeds this with the
     /// window under the panel, and the pane reads it instead.
     beneath: Option<Vec<u32>>,
+    /// The scene as it stood when the last pane that captures read it,
+    /// kept only while a pane that shares that capture is still to come
+    /// ([`GlassPaint::shares`]). A GPU tier keeps its blur pyramid for
+    /// this; the raster keeps the pixels the pyramid is built from.
+    captured: Option<Vec<u32>>,
+    /// The ground a knockout returns a shape to. `Some` is a solid
+    /// canvas: the surface is opaque and the canvas is what lies behind
+    /// every paint. `None` is a surface with nothing of its own behind
+    /// its paint — a translucent window, or an island over nothing — and
+    /// a knockout there takes the paint away and leaves it clear.
+    floor: Option<Color>,
     clip: Vec<ClipEntry>,
     /// The stack top, MIRRORED flat: `set` runs per pixel and must not
     /// pay a `Vec` deref there. An empty stack mirrors as the open
@@ -149,6 +160,36 @@ fn corner_reach(corner: Option<(f64, f64)>) -> i64 {
 
 fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
+}
+
+/// `color` multiplied by its own alpha — the ground a translucent
+/// target starts from. `blend_px` reads its destination as
+/// premultiplied, so a ground stored straight would show at full
+/// strength under a paint that expected it faint.
+///
+/// A GPU tier clears a translucent target to this same colour, rounded
+/// by this same rule, so its first pixel and the raster's agree.
+#[must_use]
+pub fn premultiply(color: Color) -> Color {
+    let alpha = color.a as u32;
+    #[expect(clippy::cast_possible_truncation, reason = "a product over 255 is a byte")]
+    let channel = |value: u8| div255(value as u32 * alpha) as u8;
+    Color { r: channel(color.r), g: channel(color.g), b: channel(color.b), a: color.a }
+}
+
+/// The ground a knockout returns a shape to on an OPAQUE target: the
+/// canvas when it is solid, and nothing when it is not — a target cleared
+/// to a canvas that is not solid has nothing of its own behind its paint,
+/// like an island over nothing. The raster and every GPU tier ask this
+/// one question, so they lower [`DrawCommand::Knockout`] alike.
+#[must_use]
+pub fn solid_floor(canvas: Color) -> Option<Color> {
+    (canvas.a == 255).then_some(canvas)
+}
+
+/// [`premultiply`], packed — the word a translucent ground holds.
+fn premultiplied(color: Color) -> u32 {
+    pack(premultiply(color))
 }
 
 #[expect(clippy::cast_possible_truncation, reason = "each field is one byte of the word")]
@@ -286,6 +327,27 @@ impl Bitmap {
             height,
             pixels: vec![pack(background); width * height],
             beneath: None,
+            captured: None,
+            floor: solid_floor(background),
+            clip: Vec::new(),
+            top_cut: OPEN_CUT,
+            top_round: None,
+        }
+    }
+
+    /// A bitmap the SYSTEM composites over what is behind the window.
+    /// The canvas lies on it at its own alpha, premultiplied; every
+    /// paint after it blends as usual and leaves premultiplied pixels,
+    /// the convention a compositor reads. A canvas at alpha 255 gives
+    /// the bitmap [`Bitmap::new`] gives, byte for byte.
+    pub fn translucent(width: usize, height: usize, canvas: Color) -> Self {
+        Bitmap {
+            width,
+            height,
+            pixels: vec![premultiplied(canvas); width * height],
+            beneath: None,
+            captured: None,
+            floor: None,
             clip: Vec::new(),
             top_cut: OPEN_CUT,
             top_round: None,
@@ -411,8 +473,7 @@ impl Bitmap {
     /// Overwrites the rect with `color` — a CLEAR, not a wash: alpha is
     /// written as-is, no blending (clearing with a translucent color
     /// must not accumulate over frames).
-    fn clear_rect(&mut self, rect: DamageRect, color: Color) {
-        let packed = pack(color);
+    fn clear_rect(&mut self, rect: DamageRect, packed: u32) {
         let x0 = rect.0.clamp(0, self.width as i64) as usize;
         let x1 = rect.2.clamp(0, self.width as i64) as usize;
         let y0 = rect.1.clamp(0, self.height as i64) as usize;
@@ -503,8 +564,11 @@ impl Bitmap {
         };
         // The scene the pane bends: this bitmap, or what the host said is
         // under it. A pane over nothing shows nothing, and a panel that
-        // carries only its own commands IS nothing.
-        let source = self.beneath.as_ref().unwrap_or(&self.pixels);
+        // carries only its own commands IS nothing. A pane that shares
+        // bends the scene the pane around it bent: the pixels kept from
+        // that moment (what a host said is under a panel never moved)
+        let kept = if glass.shares { self.captured.as_ref() } else { None };
+        let source = self.beneath.as_ref().or(kept).unwrap_or(&self.pixels);
         let (bx0, by0) = (x0.max(cx0), y0.max(cy0));
         let (bx1, by1) = (x1.min(cx1), y1.min(cy1));
         // What the composite answers depends on the LENS and on the scene
@@ -535,7 +599,17 @@ impl Bitmap {
                 let (color, coverage) = shaded[at];
                 at += 1;
                 if coverage > 0.0 {
-                    self.set_covered(x, y, unpack(color), f64::from(coverage) * opacity);
+                    let color = unpack(color);
+                    if color.a == 255 {
+                        self.set_covered(x, y, color, f64::from(coverage) * opacity);
+                    } else {
+                        // the scene it read was not solid there: the
+                        // answer is a premultiplied pixel with an alpha of
+                        // its own, and it takes the PLACE of what the pane
+                        // covers. Laid over it, the sharp scene would show
+                        // through the pane by what the alpha leaves
+                        self.set_replaced(x, y, color, f64::from(coverage) * opacity);
+                    }
                 }
             }
         }
@@ -648,6 +722,39 @@ impl Bitmap {
         }
     }
 
+    /// One pixel of a pane over a ground that is not solid: `color` is a
+    /// PREMULTIPLIED pixel, and the pixel under it gives way to it by
+    /// `coverage`, colour and alpha alike. With an alpha of 255 this is
+    /// what [`Bitmap::set_covered`] writes, which is why only a pane over
+    /// a clear ground comes here.
+    fn set_replaced(&mut self, x: i64, y: i64, color: Color, coverage: f64) {
+        if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.top_cut;
+        if x < cx0 || y < cy0 || x >= cx1 || y >= cy1 {
+            return;
+        }
+        let mut strength = (255.0 * coverage).round() as u32;
+        if let Some(round) = &self.top_round {
+            let clip = round.coverage(x, y);
+            if clip < 1.0 {
+                strength = (strength as f64 * clip).round() as u32;
+            }
+        }
+        let strength = strength.min(255);
+        if strength == 0 {
+            return;
+        }
+        let keep = 255 - strength;
+        let index = y as usize * self.width + x as usize;
+        let (under, over) = (self.pixels[index], pack(color));
+        let channel = |shift: u32| {
+            div255(((over >> shift) & 0xFF) * strength + ((under >> shift) & 0xFF) * keep)
+        };
+        self.pixels[index] = (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0);
+    }
+
     /// One anti-aliased pixel: `coverage` scales the color's alpha.
     fn set_covered(&mut self, x: i64, y: i64, color: Color, coverage: f64) {
         let alpha = (color.a as f64 * coverage).round() as u32;
@@ -659,6 +766,114 @@ impl Bitmap {
             | ((color.b as u32) << 8)
             | alpha;
         self.set(x, y, packed);
+    }
+
+    /// Before the command at `index` paints: a pane that captures keeps
+    /// the scene as it stands when the next pane shares its capture, and
+    /// lets the kept one go when none does. A pane that shares leaves it
+    /// for the next one. Every other command leaves it alone.
+    fn keep_capture(&mut self, commands: &[DrawCommand], index: usize) {
+        let DrawCommand::Backdrop { glass, .. } = &commands[index] else { return };
+        if glass.shares {
+            return;
+        }
+        let shared_next = commands[index + 1..]
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Backdrop { glass, .. } => Some(glass.shares),
+                _ => None,
+            })
+            .unwrap_or(false);
+        // what a host said is under a panel is the capture already
+        self.captured = (shared_next && self.beneath.is_none()).then(|| self.pixels.clone());
+    }
+
+    /// Returns the shape [`Bitmap::fill_rect`] covers to the ground of
+    /// the surface, by `opacity` — [`DrawCommand::Knockout`].
+    ///
+    /// Over a solid canvas that is the canvas painted at that strength:
+    /// the very fill a GPU tier lowers the command to, byte for byte.
+    /// Over a clear ground it is the pixel scaled toward nothing, colour
+    /// and alpha alike, which is what a premultiplied pixel fading to
+    /// clear is.
+    fn knockout(&mut self, rect: Rect, corner_radius: Corners, opacity: f64) {
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to a byte")]
+        let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if alpha == 0 {
+            return;
+        }
+        match self.floor {
+            Some(canvas) => self.fill_rect(rect, Color { a: alpha, ..canvas }, corner_radius),
+            None => self.erase(rect, corner_radius, alpha),
+        }
+    }
+
+    /// [`Bitmap::fill_rect`]'s shape, taken away instead of painted:
+    /// the same rows, the same corner kernel, the same clip.
+    fn erase(&mut self, rect: Rect, corner_radius: Corners, alpha: u8) {
+        let (x0, y0, x1, y1) = Self::snap(rect);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        if x0 >= cx1 || x1 <= cx0 || y0 >= cy1 || y1 <= cy0 {
+            return;
+        }
+        let radii = corner_radius.clamped((x1 - x0) as f64, (y1 - y0) as f64);
+        for y in y0.max(cy0)..y1.min(cy1) {
+            let left = corner_at(y, y0, y1, radii.top_left, radii.bottom_left);
+            let right = corner_at(y, y0, y1, radii.top_right, radii.bottom_right);
+            let (left_reach, right_reach) = (corner_reach(left), corner_reach(right));
+            for x in (x0 + left_reach).max(cx0)..(x1 - right_reach).min(cx1) {
+                self.take(x, y, alpha as u32);
+            }
+            let py = y as f64 + 0.5;
+            if let Some((radius, center_y)) = left {
+                let center_x = x0 as f64 + radius;
+                for x in x0.max(cx0)..(x0 + left_reach).min(cx1) {
+                    let distance = (x as f64 + 0.5 - center_x).hypot(py - center_y);
+                    let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+                    self.take(x, y, (alpha as f64 * coverage).round() as u32);
+                }
+            }
+            if let Some((radius, center_y)) = right {
+                let center_x = x1 as f64 - radius;
+                for x in (x1 - right_reach).max(cx0)..x1.min(cx1) {
+                    let distance = (x as f64 + 0.5 - center_x).hypot(py - center_y);
+                    let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+                    self.take(x, y, (alpha as f64 * coverage).round() as u32);
+                }
+            }
+        }
+    }
+
+    /// One pixel of a knockout over a clear ground: what is there keeps
+    /// `255 - strength` of itself, colour and alpha alike. The clip's
+    /// curve scales the strength the way [`Bitmap::set`] scales an
+    /// alpha — the two roundings a fill takes, in the same order.
+    fn take(&mut self, x: i64, y: i64, strength: u32) {
+        if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.top_cut;
+        if x < cx0 || y < cy0 || x >= cx1 || y >= cy1 {
+            return;
+        }
+        let mut strength = strength;
+        if let Some(round) = &self.top_round {
+            let coverage = round.coverage(x, y);
+            if coverage < 1.0 {
+                strength = (strength as f64 * coverage).round() as u32;
+            }
+        }
+        if strength == 0 {
+            return;
+        }
+        let keep = 255 - strength.min(255);
+        let index = y as usize * self.width + x as usize;
+        let pixel = self.pixels[index];
+        let channel = |shift: u32| div255(((pixel >> shift) & 0xFF) * keep);
+        self.pixels[index] = (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0);
     }
 
     /// Fill with optional corners: straight rows paint as wide spans;
@@ -1111,6 +1326,7 @@ pub fn list_bounds(
     for command in display.iter() {
         match command {
             DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Knockout { rect, .. }
             | DrawCommand::Gradient { rect, .. }
             | DrawCommand::Backdrop { rect, .. }
             | DrawCommand::Image { rect, .. } => fold(
@@ -1194,6 +1410,7 @@ pub fn range_covers(
         .take(range.1.saturating_sub(range.0))
         .any(|command| match command {
             DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Knockout { rect, .. }
             | DrawCommand::Gradient { rect, .. }
             | DrawCommand::Backdrop { rect, .. }
             | DrawCommand::Image { rect, .. } => hits(
@@ -1257,6 +1474,7 @@ pub fn carve_covering(
     };
     let covers = |command: &DrawCommand| match command {
         DrawCommand::FillRect { rect, .. }
+        | DrawCommand::Knockout { rect, .. }
         | DrawCommand::Gradient { rect, .. }
         | DrawCommand::Backdrop { rect, .. }
         | DrawCommand::Image { rect, .. } => hits(
@@ -1365,11 +1583,50 @@ pub fn rasterize_over(
     bitmap.beneath = beneath
         .filter(|under| under.width == width && under.height == height)
         .map(|under| under.pixels.clone());
+    paint(&mut bitmap, display, scale, text, images);
+    bitmap
+}
+
+/// [`rasterize_with`] for a window the system composites by its own
+/// alpha: the canvas is the ground at its own strength, and the bitmap
+/// that comes back holds premultiplied pixels.
+///
+/// The ground is the one difference. An opaque window clears to the
+/// canvas and its alpha never leaves the process; here the alpha the
+/// scene leaves IS the picture — what is behind the window shows
+/// through exactly where the scene left it room.
+pub fn rasterize_translucent(
+    display: &DisplayList,
+    width: usize,
+    height: usize,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) -> Bitmap {
+    let mut bitmap = Bitmap::translucent(width, height, canvas);
+    paint(&mut bitmap, display, scale, text, images);
+    bitmap
+}
+
+/// Paints the list onto a bitmap that already holds its ground.
+fn paint(
+    bitmap: &mut Bitmap,
+    display: &DisplayList,
+    scale: usize,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) {
     let factor = scale as f64;
-    for command in display.iter() {
+    let commands = display.as_slice();
+    for (index, command) in commands.iter().enumerate() {
+        bitmap.keep_capture(commands, index);
         match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
+            }
+            DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                bitmap.knockout(scale_rect(*rect, factor), corner_radius * factor, *opacity)
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => bitmap.fill_gradient(
                 scale_rect(*rect, factor),
@@ -1443,7 +1700,6 @@ pub fn rasterize_over(
             DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
-    bitmap
 }
 
 // MARK: - Surface (incremental repaint by damage regions)
@@ -1487,6 +1743,7 @@ fn command_box(
 ) -> Option<DamageRect> {
     let raw = match command {
         DrawCommand::FillRect { rect, .. }
+        | DrawCommand::Knockout { rect, .. }
         | DrawCommand::StrokeRect { rect, .. }
         | DrawCommand::Backdrop { rect, .. }
         | DrawCommand::Gradient { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
@@ -1653,7 +1910,10 @@ pub fn list_damage(
 pub struct Surface {
     bitmap: Bitmap,
     scale: usize,
-    background: Color,
+    /// The word a damaged rect is cleared to before its replay: the
+    /// background as given, or the canvas premultiplied on a
+    /// translucent surface.
+    ground: u32,
     /// The list painted on the bitmap (the previous frame). Empty at
     /// birth — the first frame damages the whole surface.
     display: DisplayList,
@@ -1683,10 +1943,21 @@ impl Surface {
     /// color — damaged rects are overwritten with it before replay
     /// (alpha is written as-is, not blended: it is a clear, not a wash).
     pub fn new(width: usize, height: usize, scale: usize, background: Color) -> Self {
+        Surface::over(Bitmap::new(width, height, background), scale, pack(background))
+    }
+
+    /// A surface the system composites over what is behind the window —
+    /// [`Bitmap::translucent`], retained. Its mirror ([`Surface::rgba`])
+    /// holds premultiplied bytes.
+    pub fn translucent(width: usize, height: usize, scale: usize, canvas: Color) -> Self {
+        Surface::over(Bitmap::translucent(width, height, canvas), scale, premultiplied(canvas))
+    }
+
+    fn over(bitmap: Bitmap, scale: usize, ground: u32) -> Self {
         Surface {
-            bitmap: Bitmap::new(width, height, background),
+            bitmap,
             scale,
-            background,
+            ground,
             display: DisplayList::default(),
             bounds: Vec::new(),
             primed: false,
@@ -1844,7 +2115,7 @@ impl Surface {
         // stay balanced no matter what is skipped)
         let factor = self.scale as f64;
         for &rect in &damage {
-            self.bitmap.clear_rect(rect, self.background);
+            self.bitmap.clear_rect(rect, self.ground);
             self.bitmap.push_clip_physical(rect);
             for (index, command) in new.iter().enumerate() {
                 match command {
@@ -1862,10 +2133,14 @@ impl Surface {
                 if !hits {
                     continue;
                 }
+                self.bitmap.keep_capture(new, index);
                 match command {
                     DrawCommand::FillRect { rect, color, corner_radius } => self
                         .bitmap
                         .fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor),
+                    DrawCommand::Knockout { rect, corner_radius, opacity } => self
+                        .bitmap
+                        .knockout(scale_rect(*rect, factor), corner_radius * factor, *opacity),
                     DrawCommand::Gradient { rect, paint, corner_radius } => {
                         self.bitmap.fill_gradient(
                             scale_rect(*rect, factor),
@@ -3386,5 +3661,259 @@ mod tests {
         assert_eq!(crate::glass::level_for(crate::glass::SIGMA_L0 * 2.0), 1.0);
         // and it never climbs past the top of the pyramid
         assert_eq!(crate::glass::level_for(10_000.0), crate::glass::MAX_LEVEL as f64);
+    }
+
+    /// A translucent ground holds the canvas ALREADY multiplied by its
+    /// alpha. The blend reads its destination as premultiplied, so a
+    /// ground stored straight would reach the compositor at full
+    /// strength — a window asked to be faint would come out solid.
+    #[test]
+    fn a_translucent_ground_holds_the_canvas_premultiplied() {
+        let bitmap = Bitmap::translucent(2, 2, Color::rgba(200, 100, 50, 128));
+        assert!(
+            bitmap.pixels().iter().all(|pixel| pixel.to_be_bytes() == [100, 50, 25, 128]),
+            "every pixel is the canvas times its own alpha"
+        );
+    }
+
+    /// A paint over a translucent ground adds its alpha to the ground's
+    /// and stays premultiplied: half white over half black is 128 grey
+    /// at three quarters — the bytes a compositor shows as 67 % white
+    /// over 25 % of what is behind the window.
+    #[test]
+    fn a_fill_over_a_translucent_ground_stays_premultiplied() {
+        let display = list(vec![fill(0.0, 0.0, 2.0, 2.0, Color::rgba(255, 255, 255, 128))]);
+        let bitmap = rasterize_translucent(
+            &display,
+            4,
+            2,
+            1,
+            Color::rgba(0, 0, 0, 128),
+            &PixelFont,
+            &RawImages::default(),
+        );
+        assert_eq!(bitmap.pixels()[0].to_be_bytes(), [128, 128, 128, 192], "under the fill");
+        assert_eq!(bitmap.pixels()[3].to_be_bytes(), [0, 0, 0, 128], "beside it, the ground alone");
+    }
+
+    /// Where the canvas is solid the two grounds are one: a window that
+    /// asked for a blur and got none paints what an opaque window paints.
+    #[test]
+    fn a_solid_canvas_is_the_same_bitmap_on_either_ground() {
+        for frame in hover_frames() {
+            let opaque = rasterize(&frame, 120, 80, Color::CANVAS);
+            let translucent = rasterize_translucent(
+                &frame,
+                120,
+                80,
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &RawImages::default(),
+            );
+            assert_eq!(opaque.pixels(), translucent.pixels());
+        }
+    }
+
+    /// The retained surface clears its damage to the SAME premultiplied
+    /// ground it was born with: every incremental frame is the one-shot
+    /// translucent raster, byte for byte.
+    #[test]
+    fn a_translucent_surface_matches_the_full_repaint_byte_for_byte() {
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let mut surface = Surface::translucent(120, 80, 1, canvas);
+        for frame in hover_frames() {
+            let oracle =
+                rasterize_translucent(&frame, 120, 80, 1, canvas, &PixelFont, &RawImages::default());
+            surface.frame(frame, &PixelFont, &RawImages::default());
+            assert_eq!(surface.bitmap().pixels(), oracle.pixels());
+        }
+    }
+
+    fn knockout(x: f64, y: f64, w: f64, h: f64, opacity: f64) -> DrawCommand {
+        DrawCommand::Knockout {
+            rect: Rect { origin: Point { x, y }, size: Size { width: w, height: h } },
+            corner_radius: Corners::ZERO,
+            opacity,
+        }
+    }
+
+    /// Over a solid canvas a knockout IS the canvas painted in its shape:
+    /// the scene under it is gone, the scene beside it is whole, and the
+    /// bytes are those of the fill a GPU tier lowers the command to.
+    #[test]
+    fn a_knockout_over_a_solid_canvas_is_the_canvas_painted_there() {
+        let red = Color::rgb(200, 30, 30);
+        let scene = |middle: DrawCommand| list(vec![fill(0.0, 0.0, 8.0, 4.0, red), middle]);
+        let knocked = rasterize(&scene(knockout(2.0, 0.0, 4.0, 4.0, 1.0)), 8, 4, Color::CANVAS);
+        assert_eq!(knocked.pixel(3, 1), Some(pack(Color::CANVAS)), "inside, the canvas again");
+        assert_eq!(knocked.pixel(0, 1), Some(pack(red)), "beside it, the scene whole");
+        let filled = rasterize(&scene(fill(2.0, 0.0, 4.0, 4.0, Color::CANVAS)), 8, 4, Color::CANVAS);
+        assert_eq!(knocked.pixels(), filled.pixels());
+        // at half strength it is the canvas at half alpha, as a fade leaves it
+        let half = rasterize(&scene(knockout(2.0, 0.0, 4.0, 4.0, 0.5)), 8, 4, Color::CANVAS);
+        let veil = rasterize(
+            &scene(fill(2.0, 0.0, 4.0, 4.0, Color { a: 128, ..Color::CANVAS })),
+            8,
+            4,
+            Color::CANVAS,
+        );
+        assert_eq!(half.pixels(), veil.pixels());
+    }
+
+    /// Over a clear ground a knockout paints nothing: it takes away. What
+    /// was there, the canvas of the window included, leaves the shape
+    /// clear, and the paint that follows is exactly as solid as it names.
+    #[test]
+    fn a_knockout_over_a_clear_ground_leaves_the_shape_clear() {
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let veil = Color::rgba(255, 255, 255, 128);
+        let blue = Color::rgba(0, 0, 255, 128);
+        let paint = |commands: Vec<DrawCommand>| {
+            rasterize_translucent(&list(commands), 8, 4, 1, canvas, &PixelFont, &RawImages::default())
+        };
+        let taken = paint(vec![fill(0.0, 0.0, 8.0, 4.0, veil), knockout(2.0, 0.0, 4.0, 4.0, 1.0)]);
+        assert_eq!(taken.pixel(3, 1), Some(0), "nothing left: what is behind the window shows whole");
+        assert_ne!(taken.pixel(0, 1), Some(0), "beside it the scene stands");
+
+        // a veil inside a veil over the canvas: three alphas added up…
+        let over = paint(vec![fill(0.0, 0.0, 8.0, 4.0, veil), fill(2.0, 0.0, 4.0, 4.0, blue)]);
+        let stacked = over.pixel(3, 1).unwrap() & 0xFF;
+        assert!(stacked > 220, "source-over is nearly solid two veils in: {stacked}");
+        // …and one alpha when the inner one replaces
+        let replaced = paint(vec![
+            fill(0.0, 0.0, 8.0, 4.0, veil),
+            knockout(2.0, 0.0, 4.0, 4.0, 1.0),
+            fill(2.0, 0.0, 4.0, 4.0, blue),
+        ]);
+        assert_eq!(replaced.pixel(3, 1).unwrap().to_be_bytes(), [0, 0, 128, 128], "blue at its own half");
+    }
+
+    /// An island over nothing has no canvas of its own behind its paint,
+    /// like a translucent window: a knockout there leaves the shape clear
+    /// and paints no ground.
+    #[test]
+    fn a_knockout_on_an_island_leaves_it_clear() {
+        let island = rasterize(
+            &list(vec![fill(0.0, 0.0, 8.0, 4.0, Color::WHITE), knockout(2.0, 0.0, 4.0, 4.0, 1.0)]),
+            8,
+            4,
+            Color::rgba(0, 0, 0, 0),
+        );
+        assert_eq!(island.pixel(3, 1), Some(0));
+        assert_eq!(island.pixel(0, 1), Some(pack(Color::WHITE)));
+    }
+
+    /// A knockout follows the curve of its shape and the curve of the clip
+    /// it is under, as a fill does: the retained surface replays it in a
+    /// damaged rect and lands on the one-shot raster, on either ground.
+    #[test]
+    fn a_surface_replays_a_knockout_byte_for_byte() {
+        let round = Corners { top_left: 6.0, top_right: 2.0, bottom_right: 6.0, bottom_left: 0.0 };
+        let frame = |veil: Color| {
+            list(vec![
+                fill(0.0, 0.0, 120.0, 80.0, Color::rgba(30, 60, 200, 200)),
+                DrawCommand::PushClip {
+                    rect: Rect { origin: Point { x: 10.0, y: 10.0 }, size: Size { width: 90.0, height: 60.0 } },
+                    corner_radius: Corners { top_left: 8.0, top_right: 8.0, bottom_right: 8.0, bottom_left: 8.0 },
+                },
+                DrawCommand::Knockout {
+                    rect: Rect { origin: Point { x: 4.0, y: 20.0 }, size: Size { width: 70.0, height: 40.0 } },
+                    corner_radius: round,
+                    opacity: 0.8,
+                },
+                fill(4.0, 20.0, 70.0, 40.0, veil),
+                DrawCommand::PopClip,
+            ])
+        };
+        let frames = [frame(Color::rgba(255, 255, 255, 60)), frame(Color::rgba(255, 200, 0, 140))];
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let mut clear = Surface::translucent(120, 80, 1, canvas);
+        let mut solid = Surface::new(120, 80, 1, Color::CANVAS);
+        for frame in frames {
+            let oracle =
+                rasterize_translucent(&frame, 120, 80, 1, canvas, &PixelFont, &RawImages::default());
+            clear.frame(frame.clone(), &PixelFont, &RawImages::default());
+            assert_eq!(clear.bitmap().pixels(), oracle.pixels(), "over a clear ground");
+            let oracle = rasterize(&frame, 120, 80, Color::CANVAS);
+            solid.frame(frame, &PixelFont, &RawImages::default());
+            assert_eq!(solid.bitmap().pixels(), oracle.pixels(), "over a solid canvas");
+        }
+    }
+
+    /// A pane that shares reads the scene the pane around it read. The
+    /// outer pane here is tinted solid red; a clear pane inside it that
+    /// reads the scene as it stands is red through and through, and the
+    /// same pane sharing is the stripes it would have shown alone.
+    #[test]
+    fn a_pane_that_shares_reads_the_scene_the_pane_around_it_read() {
+        let outer = box_at(10.0, 10.0, 100.0, 60.0);
+        let inner = box_at(30.0, 25.0, 60.0, 30.0);
+        let red = Glass::frosted().tint(Color::rgb(220, 20, 20));
+        let clear = Glass::frosted().tint(Color::rgba(0, 0, 0, 0));
+        let scene = |shares: bool| {
+            let mut display = stripes(120, 80, 8);
+            display.push(pane(outer, red, 0.0));
+            display.push(DrawCommand::Backdrop {
+                rect: inner,
+                glass: crate::layout::GlassPaint { shares, ..clear.resolve(inner) },
+                corner_radius: Corners::ZERO,
+            });
+            rasterize(&display, 120, 80, Color::WHITE)
+        };
+        let red_of = |bitmap: &Bitmap, x: usize, y: usize| {
+            let [r, g, _, _] = bitmap.pixel(x, y).expect("pixel").to_be_bytes();
+            r as i32 - g as i32
+        };
+        let (stacked, shared) = (scene(false), scene(true));
+        assert!(red_of(&stacked, 60, 40) > 150, "read as it stands, the inner pane is the red one blurred");
+        assert!(red_of(&shared, 60, 40).abs() < 12, "sharing, it is the grey the stripes blur to");
+        // beside the inner pane the outer one is as red either way
+        assert_eq!(stacked.pixel(15, 15), shared.pixel(15, 15));
+
+        // and it is the pane the inner one would have been with no pane around it
+        let mut alone = stripes(120, 80, 8);
+        alone.push(pane(inner, clear, 0.0));
+        let alone = rasterize(&alone, 120, 80, Color::WHITE);
+        assert_eq!(shared.pixel(60, 40), alone.pixel(60, 40));
+    }
+
+    /// A pane with no pane before it has no capture to share: it reads
+    /// the scene as it stands, like any pane.
+    #[test]
+    fn a_pane_with_no_capture_to_share_reads_the_scene_as_it_stands() {
+        let rect = box_at(30.0, 20.0, 60.0, 40.0);
+        let scene = |shares: bool| {
+            let mut display = stripes(120, 80, 8);
+            display.push(DrawCommand::Backdrop {
+                rect,
+                glass: crate::layout::GlassPaint { shares, ..Glass::frosted().resolve(rect) },
+                corner_radius: Corners::ZERO,
+            });
+            rasterize(&display, 120, 80, Color::WHITE)
+        };
+        assert_eq!(scene(true).pixels(), scene(false).pixels());
+    }
+
+    /// Over a ground that is not solid a pane takes the PLACE of what it
+    /// covers: its pixel is the tint over the blurred ground, with the
+    /// alpha that makes, and not a grain more. Laid over the ground
+    /// instead, the pane would add its alpha to the ground's a second
+    /// time and let the sharp scene show through what was left.
+    #[test]
+    fn a_pane_over_a_clear_ground_takes_its_place() {
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let rect = box_at(20.0, 20.0, 80.0, 40.0);
+        let mut display = DisplayList::default();
+        display.push(pane(rect, Glass::frosted().tint(Color::rgba(255, 255, 255, 51)), 0.0));
+        let bitmap =
+            rasterize_translucent(&display, 120, 80, 1, canvas, &PixelFont, &RawImages::default());
+        let [r, _, _, alpha] = bitmap.pixel(60, 40).expect("pixel").to_be_bytes();
+        // 51 over 153: 51 + 153 × 204 / 255 = 173, a step either way
+        assert!((172..=175).contains(&alpha), "the tint over the ground, once: {alpha}");
+        // and the colour is the premultiplied tint over the premultiplied
+        // ground, 51 + 10 × 0.8, with the material's own lift on top
+        assert!((55..=68).contains(&r), "white at a fifth over the dark ground: {r}");
+        assert_eq!(bitmap.pixel(5, 5).expect("pixel").to_be_bytes()[3], 153, "the ground beside it");
     }
 }

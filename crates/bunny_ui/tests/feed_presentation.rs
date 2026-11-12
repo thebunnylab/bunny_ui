@@ -285,6 +285,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         let attempt = backend::FrameObservation::begin(&source.sender(), &list).unwrap();
@@ -320,6 +321,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         atlas.live.get_mut(&feed.key().raw()).unwrap().stale = true;
@@ -339,6 +341,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         atlas.live.get_mut(&feed.key().raw()).unwrap().stale = false;
@@ -407,6 +410,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         feed.push((2, 2), vec![128; 16]);
@@ -421,6 +425,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         assert_eq!(atlas.live[&feed.key().raw()].generation, 1);
@@ -441,6 +446,7 @@ mod gpu {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(bunny_ui_core::layout::Color::CANVAS),
         )
         .unwrap();
         let ticket = backend::FrameObservation::begin(&source.sender(), &newer)

@@ -1096,6 +1096,12 @@ fn push_gradient(
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RunKind {
     Rects,
+    /// Knockouts over a CLEAR ground — rect instances drawn with the
+    /// tier's erase blend: what lies under each shape keeps `1 - alpha`
+    /// of itself, colour and alpha alike, and nothing is painted. A walk
+    /// over a solid canvas never makes this run: there a knockout is the
+    /// canvas painted at that strength, an ordinary rect.
+    Knockout,
     /// A batch of liquid-glass panes. It carries its own pass: the
     /// scene has to be blurred into the pyramid BEFORE the panes read
     /// it, and the pass boundary is what orders the two.
@@ -1127,6 +1133,10 @@ pub struct DrawRun {
     /// Glass only: how deep the blur pyramid must go for this batch —
     /// the deepest blur any pane in it asked for.
     pub levels: u32,
+    /// Glass only: the batch reads the capture ALREADY taken, by the run
+    /// of the pane around it, and the tier builds no pyramid for it. That
+    /// run was raised to dig as deep and read as wide as this one needs.
+    pub reuse: bool,
     /// The pixels the run's instances may touch, clipped: what decides
     /// whether a later instance may join it past runs painted after it.
     pub bounds: Box4,
@@ -1143,7 +1153,7 @@ pub struct DrawRun {
 /// same list stands between.
 fn list_of(kind: RunKind) -> u8 {
     match kind {
-        RunKind::Rects => 0,
+        RunKind::Rects | RunKind::Knockout => 0,
         RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => 1,
         RunKind::Glass => 2,
     }
@@ -1191,7 +1201,7 @@ fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize, bo
             break;
         }
     }
-    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, bounds, reads: NO_READS });
+    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, reuse: false, bounds, reads: NO_READS });
 }
 
 /// What a run that is not glass reads of the scene beneath it: nothing.
@@ -1256,7 +1266,7 @@ fn note_glass(
         run.reads = box_union(run.reads, reads);
         *batch = batch.map(|acc| box_union(acc, bounds));
     } else {
-        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, bounds, reads });
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, reuse: false, bounds, reads });
         *batch = Some(bounds);
     }
 }
@@ -1287,6 +1297,14 @@ pub struct FrameBatches {
 /// integers, an empty intersection degenerating to a zero-area box.
 /// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
 /// again.
+///
+/// `floor` is the ground of the target, as the raster keeps it
+/// ([`crate::raster::solid_floor`]): `Some` is the solid canvas an opaque
+/// target clears to, and a [`DrawCommand::Knockout`] over it is that
+/// canvas painted at the knockout's strength — an ordinary rect, in the
+/// ordinary run, on every tier. `None` is a target with nothing of its
+/// own behind its paint, a translucent window, and a knockout there is a
+/// [`RunKind::Knockout`] the tier draws with its erase blend.
 #[allow(clippy::too_many_arguments)]
 pub fn build_frame(
     ground: &mut dyn AtlasGround,
@@ -1297,6 +1315,7 @@ pub fn build_frame(
     images: &dyn ImageEngine,
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
+    floor: Option<Color>,
 ) -> Result<(), AtlasFull> {
     atlas.begin_walk();
     batches.rects.clear();
@@ -1318,6 +1337,9 @@ pub fn build_frame(
     // the boxes the open glass batch already holds — a pane that
     // touches one of them starts a batch of its own
     let mut glass_batch: Option<Box4> = None;
+    // the run that took the last capture of the scene: what a pane that
+    // shares reads
+    let mut capture: Option<usize> = None;
     for command in display.iter() {
         match command {
             // paint that paints nothing is no instance: it would only
@@ -1330,6 +1352,30 @@ pub fn build_frame(
                 if color.a == 0 => {}
             // and a pane faded out lands nothing over the scene it reads
             DrawCommand::Backdrop { glass, .. } if glass.opacity <= 0.0 => {}
+            DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to a byte")]
+                let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                // a knockout that takes nothing away is no instance
+                if alpha == 0 {
+                    continue;
+                }
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let (color, kind) = match floor {
+                    Some(canvas) => (Color { a: alpha, ..canvas }, RunKind::Rects),
+                    // the erase blend reads the alpha alone
+                    None => (Color { r: 0, g: 0, b: 0, a: alpha }, RunKind::Knockout),
+                };
+                push_rect(out, snapped, clip, color, radii, 0.0, KIND_FILL, 0.0);
+                note_run(&mut batches.runs, kind, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+            }
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -1390,15 +1436,41 @@ pub fn build_frame(
                     (visible.0 as f64, visible.1 as f64, visible.2 as f64, visible.3 as f64),
                     &paint,
                 );
-                note_glass(
-                    &mut batches.runs,
-                    round_of(&clips),
-                    batches.glass.len() - 1,
-                    visible,
-                    reads,
-                    crate::glass::levels_for(paint.blur) as u32,
-                    &mut glass_batch,
-                );
+                let levels = crate::glass::levels_for(paint.blur) as u32;
+                if paint.shares
+                    && let Some(taken) = capture
+                {
+                    // the capture is the one the pane around this one
+                    // took: that run digs as deep and reads as wide as
+                    // this pane needs, and this pane's run rebuilds
+                    // nothing. It stands alone, after everything painted
+                    // since the capture, which it covers
+                    let run = &mut batches.runs[taken];
+                    run.levels = run.levels.max(levels);
+                    run.reads = box_union(run.reads, reads);
+                    batches.runs.push(DrawRun {
+                        kind: RunKind::Glass,
+                        base: (batches.glass.len() - 1) as u32,
+                        count: 1,
+                        round: round_of(&clips),
+                        levels,
+                        reuse: true,
+                        bounds: visible,
+                        reads,
+                    });
+                    glass_batch = None;
+                } else {
+                    note_glass(
+                        &mut batches.runs,
+                        round_of(&clips),
+                        batches.glass.len() - 1,
+                        visible,
+                        reads,
+                        levels,
+                        &mut glass_batch,
+                    );
+                    capture = Some(batches.runs.len() - 1);
+                }
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -2066,6 +2138,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect()
@@ -2114,6 +2187,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the line fits the atlas");
         // the bytes and the corner the CPU compositor uses
@@ -2184,6 +2258,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
 
@@ -2231,6 +2306,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas2,
             &mut again,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         assert_eq!(first, again.checksum(), "the same scene is the same bytes");
@@ -2251,6 +2327,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 atlas,
                 batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the scene fits the atlas");
         };
@@ -2308,6 +2385,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 &mut atlas,
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the column fits the atlas");
             (ground.uploads.len(), batches.checksum())
@@ -2416,6 +2494,7 @@ mod tests {
                 &RawImages::default(),
                 atlas,
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             );
             match walked {
                 Ok(()) => return true,
@@ -2469,6 +2548,7 @@ mod tests {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the frame walks");
         (batches.sprites.clone(), ground)
@@ -2636,6 +2716,7 @@ mod tests {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the frame walks");
         assert_eq!(batches.runs.len(), 1);
@@ -2687,6 +2768,130 @@ mod tests {
         assert_eq!(over[1].levels, 2);
         assert_eq!(over[0].reads, (-3, -3, 23, 23));
         assert_eq!(over[1].reads, (7, 7, 33, 33), "its capture holds its own pane alone");
+    }
+
+    /// A veil, a knockout in the middle of it, and the veil that replaces
+    /// it there — walked over a ground.
+    fn replaced_walk(floor: Option<Color>) -> FrameBatches {
+        let knocked = at(10.0, 10.0, 50.0, 50.0);
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: at(0.0, 0.0, 100.0, 100.0),
+            color: Color::rgba(255, 255, 255, 128),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(DrawCommand::Knockout { rect: knocked, corner_radius: Corners::ZERO, opacity: 0.5 });
+        display.push(DrawCommand::FillRect {
+            rect: knocked,
+            color: Color::rgba(0, 0, 255, 128),
+            corner_radius: Corners::ZERO,
+        });
+        // and one that takes nothing away is no instance at all
+        display.push(DrawCommand::Knockout { rect: knocked, corner_radius: Corners::ZERO, opacity: 0.0 });
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            1,
+            (400, 400),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+            floor,
+        )
+        .expect("the scene fits the atlas");
+        batches
+    }
+
+    /// Over a solid canvas a knockout is the canvas painted at its
+    /// strength: an ordinary rect in the ordinary run, so a tier that
+    /// never presents a translucent target draws it with what it has.
+    #[test]
+    fn a_knockout_over_a_solid_floor_is_a_rect_of_the_canvas() {
+        let canvas = Color::hex(0x101014);
+        let batches = replaced_walk(Some(canvas));
+        let kinds: Vec<(RunKind, u32)> = batches.runs.iter().map(|run| (run.kind, run.count)).collect();
+        assert_eq!(kinds, vec![(RunKind::Rects, 3)], "one run of rects, nothing else");
+        assert_eq!(batches.rects[1].color, [canvas.r, canvas.g, canvas.b, 128]);
+    }
+
+    /// Over a clear ground it is a run of its own between the paint under
+    /// it and the paint that replaces: the tier draws it with its erase
+    /// blend, which reads the alpha alone.
+    #[test]
+    fn a_knockout_over_a_clear_ground_is_a_run_of_its_own() {
+        let batches = replaced_walk(None);
+        let kinds: Vec<(RunKind, u32, u32)> =
+            batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect();
+        assert_eq!(
+            kinds,
+            vec![(RunKind::Rects, 0, 1), (RunKind::Knockout, 1, 1), (RunKind::Rects, 2, 1)],
+            "paint order holds: under, taken away, replaced"
+        );
+        assert_eq!(batches.rects[1].color, [0, 0, 0, 128]);
+    }
+
+    /// A pane that shares takes a run of its own that rebuilds nothing,
+    /// and the run that took the capture is raised to hold what it reads:
+    /// as deep as the deeper of the two, as wide as both.
+    #[test]
+    fn a_pane_that_shares_rides_the_capture_already_taken() {
+        let outer = at(40.0, 40.0, 200.0, 160.0);
+        let inner = at(60.0, 60.0, 120.0, 80.0);
+        let shared = |shares: bool| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::Backdrop {
+                rect: outer,
+                glass: crate::layout::Glass::regular().blur(2.0).resolve(outer),
+                corner_radius: Corners::ZERO,
+            });
+            display.push(DrawCommand::Backdrop {
+                rect: inner,
+                glass: crate::layout::GlassPaint {
+                    shares,
+                    ..crate::layout::Glass::frosted().resolve(inner)
+                },
+                corner_radius: Corners::ZERO,
+            });
+            let mut ground = RecordingGround::default();
+            let mut atlas = RunAtlas::new();
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut ground,
+                &display,
+                1,
+                (400, 400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut atlas,
+                &mut batches,
+                Some(Color::CANVAS),
+            )
+            .expect("the scene fits the atlas");
+            batches.runs
+        };
+        let (apart, together) = (shared(false), shared(true));
+        assert_eq!(apart.iter().map(|run| run.reuse).collect::<Vec<_>>(), vec![false, false]);
+        assert_eq!(together.iter().map(|run| run.reuse).collect::<Vec<_>>(), vec![false, true]);
+        assert_eq!(
+            together[0].levels,
+            apart[0].levels.max(apart[1].levels),
+            "the capture digs as deep as the pane that shares it needs"
+        );
+        assert_eq!(together[0].reads, box_union(apart[0].reads, apart[1].reads));
+        assert_eq!((together[1].base, together[1].count), (1, 1));
+
+        // a pane that shares with no capture before it takes its own
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Backdrop {
+            rect: inner,
+            glass: crate::layout::GlassPaint { shares: true, ..crate::layout::Glass::frosted().resolve(inner) },
+            corner_radius: Corners::ZERO,
+        });
+        assert_eq!(glass_batches(&display), vec![1]);
     }
 
     /// The glass batches of a display list: each one's pane count.
@@ -2763,6 +2968,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 &mut RunAtlas::new(),
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the scene fits the atlas");
             (glass_batches(&display), batches.glass.iter().map(|pane| pane.opacity).collect::<Vec<_>>())
@@ -2841,6 +3047,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         let runs: Vec<&DrawRun> = batches.runs.iter().collect();
@@ -2913,7 +3120,7 @@ mod tests {
     fn present_as_tiers(ground: &mut RecordingGround, atlas: &mut RunAtlas, display: &DisplayList, physical: (usize, usize)) {
         let mut batches = FrameBatches::default();
         for attempt in 0..4 {
-            match build_frame(ground, display, 2, physical, &crate::text_engine::PixelFont, &RawImages::default(), atlas, &mut batches) {
+            match build_frame(ground, display, 2, physical, &crate::text_engine::PixelFont, &RawImages::default(), atlas, &mut batches, Some(crate::layout::Color::CANVAS)) {
                 Ok(()) => return,
                 Err(AtlasFull) if attempt == 0 && atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 => {}
                 Err(AtlasFull) => atlas.reset(ground, true),

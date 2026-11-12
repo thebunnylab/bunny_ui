@@ -61,8 +61,17 @@ const CONGESTED_MS: f64 = 1.5;
 /// `drawRect:` never runs. Returns false (and touches nothing) when the
 /// layer path is explicitly refused or cannot come up; the caller
 /// proceeds with the CPU path. Metal itself initializes on demand.
-pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool {
-    match graft(view, scale, width, height) {
+///
+/// `translucent` is a window the system composites by its own alpha: the
+/// root layer is then not opaque and no opaque native road is taken.
+pub(crate) fn try_install(
+    view: Id,
+    scale: f64,
+    width: f64,
+    height: f64,
+    translucent: bool,
+) -> bool {
+    match graft(view, scale, width, height, translucent) {
         Some(renderer) => {
             VIEW_PRESENTERS.with(|slot| {
                 slot.borrow_mut().insert(
@@ -96,13 +105,19 @@ pub fn forget_view(view: Id) {
 /// `None` when the GPU road is refused or cannot come up. Touches the
 /// view only on `Some`: the layer is configured first, grafted second,
 /// and primed (the anti-flash clear) once it hangs from the view.
-fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter> {
+fn graft(
+    view: Id,
+    scale: f64,
+    width: f64,
+    height: f64,
+    translucent: bool,
+) -> Option<MetalPresenter> {
     unsafe {
         let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
         if layer.is_null() {
             return None;
         }
-        let Some(mut presenter) = MetalPresenter::attach(layer, scale) else {
+        let Some(mut presenter) = MetalPresenter::attach_with(layer, scale, translucent) else {
             msg_void(layer, sel("release"));
             return None;
         };

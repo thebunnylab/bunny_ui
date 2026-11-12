@@ -96,6 +96,10 @@ name = "compose_window_linux"
 path = "examples/compose_window.rs"
 
 [[example]]
+name = "blur_window_linux"
+path = "examples/blur_window.rs"
+
+[[example]]
 name = "world_window_linux"
 path = "examples/world_window.rs"
 required-features = ["3d"]

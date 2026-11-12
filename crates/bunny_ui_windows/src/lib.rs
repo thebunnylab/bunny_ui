@@ -119,6 +119,8 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 /// WindowSpec::titled("Trinity Mail").size(1080.0, 720.0)
 /// WindowSpec::titled("New message").size(720.0, 560.0)
 /// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
+/// // a window that stands on a blur of what is behind it
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).background(WindowBackground::Blurred)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
@@ -128,6 +130,7 @@ pub struct WindowSpec {
     chrome: Chrome,
     resizable: bool,
     minimizable: bool,
+    background: WindowBackground,
 }
 
 impl WindowSpec {
@@ -140,6 +143,7 @@ impl WindowSpec {
             chrome: Chrome::Native,
             resizable: true,
             minimizable: true,
+            background: WindowBackground::Opaque,
         }
     }
 
@@ -194,14 +198,41 @@ impl WindowSpec {
         self.chrome = chrome;
         self
     }
+
+    /// What the window shows where its scene paints nothing — see
+    /// [`WindowBackground`]. A window is opaque until this says otherwise.
+    ///
+    /// In a window that is not opaque the alpha of the theme's canvas is
+    /// how strongly the canvas lies over what is behind the window: a
+    /// solid canvas hides the blur whole.
+    ///
+    /// ```ignore
+    /// bunny_ui::theme::install(Theme { canvas: theme.canvas.with_alpha(153), ..theme });
+    /// WindowSpec::titled("Trinity").background(WindowBackground::Blurred)
+    /// ```
+    ///
+    /// Not every system serves every ask: see [`window_background`] for
+    /// the answer before the window exists and [`App::background`] for
+    /// the answer after it opens.
+    #[must_use]
+    pub fn background(mut self, background: WindowBackground) -> WindowSpec {
+        self.background = background;
+        self
+    }
+
+    /// The background [`WindowSpec::background`] asked for.
+    #[must_use]
+    pub fn asked_background(&self) -> WindowBackground {
+        self.background
+    }
 }
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
 mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
-    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
+    CloseAction, DesktopPosition, DesktopSpace, WindowBackground, WindowError, WindowGeometry,
+    WindowId, WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
 /// Everything one window owns for as long as it is open. The app holds
@@ -251,6 +282,23 @@ impl Slot {
 /// the second workbench. The three shells answer this differently and
 /// an app that must run on all of them asks before it detaches.
 pub const MANY_WINDOWS: bool = true;
+
+/// The background this system serves for an ask, before a window exists.
+///
+/// A window shows by its own alpha, [`WindowBackground::Clear`], when the
+/// GPU presents it: `BUNNY_PRESENT=cpu` refuses that, and so does a
+/// system with no shader compiler or no DirectComposition. It stands on
+/// a blur, [`WindowBackground::Blurred`], from Windows 11 version 22H2.
+/// An ask the system cannot serve is answered [`WindowBackground::Opaque`],
+/// and a blur it cannot give is never answered with a clear window.
+///
+/// This is a prediction. A graphics device that does not come up, or a
+/// compositor that refuses the blur, is found only when the window
+/// opens: [`App::background`] reports the background of an open window.
+#[must_use]
+pub fn window_background(asked: WindowBackground) -> WindowBackground {
+    ffi::window_background(asked)
+}
 
 /// The application: the message pump, and the windows on it.
 ///
@@ -438,6 +486,20 @@ impl App {
             return Err(error);
         }
         self.refresh_child_visibility(id)
+    }
+
+    /// Reports the background this window has: what the system served of
+    /// the ask in its spec. See [`window_background`] for the answer
+    /// before a window exists.
+    ///
+    /// The answer is the ask or [`WindowBackground::Opaque`]. It is read
+    /// from the window each time: a blurred window whose blur the system
+    /// takes back while it is open reports opaque from then on.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn background(&self, id: WindowId) -> Result<WindowBackground, WindowError> {
+        self.slot(id).map(|slot| slot.handle.background()).ok_or(WindowError::StaleWindow)
     }
 
     /// Reports native visibility; this does not mean unobscured or focused.
@@ -689,6 +751,14 @@ pub fn run_window_chrome(
     app.run();
 }
 
+/// Is this canvas a dark one? Rec. 601 luma under the midpoint — the
+/// question the macOS shell asks before it dresses a blurred window, in
+/// the same integers.
+fn is_dark(canvas: bunny_ui::layout::Color) -> bool {
+    let luma = canvas.r as u32 * 299 + canvas.g as u32 * 587 + canvas.b as u32 * 114;
+    luma < 128 * 1000
+}
+
 /// Raises the window `spec` asks for and wires everything that lives as
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
@@ -711,10 +781,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         spec.chrome == Chrome::Scene,
         spec.resizable,
         spec.minimizable,
+        spec.background,
     );
     // the present backend, chosen ONCE: the GPU by default, the CPU
     // raster on refusal — and the window has not shown yet, so the
-    // first frame (whichever road) lands before anyone looks
+    // first frame (whichever road) lands before anyone looks. A window
+    // that is not opaque came out of `create_window` already presenting
     ffi::install_gpu(&window);
     // Native preference is independent of an application-owned palette.
     bunny_ui::theme::observe_system_appearance(
@@ -771,10 +843,30 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         // so they hold the runtime itself and not this frame's borrow of it.
         let scene = Rc::clone(&runtime);
         let segments_kept = Rc::clone(&segments_kept);
+        // what the window opened as. A window that opened opaque stays
+        // so, and its frames never ask again
+        let opened_translucent = window.background().is_translucent();
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
             let scale = window.scale();
-            let canvas = bunny_ui::theme::canvas();
+            // the alpha of the canvas is real only where the system
+            // composites the window by it. An opaque window, and every
+            // dialog and popover, stands on the canvas at full strength
+            let solid = bunny_ui::theme::canvas().with_alpha(255);
+            // read from the window: one that lost its blur is opaque now
+            let background = if opened_translucent {
+                window.background()
+            } else {
+                WindowBackground::Opaque
+            };
+            let canvas =
+                if background.is_translucent() { bunny_ui::theme::canvas() } else { solid };
+            if background == WindowBackground::Blurred {
+                // the system's material is light or dark by the caption's
+                // appearance: it follows the scene, not the desktop. The
+                // handle asks the compositor only when the answer changes
+                window.set_dark_caption(is_dark(solid));
+            }
             let physical = (
                 (width * scale as f64).round() as usize,
                 (height * scale as f64).round() as usize,
@@ -1038,9 +1130,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         // a system-drawn bar still wears the scene's
                         // appearance: a dark workbench under a white caption
                         // reads as two applications sharing one frame
-                        let luminance = 0.299 * f64::from(canvas.r)
-                            + 0.587 * f64::from(canvas.g)
-                            + 0.114 * f64::from(canvas.b);
+                        let luminance = 0.299 * f64::from(solid.r)
+                            + 0.587 * f64::from(solid.g)
+                            + 0.114 * f64::from(solid.b);
                         dialog.set_dark_caption(luminance < 128.0);
                     }
                     if opening {
@@ -1090,7 +1182,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         physical.0,
                         physical.1,
                         scale,
-                        canvas,
+                        solid,
                         &*runtime.text(),
                         &*runtime.images(),
                     );
@@ -1159,12 +1251,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             *size != panel_physical || *was != commands
                         });
                         if stale {
+                            // a popover is a panel of its own, with nothing
+                            // blurred behind it: its material reads the
+                            // window as an opaque one
                             let fresh = bunny_ui::raster::rasterize_with(
                                 &base,
                                 panel_physical.0,
                                 panel_physical.1,
                                 scale,
-                                canvas,
+                                solid,
                                 &*runtime.text(),
                                 &*runtime.images(),
                             );
@@ -1209,7 +1304,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             };
             if d3d::active(window.raw_window() as ffi::Hwnd) {
                 // GPU present: the same display list, no Surface in the
-                // path — the swapchain is the frame
+                // path — the swapchain is the frame. A window that is
+                // not opaque is always here: it has no redirection
+                // bitmap, so the CPU road below cannot show it
                 d3d::present_window(
                     window.raw_window() as ffi::Hwnd,
                     &display,
@@ -1840,6 +1937,51 @@ mod tests {
         assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
         let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
         assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
+
+    #[test]
+    fn a_window_is_opaque_until_its_spec_names_a_background() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.asked_background(), WindowBackground::Opaque);
+        let blurred = spec.background(WindowBackground::Blurred);
+        assert_eq!(blurred.asked_background(), WindowBackground::Blurred);
+        // the other options a spec carries are untouched by it
+        assert_eq!(blurred.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    /// What this system serves depends on the machine the test runs on,
+    /// so the test holds the rule and prints the answer: an ask is served
+    /// as asked or opaque, and a blur is never served as a clear window.
+    #[test]
+    fn an_ask_is_served_as_asked_or_opaque_and_a_blur_is_never_served_clear() {
+        assert_eq!(window_background(WindowBackground::Opaque), WindowBackground::Opaque);
+        let clear = window_background(WindowBackground::Clear);
+        assert!(
+            matches!(clear, WindowBackground::Clear | WindowBackground::Opaque),
+            "a clear ask was served {clear:?}"
+        );
+        let blurred = window_background(WindowBackground::Blurred);
+        assert!(
+            matches!(blurred, WindowBackground::Blurred | WindowBackground::Opaque),
+            "a blurred ask was served {blurred:?}"
+        );
+        if blurred == WindowBackground::Blurred {
+            assert_eq!(clear, WindowBackground::Clear, "a blur needs the alpha a clear window needs");
+        }
+        println!("this system serves a clear ask as {clear:?} and a blurred ask as {blurred:?}");
+    }
+
+    /// The material under a blurred window is light or dark by the
+    /// scene's own canvas: both house canvases fall on the side their
+    /// name says, and the alpha of a canvas does not move it across.
+    #[test]
+    fn a_window_is_dressed_by_the_luma_of_its_canvas() {
+        use bunny_ui::layout::Color;
+        assert!(!is_dark(Color::hex(0xF2F3F7)));
+        assert!(is_dark(Color::hex(0x101014)));
+        assert!(is_dark(Color::hex(0x101014).with_alpha(40).with_alpha(255)));
+        assert!(!is_dark(Color::rgb(128, 128, 128)));
+        assert!(is_dark(Color::rgb(127, 127, 127)));
     }
 
     #[test]

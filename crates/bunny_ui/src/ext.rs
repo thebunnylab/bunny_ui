@@ -488,6 +488,26 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::BackgroundGradient(gradient))
     }
 
+    /// How this view's background meets what is already painted under
+    /// it. The default lies on top, and alphas add up with depth;
+    /// [`BackgroundBlend::Replace`] takes the place of what is under it,
+    /// so the background is exactly as solid as it names, at any depth.
+    ///
+    /// ```ignore
+    /// // three shades of one window that stands on a blur: none of them
+    /// // hides more of the blur than its own alpha says
+    /// sidebar.background_color(SHADE.with_alpha(128)).background_blend(BackgroundBlend::Replace)
+    /// ```
+    ///
+    /// It is this view's own word, for its colour and its ramp. It is
+    /// not inherited: a hover veil inside the view still lies on top.
+    /// In an opaque window the ground a background replaces down to is
+    /// the canvas, so nested shades stop adding up there too.
+    #[track_caller]
+    fn background_blend(self, blend: crate::layout::BackgroundBlend) -> Modified<Self> {
+        Modified::new(self, Modifier::BackgroundBlend(blend))
+    }
+
     /// `repeating-linear-gradient(…)` with hard stops — bands of one ink
     /// over the background and the ramp, under the content, cut to the
     /// corner radius.

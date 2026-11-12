@@ -52,8 +52,10 @@ crates/bunny_ui_linux/container/run.sh shell           # both displays up
 The `--drive` sheets today: `counter_window_linux` (a click, the
 manners with `--fixed`, the pacer with `--sleeper`),
 `two_windows_linux`, `browser_window_linux` (the page, `--editor` for
-the letter), `scroll_window_linux`, `compose_window_linux` and
-`life_window_linux`.
+the letter), `scroll_window_linux`, `compose_window_linux`,
+`life_window_linux` and `blur_window_linux` (the background a window
+asked for and the one it was served, with `--clear`, `--opaque` and
+`--expect`; see `docs/window-background.md`).
 
 The script builds a Debian image with the libraries the shell links,
 raises a headless Weston (the Wayland door) and an Xvfb (the X11 door)

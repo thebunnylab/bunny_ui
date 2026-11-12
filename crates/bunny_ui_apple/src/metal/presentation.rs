@@ -215,7 +215,7 @@ mod tests {
         }]
         .into();
         gpu.ground.begin_slot(0, &mut gpu.atlas);
-        gpu.walk(&display, 1, &PixelFont, &RawImages::default());
+        gpu.walk(&display, 1, &PixelFont, &RawImages::default(), Some(Color::CANVAS));
         assert!(uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
         gpu.present_wait(&display, 1, Color::WHITE, &PixelFont, &RawImages::default());
         assert!(!uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
@@ -237,7 +237,7 @@ mod tests {
             placement: ImagePlacement::Pixel,
         }]
         .into();
-        gpu.walk(&next, 1, &PixelFont, &RawImages::default());
+        gpu.walk(&next, 1, &PixelFont, &RawImages::default(), Some(Color::CANVAS));
         assert!(uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
         assert_eq!(gpu.atlas.live[&feed.key().raw()].generation, 2);
     }

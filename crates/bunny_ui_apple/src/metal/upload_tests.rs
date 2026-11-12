@@ -41,7 +41,7 @@ fn abandoned_live_upload_retries_the_same_generation_pixels() {
     )
     .index;
     gpu.ground.begin_slot(index, &mut gpu.atlas);
-    gpu.walk(&second, 1, &PixelFont, &images);
+    gpu.walk(&second, 1, &PixelFont, &images, Some(Color::CANVAS));
     assert_eq!(gpu.ground.pending.len(), 1);
     assert_eq!(gpu.atlas.live.values().next().unwrap().generation, 2);
     gpu.present_wait(&second, 1, Color::BLACK, &PixelFont, &images);
@@ -64,7 +64,7 @@ fn failed_upload_status_retries_real_pixels_without_a_new_generation() {
     )
     .index;
     gpu.ground.begin_slot(index, &mut gpu.atlas);
-    gpu.walk(&second, 1, &PixelFont, &images);
+    gpu.walk(&second, 1, &PixelFont, &images, Some(Color::CANVAS));
     // Inject the terminal command result at the slot's outcome seam. The
     // staged bytes deliberately never reach the GPU; this is not a real GPU fault.
     let mut failed = FrameSlot::empty();
@@ -91,7 +91,7 @@ fn an_older_failed_generation_does_not_invalidate_a_later_upload() {
     let images = RawImages::default();
     let first = frame(&feed, [255, 0, 0, 255]);
     gpu.ground.begin_slot(0, &mut gpu.atlas);
-    gpu.walk(&first, 1, &PixelFont, &images);
+    gpu.walk(&first, 1, &PixelFont, &images, Some(Color::CANVAS));
     let mut failed = FrameSlot::empty();
     failed.submitted_uploads(&mut gpu.ground, &gpu.atlas);
     let newer = frame(&feed, [0, 0, 255, 255]);
@@ -108,7 +108,7 @@ fn an_older_failed_generation_does_not_invalidate_a_later_upload() {
     )
     .index;
     gpu.ground.begin_slot(index, &mut gpu.atlas);
-    gpu.walk(&newer, 1, &PixelFont, &images);
+    gpu.walk(&newer, 1, &PixelFont, &images, Some(Color::CANVAS));
     assert!(gpu.ground.pending.is_empty());
 }
 
@@ -144,7 +144,7 @@ fn abandoned_upload_also_recovers_in_a_patch() {
     )
     .index;
     gpu.ground.begin_slot(index, &mut gpu.atlas);
-    gpu.walk(&second, 1, &PixelFont, &images);
+    gpu.walk(&second, 1, &PixelFont, &images, Some(Color::CANVAS));
     let pixels = gpu.patch_rgba(&second, 1, Color::BLACK, &PixelFont, &images, (2, 2, 6, 6));
     assert_eq!(pixels, [0, 255, 0, 255].repeat(16));
 }
@@ -242,7 +242,7 @@ fn a_failed_upload_bypasses_the_identical_display_shortcut() {
         std::mem::swap(&mut presenter.atlas, &mut gpu.atlas);
         let second = frame(&feed, [0, 255, 0, 255]);
         presenter.ground.begin_slot(0, &mut presenter.atlas);
-        presenter.build_with_retries(&second, 1, (8, 8), &PixelFont, &images);
+        presenter.build_with_retries(&second, 1, (8, 8), &PixelFont, &images, Some(Color::CANVAS));
         // A real empty command supplies native lifetime/queue behavior. The
         // injected failure leaves the live texture at its prior red pixels.
         let command = msg_id(presenter.stack.queue, presenter.stack.sels.command_buffer);
