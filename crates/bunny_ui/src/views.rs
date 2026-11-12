@@ -498,9 +498,48 @@ pub struct TextField {
     paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     focus: Option<Rc<dyn Fn(bool)>>,
     keyboard: crate::text_input::KeyboardType,
+    /// The beat that summons the field ([`TextField::focus_on`]).
+    summon: Option<crate::beat::Summon>,
 }
 
 impl TextField {
+    /// The field takes the keyboard each time `beat` rings, from whoever
+    /// holds it, and gives it back to that holder when the field leaves
+    /// the scene still holding it.
+    ///
+    /// ```ignore
+    /// text_field("Filter", self.filter.binding()).focus_on(self.summon)
+    /// ```
+    ///
+    /// A ring is answered once, and the [`Beat`](crate::beat::Beat) keeps
+    /// how far it was answered. A field that leaves the scene and comes
+    /// back does not answer the same ring again — the rule a find bar in
+    /// a tab needs. [`ViewExt::auto_focus_beat`] with a number is the
+    /// other rule: the field forgets the number when it leaves, which is
+    /// right for a popup whose field is made new on each opening.
+    ///
+    /// Write it on the field, before the modifiers. It is a method of the
+    /// field and not a modifier, so a place where it would be lost does
+    /// not compile.
+    ///
+    /// [`ViewExt::auto_focus_beat`]: crate::ext::ViewExt::auto_focus_beat
+    pub fn focus_on(mut self, beat: crate::beat::Beat) -> Self {
+        self.summon = Some(crate::beat::Summon { beat, select: false });
+        self
+    }
+
+    /// [`TextField::focus_on`], and each ring also selects the field's
+    /// whole text, so the next keys REPLACE what it holds — whether the
+    /// ring moved the keyboard to the field or found it there.
+    ///
+    /// ```ignore
+    /// text_field("Find", self.query.binding()).select_on(self.find)
+    /// ```
+    pub fn select_on(mut self, beat: crate::beat::Beat) -> Self {
+        self.summon = Some(crate::beat::Summon { beat, select: true });
+        self
+    }
+
     /// Decorate native editing with a retained policy (for example modal editing).
     pub fn editing_strategy(
         mut self,
@@ -702,6 +741,7 @@ impl TextField {
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     crate::reconciler::EditorFn {
+                    answered: self.summon.map(|summon| summon.beat.answered()),
                     submit_on_enter: self.submit_on_enter,
                     yields_on_submit: self.yields_on_submit,
                     nav_intercept: self.nav_intercept.clone(),
@@ -855,7 +895,13 @@ impl TextField {
                     content: value,
                     placeholder: self.placeholder.clone(),
                     multiline: self.multiline,
-                    auto_focus: crate::layout::AutoFocus::Off,
+                    // the read is recorded: a ring runs this body again.
+                    // A beat that never rang summons nobody
+                    auto_focus: match self.summon.map(|summon| (summon.beat.rung(), summon.select)) {
+                        None | Some((0, _)) => crate::layout::AutoFocus::Off,
+                        Some((rung, false)) => crate::layout::AutoFocus::Beat(rung),
+                        Some((rung, true)) => crate::layout::AutoFocus::Selecting(rung),
+                    },
                     secret: self.secret,
                 });
             }
@@ -1149,6 +1195,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        summon: None,
     }
 }
 
@@ -1180,6 +1227,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        summon: None,
     }
 }
 

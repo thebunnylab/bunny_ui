@@ -66,6 +66,10 @@ pub(crate) type LentText = Rc<RefCell<Option<crate::text_input::Lent>>>;
 pub(crate) type ReadFn = Rc<dyn Fn(&mut CaretState) -> Option<std::sync::Arc<str>>>;
 #[derive(Clone)]
 pub(crate) struct EditorFn {
+    /// The newest ring answered of the beat the field wears
+    /// (`TextField::focus_on`): the beat's own cell, so a field that
+    /// left and came back finds what was answered before it left.
+    pub answered: Option<Rc<std::cell::Cell<u64>>>,
     pub submit_on_enter: bool,
     /// After its submit runs, the field hands a borrowed keyboard back to
     /// its lender (`TextField::yield_on_submit`).
@@ -3226,6 +3230,12 @@ pub(crate) fn field_intercepts_nav(path: &str) -> bool {
     let intercept = editor_at(path).and_then(|editor| editor.nav_intercept.clone());
     // out of the borrow: reading a binding may reach the app's state
     intercept.is_some_and(|binding| binding.wrappedValue())
+}
+
+/// The cell of the beat the field at `path` wears, when it wears one
+/// (`TextField::focus_on`).
+pub(crate) fn field_answered(path: &str) -> Option<Rc<std::cell::Cell<u64>>> {
+    LIVE.with(|live| live.borrow().editors.get(path).and_then(|editor| editor.answered.clone()))
 }
 
 pub(crate) fn field_yields_on_submit(path: &str) -> bool {

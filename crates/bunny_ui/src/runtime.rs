@@ -7859,6 +7859,18 @@ impl Runtime {
         if !fresh {
             return false;
         }
+        // a field that wears a `Beat` asks the beat too: the newest ring
+        // answered is kept THERE, so a field that left and came back —
+        // new to this memory — does not answer a ring again, and two
+        // fields that wear one beat answer a ring once between them
+        if let AutoFocus::Beat(ring) | AutoFocus::Selecting(ring) = ask
+            && let Some(answered) = reconciler::field_answered(path)
+        {
+            if answered.get() >= ring {
+                return false;
+            }
+            answered.set(ring);
+        }
         let beat = matches!(ask, AutoFocus::Beat(_) | AutoFocus::Selecting(_));
         let free = if beat {
             self.focus.borrow().as_deref() != Some(path)

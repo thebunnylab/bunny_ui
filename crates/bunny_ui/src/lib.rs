@@ -45,6 +45,7 @@ pub mod preview;
 pub mod action;
 pub mod angle;
 pub mod anim;
+pub mod beat;
 pub mod bind;
 mod blur;
 pub mod catalog;
@@ -204,6 +205,7 @@ pub mod prelude {
     pub use crate::ext::ViewExt;
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    pub use crate::beat::Beat;
     // the app's strings: `catalog::Table` and `catalog::Key` stay
     // qualified, as the views have a `Table` and the actions a `Key`
     pub use crate::catalog::{self, Catalog, Strings};
