@@ -118,6 +118,11 @@ pub fn forget_geometry(window: usize, id: WindowId) {
     });
 }
 
+/// The lifetime a native window answers for, while the app holds it open.
+pub(super) fn lifetime(window: usize) -> Option<WindowId> {
+    SOURCES.with(|sources| sources.borrow().get(&window).map(|events| events.id()))
+}
+
 fn view(window: usize) -> Result<Id, WindowError> {
     WINDOWS.with(|windows| {
         windows
