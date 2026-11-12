@@ -1,0 +1,13 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8874
+open = false
+
+# trunk's wasm-bindgen CLI and the crate the workspace locks must agree
+# exactly: bump this with `Cargo.lock`.
+[tools]
+wasm_bindgen = "0.2.129"

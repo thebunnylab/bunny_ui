@@ -498,6 +498,7 @@ pub struct TextField {
     paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     focus: Option<Rc<dyn Fn(bool)>>,
     keyboard: crate::text_input::KeyboardType,
+    autocomplete: Option<crate::text_input::Autocomplete>,
 }
 
 impl TextField {
@@ -655,6 +656,35 @@ impl TextField {
     /// ```
     pub fn secret(mut self, secret: bool) -> Self {
         self.secret = secret;
+        self
+    }
+
+    /// What the field holds, said to the platform's autofill: a password
+    /// manager fills a box that says it is the current password, and
+    /// offers to save one from a box that says it is a new one.
+    ///
+    /// The element lowering writes it as the input's `autocomplete`
+    /// attribute; a field that says nothing leaves the choice with the
+    /// browser, and [`Autocomplete::Off`] asks for no suggestion at all.
+    /// The pixel shells own no native field to fill, and ignore it.
+    ///
+    /// A sign-in form says both halves, and names each box for a reader
+    /// that cannot see the words beside it:
+    ///
+    /// ```ignore
+    /// text_field("", email)
+    ///     .autocomplete(Autocomplete::Username)
+    ///     .accessibility_label("Email");
+    /// text_field("", password)
+    ///     .secret(true)
+    ///     .autocomplete(Autocomplete::CurrentPassword)
+    ///     .accessibility_label("Password");
+    /// ```
+    ///
+    /// [`Autocomplete::Off`]: crate::text_input::Autocomplete::Off
+    /// [`Autocomplete`]: crate::text_input::Autocomplete
+    pub fn autocomplete(mut self, holds: crate::text_input::Autocomplete) -> Self {
+        self.autocomplete = Some(holds);
         self
     }
 }
@@ -857,6 +887,9 @@ impl TextField {
                     multiline: self.multiline,
                     auto_focus: crate::layout::AutoFocus::Off,
                     secret: self.secret,
+                    autocomplete: self.autocomplete,
+                    // a chain writes this too (`.accessibility_label`)
+                    label: None,
                 });
             }
             // outside a pass (decorative use): the value becomes plain text
@@ -1149,6 +1182,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        autocomplete: None,
     }
 }
 
@@ -1180,6 +1214,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         paste_image: None,
         focus: None,
         keyboard: crate::text_input::KeyboardType::Text,
+        autocomplete: None,
     }
 }
 
