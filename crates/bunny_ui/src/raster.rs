@@ -151,6 +151,16 @@ fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
 }
 
+/// `color` multiplied by its own alpha, packed — what a translucent
+/// ground holds. `blend_px` reads its destination as premultiplied, so
+/// a ground stored straight would show at full strength under a paint
+/// that expected it faint.
+fn premultiplied(color: Color) -> u32 {
+    let alpha = color.a as u32;
+    let channel = |value: u8| div255(value as u32 * alpha);
+    (channel(color.r) << 24) | (channel(color.g) << 16) | (channel(color.b) << 8) | alpha
+}
+
 #[expect(clippy::cast_possible_truncation, reason = "each field is one byte of the word")]
 const fn unpack(word: u32) -> Color {
     Color {
@@ -292,6 +302,23 @@ impl Bitmap {
         }
     }
 
+    /// A bitmap the SYSTEM composites over what is behind the window.
+    /// The canvas lies on it at its own alpha, premultiplied; every
+    /// paint after it blends as usual and leaves premultiplied pixels,
+    /// the convention a compositor reads. A canvas at alpha 255 gives
+    /// the bitmap [`Bitmap::new`] gives, byte for byte.
+    pub fn translucent(width: usize, height: usize, canvas: Color) -> Self {
+        Bitmap {
+            width,
+            height,
+            pixels: vec![premultiplied(canvas); width * height],
+            beneath: None,
+            clip: Vec::new(),
+            top_cut: OPEN_CUT,
+            top_round: None,
+        }
+    }
+
     pub fn width(&self) -> usize {
         self.width
     }
@@ -411,8 +438,7 @@ impl Bitmap {
     /// Overwrites the rect with `color` — a CLEAR, not a wash: alpha is
     /// written as-is, no blending (clearing with a translucent color
     /// must not accumulate over frames).
-    fn clear_rect(&mut self, rect: DamageRect, color: Color) {
-        let packed = pack(color);
+    fn clear_rect(&mut self, rect: DamageRect, packed: u32) {
         let x0 = rect.0.clamp(0, self.width as i64) as usize;
         let x1 = rect.2.clamp(0, self.width as i64) as usize;
         let y0 = rect.1.clamp(0, self.height as i64) as usize;
@@ -1365,6 +1391,40 @@ pub fn rasterize_over(
     bitmap.beneath = beneath
         .filter(|under| under.width == width && under.height == height)
         .map(|under| under.pixels.clone());
+    paint(&mut bitmap, display, scale, text, images);
+    bitmap
+}
+
+/// [`rasterize_with`] for a window the system composites by its own
+/// alpha: the canvas is the ground at its own strength, and the bitmap
+/// that comes back holds premultiplied pixels.
+///
+/// The ground is the one difference. An opaque window clears to the
+/// canvas and its alpha never leaves the process; here the alpha the
+/// scene leaves IS the picture — what is behind the window shows
+/// through exactly where the scene left it room.
+pub fn rasterize_translucent(
+    display: &DisplayList,
+    width: usize,
+    height: usize,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) -> Bitmap {
+    let mut bitmap = Bitmap::translucent(width, height, canvas);
+    paint(&mut bitmap, display, scale, text, images);
+    bitmap
+}
+
+/// Paints the list onto a bitmap that already holds its ground.
+fn paint(
+    bitmap: &mut Bitmap,
+    display: &DisplayList,
+    scale: usize,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) {
     let factor = scale as f64;
     for command in display.iter() {
         match command {
@@ -1443,7 +1503,6 @@ pub fn rasterize_over(
             DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
-    bitmap
 }
 
 // MARK: - Surface (incremental repaint by damage regions)
@@ -1653,7 +1712,10 @@ pub fn list_damage(
 pub struct Surface {
     bitmap: Bitmap,
     scale: usize,
-    background: Color,
+    /// The word a damaged rect is cleared to before its replay: the
+    /// background as given, or the canvas premultiplied on a
+    /// translucent surface.
+    ground: u32,
     /// The list painted on the bitmap (the previous frame). Empty at
     /// birth — the first frame damages the whole surface.
     display: DisplayList,
@@ -1683,10 +1745,21 @@ impl Surface {
     /// color — damaged rects are overwritten with it before replay
     /// (alpha is written as-is, not blended: it is a clear, not a wash).
     pub fn new(width: usize, height: usize, scale: usize, background: Color) -> Self {
+        Surface::over(Bitmap::new(width, height, background), scale, pack(background))
+    }
+
+    /// A surface the system composites over what is behind the window —
+    /// [`Bitmap::translucent`], retained. Its mirror ([`Surface::rgba`])
+    /// holds premultiplied bytes.
+    pub fn translucent(width: usize, height: usize, scale: usize, canvas: Color) -> Self {
+        Surface::over(Bitmap::translucent(width, height, canvas), scale, premultiplied(canvas))
+    }
+
+    fn over(bitmap: Bitmap, scale: usize, ground: u32) -> Self {
         Surface {
-            bitmap: Bitmap::new(width, height, background),
+            bitmap,
             scale,
-            background,
+            ground,
             display: DisplayList::default(),
             bounds: Vec::new(),
             primed: false,
@@ -1844,7 +1917,7 @@ impl Surface {
         // stay balanced no matter what is skipped)
         let factor = self.scale as f64;
         for &rect in &damage {
-            self.bitmap.clear_rect(rect, self.background);
+            self.bitmap.clear_rect(rect, self.ground);
             self.bitmap.push_clip_physical(rect);
             for (index, command) in new.iter().enumerate() {
                 match command {
@@ -3386,5 +3459,72 @@ mod tests {
         assert_eq!(crate::glass::level_for(crate::glass::SIGMA_L0 * 2.0), 1.0);
         // and it never climbs past the top of the pyramid
         assert_eq!(crate::glass::level_for(10_000.0), crate::glass::MAX_LEVEL as f64);
+    }
+
+    /// A translucent ground holds the canvas ALREADY multiplied by its
+    /// alpha. The blend reads its destination as premultiplied, so a
+    /// ground stored straight would reach the compositor at full
+    /// strength — a window asked to be faint would come out solid.
+    #[test]
+    fn a_translucent_ground_holds_the_canvas_premultiplied() {
+        let bitmap = Bitmap::translucent(2, 2, Color::rgba(200, 100, 50, 128));
+        assert!(
+            bitmap.pixels().iter().all(|pixel| pixel.to_be_bytes() == [100, 50, 25, 128]),
+            "every pixel is the canvas times its own alpha"
+        );
+    }
+
+    /// A paint over a translucent ground adds its alpha to the ground's
+    /// and stays premultiplied: half white over half black is 128 grey
+    /// at three quarters — the bytes a compositor shows as 67 % white
+    /// over 25 % of what is behind the window.
+    #[test]
+    fn a_fill_over_a_translucent_ground_stays_premultiplied() {
+        let display = list(vec![fill(0.0, 0.0, 2.0, 2.0, Color::rgba(255, 255, 255, 128))]);
+        let bitmap = rasterize_translucent(
+            &display,
+            4,
+            2,
+            1,
+            Color::rgba(0, 0, 0, 128),
+            &PixelFont,
+            &RawImages::default(),
+        );
+        assert_eq!(bitmap.pixels()[0].to_be_bytes(), [128, 128, 128, 192], "under the fill");
+        assert_eq!(bitmap.pixels()[3].to_be_bytes(), [0, 0, 0, 128], "beside it, the ground alone");
+    }
+
+    /// Where the canvas is solid the two grounds are one: a window that
+    /// asked for a blur and got none paints what an opaque window paints.
+    #[test]
+    fn a_solid_canvas_is_the_same_bitmap_on_either_ground() {
+        for frame in hover_frames() {
+            let opaque = rasterize(&frame, 120, 80, Color::CANVAS);
+            let translucent = rasterize_translucent(
+                &frame,
+                120,
+                80,
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &RawImages::default(),
+            );
+            assert_eq!(opaque.pixels(), translucent.pixels());
+        }
+    }
+
+    /// The retained surface clears its damage to the SAME premultiplied
+    /// ground it was born with: every incremental frame is the one-shot
+    /// translucent raster, byte for byte.
+    #[test]
+    fn a_translucent_surface_matches_the_full_repaint_byte_for_byte() {
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let mut surface = Surface::translucent(120, 80, 1, canvas);
+        for frame in hover_frames() {
+            let oracle =
+                rasterize_translucent(&frame, 120, 80, 1, canvas, &PixelFont, &RawImages::default());
+            surface.frame(frame, &PixelFont, &RawImages::default());
+            assert_eq!(surface.bitmap().pixels(), oracle.pixels());
+        }
     }
 }

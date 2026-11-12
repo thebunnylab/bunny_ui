@@ -1712,6 +1712,14 @@ impl Color {
         Color { r: (rgba >> 24) as u8, g: (rgba >> 16) as u8, b: (rgba >> 8) as u8, a: rgba as u8 }
     }
 
+    /// The same color at another alpha — `0` is clear, `255` solid.
+    /// How a theme's canvas is thinned for a window that stands on a
+    /// blur: `theme::canvas().with_alpha(153)`.
+    #[must_use]
+    pub const fn with_alpha(self, a: u8) -> Color {
+        Color { a, ..self }
+    }
+
     /// The same color with no alpha — where a ramp fades OUT.
     /// Interpolation is straight, so a glow that ends at
     /// `rgba(0,0,0,0)` drags its ramp through grey; ending at its own

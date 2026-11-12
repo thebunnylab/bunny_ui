@@ -8,11 +8,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod background;
 mod confirmation;
 mod confirmation_alert;
 mod dialog_geometry;
 mod geometry;
 mod relationships;
+pub use background::WindowBackground;
 pub use confirmation::{
     Confirmation, ConfirmationError, ConfirmationKind, ConfirmationResponse, ConfirmationSpec,
 };
