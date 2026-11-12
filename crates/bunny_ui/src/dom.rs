@@ -624,10 +624,21 @@ pub struct DomField {
     /// Many lines: the glue builds a `<textarea>` instead of an
     /// `<input>`, and the browser wraps and scrolls it at home.
     pub multiline: bool,
-    /// The field must not show what it holds: the glue builds
+    /// The field must not show what it holds: the glue writes
     /// `type="password"`, and the browser masks, refuses the copy and
-    /// keeps its own caret — the platform's own job, done natively.
+    /// keeps its own caret — the platform's own job, done natively. It
+    /// is also what the element IS to a reader and to a password
+    /// manager: a password box, by the browser's own semantics. A secret
+    /// is one line here — only an `<input>` masks ([`create_kind`]).
     pub secret: bool,
+    /// What the field holds, for the browser's autofill: the input's
+    /// `autocomplete` attribute, in the standard's tokens. `None` writes
+    /// no attribute and leaves the choice with the browser.
+    pub autocomplete: Option<crate::text_input::Autocomplete>,
+    /// The field's accessible name, when the app gave it one
+    /// (`.accessibility_label`): the input's `aria-label`. `None` writes
+    /// none, and the browser names the box by its placeholder.
+    pub label: Option<Arc<str>>,
 }
 
 /// What a node reads for itself ([`crate::bind`]): the lowering keeps
@@ -949,8 +960,9 @@ impl DomCapture {
         // tooltip armed by the wrapper lands on THIS box
         let tooltip = node.style.take_tooltip();
         let mut look = DomLook {
-            // the rebuild must not drop what the layer scope decided
-            pass_through: self.overlay_depth > 0 && interactive.is_none(),
+            // the rebuild must not drop what the layer scope decided,
+            // nor a hit the view itself declined
+            pass_through: props.passive || (self.overlay_depth > 0 && interactive.is_none()),
             transition,
             group: props.from_group.then_some(group).flatten(),
             ..DomLook::from_props(props)
@@ -2505,7 +2517,9 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Ellipse => CreateKind::Ellipse,
         DomKind::Text(_) => CreateKind::Text,
         DomKind::Field(field) => {
-            if field.multiline {
+            // a secret is one line: a `<textarea>` cannot mask, and a
+            // password shown in the clear is the one thing the flag forbids
+            if field.multiline && !field.secret {
                 CreateKind::Editor
             } else {
                 CreateKind::Field
@@ -4257,7 +4271,19 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// after every other position the box names, and the flag (1) adds
 /// `pointer-events:auto` — a box an exact interior stood in a wrapper
 /// that takes no pointer.
-pub const ABI_VERSION: u32 = 23;
+///
+/// 24 (2026-11-12): what a field is. SetField (op 7) carries three more
+/// slots after the path — u8 flags (bit 0: secret), u8 autocomplete
+/// (0 = said nothing, else one past the value's place in
+/// `Autocomplete::ALL`) and the accessible name (u16 len + utf8, empty
+/// for none). The glue writes them as the input's `type` (`password`
+/// for a secret, which until now reached the page in the clear),
+/// `autocomplete` and `aria-label`, and removes the two attributes a
+/// field stopped saying. The module glue (`esm/bunny.js`) decodes no
+/// stream of its own: `attachDom` borrows the element shell
+/// (`glue_dom.js`) whole, so this number is checked once, by the file
+/// that decodes.
+pub const ABI_VERSION: u32 = 24;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4340,7 +4366,11 @@ pub const ABI_VERSION: u32 = 23;
 ///                   u8 italic,
 ///                   u16 len + utf8 family (0 = the system's own face),
 ///                   u32 len + utf8 content, u32 len + utf8 placeholder,
-///                   u16 len + utf8 path
+///                   u16 len + utf8 path, u8 flags (bit 0: secret — the
+///                   input is a password box), u8 autocomplete (0 = said
+///                   nothing, else one past the value's place in
+///                   `Autocomplete::ALL`), u16 len + utf8 accessible
+///                   name (0 = none)
 ///   8 set scroll    f32 x, f32 y
 ///   9 set image     u32 key hi, u32 key lo, u8 cover — identity as a
 ///                   NUMBER (the shell's registry maps key → URL)
@@ -4511,6 +4541,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_bytes_u32(&mut out, field.content.as_bytes());
                 push_bytes_u32(&mut out, field.placeholder.as_bytes());
                 push_bytes_u16(&mut out, field.path.as_bytes());
+                out.push(field.secret as u8);
+                out.push(field.autocomplete.map_or(0, crate::text_input::Autocomplete::code));
+                push_bytes_u16(&mut out, field.label.as_deref().unwrap_or_default().as_bytes());
             }
             DomPatch::SetScroll { id, x, y } => {
                 out.push(8);
@@ -5815,6 +5848,171 @@ mod tests {
             13,
             "the editor kind rides the stream: {wire:?}"
         );
+    }
+
+    /// What a field IS reaches the browser: a secret as a password box,
+    /// what it holds as the autofill's token, and the name a chain gave
+    /// it — with no accessibility capture running, because the element
+    /// lowering has no tree of its own to ask.
+    #[test]
+    fn a_field_says_what_it_is_to_the_browser() {
+        use crate::text_input::Autocomplete;
+
+        #[derive(Clone)]
+        struct SignIn {
+            email: State<String>,
+            password: State<String>,
+        }
+        impl Component for SignIn {
+            fn body(self) -> impl View {
+                vstack!(
+                    text_field("", self.email.binding())
+                        .autocomplete(Autocomplete::Username)
+                        .accessibility_label("Email"),
+                    text_field("", self.password.binding())
+                        .secret(true)
+                        .autocomplete(Autocomplete::CurrentPassword)
+                        .accessibility_label("Password"),
+                    text_field("search", self.email.binding()),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = SignIn { email: State::new(String::new()), password: State::new("hunter2".into()) };
+        let fields: Vec<DomField> = runtime
+            .dom_frame(&view, Size { width: 240.0, height: 160.0 })
+            .into_iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetField { field, .. } => Some(*field),
+                _ => None,
+            })
+            .collect();
+        let said: Vec<_> = fields
+            .iter()
+            .map(|field| (field.secret, field.autocomplete, field.label.as_deref()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (false, Some(Autocomplete::Username), Some("Email")),
+                (true, Some(Autocomplete::CurrentPassword), Some("Password")),
+                // a field that said nothing says nothing
+                (false, None, None),
+            ],
+        );
+        // the record holds what the input HOLDS: the browser draws the
+        // mask, and what it holds is what the binding reads back
+        assert_eq!(fields[1].content.as_ref(), "hunter2");
+    }
+
+    /// Op 7 closes with the three slots: the flags, the autofill's code
+    /// and the name — and the glue reads every one, then writes them as
+    /// the input's `type`, `autocomplete` and `aria-label`.
+    #[test]
+    fn a_field_patch_carries_its_kind_its_autofill_and_its_name() {
+        use crate::text_input::Autocomplete;
+
+        let field = |secret, autocomplete, label: Option<&str>| DomField {
+            path: "p".into(),
+            content: Arc::from(""),
+            placeholder: Arc::from(""),
+            font: FontSpec::DEFAULT,
+            color: Color::BLACK,
+            multiline: false,
+            secret,
+            autocomplete,
+            label: label.map(Arc::from),
+        };
+        let wire = |field: DomField| encode(&[DomPatch::SetField { id: 1, field: Box::new(field) }]);
+
+        let plain = wire(field(false, None, None));
+        assert_eq!(&plain[plain.len() - 4..], &[0, 0, 0, 0], "nothing said: {plain:?}");
+
+        let password = wire(field(true, Some(Autocomplete::CurrentPassword), Some("Pw")));
+        assert_eq!(
+            &password[password.len() - 6..],
+            &[1, Autocomplete::CurrentPassword.code(), 2, 0, b'P', b'w'],
+            "secret, current-password, the name: {password:?}"
+        );
+
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        let op = glue.find("} else if (op === 7) {").expect("the glue reads op 7");
+        let next = glue[op + 1..].find("} else if (op ===").map_or(glue.len(), |at| op + 1 + at);
+        let body = &glue[op..next];
+        let slots = [
+            "const path = text(u16());",
+            "const secret = (u8() & 1) !== 0;",
+            "const holds = AUTOCOMPLETE[u8()] || \"\";",
+            "const label = text(u16());",
+            "if (el) {",
+        ];
+        let mut at = 0;
+        for slot in slots {
+            let found = body[at..].find(slot).unwrap_or_else(|| panic!("op 7 reads `{slot}`, in order"));
+            at += found + slot.len();
+        }
+        for write in [
+            "const type = secret ? \"password\" : \"text\";",
+            "el.setAttribute(\"autocomplete\", holds);",
+            "el.removeAttribute(\"autocomplete\");",
+            "el.setAttribute(\"aria-label\", label);",
+            "el.removeAttribute(\"aria-label\");",
+        ] {
+            assert!(body.contains(write), "op 7 writes `{write}`");
+        }
+    }
+
+    /// The autofill's code is a place in a table both sides keep: the
+    /// glue's `AUTOCOMPLETE` lists the standard's tokens in the order of
+    /// [`Autocomplete::ALL`], after the empty slot of a field that said
+    /// nothing. A value added on one side alone goes red here.
+    ///
+    /// [`Autocomplete::ALL`]: crate::text_input::Autocomplete::ALL
+    #[test]
+    fn the_glue_names_every_autofill_token_in_wire_order() {
+        use crate::text_input::Autocomplete;
+
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        let open = glue.find("const AUTOCOMPLETE = [").expect("the glue keeps the table");
+        let close = open + glue[open..].find("];").expect("the table closes");
+        let table: Vec<&str> = glue[open..close]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let mut expected = vec![""];
+        expected.extend(Autocomplete::ALL.iter().map(|value| value.token()));
+        assert_eq!(table, expected, "the glue's table against Autocomplete::ALL");
+        for (place, value) in Autocomplete::ALL.iter().enumerate() {
+            assert_eq!(usize::from(value.code()), place + 1, "{value:?} sits at its code");
+        }
+    }
+
+    /// A secret is one line on a page: only an `<input>` masks, so a
+    /// secret editor mounts as one rather than as a `<textarea>` that
+    /// would show the password in the clear.
+    #[test]
+    fn a_secret_of_many_lines_still_mounts_as_an_input() {
+        #[derive(Clone)]
+        struct Vault {
+            text: State<String>,
+        }
+        impl Component for Vault {
+            fn body(self) -> impl View {
+                text_editor("", self.text.binding()).secret(true)
+            }
+        }
+        let runtime = Runtime::new();
+        let kind = runtime
+            .dom_frame(&Vault { text: State::new(String::new()) }, Size { width: 200.0, height: 80.0 })
+            .into_iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { kind, .. } if kind != CreateKind::Group => Some(kind),
+                _ => None,
+            })
+            .expect("the field mounts");
+        assert_eq!(kind, CreateKind::Field);
     }
 
     #[test]
@@ -9394,6 +9592,61 @@ mod tests {
             module.contains(&pin),
             "glue/esm/bunny.js expects a different ABI than the engine encodes"
         );
+    }
+
+    /// The module glue decodes no stream of its own. `attachDom` imports
+    /// the element shell — `glue_dom.js`, the file the gate above pins —
+    /// and its exports forward the wasm's `./bunny.js` imports to that
+    /// shell's border, so the patch applier exists once, whichever
+    /// loader made the instance. A second applier written into the
+    /// module, or a verb left unforwarded, goes red here.
+    #[test]
+    fn the_module_glue_borrows_the_element_shell() {
+        let shell = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        let module = include_str!("../../bunny_ui_web/glue/esm/bunny.js");
+
+        // one applier, and it is the shell's
+        assert_eq!(shell.matches("function applyPatches(").count(), 1);
+        for decoder in ["function applyPatches(", "getUint32(", "} else if (op ==="] {
+            assert!(!module.contains(decoder), "esm/bunny.js decodes no patch (`{decoder}`)");
+        }
+
+        // the door: the module asks for the shell, and the shell tells a
+        // borrowed evaluation from its own loader
+        assert!(module.contains("export async function attachDom(memoryHandle, exports, start)"));
+        assert!(module.contains("await import(\"./glue_dom.js\");"));
+        assert!(module.contains("dom = shell.border;"));
+        assert!(module.contains("return shell.adopt(exports, handle, start);"));
+        assert!(shell.contains("const OWN_LOADER = document.currentScript !== null;"));
+        assert!(shell.contains("globalThis.bunnyDom = {"));
+        assert!(shell.contains("border: imports[\"./bunny.js\"],"));
+        // the ABI gate stands between the borrowed instance and its start
+        let gate = shell.find("if (abi !== EXPECTED_ABI) {").expect("the shell's gate");
+        let start = shell.find("if (start) start(").expect("the borrowed entry");
+        assert!(gate < start, "a refused ABI never reaches the app's entry");
+
+        // every verb whose answer differs in the element mode is forwarded,
+        // and the shell's border answers it
+        for verb in [
+            "js_apply_patches",
+            "js_island_rect",
+            "js_request_frame",
+            "js_request_wake",
+            "js_clipboard_write",
+            "js_panic",
+            "js_image_register",
+            "js_image_size",
+            "js_image_raster",
+            "js_measure_text",
+            "js_raster_text",
+        ] {
+            assert!(module.contains(&format!("dom.{verb}(")), "esm/bunny.js forwards {verb}");
+            assert!(shell.contains(&format!("    {verb}(")), "glue_dom.js answers {verb}");
+        }
+        // an island's pixels reach its element through the shell's door
+        let gpu = include_str!("../../bunny_ui_web/glue/esm/bunny_gpu.js");
+        assert!(module.contains("attachGpu(exports, handle, null, shell.island);"));
+        assert!(gpu.contains("const element = glIsland ? glIsland(id >>> 0) : null;"));
     }
 
     /// Every glue reports the reader's languages — before the start, so

@@ -36,6 +36,9 @@ pub mod appearance;
 #[path = "accessibility.rs"]
 pub(crate) mod accessibility;
 
+#[path = "active.rs"]
+pub(crate) mod active;
+
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
@@ -6318,6 +6321,8 @@ pub fn run() {
         crate::webview::deliver_pending();
         // a window a verb or the compositor asked to close, now
         settle_closes();
+        // …and the window the keyboard came to rest on, once the turn is over
+        active::settle(with_client(|client| client.keyboard_focus));
         accessibility::pump();
     }
     teardown();

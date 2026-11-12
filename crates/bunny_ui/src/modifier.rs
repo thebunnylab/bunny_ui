@@ -702,6 +702,8 @@ struct FieldParts {
     inset: Option<Rc<crate::layout::Edges>>,
     highlights: Option<Rc<TextMarks>>,
     secret: bool,
+    autocomplete: Option<crate::text_input::Autocomplete>,
+    label: Option<std::sync::Arc<str>>,
 }
 
 impl FieldParts {
@@ -716,6 +718,8 @@ impl FieldParts {
             inset: self.inset,
             highlights: self.highlights,
             secret: self.secret,
+            autocomplete: self.autocomplete,
+            label: self.label,
         }
     }
 }
@@ -754,6 +758,8 @@ fn rewrite_field_node(
             inset,
             highlights,
             secret,
+            autocomplete,
+            label,
         } => rewrite(FieldParts {
             path,
             content,
@@ -764,6 +770,8 @@ fn rewrite_field_node(
             inset,
             highlights,
             secret,
+            autocomplete,
+            label,
         }),
         LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
@@ -1351,14 +1359,33 @@ pub(crate) fn apply(
     mark: usize,
 ) {
     match modifier {
-        Modifier::AccessibilityLabel(source) if crate::accessibility::capturing() => {
+        // with no capture the name still reaches a field below — and only
+        // a field, so a view that left no node keeps leaving none
+        Modifier::AccessibilityLabel(source)
+            if crate::accessibility::capturing() || out.layout_mark() > mark =>
+        {
+            let capturing = crate::accessibility::capturing();
             let label = {
                 let _scope = motor::identity::enter("#accessibility-label");
-                source.place()
+                // a capture places the source, so the name follows its
+                // binding without the body; with no capture nothing reads
+                // a binding, and the name is this pass's
+                if capturing { source.place() } else { source.clone() }
             };
-            out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
-                semantics: crate::accessibility::Semantics::Label(label.clone()),
-                child: Box::new(node),
+            // a field keeps its name on its own node: the element lowering
+            // has no accessibility tree to ask, and says the name as the
+            // input's `aria-label`
+            out.wrap_layout_from(mark, |node| {
+                let node = rewrite_field_node(node, &|parts| {
+                    FieldParts { label: Some(label.get()), ..parts }.into_node()
+                });
+                if !capturing {
+                    return node;
+                }
+                LayoutNode::Accessible {
+                    semantics: crate::accessibility::Semantics::Label(label.clone()),
+                    child: Box::new(node),
+                }
             });
         }
         Modifier::AccessibilityHidden if crate::accessibility::capturing() => out.wrap_layout_from(mark, |node| LayoutNode::Accessible {

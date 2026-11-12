@@ -80,6 +80,10 @@ name = "system_appearance"
 harness = false
 
 [[test]]
+name = "window_active"
+harness = false
+
+[[test]]
 name = "confirmation_native"
 harness = false
 

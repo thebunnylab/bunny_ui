@@ -565,6 +565,106 @@ pub enum KeyboardType {
     Search,
 }
 
+/// What a field HOLDS, said to the platform's autofill — a password
+/// manager offers a saved credential to a field that says it is the
+/// current password, and offers to save one from a field that says it is
+/// a new one. Nothing here changes what the field shows or how it edits.
+///
+/// The element lowering says it as the input's `autocomplete` attribute,
+/// in the HTML standard's own tokens ([`Autocomplete::token`]). The pixel
+/// shells own no native field for an autofill to fill, and say nothing.
+///
+/// ```ignore
+/// text_field("", password).secret(true).autocomplete(Autocomplete::CurrentPassword)
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum Autocomplete {
+    /// The field asks for no suggestion at all — a one-off value, a
+    /// search that must not remember.
+    Off,
+    /// The name an account signs in with.
+    Username,
+    /// An email address.
+    Email,
+    /// The password of an existing account — the sign-in box.
+    CurrentPassword,
+    /// A password being chosen — the sign-up and the change boxes.
+    NewPassword,
+    /// A code sent out of band, used once.
+    OneTimeCode,
+    /// A person's full name.
+    Name,
+    /// A given name.
+    GivenName,
+    /// A family name.
+    FamilyName,
+    /// A company or an organization.
+    Organization,
+    /// A telephone number, country code included.
+    Telephone,
+    /// A web address.
+    Url,
+}
+
+impl Autocomplete {
+    /// Every value, in wire order: the glue's `AUTOCOMPLETE` table lists
+    /// the same tokens in the same places, one past a leading empty slot.
+    pub const ALL: [Self; 12] = [
+        Self::Off,
+        Self::Username,
+        Self::Email,
+        Self::CurrentPassword,
+        Self::NewPassword,
+        Self::OneTimeCode,
+        Self::Name,
+        Self::GivenName,
+        Self::FamilyName,
+        Self::Organization,
+        Self::Telephone,
+        Self::Url,
+    ];
+
+    /// The HTML standard's autofill token for this value — what the
+    /// `autocomplete` attribute reads.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Username => "username",
+            Self::Email => "email",
+            Self::CurrentPassword => "current-password",
+            Self::NewPassword => "new-password",
+            Self::OneTimeCode => "one-time-code",
+            Self::Name => "name",
+            Self::GivenName => "given-name",
+            Self::FamilyName => "family-name",
+            Self::Organization => "organization",
+            Self::Telephone => "tel",
+            Self::Url => "url",
+        }
+    }
+
+    /// The value's code on the patch stream — its place in [`Self::ALL`]
+    /// plus one. Zero is a field that said nothing.
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Off => 1,
+            Self::Username => 2,
+            Self::Email => 3,
+            Self::CurrentPassword => 4,
+            Self::NewPassword => 5,
+            Self::OneTimeCode => 6,
+            Self::Name => 7,
+            Self::GivenName => 8,
+            Self::FamilyName => 9,
+            Self::Organization => 10,
+            Self::Telephone => 11,
+            Self::Url => 12,
+        }
+    }
+}
+
 /// An optional editing policy for a native field. The field keeps its binding,
 /// layout, selection, IME and scrolling; the policy interprets keyboard input.
 /// Retain one policy per document, independently of the rendered view's lifetime.
@@ -631,6 +731,22 @@ pub fn is_rtl_char(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Every value has a token of its own and a code of its own, and
+    /// none takes zero — the wire's "said nothing".
+    #[test]
+    fn an_autofill_value_has_one_token_and_one_code() {
+        use super::Autocomplete;
+        let mut tokens: Vec<&str> = Autocomplete::ALL.iter().map(|value| value.token()).collect();
+        let mut codes: Vec<u8> = Autocomplete::ALL.iter().map(|value| value.code()).collect();
+        assert!(codes.iter().all(|code| *code != 0));
+        tokens.sort_unstable();
+        tokens.dedup();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!((tokens.len(), codes.len()), (Autocomplete::ALL.len(), Autocomplete::ALL.len()));
+        assert_eq!(Autocomplete::CurrentPassword.token(), "current-password");
+    }
+
     #[test]
     fn utf16_offsets_are_counted_as_the_decoder_would_count_them() {
         let text = "ascii, then café, then 日本語, then 🦀🐇, then more";

@@ -623,6 +623,21 @@ impl Tree {
                 element.attrs.insert("value", field.content.to_string());
                 element.attrs.insert("placeholder", field.placeholder.to_string());
                 element.attrs.insert("data-path", field.path.clone());
+                // what the field is — the glue's op 7, mirrored: a secret
+                // is a password box, and the two attributes a field does
+                // not say are not written
+                if element.tag == "input" {
+                    let kind = if field.secret { "password" } else { "text" };
+                    element.attrs.insert("type", kind.to_string());
+                }
+                match field.autocomplete {
+                    Some(holds) => element.attrs.insert("autocomplete", holds.token().to_string()),
+                    None => element.attrs.remove("autocomplete"),
+                };
+                match &field.label {
+                    Some(label) => element.attrs.insert("aria-label", label.to_string()),
+                    None => element.attrs.remove("aria-label"),
+                };
             }
             DomPatch::SetHints { id, class, address } => {
                 let address = address.as_deref();
@@ -1380,6 +1395,42 @@ mod tests {
         assert!(rule.contains("padding-block:1px 3px"), "{rule}");
         assert!(rule.contains("padding-inline:4px 2px"), "leading first: {rule}");
         assert!(!rule.contains("padding:"), "no physical padding: {rule}");
+    }
+
+    /// A served field says what the mounted one says — the glue's op 7,
+    /// mirrored: a secret is a password box, what it holds is the
+    /// autofill's token, its name is `aria-label`, and a field that said
+    /// neither carries neither attribute.
+    #[test]
+    fn a_served_field_says_what_it_is() {
+        use crate::text_input::Autocomplete;
+
+        #[derive(Clone)]
+        struct SignIn {
+            email: State<String>,
+            password: State<String>,
+        }
+        impl Component for SignIn {
+            fn body(self) -> impl View {
+                vstack!(
+                    text_field("you@example.com", self.email.binding()),
+                    text_field("", self.password.binding())
+                        .secret(true)
+                        .autocomplete(Autocomplete::CurrentPassword)
+                        .accessibility_label("Password"),
+                )
+            }
+        }
+        let view = SignIn { email: State::new(String::new()), password: State::new(String::new()) };
+        let page = render(&view, Size { width: 240.0, height: 120.0 });
+        let inputs: Vec<&str> = page.html.split("<input").skip(1).collect();
+        assert_eq!(inputs.len(), 2, "{}", page.html);
+        let (plain, password) = (inputs[0], inputs[1]);
+        assert!(plain.contains(" type=\"text\""), "{plain}");
+        assert!(!plain.contains("autocomplete=") && !plain.contains("aria-label="), "{plain}");
+        assert!(password.contains(" type=\"password\""), "{password}");
+        assert!(password.contains(" autocomplete=\"current-password\""), "{password}");
+        assert!(password.contains(" aria-label=\"Password\""), "{password}");
     }
 
     /// A trailing text aligns to `end`, never `right`; a leading one

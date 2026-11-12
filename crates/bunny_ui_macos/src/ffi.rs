@@ -40,6 +40,8 @@ pub(crate) use bunny_ui_apple::ffi::{
 
 use crate::objc_bool::{self, ObjcBool};
 
+#[path = "active.rs"]
+mod active;
 #[path = "appearance.rs"]
 mod appearance;
 #[path = "confirmation.rs"]
@@ -703,6 +705,7 @@ pub fn dispatch(event: AppEvent) {
 /// more beat for every window.
 extern "C" fn perform_wake(_info: *mut c_void) {
     appearance::deliver();
+    active::settle();
     dispatch_all(AppEvent::Wake);
     confirmation::drain();
 }
@@ -712,6 +715,7 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 pub fn install_wake_source() {
     bunny_ui_apple::ffi::install_wake_source(perform_wake);
     appearance::install();
+    active::install();
 }
 
 /// The system says memory is short: every window hears it on the main

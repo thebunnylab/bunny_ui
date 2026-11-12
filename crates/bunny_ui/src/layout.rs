@@ -1173,6 +1173,17 @@ pub enum LayoutNode {
         /// characters of it. The reveal a password box offers is the
         /// app flipping this back off.
         secret: bool,
+        /// What the field holds, for the platform's autofill
+        /// (`TextField::autocomplete`). `None` says nothing: the
+        /// platform decides. Read by the element lowering alone — the
+        /// pixel shells own no native field to fill.
+        autocomplete: Option<crate::text_input::Autocomplete>,
+        /// The field's accessible name, when a chain gave it one
+        /// (`.accessibility_label`). It rides the node, and not only
+        /// the semantic wrapper a capture adds, so a lowering that
+        /// keeps no accessibility tree of its own — the browser's
+        /// elements — can still say it. `None` is the placeholder.
+        label: Option<Arc<str>>,
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
@@ -7533,6 +7544,8 @@ impl LayoutNode {
                     inset,
                     highlights,
                     secret,
+                    autocomplete,
+                    label,
                 },
                 Fit::Leaf,
             ) => {
@@ -7545,7 +7558,7 @@ impl LayoutNode {
                             range: None,
                             path: Rc::from(path.as_str()),
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
-                            label: Arc::clone(placeholder),
+                            label: Arc::clone(label.as_ref().unwrap_or(placeholder)),
                             value: (!*secret).then(|| Arc::clone(content)),
                             bounds: Some(bounds), surface: out.accessibility_surface.clone(), multiline: *multiline,
                         });
@@ -7570,7 +7583,10 @@ impl LayoutNode {
                 let highlights = if secret { &None } else { highlights };
                 if out.dom.is_some() {
                     // the browser's input owns focus, caret and
-                    // composition — the record carries what to SHOW,
+                    // composition — the record carries what the input
+                    // HOLDS (a secret's mask is the browser's to draw:
+                    // the element is a password box, and what it holds
+                    // is what the binding reads back),
                     // and the THEME chrome rides the node's style (the
                     // same tokens the pixel paint below reads)
                     let theme = crate::theme::current();
@@ -7583,12 +7599,14 @@ impl LayoutNode {
                         dom.leaf_styled(
                             crate::dom::DomKind::Field(Box::new(crate::dom::DomField {
                                 path: path.clone(),
-                                content: content.clone(),
+                                content: held.clone(),
                                 placeholder: placeholder.clone(),
                                 font: env.font,
                                 color,
                                 multiline,
                                 secret,
+                                autocomplete: *autocomplete,
+                                label: label.clone(),
                             })),
                             frame,
                             // a bare field carries no ground, no edge
