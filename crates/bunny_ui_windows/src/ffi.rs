@@ -14,6 +14,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+use bunny_ui::window::WindowBackground;
+
 #[path = "accessibility.rs"]
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
@@ -286,6 +288,7 @@ unsafe extern "system" {
     ) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
+    fn SetWindowLongW(hwnd: Hwnd, index: i32, value: i32) -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
     fn GetFocus() -> Hwnd;
 }
@@ -410,15 +413,67 @@ unsafe extern "system" {
         value: *const c_void,
         size: u32,
     ) -> i32;
+    fn DwmExtendFrameIntoClientArea(hwnd: Hwnd, margins: *const Margins) -> i32;
+}
+
+/// `MARGINS`: how far the frame reaches into the client area on each
+/// side, in the header's order. Minus one on every side is the whole
+/// window.
+#[repr(C)]
+struct Margins {
+    left: i32,
+    right: i32,
+    top: i32,
+    bottom: i32,
+}
+
+/// `RTL_OSVERSIONINFOW`, what `RtlGetVersion` fills.
+#[repr(C)]
+struct OsVersionInfo {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform: u32,
+    service_pack: [u16; 128],
+}
+const _: () = assert!(std::mem::size_of::<OsVersionInfo>() == 276);
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// The version of the system as it is. `GetVersionEx` answers by the
+    /// manifest of the program, and this crate embeds none, so it would
+    /// name an older system than the one that runs.
+    fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
 }
 
 /// `DWMWA_WINDOW_CORNER_PREFERENCE` / `DWMWCP_ROUND` — the system's
 /// own rounded corners, the same radius its apps wear.
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_ROUND: u32 = 2;
+/// `DWMWA_SYSTEMBACKDROP_TYPE`: the material the system draws behind a
+/// window. `DWMSBT_AUTO` is what a window has before it asks, and
+/// `DWMSBT_TRANSIENTWINDOW` is the acrylic one: a blur of what is behind
+/// the window.
+const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+const DWMSBT_AUTO: u32 = 0;
+const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+/// `DWMWA_CAPTION_COLOR`, and the value that asks for no colour there.
+const DWMWA_CAPTION_COLOR: u32 = 35;
+const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+/// The first build that serves `DWMWA_SYSTEMBACKDROP_TYPE`: Windows 11,
+/// version 22H2.
+const BACKDROP_BUILD: u32 = 22621;
 
 // window styles
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+/// The bit that gives a window its system menu, and with it the caption
+/// buttons the system draws.
+const WS_SYSMENU: u32 = 0x0008_0000;
+/// The window has no redirection bitmap: nothing GDI paints on it is
+/// shown, and what shows is what DirectComposition puts there. It is
+/// read once, when the window is created.
+const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
 /// The three bits a door drops: the resize border, the zoom box, the
 /// minimize box.
 const WS_THICKFRAME: u32 = 0x0004_0000;
@@ -2951,6 +3006,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DWMCOMPOSITIONCHANGED => {
+            // the compositor that restarted forgot the material it drew
+            // behind a blurred window: ask for it again. A window it
+            // will not give the blur back to paints opaque from here on
+            if background_of(hwnd) == WindowBackground::Blurred
+                && !apply_backdrop(hwnd, wears_scene_chrome(hwnd))
+            {
+                lose_backdrop(hwnd);
+            }
             // the compositor restarted (a driver reset restarts it):
             // every window's on-screen content was discarded, and no
             // paint is coming on its own — ask for one
@@ -3063,6 +3126,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             if is_top_level(hwnd) {
                 // the swapchain must not outlive its window
                 crate::d3d::teardown(hwnd);
+                BACKGROUNDS.with(|windows| {
+                    windows.borrow_mut().remove(&hwnd);
+                });
                 want_pace(hwnd as usize, DriverPace::Off);
                 // reported while the window can still be ADDRESSED: the
                 // app buries the slot the source names
@@ -3155,6 +3221,20 @@ fn register_class() -> Vec<u16> {
 /// own drag handle and buttons, and resize borders survive. `min`, when
 /// given, is the content floor in layout points that a drag cannot go
 /// under.
+///
+/// `background` is the ask of the spec, not yet resolved, because only
+/// this function can resolve it whole. A window that is not opaque is
+/// born with no redirection bitmap, and that bit of the extended style
+/// is read at creation alone. Nothing GDI paints on such a window is
+/// shown, so its GPU present is installed HERE, and not by
+/// [`install_gpu`] after the fact. Where the present, or the blur a
+/// blurred window stands on, does not come up, the window is destroyed
+/// and an opaque one is created in its place. [`WindowHandle::background`]
+/// reports which of the two the caller holds.
+///
+/// An opaque ask takes the road it always took: one window, extended
+/// style zero, and no presenter until [`install_gpu`].
+#[allow(clippy::too_many_arguments)]
 pub fn create_window(
     title: &str,
     width: f64,
@@ -3163,7 +3243,42 @@ pub fn create_window(
     scene_chrome: bool,
     resizable: bool,
     minimizable: bool,
+    background: WindowBackground,
 ) -> WindowHandle {
+    let raise = |ex_style: u32| {
+        raise_window(title, width, height, min, scene_chrome, resizable, minimizable, ex_style)
+    };
+    let served = window_background(background);
+    if !served.is_translucent() {
+        return WindowHandle { hwnd: raise(0) };
+    }
+    let hwnd = raise(WS_EX_NOREDIRECTIONBITMAP);
+    if compose(hwnd, served, scene_chrome) {
+        BACKGROUNDS.with(|windows| {
+            windows.borrow_mut().insert(hwnd, served);
+        });
+        return WindowHandle { hwnd };
+    }
+    // no redirection bitmap and no presenter is a window nothing can
+    // paint: it goes, and an opaque one takes its place
+    retire_stillborn(hwnd);
+    WindowHandle { hwnd: raise(0) }
+}
+
+/// One top-level window, hidden, sized and registered: everything
+/// [`create_window`] does that does not depend on the background. The
+/// extended style is the one input a background adds.
+#[allow(clippy::too_many_arguments)]
+fn raise_window(
+    title: &str,
+    width: f64,
+    height: f64,
+    min: Option<(f64, f64)>,
+    scene_chrome: bool,
+    resizable: bool,
+    minimizable: bool,
+    ex_style: u32,
+) -> Hwnd {
     install_dpi_awareness();
     let class_name = register_class();
     let title = wide(title);
@@ -3182,7 +3297,7 @@ pub fn create_window(
     const CW_USEDEFAULT: i32 = i32::MIN; // 0x80000000
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            ex_style,
             class_name.as_ptr(),
             title.as_ptr(),
             style,
@@ -3264,7 +3379,201 @@ pub fn create_window(
         );
     }
     refresh_metrics(hwnd);
-    WindowHandle { hwnd }
+    hwnd
+}
+
+thread_local! {
+    /// The background of each open window that is not opaque: what the
+    /// system served of its spec's ask. A window that is not here is
+    /// opaque.
+    static BACKGROUNDS: RefCell<HashMap<Hwnd, WindowBackground>> = RefCell::new(HashMap::new());
+}
+
+/// The build number of the system that runs, read once. Zero when the
+/// system does not say, and zero serves no blur.
+fn os_build() -> u32 {
+    static BUILD: OnceLock<u32> = OnceLock::new();
+    *BUILD.get_or_init(|| {
+        let mut info = OsVersionInfo {
+            size: std::mem::size_of::<OsVersionInfo>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            service_pack: [0; 128],
+        };
+        // an NTSTATUS: zero is success
+        let status = unsafe { RtlGetVersion(&mut info) };
+        if status == 0 { info.build } else { 0 }
+    })
+}
+
+/// The background this system serves for an ask, before a window exists.
+///
+/// A window shows by its own alpha when the GPU road is not refused
+/// (`BUNNY_PRESENT=cpu` refuses it) and the system has the shader
+/// compiler and DirectComposition. It can stand on a blur from Windows
+/// 11, version 22H2. This is a prediction: a device that does not come
+/// up, or a compositor that refuses the material, is found when the
+/// window opens, and [`WindowHandle::background`] has the truth then.
+pub fn window_background(asked: WindowBackground) -> WindowBackground {
+    if asked == WindowBackground::Opaque {
+        // nothing to find out, and no library is loaded to say it
+        return asked;
+    }
+    asked.resolve(crate::d3d::composes(), os_build() >= BACKDROP_BUILD)
+}
+
+/// The background an open window was given.
+fn background_of(hwnd: Hwnd) -> WindowBackground {
+    BACKGROUNDS
+        .with(|windows| windows.borrow().get(&hwnd).copied())
+        .unwrap_or(WindowBackground::Opaque)
+}
+
+/// Makes a window born with no redirection bitmap show its scene: the
+/// composed present and, for a blurred window, the system's material
+/// behind it. False when either does not come up, and the caller then
+/// takes the window back.
+fn compose(hwnd: Hwnd, served: WindowBackground, scene_chrome: bool) -> bool {
+    if !crate::d3d::try_install_composed(hwnd) {
+        return false;
+    }
+    served != WindowBackground::Blurred || apply_backdrop(hwnd, scene_chrome)
+}
+
+/// Asks the system for the blur a [`WindowBackground::Blurred`] window
+/// stands on, and answers whether the system gave it.
+///
+/// Two calls make the recipe. The frame is extended over the whole
+/// client area, so that what the compositor draws behind the frame lies
+/// behind the scene, and the backdrop is set to the acrylic material. A
+/// negative `HRESULT` from either call undoes both and answers false:
+/// the caller then makes the window opaque, never clear. A success says
+/// that the compositor took the ask, and not that a blur is on the
+/// screen. The material is light or dark by the dark-caption attribute,
+/// which the shell drives from the luminance of the canvas
+/// ([`WindowHandle::set_dark_caption`]).
+///
+/// This is the one place that says how the backdrop is asked for, at
+/// creation and again when the compositor restarts.
+///
+/// # An open question, for a real Windows 11 machine
+///
+/// A window whose scene draws its own bar ([`create_window`]'s
+/// `scene_chrome`) has no non-client area, and its frame was never
+/// extended before. With the frame extended, the compositor may draw its
+/// caption tint or its caption buttons under the scene, where they show
+/// through every part of the bar that is not solid. This code was
+/// type-checked and not run, so it does not know. The three ways to keep
+/// the two apart are the three constants at the top of the body:
+///
+/// 1. `SCENE_SKIPS_FRAME`: do not extend the frame under a scene-drawn
+///    bar. The risk moves: the material may then not reach the client
+///    area at all.
+/// 2. `SCENE_CLEARS_CAPTION_COLOR`: set `DWMWA_CAPTION_COLOR` to
+///    `DWMWA_COLOR_NONE`.
+/// 3. `SCENE_DROPS_SYSMENU`: drop `WS_SYSMENU`, and with it the buttons
+///    the system draws. The window also loses its system menu.
+///
+/// All three are off. That default changes least: the window keeps
+/// every style bit and every caption attribute it has as an opaque
+/// window, and the recipe that brings the material under the client
+/// area is applied whole, so a window that reports a blur is never left
+/// over a sharp desktop by a step this code chose to skip. Which
+/// constant to turn on, if any, is a choice to make in front of a real
+/// Windows 11 machine with `Chrome::Scene` and a canvas that is not
+/// solid.
+fn apply_backdrop(hwnd: Hwnd, scene_chrome: bool) -> bool {
+    const SCENE_SKIPS_FRAME: bool = false;
+    const SCENE_CLEARS_CAPTION_COLOR: bool = false;
+    const SCENE_DROPS_SYSMENU: bool = false;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+    unsafe {
+        if !(scene_chrome && SCENE_SKIPS_FRAME) {
+            let whole = Margins { left: -1, right: -1, top: -1, bottom: -1 };
+            if !com_ok(DwmExtendFrameIntoClientArea(hwnd, &whole)) {
+                return false;
+            }
+        }
+        if !com_ok(DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &DWMSBT_TRANSIENTWINDOW as *const u32 as *const c_void,
+            4,
+        )) {
+            remove_backdrop(hwnd);
+            return false;
+        }
+        if scene_chrome && SCENE_CLEARS_CAPTION_COLOR {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                &DWMWA_COLOR_NONE as *const u32 as *const c_void,
+                4,
+            );
+        }
+        if scene_chrome && SCENE_DROPS_SYSMENU {
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            SetWindowLongW(hwnd, GWL_STYLE, (style & !WS_SYSMENU) as i32);
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+    true
+}
+
+/// Undoes [`apply_backdrop`]: the frame goes back to the edge of the
+/// window, and the backdrop to what a window has before it asks.
+fn remove_backdrop(hwnd: Hwnd) {
+    let none = Margins { left: 0, right: 0, top: 0, bottom: 0 };
+    unsafe {
+        DwmExtendFrameIntoClientArea(hwnd, &none);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &DWMSBT_AUTO as *const u32 as *const c_void,
+            4,
+        );
+    }
+}
+
+/// A blurred window whose blur the system took back and will not give
+/// again: it paints as an opaque window from its next frame. It cannot
+/// become a clear one, because a scene drawn to stand on a blur cannot
+/// be read over a sharp desktop. The window stays composed; the bit
+/// that made it so cannot change.
+fn lose_backdrop(hwnd: Hwnd) {
+    remove_backdrop(hwnd);
+    BACKGROUNDS.with(|windows| {
+        windows.borrow_mut().remove(&hwnd);
+    });
+    crate::d3d::make_opaque(hwnd);
+}
+
+/// Takes back a window that was born with no redirection bitmap and
+/// then found no presenter, before the app ever heard of it.
+///
+/// It leaves the registry FIRST, so that the destroy below reads as a
+/// panel's, which dies in silence. The destroy of a top-level window
+/// reports a closed window to the app and, when it was the only one,
+/// ends the pump.
+fn retire_stillborn(hwnd: Hwnd) {
+    crate::d3d::teardown(hwnd);
+    unregister_top_level(hwnd);
+    METRICS.with(|slot| {
+        slot.borrow_mut().remove(&hwnd);
+    });
+    unsafe {
+        DestroyWindow(hwnd);
+    }
 }
 
 /// Grafts the GPU present onto the main window — called by the shell
@@ -3275,7 +3584,13 @@ pub fn create_window(
 /// the DIB road, byte for byte. NOT part of `create_window` itself:
 /// the headless tests build windows on arbitrary test threads, where a
 /// swapchain would be dead weight wearing DXGI's cross-thread locks.
+///
+/// A window that is not opaque already presents when it leaves
+/// `create_window`, and this leaves it as it is.
 pub fn install_gpu(window: &WindowHandle) {
+    if crate::d3d::active(window.hwnd) {
+        return;
+    }
     let _ = crate::d3d::try_install(window.hwnd);
 }
 
@@ -3372,6 +3687,14 @@ impl WindowHandle {
     /// against, and the app's own handle for it.
     pub fn raw_window(&self) -> usize {
         self.hwnd as usize
+    }
+
+    /// The background this window has NOW: what the system served of the
+    /// ask it was created with. It is the ask or
+    /// [`WindowBackground::Opaque`], and a blurred window that loses its
+    /// blur while it is open becomes opaque here too.
+    pub fn background(&self) -> WindowBackground {
+        background_of(self.hwnd)
     }
 
     /// Logical size of the content area (the layout viewport). Under a
@@ -4603,7 +4926,7 @@ mod tests {
 
     #[test]
     fn a_window_that_only_loops_arms_the_slow_beat_and_a_spring_takes_it_back() {
-        let window = create_window("bunny pace", 80.0, 60.0, None, false, true, true);
+        let window = create_window("bunny pace", 80.0, 60.0, None, false, true, true, WindowBackground::Opaque);
         let id = window.raw_window();
         want_pace(id, DriverPace::Slow(0.25));
         assert_eq!(SLOW_STEP.with(Cell::get), Some(0.25), "a loop alone: the slow beat");
@@ -4664,7 +4987,7 @@ mod tests {
     fn a_window_registers_creates_and_dies() {
         // headless smoke: the class registers and a real window is
         // born and destroyed without a pump
-        let window = create_window("bunny test", 120.0, 90.0, None, false, true, true);
+        let window = create_window("bunny test", 120.0, 90.0, None, false, true, true, WindowBackground::Opaque);
         let (width, height) = window.content_size();
         assert!(width > 0.0 && height > 0.0);
         assert!(window.scale() >= 1);
@@ -4686,7 +5009,7 @@ mod tests {
 
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
-        let window = create_window("bunny screen", 200.0, 150.0, None, false, true, true);
+        let window = create_window("bunny screen", 200.0, 150.0, None, false, true, true, WindowBackground::Opaque);
         let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
@@ -4710,7 +5033,7 @@ mod tests {
             let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), 64) };
             String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
         };
-        let owner = create_window("bunny owner", 200.0, 150.0, None, false, true, true);
+        let owner = create_window("bunny owner", 200.0, 150.0, None, false, true, true, WindowBackground::Opaque);
         let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true, false);
         assert_eq!(caption(dialog.hwnd), "Account");
 
@@ -4745,7 +5068,7 @@ mod tests {
             fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
         }
         const GWL_STYLE: i32 = -16;
-        let owner = create_window("bunny owner", 400.0, 300.0, None, false, true, true);
+        let owner = create_window("bunny owner", 400.0, 300.0, None, false, true, true, WindowBackground::Opaque);
         let alert = create_dialog(&owner, "Unsaved Changes", 420.0, 150.0, false, true);
         let style = unsafe { GetWindowLongPtrW(alert.hwnd, GWL_STYLE) } as u32;
         assert_eq!(style & (WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX), 0, "{style:#x}");
@@ -4772,7 +5095,7 @@ mod tests {
 
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
-        let window = create_window("bunny panel", 100.0, 80.0, None, false, true, true);
+        let window = create_window("bunny panel", 100.0, 80.0, None, false, true, true, WindowBackground::Opaque);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
         let factor = factor_of(&window);
@@ -4790,7 +5113,7 @@ mod tests {
     #[test]
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
-        let window = create_window("bunny host", 200.0, 150.0, None, false, true, true);
+        let window = create_window("bunny host", 200.0, 150.0, None, false, true, true, WindowBackground::Opaque);
         let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
@@ -4892,7 +5215,7 @@ mod tests {
 
     #[test]
     fn the_layered_copy_premultiplies_into_bgra() {
-        let window = create_window("bunny layered", 60.0, 40.0, None, false, true, true);
+        let window = create_window("bunny layered", 60.0, 40.0, None, false, true, true, WindowBackground::Opaque);
         let panel = create_panel(&window);
         // one half-transparent red pixel: premultiplied BGRA
         panel.present_layered(
@@ -4927,7 +5250,7 @@ mod tests {
 
     #[test]
     fn a_wake_crosses_threads_into_the_pump() {
-        let window = create_window("bunny wake", 80.0, 60.0, None, false, true, true);
+        let window = create_window("bunny wake", 80.0, 60.0, None, false, true, true, WindowBackground::Opaque);
         let hwnd = window.hwnd;
         let handle = std::thread::spawn(move || {
             // the thread-safe half of the pump, from another thread
@@ -4954,7 +5277,7 @@ mod tests {
     #[test]
     fn the_backing_holds_the_swizzled_rows()
     {
-        let window = create_window("bunny backing", 64.0, 64.0, None, false, true, true);
+        let window = create_window("bunny backing", 64.0, 64.0, None, false, true, true, WindowBackground::Opaque);
         let width = 8usize;
         let height = 4usize;
         let mut rgba = vec![0u8; width * height * 4];
@@ -4977,15 +5300,180 @@ mod tests {
 
     #[test]
     fn a_window_floor_answers_the_frame_and_leaves_with_the_window() {
-        let window = create_window("bunny floor", 800.0, 600.0, Some((720.0, 480.0)), false, true, true);
+        let window = create_window("bunny floor", 800.0, 600.0, Some((720.0, 480.0)), false, true, true, WindowBackground::Opaque);
         assert_eq!(content_floor(window.hwnd), Some((720.0, 480.0)), "WM_GETMINMAXINFO answers from this");
         assert!(!is_dialog(window.hwnd), "a floor does not make a window a dialog");
-        let plain = create_window("bunny plain", 800.0, 600.0, None, false, true, true);
+        let plain = create_window("bunny plain", 800.0, 600.0, None, false, true, true, WindowBackground::Opaque);
         assert_eq!(content_floor(plain.hwnd), None, "no floor: the platform answers alone");
         unsafe {
             DestroyWindow(window.hwnd);
             DestroyWindow(plain.hwnd);
         }
         assert_eq!(content_floor(window.hwnd), None, "a closed window leaves no floor behind");
+    }
+
+    /// `GWL_EXSTYLE`: where a window's extended style is read back.
+    const GWL_EXSTYLE: i32 = -20;
+
+    /// Can GDI paint this window? One born with
+    /// `WS_EX_NOREDIRECTIONBITMAP` has nothing for GDI to paint on.
+    fn has_redirection_bitmap(hwnd: Hwnd) -> bool {
+        let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        ex_style & WS_EX_NOREDIRECTIONBITMAP == 0
+    }
+
+    /// An opaque ask opens the window it always opened: GDI can paint it,
+    /// and no presenter exists until the shell asks for one.
+    #[test]
+    fn an_opaque_window_keeps_its_redirection_bitmap_and_takes_no_presenter() {
+        let window = create_window("bunny opaque", 120.0, 90.0, None, false, true, true, WindowBackground::Opaque);
+        assert!(has_redirection_bitmap(window.hwnd), "GDI can paint an opaque window");
+        assert!(!crate::d3d::active(window.hwnd), "the presenter waits for `install_gpu`");
+        assert!(!crate::d3d::composed(window.hwnd));
+        assert_eq!(window.background(), WindowBackground::Opaque);
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    /// The two ends a window that asked not to be opaque can come to, and
+    /// nothing between them: served as asked, with no redirection bitmap
+    /// and a composition swapchain that presents it; or opaque, exactly
+    /// as an opaque ask opens. Answers which one this window is.
+    fn served_whole(window: &WindowHandle, asked: WindowBackground) -> WindowBackground {
+        let served = window.background();
+        if served == asked {
+            assert!(!has_redirection_bitmap(window.hwnd), "a composed window has no redirection bitmap");
+            assert!(crate::d3d::composed(window.hwnd), "a composition swapchain presents it");
+            assert!(crate::d3d::active(window.hwnd), "and it is on the GPU road for life");
+            assert_eq!(window_background(asked), asked, "the prediction said so before it opened");
+        } else {
+            assert_eq!(served, WindowBackground::Opaque, "an ask is served as asked or opaque");
+            assert!(has_redirection_bitmap(window.hwnd), "an opaque window keeps its redirection bitmap");
+            assert!(!crate::d3d::composed(window.hwnd));
+            assert!(!crate::d3d::active(window.hwnd), "and waits for `install_gpu` like any other");
+        }
+        let (width, height) = window.content_size();
+        assert!(width > 0.0 && height > 0.0, "either window has its metrics");
+        assert!(is_top_level(window.hwnd), "and is the one the registry holds");
+        served
+    }
+
+    /// Which end a machine reaches is the machine's to say: an adapter
+    /// that refuses the composition swapchain opens the window opaque.
+    /// The test holds that the window is whole either way, and prints
+    /// which one this machine opened.
+    #[test]
+    fn a_clear_window_is_composed_or_honestly_opaque() {
+        let window = create_window("bunny clear", 160.0, 120.0, None, false, true, true, WindowBackground::Clear);
+        let served = served_whole(&window, WindowBackground::Clear);
+        println!(
+            "a clear window on this system: predicted {:?}, opened {served:?}",
+            window_background(WindowBackground::Clear),
+        );
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+        assert_eq!(background_of(window.hwnd), WindowBackground::Opaque, "a closed window leaves no background behind");
+        assert!(!crate::d3d::active(window.hwnd), "and no presenter");
+    }
+
+    /// Opens a blurred window, holds it to the two ends, prints which one
+    /// this machine reached, and closes it.
+    fn a_blurred_window_opens_whole(scene_chrome: bool) {
+        let window = create_window("bunny blur", 160.0, 120.0, None, scene_chrome, true, true, WindowBackground::Blurred);
+        let served = served_whole(&window, WindowBackground::Blurred);
+        assert_ne!(served, WindowBackground::Clear, "a blur the system cannot give is not a clear window");
+        println!(
+            "a blurred window on this system (build {}, scene chrome {scene_chrome}): predicted {:?}, opened {served:?}",
+            os_build(),
+            window_background(WindowBackground::Blurred),
+        );
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+        assert_eq!(background_of(window.hwnd), WindowBackground::Opaque, "a closed window leaves no background behind");
+    }
+
+    /// The same for a blur: blurred or opaque, and never the clear
+    /// window a refused blur would leave.
+    #[test]
+    fn a_blurred_window_is_blurred_or_honestly_opaque_and_never_clear() {
+        a_blurred_window_opens_whole(false);
+    }
+
+    /// And under a bar the scene draws, where the frame of the window
+    /// was never extended before. What the compositor then shows at the
+    /// top edge is a question for a real machine; that the window opens
+    /// whole is held here.
+    #[test]
+    fn a_blurred_window_under_a_scene_drawn_bar_opens_whole() {
+        a_blurred_window_opens_whole(true);
+    }
+
+    /// A blurred window whose blur the system takes back paints opaque
+    /// from then on and says so. It stays composed, because the bit that
+    /// made it so is read at creation alone.
+    #[test]
+    fn a_window_that_loses_its_blur_becomes_opaque_and_stays_composed() {
+        let window = create_window("bunny lost blur", 160.0, 120.0, None, false, true, true, WindowBackground::Blurred);
+        if window.background() != WindowBackground::Blurred {
+            println!("this system opened the blurred window opaque — nothing to lose, skipping");
+            unsafe {
+                DestroyWindow(window.hwnd);
+            }
+            return;
+        }
+        lose_backdrop(window.hwnd);
+        assert_eq!(window.background(), WindowBackground::Opaque, "never clear");
+        assert!(crate::d3d::composed(window.hwnd), "the window is the same window");
+        assert!(crate::d3d::active(window.hwnd), "and the GPU still presents it");
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    /// A window that is taken back before the app is handed it leaves
+    /// every registry and says nothing: the app is told of no closed
+    /// window, and the pump is not ended for a window that was never one
+    /// of the app's.
+    #[test]
+    fn a_stillborn_window_leaves_without_a_word_to_the_app() {
+        let closed = std::rc::Rc::new(Cell::new(0usize));
+        set_handler(Box::new({
+            let closed = std::rc::Rc::clone(&closed);
+            move |event| {
+                if matches!(event, AppEvent::WindowClosed) {
+                    closed.set(closed.get() + 1);
+                }
+            }
+        }));
+        let window = create_window("bunny stillborn", 120.0, 90.0, Some((80.0, 60.0)), true, true, true, WindowBackground::Opaque);
+        let hwnd = window.hwnd;
+        retire_stillborn(hwnd);
+        unsafe {
+            assert!(IsWindow(hwnd) == 0, "the window is gone");
+        }
+        assert!(!is_top_level(hwnd), "the registry forgot it before it died");
+        assert!(!wears_scene_chrome(hwnd), "and so did the scene-chrome set");
+        assert_eq!(content_floor(hwnd), None, "and the floors");
+        assert_eq!(closed.get(), 0, "the app heard of no closed window");
+        // the window that takes its place is a window like any other
+        let heir = create_window("bunny heir", 120.0, 90.0, None, false, true, true, WindowBackground::Opaque);
+        assert!(is_top_level(heir.hwnd));
+        unsafe {
+            DestroyWindow(heir.hwnd);
+        }
+        assert_eq!(closed.get(), 1, "a window the app holds does report its end");
+        HANDLER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// The version comes from the system itself and not from a manifest:
+    /// every system this crate runs on is build 10240 or later.
+    #[test]
+    fn the_system_reports_its_own_build() {
+        let build = os_build();
+        println!("this system is build {build}");
+        assert!(build >= 10240, "RtlGetVersion answered build {build}");
     }
 }
