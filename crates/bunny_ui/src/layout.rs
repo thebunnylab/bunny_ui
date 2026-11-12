@@ -1393,6 +1393,8 @@ pub(crate) enum ControlKind {
     Checkbox,
     /// Two states behind a switch. Keys as a checkbox.
     Switch,
+    /// One of a set: a press selects it. Space and Enter select it.
+    Radio,
 }
 
 impl ControlKind {
@@ -1403,6 +1405,7 @@ impl ControlKind {
             ControlKind::Button => Role::Button,
             ControlKind::Checkbox => Role::Checkbox,
             ControlKind::Switch => Role::Switch,
+            ControlKind::Radio => Role::RadioButton,
         }
     }
 
@@ -1412,6 +1415,7 @@ impl ControlKind {
             ControlKind::Button => "Button",
             ControlKind::Checkbox => "Checkbox",
             ControlKind::Switch => "Toggle",
+            ControlKind::Radio => "Choice",
         }
     }
 
@@ -1438,9 +1442,45 @@ pub(crate) struct FocusStop {
     pub control: Option<ControlState>,
 }
 
+/// The controls under one node travel as ONE group: Tab enters the group
+/// and leaves it, and the arrows move inside it. It is how the segments
+/// of a choice, the tabs of a bar, the rows of a list of choices and the
+/// days of a month are reached — one Tab stop each, as the native ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GroupSpec {
+    /// The members in one row. The vertical arrows move by this many, so
+    /// a month is seven and a list is one. A group of ONE row moves by
+    /// one on the vertical arrows too.
+    pub columns: u8,
+    /// Moving onto a member also activates it — the rule of a set of
+    /// radio buttons, where the focused one is the selected one. `false`
+    /// for a list that selects on Space or Enter.
+    pub selects: bool,
+}
+
+/// A group as the last layout placed it: its members are the focus stops
+/// `start..end`, in reading order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusGroup {
+    pub start: usize,
+    pub end: usize,
+    pub spec: GroupSpec,
+    /// The group reads right to left: the horizontal arrows swap.
+    pub rtl: bool,
+}
+
+impl FocusGroup {
+    pub(crate) const fn holds(&self, stop: usize) -> bool {
+        self.start <= stop && stop < self.end
+    }
+}
+
 impl ElementHints {
     pub(crate) fn control(&self) -> Option<ControlState> {
         self.address.as_ref().and_then(|address| address.control)
+    }
+    pub(crate) fn group(&self) -> Option<GroupSpec> {
+        self.address.as_ref().and_then(|address| address.group)
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
@@ -1453,6 +1493,8 @@ impl ElementHints {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Address {
     pub(crate) control: Option<ControlState>,
+    /// The controls under this node travel as one group ([`GroupSpec`]).
+    pub(crate) group: Option<GroupSpec>,
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
 }
@@ -4492,6 +4534,7 @@ pub struct Placement {
     /// The enclosing component boundaries, by path — what a site names.
     boundary_stack: Vec<Rc<str>>,
     pub(crate) focus_order: Vec<FocusStop>,
+    pub(crate) focus_groups: Vec<FocusGroup>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
     accessibility_viewport: Option<Rect>,
@@ -5038,6 +5081,8 @@ pub struct LayoutResult {
     /// frame; empty unless the runtime recorded sites.
     pub sites: Vec<crate::provenance::SitePlacement>,
     pub(crate) focus_order: Vec<FocusStop>,
+    /// The groups of `focus_order` that travel as one stop each.
+    pub(crate) focus_groups: Vec<FocusGroup>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
@@ -5272,6 +5317,7 @@ pub(crate) fn layout_placing(
         accessibility: out.accessibility,
         sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+        focus_groups: out.focus_groups,
         frames: out.frames,
         display: out.display,
         hits: out.hits,
@@ -5320,6 +5366,7 @@ fn assert_seen_placement(full: &Placement, cut: &Placement) {
             && full.scrolls.len() == cut.scrolls.len()
             && full.fields.len() == cut.fields.len()
             && full.focus_order == cut.focus_order
+            && full.focus_groups == cut.focus_groups
             && full.focus_floor == cut.focus_floor
             && full.focus_scope == cut.focus_scope
             && full.customs.len() == cut.customs.len()
@@ -5763,6 +5810,7 @@ pub fn layout_dom(
             accessibility: out.accessibility,
             sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+            focus_groups: out.focus_groups,
             frames: out.frames,
             display: out.display,
             hits: out.hits,
@@ -7382,6 +7430,8 @@ impl LayoutNode {
         out.passive += u32::from(passive);
         let semantic_start = out.accessibility.len();
         let control = self.carried_hints().and_then(ElementHints::control);
+        // the focus stops this node's subtree adds are one group
+        let group = self.carried_hints().and_then(ElementHints::group).map(|spec| (spec, out.focus_order.len()));
         let target = self.carried_action();
         if let (Some(state), Some(path)) = (control, target)
             && state.enabled && out.can_reveal_focus(frame)
@@ -7399,6 +7449,11 @@ impl LayoutNode {
                 place_target(path, frame, env, out, |out| self.place_node(frame, fit, env, out));
             }
             None => self.place_node(frame, fit, env, out),
+        }
+        if let Some((spec, start)) = group
+            && out.focus_order.len() > start
+        {
+            out.focus_groups.push(FocusGroup { start, end: out.focus_order.len(), spec, rtl: env.rtl() });
         }
         // the ring is for the reader who travels by keys: a control the
         // mouse pressed holds focus and shows none, as in a browser

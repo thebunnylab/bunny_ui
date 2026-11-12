@@ -336,6 +336,8 @@ pub struct Runtime {
     /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
     last_focus_order: RefCell<Vec<crate::layout::FocusStop>>,
+    /// The groups of that order that travel as one Tab stop each.
+    last_focus_groups: RefCell<Vec<crate::layout::FocusGroup>>,
     last_focus_floor: Cell<usize>,
     navigation_scopes: RefCell<Vec<(Rc<str>, Option<String>)>>,
     /// The splits of the last layout — a divider drag maps the pointer
@@ -763,23 +765,83 @@ impl Runtime {
         }
     }
 
+    /// Tab and Shift+Tab. A group of controls ([`crate::layout::GroupSpec`])
+    /// is ONE stop: Tab leaves it whole, and lands in one on its selected
+    /// member — the segment that is chosen, the tab that is shown — or on
+    /// its first.
     fn traverse_focus(&self, backwards: bool) -> bool {
         let stop = {
             let order = self.last_focus_order.borrow();
-            let order = &order[self.last_focus_floor.get()..];
-            if order.is_empty() { return false; }
+            let floor = self.last_focus_floor.get();
+            if order.len() <= floor { return false; }
+            let groups = self.last_focus_groups.borrow();
+            let group_of = |index: usize| groups.iter().find(|group| group.holds(index)).copied();
             let held = self.focus.borrow();
-            let current = order.iter().position(|stop| Some(stop.path.as_ref()) == held.as_deref());
-            let next = match (current, backwards) {
-                (Some(0) | None, true) => order.len() - 1,
-                (Some(index), true) => index - 1,
-                (Some(index), false) => (index + 1) % order.len(),
-                (None, false) => 0,
+            let current = (floor..order.len()).find(|&index| Some(order[index].path.as_ref()) == held.as_deref());
+            let (first, last) = (floor, order.len() - 1);
+            let next = match current {
+                None if backwards => last,
+                None => first,
+                Some(index) => {
+                    // the stop under the keyboard, as wide as its group
+                    let (from, to) = group_of(index)
+                        .map_or((index, index), |group| (group.start.max(first), (group.end - 1).min(last)));
+                    match backwards {
+                        true if from == first => last,
+                        true => from - 1,
+                        false if to == last => first,
+                        false => to + 1,
+                    }
+                }
             };
+            let next = group_of(next).map_or(next, |group| group_entry(&order, group));
             order[next].clone()
         };
         self.focus_stop(&stop);
         true
+    }
+
+    /// An arrow, Home or End with the keyboard inside a group: the member
+    /// the key moves to, and whether moving there activates it.
+    ///
+    /// The horizontal arrows move by one member, mirrored where the group
+    /// reads right to left. The vertical arrows move by one row. A group
+    /// of one row or of one column goes round at its ends, as a set of
+    /// radio buttons does; a grid stops at its edges. A list of one
+    /// column leaves the horizontal arrows alone.
+    fn group_move(&self, key: crate::action::Key) -> Option<(crate::layout::FocusStop, bool)> {
+        use crate::action::Key;
+        let order = self.last_focus_order.borrow();
+        let floor = self.last_focus_floor.get();
+        let held = self.focus.borrow();
+        let index = (floor..order.len()).find(|&index| Some(order[index].path.as_ref()) == held.as_deref())?;
+        let group = self.last_focus_groups.borrow().iter().find(|group| group.holds(index)).copied()?;
+        let (start, end) = (group.start.max(floor), group.end.min(order.len()));
+        let len = end - start;
+        let at = index - start;
+        let columns = usize::from(group.spec.columns.max(1));
+        let line = len <= columns || columns == 1;
+        // a step of `by` members: round the ends of a line, never past the edge of a grid
+        let step = |by: usize, forward: bool| -> Option<usize> {
+            if line {
+                Some(if forward { (at + by) % len } else { (at + len - by % len) % len })
+            } else if forward {
+                (at + by < len).then_some(at + by)
+            } else {
+                at.checked_sub(by)
+            }
+        };
+        let target = match key {
+            Key::Home => Some(0),
+            Key::End => Some(len - 1),
+            Key::Left | Key::Right if columns == 1 && len > 1 => return None,
+            Key::Right => step(1, !group.rtl),
+            Key::Left => step(1, group.rtl),
+            Key::Down => step(if len <= columns { 1 } else { columns }, true),
+            Key::Up => step(if len <= columns { 1 } else { columns }, false),
+            _ => return None,
+        }?;
+        (target != at).then(|| (order[start + target].clone(), group.spec.selects))
     }
 
     /// A popup or modal layer owns its controls until it closes. Remember the
@@ -814,7 +876,12 @@ impl Runtime {
             && !available.iter().any(|stop| Some(stop.path.as_ref()) == held.as_deref())
             && !held.as_deref().is_some_and(|path| reconciler::declares(path, ALERT_CONTEXT))
         {
-            if let Some(stop) = available.first() { self.focus_stop(stop); }
+            // a layer that opens on a group opens on its selected member:
+            // a list of choices shows the keyboard where the choice is
+            let first = result.focus_floor;
+            let entry = result.focus_groups.iter().find(|group| group.holds(first))
+                .map_or(first, |group| group_entry(&result.focus_order, *group));
+            if let Some(stop) = result.focus_order.get(entry) { self.focus_stop(stop); }
             else if held.is_some() { self.blur(); }
         }
         changed || self.focused() != held
@@ -1788,6 +1855,7 @@ impl Runtime {
             accessibility: RefCell::new(crate::accessibility::State::default()),
             last_fields: RefCell::new(Vec::new()),
             last_focus_order: RefCell::new(Vec::new()),
+            last_focus_groups: RefCell::new(Vec::new()),
             last_focus_floor: Cell::new(0),
             navigation_scopes: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
@@ -2658,6 +2726,16 @@ impl Runtime {
             return crate::custom::Response::handled();
         }
         if pattern.is_plain() && !pattern.shift {
+            // inside a group the arrows, Home and End travel between its
+            // members; where the group says so, arriving selects
+            if let Some((stop, selects)) = self.group_move(pattern.key) {
+                self.focus_stop(&stop);
+                if selects {
+                    reconciler::run_action(&stop.path, 1);
+                }
+                self.frame_asked.set(true);
+                return crate::custom::Response::handled();
+            }
             let control = {
                 let order = self.last_focus_order.borrow();
                 let held = self.focus.borrow();
@@ -8151,6 +8229,7 @@ impl Runtime {
         if lost_control { self.blur(); }
         self.last_fields.borrow_mut().clone_from(&result.fields);
         self.last_focus_order.borrow_mut().clone_from(&result.focus_order);
+        self.last_focus_groups.borrow_mut().clone_from(&result.focus_groups);
         self.last_focus_floor.set(result.focus_floor);
         self.accessibility.borrow_mut().update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
@@ -8682,6 +8761,16 @@ impl FrameNeed {
             || self.webview
             || self.bindings
     }
+}
+
+/// The member of `group` the keyboard enters on: the checked one — the
+/// segment that is chosen, the tab that is shown, the row of the current
+/// choice — or the first.
+fn group_entry(order: &[crate::layout::FocusStop], group: crate::layout::FocusGroup) -> usize {
+    let end = group.end.min(order.len());
+    (group.start..end)
+        .find(|&index| order[index].control.is_some_and(|state| state.checked == Some(true)))
+        .unwrap_or(group.start)
 }
 
 /// What each input has already answered, so that it takes the keyboard

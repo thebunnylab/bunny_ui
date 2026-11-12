@@ -284,6 +284,8 @@ pub enum NodeKind {
     Ellipse,
     /// `toggle(…)`.
     Toggle,
+    /// `segmented(…)`.
+    Segmented,
 }
 
 impl NodeKind {
@@ -310,6 +312,7 @@ impl NodeKind {
             Self::VirtualList => "virtual_list",
             Self::Modifier => "modifier",
             Self::Toggle => "toggle",
+            Self::Segmented => "segmented",
         }
     }
 }

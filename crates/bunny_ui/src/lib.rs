@@ -49,6 +49,7 @@ pub mod beat;
 pub mod bind;
 mod blur;
 pub mod catalog;
+pub mod choice;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
@@ -207,6 +208,7 @@ pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::beat::Beat;
+    pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
     pub use crate::toggle::{Toggle, toggle};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
     // qualified, as the views have a `Table` and the actions a `Key`
