@@ -238,7 +238,7 @@ pub mod prelude {
     pub use crate::preview::{Preview, Scheme, Sizing, Traits};
     pub use crate::words::{self, Word, Words};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
-    pub use crate::text_input::{CaretState, EditCommand, KeyboardType};
+    pub use crate::text_input::{Autocomplete, CaretState, EditCommand, KeyboardType};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::{Edited, FrameNeed, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};

@@ -21,6 +21,16 @@
 //! a bare name needs an import map, which a Web Worker never sees; a
 //! relative one resolves beside the generated JS wherever the module is
 //! evaluated, the workers a threaded build spawns included.
+//!
+//! The element mode has ONE shell, `glue/glue_dom.js`, behind both
+//! loaders. A page we own whole loads it as its script and it
+//! instantiates the wasm; a page whose loader is someone else's calls
+//! the module glue's `attachDom`, which imports that same file and
+//! forwards the wasm's imports to its border — so [`start_dom`] and
+//! [`start_dom_hydrated`] run under wasm-bindgen with the patch applier
+//! the classic page runs, and the ABI gate that file carries
+//! (`apps/signin_web` is such a page). Deploy `glue_dom.js` beside
+//! `bunny.js` and `bunny_gpu.js`.
 #![cfg(target_arch = "wasm32")]
 
 #[cfg(feature = "gpu")]
@@ -1041,6 +1051,11 @@ pub fn start_with(
 /// here (reduce-motion on): animation specs lower to CSS transitions
 /// and programmatic scrolls ride `scroll-behavior`, so the browser
 /// animates while the engine stays event-driven.
+///
+/// The page reaches this through an entry of its own: the export
+/// `glue_dom.js` calls on a page it loads (`start_dom` unless the page
+/// names another), or the closure the page hands the module glue's
+/// `attachDom` where another loader made the instance.
 pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     start_dom_with(width, height, scale, false, root)
 }

@@ -23,6 +23,14 @@
 //    own instance — an engine that is not there. The wake crosses to the
 //    page on a BroadcastChannel and lands in the page's single microtask,
 //    so a query that came home is a frame and not a beachball.
+//
+// The single binary carries both shells, and so does this border. A page
+// calls `attach` for the canvas one — every pixel ours — or `attachDom`
+// for the element one, where the engine lowers the scene to patches and
+// the browser renders at home. The element shell is `glue_dom.js`, whole:
+// it is not copied here. `attachDom` imports it when a page asks for the
+// mode, and from then on the verbs below forward to its border — so a
+// canvas page never fetches it and a worker never evaluates it.
 
 import { attach as attachGpu } from "./bunny_gpu.js";
 
@@ -30,7 +38,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 23;
+export const EXPECTED_ABI = 24;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";
@@ -47,6 +55,11 @@ let pendingFrame = false;
 let pendingWake = false;
 let wakeChannel = null;
 let primaryIsMeta = true;
+// The element shell's border, once `attachDom` borrowed it: the verbs
+// whose answer differs in that mode forward here. The ones a canvas
+// page that never attached already answers rightly — no blit, no cursor,
+// no host overlay, the clock — stay as they are.
+let dom = null;
 
 const decoder = new TextDecoder();
 
@@ -197,6 +210,7 @@ export function js_blit(pointer, width, height) {
 // Called inside the stroke's own keydown, which is the user gesture the
 // browser wants; a refusal (no permission, no focus) is silent.
 export function js_clipboard_write(pointer, length) {
+  if (dom) return dom.js_clipboard_write(pointer, length);
   if (!memory || typeof navigator === "undefined" || !navigator.clipboard) return;
   navigator.clipboard.writeText(text(pointer, length)).catch(() => {});
 }
@@ -217,6 +231,7 @@ export function js_set_cursor(kind) {
 export function js_request_frame() {
   // a worker never presents: the frame belongs to the page
   if (IN_WORKER) return;
+  if (dom) return dom.js_request_frame();
   requestFrame();
 }
 
@@ -235,13 +250,20 @@ export function js_request_wake() {
     wakeChannelOnce().postMessage(0);
     return;
   }
+  // in the element mode the turn is a patch pass, and the shell's own
+  if (dom) return dom.js_request_wake();
   requestWake();
 }
 
-// Dom-mode imports — the single binary carries both shells, and this
-// module only ever drives the canvas one.
-export function js_apply_patches() {}
-export function js_island_rect() {}
+// The element mode's two verbs: the patch stream, and the pixels of the
+// rect that changed inside one canvas island. The shell that decodes
+// them is the one `attachDom` borrowed; a canvas page never hears them.
+export function js_apply_patches(pointer, length) {
+  if (dom) dom.js_apply_patches(pointer, length);
+}
+export function js_island_rect(id, pointer, width, height, x, y, dirtyWidth, dirtyHeight) {
+  if (dom) dom.js_island_rect(id, pointer, width, height, x, y, dirtyWidth, dirtyHeight);
+}
 
 // MARK: - The media registry and the host overlay (`docs/video.md`)
 
@@ -374,6 +396,7 @@ export function js_host_end() {
 // A worker holds no memory handle here — its message stays in the
 // memory the page holds, and the page's own hook says the rest.
 export function js_panic(pointer, length) {
+  if (dom) return dom.js_panic(pointer, length);
   if (!memory) {
     console.error("bunny panic (in a worker; the page's hook carries the message)");
     return;
@@ -393,6 +416,8 @@ function imageKey(hi, lo) {
 }
 
 export function js_image_register(hi, lo, pointer, length) {
+  // the element mode keeps its pictures as URLs an `<img>` loads from
+  if (dom) return dom.js_image_register(hi, lo, pointer, length);
   if (!memory) return;
   const key = imageKey(hi, lo);
   // `slice` copies — the bytes outlive any growth, shared or not
@@ -409,6 +434,7 @@ export function js_image_register(hi, lo, pointer, length) {
 
 // Writes [width, height] as two u32 at `out`; [0, 0] = not decoded.
 export function js_image_size(hi, lo, out) {
+  if (dom) return dom.js_image_size(hi, lo, out);
   if (!memory) return;
   const bitmap = images.get(imageKey(hi, lo));
   const view = new Uint32Array(memory.buffer, out >>> 0, 2);
@@ -419,6 +445,7 @@ export function js_image_size(hi, lo, out) {
 // Draws the bitmap at exactly width×height physical px and writes the
 // straight-alpha RGBA back (getImageData is straight by spec).
 export function js_image_raster(hi, lo, width, height, out) {
+  if (dom) return dom.js_image_raster(hi, lo, width, height, out);
   if (!host) return;
   const bitmap = images.get(imageKey(hi, lo));
   if (!bitmap) return;
@@ -438,6 +465,11 @@ export function js_image_raster(hi, lo, width, height, out) {
 export function js_measure_text(
   pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
 ) {
+  if (dom) {
+    return dom.js_measure_text(
+      pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
+    );
+  }
   if (!host) return;
   const line = text(pointer, length);
   const ink = inkSurface(1, 1);
@@ -456,6 +488,12 @@ export function js_raster_text(
   pointer, length, size, weight, mono, italic, familyPointer, familyLength,
   scale, width, height, descent, color, out,
 ) {
+  if (dom) {
+    return dom.js_raster_text(
+      pointer, length, size, weight, mono, italic, familyPointer, familyLength,
+      scale, width, height, descent, color, out,
+    );
+  }
   if (!host) return;
   const line = text(pointer, length);
   const ink = inkSurface(width, height);
@@ -593,6 +631,37 @@ function watchScale() {
     },
     { once: true },
   );
+}
+
+// Boots the ELEMENT shell into the page's `#app` — the mount the element
+// lowering and the serializer both name, so there is no host to pass.
+//
+// `memoryHandle` and `exports` are `attach`'s. `start(width, height,
+// scale, hydrated)` is the app's own entry, exported through the page's
+// loader: it reaches `bunny_ui_web::start_dom`, or `start_dom_hydrated`
+// when `hydrated` is 1 — a mount the build already painted
+// (`data-hydrate="1"`), whose elements the shell adopted. Resolves to
+// `true` once the shell runs, `false` on an ABI it was not written for.
+//
+// `glue_dom.js` is imported from beside this file, the way the wasm
+// imports this file from beside the page: deploy the two together.
+export async function attachDom(memoryHandle, exports, start) {
+  if (!document.getElementById("app")) {
+    throw new Error('bunny: the element mode mounts into the element with id "app"; this page has none');
+  }
+  const handle = memoryHandle || exports.memory;
+  // a video element finds its stream by the name the classic registry
+  // (`media.js`) has, in the table `registerMediaStream` fills here
+  globalThis.bunnyMedia ??= { get: (stream) => streams.get(stream >>> 0) ?? null };
+  await import("./glue_dom.js");
+  const shell = globalThis.bunnyDom;
+  dom = shell.border;
+  // a wake from a worker crosses here (rule 3), into the shell's turn
+  wakeChannelOnce().onmessage = () => dom.js_request_wake();
+  // the islands' one GL context: this mode has no presentation surface,
+  // and an island's pixels are copied into its own element
+  attachGpu(exports, handle, null, shell.island);
+  return shell.adopt(exports, handle, start);
 }
 
 // Boots the shell into `hostElement`.

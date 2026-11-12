@@ -2,6 +2,16 @@
 // lowers the semantic scene to a patch stream (fixed little-endian ABI)
 // and this file mutates real elements with it. Text selects, scroll
 // carries momentum, the input owns the editing — the browser at home.
+//
+// One shell, two loaders. Loaded as the page's own `<script>`, this file
+// IS the platform layer of a page we own whole: it fetches the wasm the
+// page names, instantiates it with the border below and boots. Imported
+// by the module glue (`esm/bunny.js`, `attachDom`), it is the same shell
+// for a page whose loader is someone else's — wasm-bindgen's, say — and
+// touches no WebAssembly: the instance arrives through `bunnyDom.adopt`,
+// and the module glue forwards the wasm's `./bunny.js` imports to
+// `bunnyDom.border`. The applier, the registry and the events exist
+// once, here.
 
 const app = document.getElementById("app");
 // the root element IS scene node 0 — its backdrop arrives through the
@@ -28,6 +38,17 @@ sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
 sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
 
 let wasm = null;
+// The instance's memory: its own export on a page this file instantiates,
+// the handle the page passed where another loader did (an imported
+// memory is no export). A threaded build's is a SharedArrayBuffer, which
+// `TextDecoder.decode` and `ImageData` refuse a view over, so `bytesAt`
+// copies then; writes INTO the memory stay on views, legal either way.
+let memory = null;
+let shared = false;
+function bytesAt(pointer, length) {
+  const view = new Uint8Array(memory.buffer, pointer >>> 0, length >>> 0);
+  return shared ? view.slice() : view;
+}
 // Does the mount read right to left? Op 27 says, and a horizontal
 // scroll offset is logical on the wire: the browser reports scrollLeft
 // at or below zero under a right-to-left box, and the engine counts
@@ -47,7 +68,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 23;
+const EXPECTED_ABI = 24;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -96,6 +117,26 @@ const KEYS = {
   Insert: 14,
 };
 
+// What a field holds, as the input's `autocomplete`: op 7 names a place
+// in this table — the standard's tokens in the order of
+// `bunny_ui::text_input::Autocomplete::ALL`, after the empty slot of a
+// field that said nothing.
+const AUTOCOMPLETE = [
+  "",
+  "off",
+  "username",
+  "email",
+  "current-password",
+  "new-password",
+  "one-time-code",
+  "name",
+  "given-name",
+  "family-name",
+  "organization",
+  "tel",
+  "url",
+];
+
 // The function row: `F1` to `F24`, sent as 101 to 124.
 const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
 
@@ -130,7 +171,7 @@ window.__bunnyPath = actionPath;
 function sendAction(path, clicks) {
   const bytes = new TextEncoder().encode(path);
   const pointer = wasm.bunny_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  new Uint8Array(memory.buffer, pointer, bytes.length).set(bytes);
   wasm.bunny_action(pointer, bytes.length, clicks);
 }
 
@@ -185,7 +226,7 @@ function wireIsland(el, id) {
 function sendText(text) {
   const bytes = new TextEncoder().encode(text);
   const pointer = wasm.bunny_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  new Uint8Array(memory.buffer, pointer, bytes.length).set(bytes);
   wasm.bunny_text(pointer, bytes.length);
 }
 // The languages the reader prefers, best first, as the browser lists
@@ -195,7 +236,7 @@ const readerLanguages = () =>
 function sendLanguages(list) {
   const bytes = new TextEncoder().encode(list);
   const pointer = wasm.bunny_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  new Uint8Array(memory.buffer, pointer, bytes.length).set(bytes);
   wasm.bunny_set_languages(pointer, bytes.length);
 }
 // The element registry: what the engine created, by id — and the
@@ -713,7 +754,7 @@ function baseChar(event) {
 // a zero length is the common case and costs one comparison.
 function familyOf(pointer, length) {
   return length
-    ? decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length))
+    ? decoder.decode(bytesAt(pointer, length))
     : null;
 }
 
@@ -1434,11 +1475,27 @@ function applyPatches(view, length) {
       const content = text(u32());
       const placeholder = text(u32());
       const path = text(u16());
+      // what the field is: a secret is a password box, and the two
+      // attributes say what it holds and what a reader calls it
+      const secret = (u8() & 1) !== 0;
+      const holds = AUTOCOMPLETE[u8()] || "";
+      const label = text(u16());
       if (el) {
         el.style.font = cssFont(size, weight, mono, italic, family);
         el.style.color = color;
         el.placeholder = placeholder;
         el.dataset.path = path;
+        // an input is retyped in place: the browser keeps the value, the
+        // focus and the caret across it — the reveal a password box offers
+        if (el.tagName === "INPUT") {
+          const type = secret ? "password" : "text";
+          if (el.type !== type) el.type = type;
+        }
+        // a field that stopped saying one loses the attribute
+        if (holds) el.setAttribute("autocomplete", holds);
+        else el.removeAttribute("autocomplete");
+        if (label) el.setAttribute("aria-label", label);
+        else el.removeAttribute("aria-label");
         // write only when the value differs — echoing the browser's own
         // edit back into it would fight the caret
         if (el.value !== content) el.value = content;
@@ -1757,9 +1814,9 @@ function sendField(path, value, caret) {
   const pathBytes = new TextEncoder().encode(path);
   const valueBytes = new TextEncoder().encode(value);
   const pathPointer = wasm.bunny_alloc(pathBytes.length);
-  new Uint8Array(wasm.memory.buffer, pathPointer, pathBytes.length).set(pathBytes);
+  new Uint8Array(memory.buffer, pathPointer, pathBytes.length).set(pathBytes);
   const valuePointer = wasm.bunny_alloc(valueBytes.length);
-  new Uint8Array(wasm.memory.buffer, valuePointer, valueBytes.length).set(valueBytes);
+  new Uint8Array(memory.buffer, valuePointer, valueBytes.length).set(valueBytes);
   wasm.bunny_field(
     pathPointer,
     pathBytes.length,
@@ -1818,7 +1875,7 @@ const imports = {
     js_host_end() {},
     // a focused island copied: the same road the canvas shell takes
     js_clipboard_write(pointer, length) {
-      const text = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));
+      const text = decoder.decode(bytesAt(pointer, length));
       if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
     },
     // the browser owns hover in this mode; the shell never asks
@@ -1853,7 +1910,7 @@ const imports = {
     // reports the intrinsic size so the engine's geometry reflows.
     js_image_register(hi, lo, pointer, length) {
       const key = imageKey(hi, lo);
-      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+      const bytes = new Uint8Array(memory.buffer, pointer, length).slice();
       // a browser sniffs the raster formats, never SVG: the markup
       // needs its type named or the blob never decodes
       const head = decoder.decode(bytes.subarray(0, 256)).trimStart();
@@ -1875,7 +1932,7 @@ const imports = {
     },
     js_image_size(hi, lo, out) {
       const entry = images.get(imageKey(hi, lo));
-      const view = new Uint32Array(wasm.memory.buffer, out, 2);
+      const view = new Uint32Array(memory.buffer, out, 2);
       view[0] = entry ? entry.width : 0;
       view[1] = entry ? entry.height : 0;
     },
@@ -1891,10 +1948,13 @@ const imports = {
       ink.imageSmoothingQuality = "high";
       ink.drawImage(entry.probe, 0, 0, width, height);
       const pixels = ink.getImageData(0, 0, width, height).data;
-      new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+      new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },
     js_apply_patches(pointer, length) {
-      const view = new DataView(wasm.memory.buffer, pointer, length);
+      // one batch, read where it stands — or copied once, whole, when
+      // the memory is shared: every string in it goes to the decoder
+      const batch = bytesAt(pointer, length);
+      const view = new DataView(batch.buffer, batch.byteOffset, batch.byteLength);
       if (!STATS) {
         applyPatches(view, length);
         armIdle();
@@ -1915,19 +1975,15 @@ const imports = {
       if (!el || el.tagName !== "CANVAS") return;
       if (el.width !== width) el.width = width;
       if (el.height !== height) el.height = height;
-      const pixels = new Uint8ClampedArray(
-        wasm.memory.buffer,
-        pointer,
-        dirtyWidth * dirtyHeight * 4,
-      );
+      const rect = bytesAt(pointer, dirtyWidth * dirtyHeight * 4);
+      const pixels = new Uint8ClampedArray(rect.buffer, rect.byteOffset, rect.length);
       el.getContext("2d").putImageData(new ImageData(pixels, dirtyWidth, dirtyHeight), x, y);
     },
     // A panic on its way out of wasm: decode the message and log it, so
     // an abort is a sentence instead of `unreachable` and a stack of
     // numbers.
     js_panic(pointer, length) {
-      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length);
-      console.error("bunny panic: " + decoder.decode(bytes));
+      console.error("bunny panic: " + decoder.decode(bytesAt(pointer, length)));
     },
     js_measure_text(
       pointer,
@@ -1940,9 +1996,7 @@ const imports = {
       familyLength,
       out,
     ) {
-      const text = decoder.decode(
-        new Uint8Array(wasm.memory.buffer, pointer, length),
-      );
+      const text = decoder.decode(bytesAt(pointer, length));
       const ink = inkSurface();
       ink.font = cssFont(
         size,
@@ -1952,7 +2006,7 @@ const imports = {
         familyOf(familyPointer, familyLength),
       );
       const probe = ink.measureText(text || "Mg");
-      const metrics = new Float64Array(wasm.memory.buffer, out, 3);
+      const metrics = new Float64Array(memory.buffer, out, 3);
       metrics[0] = text ? probe.width : 0;
       metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
       metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
@@ -1975,9 +2029,7 @@ const imports = {
       color,
       out,
     ) {
-      const text = decoder.decode(
-        new Uint8Array(wasm.memory.buffer, pointer, length),
-      );
+      const text = decoder.decode(bytesAt(pointer, length));
       const ink = inkSurface(width, height);
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
@@ -1997,7 +2049,7 @@ const imports = {
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
       ink.fillText(text, 0, height / scale - descent);
       const pixels = ink.getImageData(0, 0, width, height).data;
-      new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+      new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },
   },
 };
@@ -2032,12 +2084,38 @@ function missingWasm() {
   app.replaceChildren(notice);
   return new Error(notice.textContent);
 }
-const booting = WASM_URL
-  ? WebAssembly.instantiateStreaming(fetch(WASM_URL), imports)
-  : Promise.reject(missingWasm());
-booting.then(
-  ({ instance }) => {
+// Who instantiates. A classic script is running as the page's own loader
+// — the document names it while it runs — and fetches the wasm the page
+// named. An import names no script: the module glue is borrowing the
+// shell for an instance another loader made, and the boot below waits
+// for it at the door.
+const OWN_LOADER = document.currentScript !== null;
+const booting = OWN_LOADER
+  ? WASM_URL
+    ? WebAssembly.instantiateStreaming(fetch(WASM_URL), imports)
+    : Promise.reject(missingWasm())
+  : new Promise((resolve) => {
+      // The door (`esm/bunny.js`, `attachDom`): the border the module
+      // glue's exports forward the wasm's `./bunny.js` imports to, an
+      // island's element by its id — the GL tier copies an island's
+      // pixels into its own canvas — and the instance on its way in,
+      // with its memory and the app's own entry. `adopt` answers what
+      // the boot answers: true once the shell runs, false on an ABI
+      // this file was not written for.
+      globalThis.bunnyDom = {
+        border: imports["./bunny.js"],
+        island: lookup,
+        adopt(exports, memoryHandle, start) {
+          resolve({ instance: { exports }, memory: memoryHandle, start });
+          return booted;
+        },
+      };
+    });
+const booted = booting.then(
+  ({ instance, memory: handle, start }) => {
     wasm = instance.exports;
+    memory = handle || wasm.memory;
+    shared = typeof SharedArrayBuffer !== "undefined" && memory.buffer instanceof SharedArrayBuffer;
     if (typeof gpuAttach === "function") gpuAttach(wasm);
     window.__bunny = wasm;
     window.__bunnyDebug = { elements, looks, cloneRoots };
@@ -2047,7 +2125,7 @@ booting.then(
       window.__bunnyHits = () => {
         const len = wasm.bunny_hits_json() >>> 0;
         const ptr = wasm.bunny_probe_ptr() >>> 0;
-        return JSON.parse(new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
+        return JSON.parse(decoder.decode(bytesAt(ptr, len)));
       };
     }
     // the ABI gate: a missing export counts as version 0
@@ -2058,7 +2136,7 @@ booting.then(
         `This page decodes ABI ${EXPECTED_ABI}. ` +
         `The wasm encodes ABI ${abi}. ` +
         `Deploy the page and the wasm together, then reload.`;
-      return;
+      return false;
     }
     // the window is a one-slot column: its child can take the box
     app.style.display = "flex";
@@ -2121,7 +2199,11 @@ booting.then(
     if (wasm.bunny_set_languages) {
       sendLanguages(hydrated && app.lang ? app.lang : readerLanguages());
     }
-    wasm[START_EXPORT](served[0], served[1], window.devicePixelRatio || 1, hydrated ? 1 : 0);
+    // the app's entry: the export the page named, on a page this file
+    // instantiated; the page's own door to it where another loader did
+    const scale = window.devicePixelRatio || 1;
+    if (start) start(served[0], served[1], scale, hydrated ? 1 : 0);
+    else wasm[START_EXPORT](served[0], served[1], scale, hydrated ? 1 : 0);
     if (reader[0] !== served[0] || reader[1] !== served[1]) {
       mounted = reader;
       wasm.bunny_resize(reader[0], reader[1], window.devicePixelRatio || 1);
@@ -2237,5 +2319,6 @@ booting.then(
       event.preventDefault();
       sendText(event.key);
     });
+    return true;
   },
 );

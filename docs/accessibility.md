@@ -199,6 +199,39 @@ D-Bus calls so their exact error and unchanged value remain observable. The
 adapter preserves rejection rather than returning a false success. This client
 compatibility limit remains relevant to human assistive-technology acceptance.
 
+## Browser elements
+
+The element lowering (`start_dom`) builds no projection: the browser exposes
+its own elements, so a field's semantics travel on the element itself. A field
+is an `<input>` or, with many lines, a `<textarea>`. A secret field is
+`<input type="password">` — the browser masks it, refuses the copy and reports
+a password box to assistive technology and to a password manager — and a
+secret is always one line there, since a `<textarea>` cannot mask. Flipping
+`secret` retypes the input in place, value, focus and caret kept.
+
+`accessibility_label` on a field is written as the input's `aria-label`,
+whether or not a capture is running; without one the browser names the box by
+its placeholder, as the native projection does. What the field holds is said
+with `TextField::autocomplete`, written as the `autocomplete` attribute in the
+HTML standard's tokens:
+
+```rust,ignore
+text_field("", email)
+    .autocomplete(Autocomplete::Username)
+    .accessibility_label("Email");
+text_field("", password)
+    .secret(true)
+    .autocomplete(Autocomplete::CurrentPassword)
+    .accessibility_label("Password");
+```
+
+A field that names no `autocomplete` carries no attribute and leaves the
+choice with the browser; the pixel shells own no native field for an autofill
+to fill and ignore it. The served page (`ssr`) writes the same three
+attributes. Only fields carry a name into the element lowering today: a label
+on a button or on text reaches the native projection alone, and a pressable
+box is a `<div>` with no `role`.
+
 ## Remaining work
 
 The core projection is a flat sequence of exposed leaves, not a complete document model.
