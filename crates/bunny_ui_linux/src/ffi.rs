@@ -6893,9 +6893,16 @@ mod tests {
         let path = "/usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml";
         let Ok(xml) = std::fs::read_to_string(path) else { return };
         assert_tables_match(&xml, background_effect_spec());
+        // wayland-protocols 1.45, the first release to carry the protocol,
+        // names the blur 0: a value no flag of a bitfield can hold, and
+        // 1.46 corrected it to 1. A compositor sends the 1, so the 1 is
+        // the constant here, and a system that still installs the 1.45
+        // file agrees with these tables in everything but that digit
+        let names_the_blur =
+            |value: u32| xml.contains(&format!("<entry name=\"blur\" value=\"{value}\""));
         assert!(
-            xml.contains("<entry name=\"blur\" value=\"1\""),
-            "the blur is capability 1"
+            names_the_blur(EFFECT_CAPABILITY_BLUR) || names_the_blur(0),
+            "the blur is capability 1, or the 0 of the 1.45 file"
         );
     }
 

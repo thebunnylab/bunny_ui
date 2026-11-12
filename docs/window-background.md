@@ -240,6 +240,10 @@ same strength.
   the property on a window is CARDINAL/32 rectangles in device pixels.
   X11 resolves the background when the window is created and does not
   watch for a compositor that leaves. No real GPU driver was tried.
+- wayland-protocols 1.45, the first release with
+  `ext-background-effect-v1`, names the blur capability 0. Release 1.46
+  corrected it to 1, which is what a compositor sends and what the shell
+  reads.
 - On Windows the vtable slots of `IDCompositionDevice`,
   `IDCompositionTarget`, `IDCompositionVisual` and
   `CreateSwapChainForComposition` are the order of the headers, counted
