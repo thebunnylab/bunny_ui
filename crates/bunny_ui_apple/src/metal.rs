@@ -215,6 +215,7 @@ const STORE_ACTION_STORE: u64 = 1;
 const BLEND_ONE: u64 = 1;
 const BLEND_SOURCE_ALPHA: u64 = 4;
 const BLEND_ONE_MINUS_SOURCE_ALPHA: u64 = 5;
+const BLEND_ZERO: u64 = 0;
 const STORAGE_MODE_SHARED: u64 = 0;
 const STORAGE_MODE_PRIVATE: u64 = 2;
 const TEXTURE_USAGE_SHADER_READ: u64 = 1;
@@ -938,6 +939,8 @@ struct MetalStack {
     device: Id,
     queue: Id,
     rect_pipeline: Id,
+    /// The rect shaders under the erase blend — [`RunKind::Knockout`].
+    knockout_pipeline: Id,
     sprite_pipeline: Id,
     /// The feeds' pipeline: the sprite vertex over a LINEAR sampler, so
     /// a picture of one size lands in a box of another.
@@ -1029,32 +1032,43 @@ impl MetalStack {
             if library.is_null() {
                 return Err(format!("shader compile failed: {}", error_message(error)));
             }
-            let rect_pipeline =
-                build_pipeline(device, library, "rect_vertex", "rect_fragment", format, true)?;
-            let sprite_pipeline =
-                build_pipeline(device, library, "sprite_vertex", "sprite_fragment", format, true)?;
-            let live_pipeline =
-                build_pipeline(device, library, "sprite_vertex", "live_fragment", format, true)?;
+            let rect_pipeline = build_pipeline(
+                device, library, "rect_vertex", "rect_fragment", format, PassBlend::Over,
+            )?;
+            // the same shape, taken away instead of painted: the rect
+            // shaders, and a blend that keeps only what the shape leaves
+            let knockout_pipeline = build_pipeline(
+                device, library, "rect_vertex", "rect_fragment", format, PassBlend::Erase,
+            )?;
+            let sprite_pipeline = build_pipeline(
+                device, library, "sprite_vertex", "sprite_fragment", format, PassBlend::Over,
+            )?;
+            let live_pipeline = build_pipeline(
+                device, library, "sprite_vertex", "live_fragment", format, PassBlend::Over,
+            )?;
             // a pane blends over the scene like any other paint; the
             // blur and the blit REPLACE what they write (a pass that
             // covers its whole destination has nothing to keep)
-            let glass_pipeline =
-                build_pipeline(device, library, "glass_vertex", "glass_fragment", format, true)?;
+            let glass_pipeline = build_pipeline(
+                device, library, "glass_vertex", "glass_fragment", format, PassBlend::Over,
+            )?;
             let blur_pipeline = build_pipeline(
                 device,
                 library,
                 "full_vertex",
                 "blur_fragment",
                 PIXEL_FORMAT_RGBA8_SRGB,
-                false,
+                PassBlend::Off,
             )?;
-            let blit_pipeline =
-                build_pipeline(device, library, "full_vertex", "blit_fragment", format, false)?;
+            let blit_pipeline = build_pipeline(
+                device, library, "full_vertex", "blit_fragment", format, PassBlend::Off,
+            )?;
             msg_void(library, sel("release"));
             Ok(MetalStack {
                 device,
                 queue,
                 rect_pipeline,
+                knockout_pipeline,
                 sprite_pipeline,
                 live_pipeline,
                 glass_pipeline,
@@ -1253,8 +1267,13 @@ impl MetalStack {
                     }
                     if bound != Some(run.kind) {
                         match run.kind {
-                            RunKind::Rects => {
-                                msg_void_id(encoder, self.sels.set_pipeline, self.rect_pipeline);
+                            RunKind::Rects | RunKind::Knockout => {
+                                let pipeline = if run.kind == RunKind::Knockout {
+                                    self.knockout_pipeline
+                                } else {
+                                    self.rect_pipeline
+                                };
+                                msg_void_id(encoder, self.sels.set_pipeline, pipeline);
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_vertex_buffer,
@@ -1636,13 +1655,26 @@ unsafe fn make_texture(device: Id, format: u64, size: (usize, usize), levels: u3
 /// `blend` false is a REPLACING pipeline: a pass that covers its whole
 /// destination has nothing to blend with, and blending a blur or a blit
 /// would only fold the destination back in.
+/// How a pipeline's output meets what its target already holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassBlend {
+    /// The output replaces the target: a pass that covers its whole
+    /// destination has nothing to keep.
+    Off,
+    /// Source-over with straight alpha — the house blend.
+    Over,
+    /// Nothing is painted: the target keeps `1 - alpha` of itself, colour
+    /// and alpha alike. A knockout over a clear ground.
+    Erase,
+}
+
 unsafe fn build_pipeline(
     device: Id,
     library: Id,
     vertex: &str,
     fragment: &str,
     format: u64,
-    blend: bool,
+    blend: PassBlend,
 ) -> Result<Id, String> {
     unsafe {
         let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(vertex));
@@ -1666,19 +1698,21 @@ unsafe fn build_pipeline(
         );
         msg_void_u64(attachment, sel("setPixelFormat:"), format);
         // Source-over with straight alpha — the LITERAL blend_px formula:
-        // rgb = s·sa + d·(1−sa); a = sa + da·(1−sa).
-        msg_void_bool(attachment, sel("setBlendingEnabled:"), blend as i8);
-        msg_void_u64(
-            attachment,
-            sel("setSourceRGBBlendFactor:"),
-            BLEND_SOURCE_ALPHA,
-        );
+        // rgb = s·sa + d·(1−sa); a = sa + da·(1−sa). The erase keeps
+        // the destination's half of it and drops the source's: every
+        // channel is d·(1−sa), the raster's `Bitmap::take`.
+        let (source_rgb, source_alpha) = match blend {
+            PassBlend::Erase => (BLEND_ZERO, BLEND_ZERO),
+            PassBlend::Off | PassBlend::Over => (BLEND_SOURCE_ALPHA, BLEND_ONE),
+        };
+        msg_void_bool(attachment, sel("setBlendingEnabled:"), i8::from(blend != PassBlend::Off));
+        msg_void_u64(attachment, sel("setSourceRGBBlendFactor:"), source_rgb);
         msg_void_u64(
             attachment,
             sel("setDestinationRGBBlendFactor:"),
             BLEND_ONE_MINUS_SOURCE_ALPHA,
         );
-        msg_void_u64(attachment, sel("setSourceAlphaBlendFactor:"), BLEND_ONE);
+        msg_void_u64(attachment, sel("setSourceAlphaBlendFactor:"), source_alpha);
         msg_void_u64(
             attachment,
             sel("setDestinationAlphaBlendFactor:"),
@@ -2972,6 +3006,7 @@ impl MetalPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
+        floor: Option<Color>,
     ) {
         self.ground.clear_native();
         for attempt in 0..4 {
@@ -2984,6 +3019,7 @@ impl MetalPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
@@ -3178,7 +3214,7 @@ impl MetalPresenter {
                 plan = Plan::Whole;
             }
             self.ground.begin_slot(index, &mut self.atlas);
-            self.build_with_retries(display, scale, physical, text, images);
+            self.build_with_retries(display, scale, physical, text, images, self.floor(canvas));
             if self.base.is_none() {
                 plan = Plan::Whole;
             }
@@ -3761,6 +3797,12 @@ impl MetalPresenter {
         if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
     }
 
+    /// The ground a knockout returns a shape to — what the walk is told.
+    /// A translucent layer has none of its own.
+    fn floor(&self, canvas: Color) -> Option<Color> {
+        if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) }
+    }
+
     /// The anti-flash frame: one clear at the size the surface will
     /// show, BEFORE it shows. A virgin `CAMetalLayer` flashes black on
     /// its first appearance otherwise.
@@ -3846,7 +3888,14 @@ impl OffscreenGpu {
 
     /// Walks the frame into the batches, resetting the atlas on overflow
     /// as the window does.
-    fn walk(&mut self, display: &DisplayList, scale: usize, text: &dyn TextEngine, images: &dyn ImageEngine) {
+    fn walk(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        floor: Option<Color>,
+    ) {
         self.ground.clear_native();
         for attempt in 0..4 {
             match build_frame(
@@ -3858,6 +3907,7 @@ impl OffscreenGpu {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => break,
                 Err(AtlasFull) => {
@@ -3910,7 +3960,9 @@ impl OffscreenGpu {
             )
             .index;
             self.ground.begin_slot(index, &mut self.atlas);
-            self.walk(display, scale, text, images);
+            let floor =
+                if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) };
+            self.walk(display, scale, text, images, floor);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -4037,7 +4089,9 @@ impl OffscreenGpu {
             )
             .index;
             self.ground.begin_slot(index, &mut self.atlas);
-            self.walk(display, scale, text, images);
+            let floor =
+                if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) };
+            self.walk(display, scale, text, images, floor);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -4344,6 +4398,73 @@ mod tests {
             gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255),
             "a solid fill is solid"
         );
+    }
+
+    /// One veil around `inside`: rounded, with a halo, meeting what is
+    /// under it by `blend`.
+    fn veil_around(
+        inside: impl View<Arity = bunny_ui::view::Single>,
+        blend: bunny_ui::layout::BackgroundBlend,
+    ) -> impl View<Arity = bunny_ui::view::Single> {
+        inside
+            .padding_length(10.0)
+            .background_color(Color::rgba(255, 255, 255, 110))
+            .corner_radius(9.0)
+            .shadow(6.0)
+            .background_blend(blend)
+    }
+
+    /// Three veils, each inside the one before — the scene a background
+    /// that replaces exists for.
+    fn veils(blend: bunny_ui::layout::BackgroundBlend) -> impl View<Arity = bunny_ui::view::Single> {
+        let core = || empty().frame(60.0, 26.0);
+        let inner = veil_around(core(), blend);
+        let middle = veil_around(vstack((core(), inner)), blend);
+        veil_around(vstack((core(), middle)), blend).padding_length(14.0)
+    }
+
+    /// A background that replaces, over a SOLID canvas: every tier draws
+    /// the knockout as a rect of the canvas, so the GPU and the raster
+    /// agree as closely as they do on any rounded fill.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_solid_canvas() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::hex(0x101014);
+        let (gpu, cpu) = scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a solid canvas");
+        // and replacing is not the picture source-over paints
+        let (over, _) = scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(max_channel_delta(&gpu, &over) > 40, "the innermost veil stops adding up");
+    }
+
+    /// The same over a CLEAR ground, where the knockout is the erase
+    /// blend: the target keeps `1 - alpha` of itself under each shape.
+    /// Every veil then reads back at its own alpha, however deep it is,
+    /// where source-over reads back nearly solid at the third.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
+        let deepest =
+            |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.as_chunks::<4>().0.iter().filter(|pixel| pixel[3] == 110).count();
+        // every veil reads back at its own alpha, 110, at all three depths:
+        // together they are most of the picture
+        assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");
+        // and nothing is more solid than a halo over the canvas, 80 over 153
+        assert!(deepest(&gpu) < 200, "no depth adds up: {}", deepest(&gpu));
+        let (over, _) = translucent_scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(deepest(&over) > 225, "source-over is nearly solid three veils in: {}", deepest(&over));
     }
 
     /// Text and a rounded shape over a translucent ground: coverage and

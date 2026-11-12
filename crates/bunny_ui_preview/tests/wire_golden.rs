@@ -324,6 +324,21 @@ fn a_picture_between_pixels_rides_a_tag_of_its_own() {
 }
 
 #[test]
+fn a_knockout_rides_a_tag_of_its_own() {
+    // the golden frame, with a shape returned to the ground in it
+    let knockout = Draw::Knockout { rect: rect(8.0, 8.0, 40.0, 30.0), corners: corners(4.0), opacity: 0.5 };
+    let mut framed = frame();
+    framed.commands.insert(1, knockout);
+    let message = Message::ToIde(ToIde::Frame(framed));
+    let (plain, with) = (encode(&Message::ToIde(ToIde::Frame(frame()))), encode(&message));
+    // tag 11, a rect, four corners and its opacity: 1 + 32 + 32 + 8 bytes
+    assert_eq!(with.len(), plain.len() + 73);
+    let mut reader = Reader::new();
+    reader.feed(&with);
+    assert_eq!(reader.pull().unwrap(), Some(Received::Message(message)), "and it decodes to itself");
+}
+
+#[test]
 fn a_faded_pane_rides_a_tag_of_its_own() {
     // the golden frame's one pane, whole and faded under an opacity
     let with = |opacity: f64| {

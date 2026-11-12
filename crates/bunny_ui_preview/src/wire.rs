@@ -284,6 +284,10 @@ pub enum Draw {
     Image { rect: Rect, image: ImageRef, subpixel: bool },
     PushClip { rect: Rect, corners: Corners },
     PopClip,
+    /// A shape returned to the ground of the surface, by `opacity` — what
+    /// a background that replaces paints before itself. It travels as
+    /// tag 11.
+    Knockout { rect: Rect, corners: Corners, opacity: f64 },
 }
 
 // =============================================================================
@@ -1413,6 +1417,12 @@ impl Wire for Draw {
                 corners.put(out);
             }
             Draw::PopClip => out.u8(8),
+            Draw::Knockout { rect, corners, opacity } => {
+                out.u8(11);
+                rect.put(out);
+                corners.put(out);
+                out.f64(*opacity);
+            }
         }
     }
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
@@ -1438,6 +1448,7 @@ impl Wire for Draw {
                 glass.opacity = c.f64()?;
                 Draw::Backdrop { rect, glass, corners }
             }
+            11 => Draw::Knockout { rect: Rect::get(c)?, corners: Corners::get(c)?, opacity: c.f64()? },
             tag => return Err(Malformed::BadTag { what: "Draw", tag }),
         })
     }

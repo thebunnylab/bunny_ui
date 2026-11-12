@@ -1060,6 +1060,10 @@ impl GlStack {
                         }
                         // handled above, in a pass of its own
                         RunKind::Glass => continue,
+                        // this tier presents no translucent target yet,
+                        // so the walk is never told of a clear ground
+                        // and makes no such run
+                        RunKind::Knockout => continue,
                         // a world's target, composited with the box's
                         // veil and its clip: the sprite's road
                         RunKind::World(index) => {
@@ -1071,7 +1075,7 @@ impl GlStack {
                 }
                 match run.kind {
                     // handled above, in a pass of its own
-                    RunKind::Glass => continue,
+                    RunKind::Glass | RunKind::Knockout => continue,
                     RunKind::Rects => {
                         // the run's base = the byte offset every attrib
                         // pointer carries — the SV_InstanceID trap of
@@ -2211,6 +2215,7 @@ impl GlPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
+        floor: Option<Color>,
     ) {
         for attempt in 0..3 {
             let mut ground = GlGround {
@@ -2228,6 +2233,7 @@ impl GlPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
@@ -2300,7 +2306,14 @@ impl GlPresenter {
             }
             self.buffer = physical;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(
+            display,
+            scale,
+            physical,
+            text,
+            images,
+            bunny_ui::raster::solid_floor(canvas),
+        );
         let index = acquire_slot(&self.stack.gl, &mut self.slots, &mut self.cursor);
         if !upload_frame(&mut self.slots[index], &self.stack.gl, &self.batches) {
             return Presented::DeviceLost;
@@ -2674,6 +2687,7 @@ impl OffscreenGl {
         images: &dyn ImageEngine,
         wait: bool,
     ) {
+        let floor = bunny_ui::raster::solid_floor(canvas);
         for attempt in 0..3 {
             let mut ground = GlGround {
                 gl: &self.stack.gl,
@@ -2690,6 +2704,7 @@ impl OffscreenGl {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => break,
                 Err(AtlasFull) => {

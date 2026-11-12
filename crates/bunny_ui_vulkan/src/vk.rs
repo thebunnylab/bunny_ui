@@ -3295,6 +3295,10 @@ fn draw_runs(
             match run.kind {
                 // a pane reads the scene: it takes a pass of its own
                 RunKind::Glass => continue,
+                // this tier presents no translucent target yet, so the
+                // walk is never told of a clear ground and makes no such
+                // run
+                RunKind::Knockout => continue,
                 RunKind::Rects => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
@@ -4118,6 +4122,7 @@ impl VkPresenter {
         self.world.sweep(&self.stack);
         // walk with retries; staging overflow grows the arena, atlas
         // overflow runs the copying collector
+        let floor = bunny_ui::raster::solid_floor(canvas);
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
@@ -4136,6 +4141,7 @@ impl VkPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             );
             if self.ground.overflow {
                 // the arena refused an upload — a run, or a dedicated
@@ -4718,6 +4724,7 @@ impl OffscreenVk {
         self.cursor = (self.cursor + 1) % self.slots.len();
         wait_slot(&self.stack, &mut self.slots[index]);
         self.world.sweep(&self.stack);
+        let floor = bunny_ui::raster::solid_floor(canvas);
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
@@ -4736,6 +4743,7 @@ impl OffscreenVk {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             );
             if self.ground.overflow {
                 // the same law as the window's: the arena grows and every

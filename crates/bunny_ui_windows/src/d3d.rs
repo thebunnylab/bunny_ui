@@ -1712,6 +1712,10 @@ impl D3dStack {
                 }
                 if bound != Some(run.kind) {
                     match run.kind {
+                        // this tier presents no translucent target yet, so
+                        // the walk is never told of a clear ground and
+                        // makes no such run
+                        RunKind::Knockout => continue,
                         RunKind::Rects => {
                             (vtbl.vs_set_shader)(context, self.rect_vs.as_ptr(), null(), 0);
                             (vtbl.ps_set_shader)(context, self.rect_ps.as_ptr(), null(), 0);
@@ -2583,6 +2587,7 @@ impl D3dPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
+        floor: Option<Color>,
     ) {
         for attempt in 0..3 {
             match build_frame(
@@ -2594,6 +2599,7 @@ impl D3dPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
@@ -2756,7 +2762,14 @@ impl D3dPresenter {
         } else {
             self.intermediate = None;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(
+            display,
+            scale,
+            physical,
+            text,
+            images,
+            bunny_ui::raster::solid_floor(canvas),
+        );
         // a frame with glass needs a scene of its own to read; a frame
         // without one never asks for the textures
         if !self.batches.glass.is_empty()
@@ -3149,6 +3162,7 @@ impl OffscreenD3d {
     ) {
         let context = self.stack.context.as_ptr();
         let device = self.stack.device.as_ptr();
+        let floor = bunny_ui::raster::solid_floor(canvas);
         for attempt in 0..3 {
             match build_frame(
                 &mut self.ground,
@@ -3159,6 +3173,7 @@ impl OffscreenD3d {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => break,
                 Err(AtlasFull) => {

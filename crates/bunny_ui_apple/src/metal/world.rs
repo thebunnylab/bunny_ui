@@ -1562,7 +1562,7 @@ impl WorldStack {
             if library.is_null() {
                 return Err(format!("world shader compile failed: {}", error_message(error)));
             }
-            let composite = super::build_pipeline(device, library, "sprite_vertex", "world_composite_fragment", format, true)?;
+            let composite = super::build_pipeline(device, library, "sprite_vertex", "world_composite_fragment", format, super::PassBlend::Over)?;
             let shadow = shadow_pipeline(device, library)?;
             let bloom = [
                 bloom_pipeline(device, library, "bloom_down_fragment", false)?,

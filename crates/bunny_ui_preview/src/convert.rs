@@ -862,6 +862,9 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 Draw::FillRect { rect: (*rect).into(), color: (*color).into(), corners: (*corner_radius).into() }
             }
+            DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                Draw::Knockout { rect: (*rect).into(), corners: (*corner_radius).into(), opacity: *opacity }
+            }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 Draw::Gradient { rect: (*rect).into(), paint: (*paint).into(), corners: (*corner_radius).into() }
             }
@@ -922,6 +925,9 @@ pub fn raise(commands: &[Draw], strings: &[String], images: &HashMap<u64, ImageS
         out.push(match command {
             Draw::FillRect { rect, color, corners } => {
                 DrawCommand::FillRect { rect: (*rect).into(), color: (*color).into(), corner_radius: (*corners).into() }
+            }
+            Draw::Knockout { rect, corners, opacity } => {
+                DrawCommand::Knockout { rect: (*rect).into(), corner_radius: (*corners).into(), opacity: *opacity }
             }
             Draw::Gradient { rect, paint, corners } => {
                 DrawCommand::Gradient { rect: (*rect).into(), paint: (*paint).into(), corner_radius: (*corners).into() }

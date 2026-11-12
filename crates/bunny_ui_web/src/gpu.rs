@@ -1098,7 +1098,10 @@ pub(crate) fn present_window(
         let mut walked = false;
         for attempt in 0..3 {
             let Tier { ground, atlas, batches, .. } = tier;
-            match build_frame(ground, display, scale, target, text, images, atlas, batches) {
+            // the page is opaque and an island clears to nothing: the one
+            // rule the raster asks answers both
+            let floor = bunny_ui::raster::solid_floor(canvas);
+            match build_frame(ground, display, scale, target, text, images, atlas, batches, floor) {
                 Ok(()) => {
                     walked = true;
                     break;
@@ -1209,6 +1212,9 @@ pub(crate) fn present_window(
                 }
             }
             match run.kind {
+                // an island over nothing makes this run; the erase blend
+                // of this tier lands with its translucent targets
+                RunKind::Knockout => continue,
                 RunKind::Rects => {
                     if program != tier.pipelines.rect {
                         program = tier.pipelines.rect;

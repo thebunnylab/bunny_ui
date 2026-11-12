@@ -585,6 +585,9 @@ impl<'a> Painter<'a> {
                 DrawCommand::FillRect { rect, color, corner_radius } => {
                     DrawCommand::FillRect { rect: self.shift(rect), color, corner_radius }
                 }
+                DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                    DrawCommand::Knockout { rect: self.shift(rect), corner_radius, opacity }
+                }
                 DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
                     rect: self.shift(rect),
                     paint: match paint {

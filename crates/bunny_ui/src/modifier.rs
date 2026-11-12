@@ -74,6 +74,8 @@ pub enum Modifier {
     // MARK: - Visuals (pure data → `Styled` in the scene)
     BackgroundColor(Color),
     BackgroundGradient(crate::layout::Gradient),
+    /// Whether the background lies over what is under it or replaces it.
+    BackgroundBlend(crate::layout::BackgroundBlend),
     ForegroundColor(Color),
     Border(Color, f64),
     /// `.border_style(…)` — how the border's line is drawn.
@@ -308,6 +310,7 @@ impl Modifier {
             Modifier::Equatable => "equatable",
             Modifier::BackgroundColor { .. } => "background_color",
             Modifier::BackgroundGradient { .. } => "background_gradient",
+            Modifier::BackgroundBlend { .. } => "background_blend",
             Modifier::ForegroundColor { .. } => "foreground_color",
             Modifier::Border { .. } => "border",
             Modifier::BorderStyle { .. } => "border_style",
@@ -438,6 +441,7 @@ impl Modifier {
             Modifier::Sticky(top) => format!(" [.sticky(top: {top})]"),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
+            Modifier::BackgroundBlend(blend) => format!(" [.backgroundBlend({blend:?})]"),
             Modifier::BackgroundGradient(gradient) => match gradient {
                 crate::layout::Gradient::Radial { inner, outer, .. } => {
                     format!(" [.background(RadialGradient({inner} → {outer}))]")
@@ -1707,6 +1711,11 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
+        ),
+        Modifier::BackgroundBlend(blend) => wrap_styled(
+            out,
+            mark,
+            VisualProps { blend: Some(*blend), ..VisualProps::default() },
         ),
         Modifier::Blur(radius) => {
             if let Some(radius) = crate::blur::radius(*radius) {

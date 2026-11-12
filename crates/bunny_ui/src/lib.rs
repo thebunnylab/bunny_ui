@@ -229,7 +229,8 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        AlertSpec, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
+        AlertSpec, BackgroundBlend, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction,
+        Glass, Gradient,
         OverlaySurface, Point, Proposal, Px, Rect, Rendering, ScrollIndicators, Side, Size,
         Truncation, UnitPoint, VisualProps,
     };
@@ -6101,6 +6102,127 @@ mod tests {
             vec![(Color::hex(0x123456), crate::layout::Corners::all(5.0))],
             "a single Styled — the radius rounds THIS background"
         );
+    }
+
+    /// What a view paints for its box, by kind, in paint order.
+    fn box_paint(result: &crate::layout::LayoutResult) -> Vec<&'static str> {
+        use crate::layout::DrawCommand;
+        result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Shadow { .. } => Some("shadow"),
+                DrawCommand::Knockout { .. } => Some("knockout"),
+                DrawCommand::FillRect { .. } => Some("fill"),
+                DrawCommand::Gradient { .. } => Some("ramp"),
+                DrawCommand::Backdrop { .. } => Some("pane"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A background that replaces returns its shape to the ground and
+    /// THEN paints: the halo stays under the knockout, so it shows only
+    /// outside the shape, and the fill lands on the ground alone.
+    #[test]
+    fn a_background_that_replaces_knocks_out_before_it_paints() {
+        use crate::layout::{BackgroundBlend, Corners, DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let veil = Color::rgba(255, 255, 255, 128);
+        let view = text("ab")
+            .background_color(veil)
+            .corner_radius(6.0)
+            .shadow(4.0)
+            .background_blend(BackgroundBlend::Replace);
+        let result = runtime.layout(&view, Proposal::unspecified());
+        assert_eq!(box_paint(&result), vec!["shadow", "knockout", "fill"]);
+        let shapes: Vec<(crate::layout::Rect, Corners)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                    assert_eq!(*opacity, 1.0);
+                    Some((*rect, *corner_radius))
+                }
+                DrawCommand::FillRect { rect, corner_radius, .. } => Some((*rect, *corner_radius)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shapes[0], shapes[1], "the knockout is the shape the fill covers");
+
+        // a ramp alone replaces too, and without the word nothing is taken away
+        let ramp = text("ab")
+            .background_gradient(crate::layout::Gradient::linear(veil, veil.fade()))
+            .background_blend(BackgroundBlend::Replace);
+        assert_eq!(box_paint(&runtime.layout(&ramp, Proposal::unspecified())), vec!["knockout", "ramp"]);
+        let plain = text("ab").background_color(veil);
+        assert_eq!(box_paint(&runtime.layout(&plain, Proposal::unspecified())), vec!["fill"]);
+        let over = text("ab").background_color(veil).background_blend(BackgroundBlend::Over);
+        assert_eq!(box_paint(&runtime.layout(&over, Proposal::unspecified())), vec!["fill"]);
+        // the word with nothing to paint takes nothing away
+        let bare = text("ab").background_blend(BackgroundBlend::Replace);
+        assert!(box_paint(&runtime.layout(&bare, Proposal::unspecified())).is_empty());
+    }
+
+    /// The word is a box's own. A veil inside a panel that replaces still
+    /// lies over it: inherited, a hover veil would take its panel away.
+    #[test]
+    fn replacing_is_a_box_s_own_word_and_is_not_inherited() {
+        use crate::layout::{BackgroundBlend, Proposal};
+
+        let runtime = Runtime::new();
+        let veil = Color::rgba(255, 255, 255, 128);
+        let view = text("ab")
+            .background_color(veil)
+            .padding_length(8.0)
+            .background_color(veil)
+            .background_blend(BackgroundBlend::Replace);
+        let result = runtime.layout(&view, Proposal::unspecified());
+        assert_eq!(box_paint(&result), vec!["knockout", "fill", "fill"]);
+    }
+
+    /// A pane of glass reads the scene under it; a scene taken away is
+    /// nothing to read. With glass the word asks for no knockout.
+    #[test]
+    fn glass_that_replaces_takes_nothing_away() {
+        use crate::layout::{BackgroundBlend, Glass, Proposal};
+
+        let runtime = Runtime::new();
+        let view = text("ab")
+            .glass(Glass::regular())
+            .background_color(Color::rgba(255, 255, 255, 40))
+            .background_blend(BackgroundBlend::Replace);
+        let result = runtime.layout(&view, Proposal::unspecified());
+        assert_eq!(box_paint(&result), vec!["pane", "fill"]);
+    }
+
+    /// A knockout has no colour to fade, so a fade scales how much it
+    /// takes away: a view at half opacity leaves half the scene under it,
+    /// and one at zero leaves all of it.
+    #[test]
+    fn a_fade_scales_what_a_knockout_takes() {
+        use crate::layout::{BackgroundBlend, DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let view = |opacity: f64| {
+            text("ab")
+                .background_color(Color::rgba(255, 255, 255, 200))
+                .background_blend(BackgroundBlend::Replace)
+                .opacity(opacity)
+        };
+        let taken = |opacity: f64| {
+            runtime
+                .layout(&view(opacity), Proposal::unspecified())
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::Knockout { opacity, .. } => Some(*opacity),
+                    _ => None,
+                })
+        };
+        assert_eq!(taken(0.5), Some(0.5));
+        assert_eq!(taken(0.0), Some(0.0));
     }
 
     #[test]

@@ -14,10 +14,14 @@
 //! 2. The canvas is the theme's own, thinned to 60 %. That alpha is the
 //!    whole of what the app says: no view in the scene knows the window
 //!    is not opaque.
-//! 3. The panels are the same colour at the same alpha, one inside the
-//!    other. Each one adds its alpha to the one under it, so the blur
-//!    fades with every step in: that is source-over, and it is the
-//!    default.
+//! 3. The two stacks are the same three shades, one inside the other,
+//!    each at the same alpha. On the left each shade adds its alpha to
+//!    the ones under it and mixes with their colour, so the blur fades
+//!    with every step in: that is source-over, and it is the default.
+//!    On the right each shade REPLACES what is under it
+//!    (`.background_blend(BackgroundBlend::Replace)`): the colour
+//!    changes from one to the next and the blur shows through all three
+//!    at the one strength a shade names, however deep it sits.
 //! 4. `--clear` is the same window with no blur: what is behind it shows
 //!    sharp. `--opaque` is the window every other example opens, and the
 //!    alpha of the canvas is ignored.
@@ -35,14 +39,32 @@
 use bunny_ui::layout::Color;
 use bunny_ui::prelude::*;
 
-/// One panel of the stack: a veil at `alpha`, and whatever stands in it.
-fn panel(label: &'static str, veil: Color, inside: impl View) -> impl View {
+/// One panel of a stack: a veil, and whatever stands in it. `blend` says
+/// whether the veil lies over what is under it or takes its place.
+fn panel(label: &'static str, veil: Color, blend: BackgroundBlend, inside: impl View) -> impl View {
     vstack!(text(label).font(Font::Caption), inside)
         .spacing(8.0)
         .alignment(HorizontalAlignment::Leading)
         .padding_length(12.0)
         .background_color(veil)
         .corner_radius(12.0)
+        .background_blend(blend)
+}
+
+/// Three shades of one window, each inside the one before.
+fn stack(title: &'static str, shades: [Color; 3], blend: BackgroundBlend) -> impl View {
+    let [outer, middle, inner] = shades;
+    vstack!(
+        text(title).font(Font::Headline),
+        panel(
+            "a shade",
+            outer,
+            blend,
+            panel("a second, inside it", middle, blend, panel("a third", inner, blend, text("the blur"))),
+        ),
+    )
+    .spacing(8.0)
+    .alignment(HorizontalAlignment::Leading)
 }
 
 #[derive(Clone)]
@@ -54,22 +76,26 @@ struct Scene {
 
 impl Component for Scene {
     fn body(self) -> impl View {
-        // one veil, three deep: white over a dark scene, black over a light
-        let veil = if self.dark { Color::rgba(255, 255, 255, 46) } else { Color::rgba(0, 0, 0, 30) };
-        let stack = panel(
-            "one veil",
-            veil,
-            panel(
-                "two veils",
-                veil,
-                panel("three veils", veil, text("each step in hides more of the blur")),
-            ),
-        );
+        // three shades at ONE alpha: what differs from one to the next is
+        // the colour, never how much of the blur it lets through
+        let alpha = if self.dark { 64 } else { 56 };
+        let shades = if self.dark {
+            [Color::rgb(255, 255, 255), Color::rgb(110, 160, 255), Color::rgb(255, 140, 110)]
+        } else {
+            [Color::rgb(0, 0, 0), Color::rgb(20, 70, 190), Color::rgb(190, 60, 30)]
+        }
+        .map(|shade| shade.with_alpha(alpha));
+        let stacks = hstack!(
+            stack("over: the alphas add up", shades, BackgroundBlend::Over),
+            stack("replace: each is its own", shades, BackgroundBlend::Replace),
+        )
+        .spacing(16.0)
+        .alignment(VerticalAlignment::Top);
         let count = self.count;
         vstack!(
             text!("The window stands on: {}", self.served).font(Font::Title),
             text("The canvas is the theme's, at 60 %. Nothing else in the scene knows."),
-            stack,
+            stacks,
             text!("repainted {} times over the blur", count).font(Font::Title),
             spacer(),
         )
@@ -118,7 +144,7 @@ fn main() {
         WindowBackground::Blurred => "the desktop, blurred",
     };
     let window = app.open(
-        WindowSpec::titled("blur_window").size(560.0, 420.0).background(asked),
+        WindowSpec::titled("blur_window").size(620.0, 460.0).background(asked),
         Rc::new(runtime),
         Scene { served, dark, count: State::new(0) },
     );

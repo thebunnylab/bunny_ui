@@ -1096,6 +1096,12 @@ fn push_gradient(
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RunKind {
     Rects,
+    /// Knockouts over a CLEAR ground — rect instances drawn with the
+    /// tier's erase blend: what lies under each shape keeps `1 - alpha`
+    /// of itself, colour and alpha alike, and nothing is painted. A walk
+    /// over a solid canvas never makes this run: there a knockout is the
+    /// canvas painted at that strength, an ordinary rect.
+    Knockout,
     /// A batch of liquid-glass panes. It carries its own pass: the
     /// scene has to be blurred into the pyramid BEFORE the panes read
     /// it, and the pass boundary is what orders the two.
@@ -1143,7 +1149,7 @@ pub struct DrawRun {
 /// same list stands between.
 fn list_of(kind: RunKind) -> u8 {
     match kind {
-        RunKind::Rects => 0,
+        RunKind::Rects | RunKind::Knockout => 0,
         RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => 1,
         RunKind::Glass => 2,
     }
@@ -1287,6 +1293,14 @@ pub struct FrameBatches {
 /// integers, an empty intersection degenerating to a zero-area box.
 /// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
 /// again.
+///
+/// `floor` is the ground of the target, as the raster keeps it
+/// ([`crate::raster::solid_floor`]): `Some` is the solid canvas an opaque
+/// target clears to, and a [`DrawCommand::Knockout`] over it is that
+/// canvas painted at the knockout's strength — an ordinary rect, in the
+/// ordinary run, on every tier. `None` is a target with nothing of its
+/// own behind its paint, a translucent window, and a knockout there is a
+/// [`RunKind::Knockout`] the tier draws with its erase blend.
 #[allow(clippy::too_many_arguments)]
 pub fn build_frame(
     ground: &mut dyn AtlasGround,
@@ -1297,6 +1311,7 @@ pub fn build_frame(
     images: &dyn ImageEngine,
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
+    floor: Option<Color>,
 ) -> Result<(), AtlasFull> {
     atlas.begin_walk();
     batches.rects.clear();
@@ -1330,6 +1345,30 @@ pub fn build_frame(
                 if color.a == 0 => {}
             // and a pane faded out lands nothing over the scene it reads
             DrawCommand::Backdrop { glass, .. } if glass.opacity <= 0.0 => {}
+            DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to a byte")]
+                let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                // a knockout that takes nothing away is no instance
+                if alpha == 0 {
+                    continue;
+                }
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let (color, kind) = match floor {
+                    Some(canvas) => (Color { a: alpha, ..canvas }, RunKind::Rects),
+                    // the erase blend reads the alpha alone
+                    None => (Color { r: 0, g: 0, b: 0, a: alpha }, RunKind::Knockout),
+                };
+                push_rect(out, snapped, clip, color, radii, 0.0, KIND_FILL, 0.0);
+                note_run(&mut batches.runs, kind, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+            }
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -2066,6 +2105,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect()
@@ -2114,6 +2154,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the line fits the atlas");
         // the bytes and the corner the CPU compositor uses
@@ -2184,6 +2225,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
 
@@ -2231,6 +2273,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas2,
             &mut again,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         assert_eq!(first, again.checksum(), "the same scene is the same bytes");
@@ -2251,6 +2294,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 atlas,
                 batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the scene fits the atlas");
         };
@@ -2308,6 +2352,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 &mut atlas,
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the column fits the atlas");
             (ground.uploads.len(), batches.checksum())
@@ -2416,6 +2461,7 @@ mod tests {
                 &RawImages::default(),
                 atlas,
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             );
             match walked {
                 Ok(()) => return true,
@@ -2469,6 +2515,7 @@ mod tests {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the frame walks");
         (batches.sprites.clone(), ground)
@@ -2636,6 +2683,7 @@ mod tests {
             &RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the frame walks");
         assert_eq!(batches.runs.len(), 1);
@@ -2687,6 +2735,70 @@ mod tests {
         assert_eq!(over[1].levels, 2);
         assert_eq!(over[0].reads, (-3, -3, 23, 23));
         assert_eq!(over[1].reads, (7, 7, 33, 33), "its capture holds its own pane alone");
+    }
+
+    /// A veil, a knockout in the middle of it, and the veil that replaces
+    /// it there — walked over a ground.
+    fn replaced_walk(floor: Option<Color>) -> FrameBatches {
+        let knocked = at(10.0, 10.0, 50.0, 50.0);
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: at(0.0, 0.0, 100.0, 100.0),
+            color: Color::rgba(255, 255, 255, 128),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(DrawCommand::Knockout { rect: knocked, corner_radius: Corners::ZERO, opacity: 0.5 });
+        display.push(DrawCommand::FillRect {
+            rect: knocked,
+            color: Color::rgba(0, 0, 255, 128),
+            corner_radius: Corners::ZERO,
+        });
+        // and one that takes nothing away is no instance at all
+        display.push(DrawCommand::Knockout { rect: knocked, corner_radius: Corners::ZERO, opacity: 0.0 });
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            1,
+            (400, 400),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+            floor,
+        )
+        .expect("the scene fits the atlas");
+        batches
+    }
+
+    /// Over a solid canvas a knockout is the canvas painted at its
+    /// strength: an ordinary rect in the ordinary run, so a tier that
+    /// never presents a translucent target draws it with what it has.
+    #[test]
+    fn a_knockout_over_a_solid_floor_is_a_rect_of_the_canvas() {
+        let canvas = Color::hex(0x101014);
+        let batches = replaced_walk(Some(canvas));
+        let kinds: Vec<(RunKind, u32)> = batches.runs.iter().map(|run| (run.kind, run.count)).collect();
+        assert_eq!(kinds, vec![(RunKind::Rects, 3)], "one run of rects, nothing else");
+        assert_eq!(batches.rects[1].color, [canvas.r, canvas.g, canvas.b, 128]);
+    }
+
+    /// Over a clear ground it is a run of its own between the paint under
+    /// it and the paint that replaces: the tier draws it with its erase
+    /// blend, which reads the alpha alone.
+    #[test]
+    fn a_knockout_over_a_clear_ground_is_a_run_of_its_own() {
+        let batches = replaced_walk(None);
+        let kinds: Vec<(RunKind, u32, u32)> =
+            batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect();
+        assert_eq!(
+            kinds,
+            vec![(RunKind::Rects, 0, 1), (RunKind::Knockout, 1, 1), (RunKind::Rects, 2, 1)],
+            "paint order holds: under, taken away, replaced"
+        );
+        assert_eq!(batches.rects[1].color, [0, 0, 0, 128]);
     }
 
     /// The glass batches of a display list: each one's pane count.
@@ -2763,6 +2875,7 @@ mod tests {
                 &crate::image_engine::RawImages::default(),
                 &mut RunAtlas::new(),
                 &mut batches,
+                Some(crate::layout::Color::CANVAS),
             )
             .expect("the scene fits the atlas");
             (glass_batches(&display), batches.glass.iter().map(|pane| pane.opacity).collect::<Vec<_>>())
@@ -2841,6 +2954,7 @@ mod tests {
             &crate::image_engine::RawImages::default(),
             &mut atlas,
             &mut batches,
+            Some(crate::layout::Color::CANVAS),
         )
         .expect("the scene fits the atlas");
         let runs: Vec<&DrawRun> = batches.runs.iter().collect();
@@ -2913,7 +3027,7 @@ mod tests {
     fn present_as_tiers(ground: &mut RecordingGround, atlas: &mut RunAtlas, display: &DisplayList, physical: (usize, usize)) {
         let mut batches = FrameBatches::default();
         for attempt in 0..4 {
-            match build_frame(ground, display, 2, physical, &crate::text_engine::PixelFont, &RawImages::default(), atlas, &mut batches) {
+            match build_frame(ground, display, 2, physical, &crate::text_engine::PixelFont, &RawImages::default(), atlas, &mut batches, Some(crate::layout::Color::CANVAS)) {
                 Ok(()) => return,
                 Err(AtlasFull) if attempt == 0 && atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 => {}
                 Err(AtlasFull) => atlas.reset(ground, true),

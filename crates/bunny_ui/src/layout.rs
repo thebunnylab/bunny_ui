@@ -2379,6 +2379,11 @@ impl GlassPaint {
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct VisualProps {
     pub background: Option<Color>,
+    /// How the background meets what is already painted under it —
+    /// see [`BackgroundBlend`]. `None` is [`BackgroundBlend::Over`]. It
+    /// is the box's own word and is NOT inherited: a hover veil inside a
+    /// panel that replaces would otherwise replace the panel.
+    pub blend: Option<BackgroundBlend>,
     /// A ramp painted OVER the flat background and under the child —
     /// the two compose (`.background_color(base).background_gradient(…)`).
     pub gradient: Option<Gradient>,
@@ -2496,6 +2501,7 @@ impl VisualProps {
     pub fn or(self, outer: VisualProps) -> VisualProps {
         VisualProps {
             background: self.background.or(outer.background),
+            blend: self.blend.or(outer.blend),
             gradient: self.gradient.or(outer.gradient),
             // knob by knob, so a chain of `.backdrop_*()` builds ONE
             // material instead of the innermost one winning whole
@@ -2683,6 +2689,33 @@ pub enum ImagePlacement {
     Subpixel,
 }
 
+/// How a view's background meets what is already painted under it —
+/// `.background_blend(…)`.
+///
+/// ```ignore
+/// sidebar.background_color(veil).background_blend(BackgroundBlend::Replace)
+/// ```
+///
+/// A window that stands on a blur is where the difference shows. With
+/// the default, a veil at 50 % inside a veil at 50 % over a canvas at
+/// 60 % is 90 % solid, and the blur is gone two panels in. With
+/// `Replace` each of the three is exactly what it names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BackgroundBlend {
+    /// The background lies ON TOP of what is under it: source-over, the
+    /// rule every paint follows. Alphas add up with depth, and a pane of
+    /// glass blurs the pane beneath it again.
+    #[default]
+    Over,
+    /// The background takes the PLACE of what is under it. The shape is
+    /// first returned to the ground of the surface — the canvas in an
+    /// opaque window, what is behind the window in one that is not — and
+    /// the background is painted on the ground alone, at any depth. A
+    /// halo the same view casts stays outside the shape, where a halo
+    /// belongs, instead of darkening a translucent box from inside.
+    Replace,
+}
+
 /// A draw command — the output of the placement pass, in paint order
 /// (whoever comes later paints on top; `Layered` counts on that).
 /// It is the rasterizer's interface and, later on, any backend's.
@@ -2693,6 +2726,17 @@ pub enum DrawCommand {
     /// straight path). Four numbers, so a band of a bigger figure can
     /// round only the corners that end it.
     FillRect { rect: Rect, color: Color, corner_radius: Corners },
+    /// Returns the shape a `FillRect` covers to the GROUND of the surface:
+    /// everything painted there so far is taken away, by `opacity`. The
+    /// ground is whatever is behind the scene — the canvas on an opaque
+    /// surface, what is behind the window on one the system composites
+    /// by its own alpha. It is how a background replaces what is under
+    /// it instead of adding to it ([`BackgroundBlend::Replace`]): the
+    /// paint that follows lands on the ground alone, at any depth.
+    ///
+    /// It carries no colour of its own, so a fade scales its `opacity`:
+    /// a view at zero takes nothing away.
+    Knockout { rect: Rect, corner_radius: Corners, opacity: f64 },
     /// A two-stop ramp inside the rounded rect — the same shape a
     /// `FillRect` covers, with the color resolved per pixel.
     Gradient { rect: Rect, paint: GradientPaint, corner_radius: Corners },
@@ -2778,6 +2822,9 @@ impl PartialEq for DrawCommand {
         match self {
             FillRect { rect, color, corner_radius } => matches!(other,
                 FillRect { rect: r, color: c, corner_radius: k } if rect == r && color == c && corner_radius == k),
+            Knockout { rect, corner_radius, opacity } => matches!(other,
+                Knockout { rect: r, corner_radius: k, opacity: o }
+                    if rect == r && corner_radius == k && opacity == o),
             Gradient { rect, paint, corner_radius } => matches!(other,
                 Gradient { rect: r, paint: p, corner_radius: k } if rect == r && paint == p && corner_radius == k),
             Backdrop { rect, glass, corner_radius } => matches!(other,
@@ -2981,6 +3028,7 @@ impl DrawCommand {
         };
         match self {
             DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Knockout { rect, .. }
             | DrawCommand::Gradient { rect, .. }
             | DrawCommand::Backdrop { rect, .. }
             | DrawCommand::Image { rect, .. } => around(rect, 0.0),
@@ -3023,6 +3071,11 @@ impl DrawCommand {
                 rect: moved(rect),
                 color: *color,
                 corner_radius: *corner_radius,
+            },
+            DrawCommand::Knockout { rect, corner_radius, opacity } => DrawCommand::Knockout {
+                rect: moved(rect),
+                corner_radius: *corner_radius,
+                opacity: *opacity,
             },
             DrawCommand::Shadow { rect, radius, color, corner_radius } => DrawCommand::Shadow {
                 rect: moved(rect),
@@ -3289,6 +3342,10 @@ impl DisplayList {
                 // the scene. Fading its tint and lights alone left the
                 // blurred scene at full strength, an empty box at 0
                 DrawCommand::Backdrop { glass, .. } => glass.opacity *= opacity,
+                // it has no colour to fade: what fades is how much of the
+                // scene under it is taken away, so a view at zero leaves
+                // that scene whole
+                DrawCommand::Knockout { opacity: strength, .. } => *strength *= opacity,
                 DrawCommand::Gradient { paint, .. } => match paint {
                     GradientPaint::Radial { inner, outer, .. } => {
                         fade(inner);
@@ -3366,6 +3423,11 @@ impl DisplayList {
                 DrawCommand::FillRect { rect: r, color, corner_radius } => {
                     DrawCommand::FillRect { rect: rect(r), color, corner_radius: corners(corner_radius) }
                 }
+                DrawCommand::Knockout { rect: r, corner_radius, opacity } => DrawCommand::Knockout {
+                    rect: rect(r),
+                    corner_radius: corners(corner_radius),
+                    opacity,
+                },
                 DrawCommand::StrokeRect { rect: r, color, width, corner_radius } => DrawCommand::StrokeRect {
                     rect: rect(r),
                     color,
@@ -3464,6 +3526,9 @@ impl DisplayList {
             .map(|command| match command {
                 DrawCommand::FillRect { rect, color, corner_radius } => {
                     DrawCommand::FillRect { rect: shift_rect(rect), color, corner_radius }
+                }
+                DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                    DrawCommand::Knockout { rect: shift_rect(rect), corner_radius, opacity }
                 }
                 DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                     DrawCommand::StrokeRect { rect: shift_rect(rect), color, width, corner_radius }
@@ -5280,6 +5345,14 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
         .min(out.display.len());
     let commands = &out.display.as_slice()[..end];
     let floor = crate::theme::canvas();
+    // a lifted thumb is an OPAQUE layer, the floor with the thumb blended
+    // over it. Over a canvas that is not solid, the canvas of a window
+    // that stands on a blur, that layer would hide what the window lets
+    // through; the thumb stays in the scene. (A knockout under a thumb
+    // is not a fill, so the scan below already refuses it.)
+    if floor.a != 255 {
+        return Vec::new();
+    }
     let mut candidates: Vec<Candidate> = marks
         .iter()
         .filter(|&&at| at < end)
@@ -5493,6 +5566,7 @@ fn painted_reach(command: &DrawCommand, env: &LayoutEnv<'_>) -> Option<Rect> {
     };
     match command {
         DrawCommand::FillRect { rect, .. }
+        | DrawCommand::Knockout { rect, .. }
         | DrawCommand::Gradient { rect, .. }
         | DrawCommand::Backdrop { rect, .. }
         | DrawCommand::Image { rect, .. } => Some(*rect),
@@ -9125,6 +9199,21 @@ impl LayoutNode {
                 } else {
                     props.background
                 };
+                // a background that REPLACES returns its shape to the
+                // ground first, so the fill and the ramp below land on
+                // the ground alone. A pane of glass reads the scene under
+                // it, and a scene taken away is nothing to read: with
+                // glass the word means something else, and no knockout
+                if props.blend == Some(BackgroundBlend::Replace)
+                    && props.glass.is_none()
+                    && (background.is_some() || props.gradient.is_some())
+                {
+                    out.draw(DrawCommand::Knockout {
+                        rect: frame,
+                        corner_radius: props.corner_radius.unwrap_or_default(),
+                        opacity: 1.0,
+                    });
+                }
                 if let Some(color) = background {
                     out.draw(DrawCommand::FillRect {
                         rect: frame,
