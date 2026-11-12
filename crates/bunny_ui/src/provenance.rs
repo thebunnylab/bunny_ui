@@ -296,6 +296,8 @@ pub enum NodeKind {
     Form,
     /// `labeled(…)`.
     Labeled,
+    /// `search_field(…)`.
+    SearchField,
 }
 
 impl NodeKind {
@@ -328,6 +330,7 @@ impl NodeKind {
             Self::Picker => "picker",
             Self::Form => "form",
             Self::Labeled => "labeled",
+            Self::SearchField => "search_field",
         }
     }
 }

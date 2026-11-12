@@ -3,8 +3,10 @@
 //!
 //! The mac's app menu and Window menu, the Edit items every platform
 //! lists, the iPad's Settings row, a notification's default action on
-//! a Linux desktop, the Android channel's name: twenty-one words no app
-//! can reach, because the shell writes them. They come from a
+//! a Linux desktop, the Android channel's name, the prompt of a search
+//! field and the name of the button that empties it: words no app can
+//! reach, because the shell or a built-in control writes them. They come
+//! from a
 //! [`Catalog`] of sixteen languages, picked by the locale in effect —
 //! and the app has the last word through [`install`], a hook that may
 //! answer for any word in any language, or stay silent and leave the
@@ -28,7 +30,7 @@ use motor::state::Locale;
 use crate::catalog::{Catalog, Key, Strings, Table, fill};
 
 /// How many words the framework owns — the length of every table.
-pub const WORDS: usize = 21;
+pub const WORDS: usize = 23;
 
 /// One of the framework's own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,6 +74,10 @@ pub enum Word {
     Yes,
     /// A negative answer to a confirmation question.
     No,
+    /// The prompt of a search field, and its name for assistive technology.
+    Search,
+    /// The button that empties a field.
+    Clear,
 }
 
 impl Word {
@@ -98,6 +104,8 @@ impl Word {
         Word::Notifications,
         Self::Yes,
         Self::No,
+        Self::Search,
+        Self::Clear,
     ];
 
     /// Does the word name the app — is its entry a template with `{app}`?
@@ -123,6 +131,7 @@ pub type WordTable = Table<WORDS>;
 //   Undo, Redo, Cut, Copy, Paste, SelectAll
 //   Open, Notifications
 //   Yes, No
+//   Search, Clear
 #[rustfmt::skip]
 const EN: WordTable = Table { tag: "en", entries: [
     "About {app}", "Settings…", "Services", "Hide {app}", "Hide Others", "Show All", "Quit {app}",
@@ -130,6 +139,7 @@ const EN: WordTable = Table { tag: "en", entries: [
     "Undo", "Redo", "Cut", "Copy", "Paste", "Select All",
     "Open", "Notifications",
     "Yes", "No",
+    "Search", "Clear",
 ]};
 
 /// Brazilian Portuguese, tagged `pt`: `pt-BR` and bare `pt` both land
@@ -141,6 +151,7 @@ const PT: WordTable = Table { tag: "pt", entries: [
     "Desfazer", "Refazer", "Recortar", "Copiar", "Colar", "Selecionar Tudo",
     "Abrir", "Notificações",
     "Sim", "Não",
+    "Buscar", "Limpar",
 ]};
 
 #[rustfmt::skip]
@@ -150,6 +161,7 @@ const PT_PT: WordTable = Table { tag: "pt-PT", entries: [
     "Anular", "Refazer", "Cortar", "Copiar", "Colar", "Selecionar Tudo",
     "Abrir", "Notificações",
     "Sim", "Não",
+    "Pesquisar", "Limpar",
 ]};
 
 #[rustfmt::skip]
@@ -159,6 +171,7 @@ const ES: WordTable = Table { tag: "es", entries: [
     "Deshacer", "Rehacer", "Cortar", "Copiar", "Pegar", "Seleccionar todo",
     "Abrir", "Notificaciones",
     "Sí", "No",
+    "Buscar", "Borrar",
 ]};
 
 #[rustfmt::skip]
@@ -168,6 +181,7 @@ const FR: WordTable = Table { tag: "fr", entries: [
     "Annuler", "Rétablir", "Couper", "Copier", "Coller", "Tout sélectionner",
     "Ouvrir", "Notifications",
     "Oui", "Non",
+    "Rechercher", "Effacer",
 ]};
 
 #[rustfmt::skip]
@@ -177,6 +191,7 @@ const DE: WordTable = Table { tag: "de", entries: [
     "Widerrufen", "Wiederholen", "Ausschneiden", "Kopieren", "Einsetzen", "Alles auswählen",
     "Öffnen", "Mitteilungen",
     "Ja", "Nein",
+    "Suchen", "Löschen",
 ]};
 
 #[rustfmt::skip]
@@ -186,6 +201,7 @@ const IT: WordTable = Table { tag: "it", entries: [
     "Annulla", "Ripeti", "Taglia", "Copia", "Incolla", "Seleziona tutto",
     "Apri", "Notifiche",
     "Sì", "No",
+    "Cerca", "Cancella",
 ]};
 
 #[rustfmt::skip]
@@ -195,6 +211,7 @@ const JA: WordTable = Table { tag: "ja", entries: [
     "取り消す", "やり直す", "カット", "コピー", "ペースト", "すべてを選択",
     "開く", "通知",
     "はい", "いいえ",
+    "検索", "消去",
 ]};
 
 #[rustfmt::skip]
@@ -204,6 +221,7 @@ const ZH_HANS: WordTable = Table { tag: "zh-Hans", entries: [
     "撤销", "重做", "剪切", "拷贝", "粘贴", "全选",
     "打开", "通知",
     "是", "否",
+    "搜索", "清除",
 ]};
 
 #[rustfmt::skip]
@@ -213,6 +231,7 @@ const ZH_HANT: WordTable = Table { tag: "zh-Hant", entries: [
     "還原", "重做", "剪下", "拷貝", "貼上", "全選",
     "打開", "通知",
     "是", "否",
+    "搜尋", "清除",
 ]};
 
 #[rustfmt::skip]
@@ -222,6 +241,7 @@ const KO: WordTable = Table { tag: "ko", entries: [
     "실행 취소", "실행 복귀", "오려두기", "복사하기", "붙여넣기", "전체 선택",
     "열기", "알림",
     "예", "아니요",
+    "검색", "지우기",
 ]};
 
 #[rustfmt::skip]
@@ -231,6 +251,7 @@ const NL: WordTable = Table { tag: "nl", entries: [
     "Herstel", "Opnieuw", "Knip", "Kopieer", "Plak", "Selecteer alles",
     "Open", "Meldingen",
     "Ja", "Nee",
+    "Zoek", "Wis",
 ]};
 
 #[rustfmt::skip]
@@ -240,6 +261,7 @@ const RU: WordTable = Table { tag: "ru", entries: [
     "Отменить", "Повторить", "Вырезать", "Скопировать", "Вставить", "Выбрать все",
     "Открыть", "Уведомления",
     "Да", "Нет",
+    "Поиск", "Очистить",
 ]};
 
 /// Turkish inflects what it attaches to, and a suffix cannot attach to
@@ -252,6 +274,7 @@ const TR: WordTable = Table { tag: "tr", entries: [
     "Geri Al", "Yinele", "Kes", "Kopyala", "Yapıştır", "Tümünü Seç",
     "Aç", "Bildirimler",
     "Evet", "Hayır",
+    "Ara", "Temizle",
 ]};
 
 #[rustfmt::skip]
@@ -261,6 +284,7 @@ const PL: WordTable = Table { tag: "pl", entries: [
     "Cofnij", "Przywróć", "Wytnij", "Kopiuj", "Wklej", "Zaznacz wszystko",
     "Otwórz", "Powiadomienia",
     "Tak", "Nie",
+    "Szukaj", "Wyczyść",
 ]};
 
 #[rustfmt::skip]
@@ -270,6 +294,7 @@ const SV: WordTable = Table { tag: "sv", entries: [
     "Ångra", "Gör om", "Klipp ut", "Kopiera", "Klistra in", "Markera allt",
     "Öppna", "Notiser",
     "Ja", "Nej",
+    "Sök", "Rensa",
 ]};
 
 /// The sixteen tables, English first — the source every other falls to.

@@ -87,6 +87,7 @@ mod reconciler;
 mod shapes;
 pub use shapes::{BorderStyle, Stripes};
 pub mod runtime;
+pub mod search_field;
 #[cfg(feature = "canvas")]
 pub mod slider;
 #[cfg(feature = "canvas")]
@@ -225,6 +226,7 @@ pub mod prelude {
     pub use crate::beat::Beat;
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
     pub use crate::picker::{Picker, picker};
+    pub use crate::search_field::{SearchField, search_field};
     pub use crate::tabs::{TabItem, TabPages, TabView, Tabs, tab, tab_view, tabs};
     pub use crate::toggle::{Toggle, toggle};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
