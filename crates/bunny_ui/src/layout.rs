@@ -1391,6 +1391,8 @@ pub(crate) enum ControlKind {
     /// Two states behind a mark. Space toggles it; Enter is left to the
     /// form around it.
     Checkbox,
+    /// Two states behind a switch. Keys as a checkbox.
+    Switch,
 }
 
 impl ControlKind {
@@ -1400,13 +1402,23 @@ impl ControlKind {
         match self {
             ControlKind::Button => Role::Button,
             ControlKind::Checkbox => Role::Checkbox,
+            ControlKind::Switch => Role::Switch,
+        }
+    }
+
+    /// The name the control prints by.
+    pub(crate) const fn print_name(self) -> &'static str {
+        match self {
+            ControlKind::Button => "Button",
+            ControlKind::Checkbox => "Checkbox",
+            ControlKind::Switch => "Toggle",
         }
     }
 
     /// Does a bare Enter activate it? A two-state control leaves Enter to
     /// the form around it, as a native checkbox does.
     pub(crate) const fn enter_activates(self) -> bool {
-        !matches!(self, ControlKind::Checkbox)
+        !matches!(self, ControlKind::Checkbox | ControlKind::Switch)
     }
 }
 

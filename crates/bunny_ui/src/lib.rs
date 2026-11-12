@@ -97,6 +97,7 @@ pub mod text_input;
 mod field_history;
 mod grapheme;
 pub mod theme;
+pub mod toggle;
 pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
@@ -206,6 +207,7 @@ pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::beat::Beat;
+    pub use crate::toggle::{Toggle, toggle};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
     // qualified, as the views have a `Table` and the actions a `Key`
     pub use crate::catalog::{self, Catalog, Strings};

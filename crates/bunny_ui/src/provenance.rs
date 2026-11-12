@@ -282,6 +282,8 @@ pub enum NodeKind {
     Grid,
     /// `ellipse()`.
     Ellipse,
+    /// `toggle(…)`.
+    Toggle,
 }
 
 impl NodeKind {
@@ -307,6 +309,7 @@ impl NodeKind {
             Self::List => "list",
             Self::VirtualList => "virtual_list",
             Self::Modifier => "modifier",
+            Self::Toggle => "toggle",
         }
     }
 }
@@ -350,6 +353,56 @@ pub fn recording() -> bool {
 /// why it must be on before the first pass.
 pub fn set_recording(on: bool) {
     RECORDING.with(|recording| recording.set(on));
+}
+
+thread_local! {
+    /// Whether sites were recorded outside the quiet scope under way.
+    static OUTSIDE_QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores the recording a quiet or a written scope changed.
+struct RecordingScope {
+    recording: bool,
+    outside: bool,
+}
+
+impl Drop for RecordingScope {
+    fn drop(&mut self) {
+        RECORDING.with(|recording| recording.set(self.recording));
+        OUTSIDE_QUIET.with(|outside| outside.set(self.outside));
+    }
+}
+
+/// Runs `render` with site recording off.
+///
+/// A built-in control is composed of ordinary views — a stack, a spacer,
+/// a painted box — and those are written in THIS crate. A tool that maps
+/// frames to source lines must not show one of those lines as if the app
+/// had written it. The control renders its inside in a quiet scope, and
+/// then seals its own site, the app's line, over the whole.
+///
+/// The views the app handed to the control (its label) are the app's own:
+/// they go inside [`Written`], which records them again.
+pub(crate) fn quiet<R>(render: impl FnOnce() -> R) -> R {
+    let was = RECORDING.with(|recording| recording.replace(false));
+    let _scope = RecordingScope { recording: was, outside: OUTSIDE_QUIET.with(|outside| outside.replace(was)) };
+    render()
+}
+
+/// A view the APP wrote, standing inside a control the framework
+/// composes: its sites are recorded as they were outside the control's
+/// [`quiet`] scope.
+#[derive(Clone)]
+pub(crate) struct Written<V>(pub V);
+
+impl<V: crate::view::View> crate::view::View for Written<V> {
+    type Arity = V::Arity;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let outside = OUTSIDE_QUIET.with(Cell::get);
+        let _scope = RecordingScope { recording: RECORDING.with(|recording| recording.replace(outside)), outside };
+        self.0.render_into(ctx, out);
+    }
 }
 
 /// The site of whoever called the `#[track_caller]` function that called

@@ -320,11 +320,11 @@ where
     F: Fn() + Clone + 'static,
 {
     /// The node itself, before its site is sealed over it.
-    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
+    pub(crate) fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut label = NodeList::new();
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
-        out.push(RenderNode::branch(crate::view::print_label(if self.checked.is_some() { "Checkbox" } else { "Button" }), prints));
+        out.push(RenderNode::branch(crate::view::print_label(self.kind.print_name()), prints));
 
         // inside a pass, the button is an interaction target: the frame joins
         // the hit-test under the identity path, and the action stays registered
@@ -448,6 +448,37 @@ where
         kind: crate::layout::ControlKind::Button,
         chrome: ButtonChrome::Standard,
         site: crate::provenance::here(),
+    }
+}
+
+/// What a built-in control asks of the button it is made of.
+pub(crate) struct ControlSpec {
+    pub kind: crate::layout::ControlKind,
+    /// The value a two-state control publishes; `None` for a press.
+    pub checked: Option<bool>,
+    pub disabled: bool,
+    /// The label draws everything: no padding and no chrome are added.
+    pub plain: bool,
+    pub site: crate::provenance::Site,
+}
+
+/// The one place a built-in activation control is made. A switch, a
+/// segment, a tab and a row of a list of choices are each a label over
+/// this: the target, the focus stop, the keys, the disabled state and
+/// the semantics are the button's own, written once.
+pub(crate) fn control<L, F>(label: L, action: F, spec: ControlSpec) -> Button<L, F>
+where
+    L: View,
+    F: Fn() + Clone + 'static,
+{
+    Button {
+        label,
+        action,
+        disabled: spec.disabled,
+        checked: spec.checked,
+        kind: spec.kind,
+        chrome: if spec.plain { ButtonChrome::Plain } else { ButtonChrome::Standard },
+        site: spec.site,
     }
 }
 
