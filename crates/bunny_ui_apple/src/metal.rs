@@ -2737,6 +2737,12 @@ pub struct MetalPresenter {
     observation: Option<bunny_ui::presentation::backend::PresentationSender>,
     stack: MetalStack,
     layer: Id,
+    /// The system composites this layer by its own alpha. Such a frame
+    /// clears to the premultiplied canvas and is always presented whole:
+    /// a patch, a scroll band and a bridge are opaque layers, and an
+    /// opaque layer over a translucent frame hides what is behind the
+    /// window.
+    translucent: bool,
     physical: (usize, usize),
     scale: usize,
     slots: [FrameSlot; 3],
@@ -3058,7 +3064,7 @@ impl MetalPresenter {
             #[cfg(not(target_os = "macos"))]
             let rows_active = false;
             #[cfg(target_os = "macos")]
-            if !live && physical == self.physical && scale == self.scale
+            if !live && !self.translucent && physical == self.physical && scale == self.scale
                 && self.base.as_ref().is_some_and(|(_, _, _, c)| *c == canvas)
                 && !self.patches.iter().any(|p| p.shown.is_some())
                 && self.scroll_bands.present(scroll_bands::Frame { root: self.layer, display, physical, scale, canvas, text, images, boxes: &self.boxes })
@@ -3233,7 +3239,7 @@ impl MetalPresenter {
             let encoded = self.stack.encode_frame(EncodeFrame {
                 target,
                 present_to,
-                canvas,
+                canvas: self.ground_color(canvas),
                 viewport: (physical.0 as f32, physical.1 as f32),
                 origin: (0.0, 0.0),
                 instances: self.slots[index].buffer,
@@ -3463,6 +3469,8 @@ impl MetalPresenter {
         ) {
             ListDamage::Same => Plan::Same,
             ListDamage::Whole => Plan::Whole,
+            // a patch is an opaque layer over the frame
+            ListDamage::Rect(_) if self.translucent => Plan::Whole,
             ListDamage::Rect(damage) => patch_box(damage, physical).map_or(Plan::Whole, Plan::Patch),
         }
     }
@@ -3654,6 +3662,15 @@ impl MetalPresenter {
     /// not compile) prints one line and the shell falls back — a window
     /// never fails to open because of Metal.
     pub fn attach(layer: Id, scale: f64) -> Option<MetalPresenter> {
+        MetalPresenter::attach_with(layer, scale, false)
+    }
+
+    /// [`MetalPresenter::attach`], for a layer the system composites by
+    /// its own alpha when `translucent` is true: a window whose
+    /// background is not opaque. The layer is then not opaque, its frames
+    /// clear to the premultiplied canvas, and the alpha the scene leaves
+    /// reaches the compositor.
+    pub(crate) fn attach_with(layer: Id, scale: f64, translucent: bool) -> Option<MetalPresenter> {
         if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
             return None;
         }
@@ -3665,7 +3682,7 @@ impl MetalPresenter {
             let scale = scale.round().max(1.0);
             msg_void_id(layer, sel("setDevice:"), stack.device);
             msg_void_u64(layer, sel("setPixelFormat:"), PIXEL_FORMAT_BGRA8);
-            msg_void_bool(layer, sel("setOpaque:"), 1);
+            msg_void_bool(layer, sel("setOpaque:"), i8::from(!translucent));
             msg_void_bool(layer, sel("setFramebufferOnly:"), 1);
             msg_void_u64(layer, sel("setMaximumDrawableCount:"), 3);
             // nextDrawable BLOCKS instead of returning nil — the natural
@@ -3684,6 +3701,7 @@ impl MetalPresenter {
             observation: None,
             stack,
             layer,
+            translucent,
             physical: (0, 0),
             scale: 0,
             slots: std::array::from_fn(|_| FrameSlot::empty()),
@@ -3736,6 +3754,13 @@ impl MetalPresenter {
         self.drawable_wait_ms
     }
 
+    /// The colour a frame clears to: the canvas, or the canvas
+    /// premultiplied on a translucent layer — the ground the raster
+    /// starts a translucent bitmap from.
+    fn ground_color(&self, canvas: Color) -> Color {
+        if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
+    }
+
     /// The anti-flash frame: one clear at the size the surface will
     /// show, BEFORE it shows. A virgin `CAMetalLayer` flashes black on
     /// its first appearance otherwise.
@@ -3769,6 +3794,9 @@ pub struct OffscreenGpu {
     ground: MetalGround,
     atlas: RunAtlas,
     batches: FrameBatches,
+    /// The target stands for a translucent window: it clears to the
+    /// premultiplied canvas, and what it reads back is premultiplied.
+    translucent: bool,
 }
 
 impl OffscreenGpu {
@@ -3800,8 +3828,20 @@ impl OffscreenGpu {
                 ground,
                 atlas: RunAtlas::new(),
                 batches: FrameBatches::default(),
+                translucent: false,
             })
         }
+    }
+
+    /// The same target, standing for a window the system composites by
+    /// its own alpha: it clears to the premultiplied canvas, as
+    /// the window presenter does for a translucent layer, and
+    /// [`OffscreenGpu::read_rgba`] answers premultiplied bytes — what
+    /// `rasterize_translucent` paints.
+    #[must_use]
+    pub fn translucent(mut self) -> OffscreenGpu {
+        self.translucent = true;
+        self
     }
 
     /// Walks the frame into the batches, resetting the atlas on overflow
@@ -3894,7 +3934,7 @@ impl OffscreenGpu {
             let encoded = self.stack.encode_frame(EncodeFrame {
                 target: self.target,
                 present_to: null_mut(),
-                canvas,
+                canvas: if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas },
                 viewport: (self.width as f32, self.height as f32),
                 origin: (0.0, 0.0),
                 instances: self.slots[index].buffer,
@@ -4218,8 +4258,117 @@ mod tests {
         (gpu.read_rgba(), cpu)
     }
 
+    /// [`scene_bytes`] for a window the system composites by its own
+    /// alpha: the target clears to the premultiplied canvas, the oracle
+    /// is the translucent raster, and both sides hold premultiplied
+    /// bytes.
+    fn translucent_scene_bytes(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let physical = (
+            (logical.width.round() as usize) * scale,
+            (logical.height.round() as usize) * scale,
+        );
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(root, logical);
+        let cpu = bunny_ui::raster::rasterize_translucent(
+            &display,
+            physical.0,
+            physical.1,
+            scale,
+            canvas,
+            &PixelFont,
+            &RawImages::default(),
+        )
+        .to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu").translucent();
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
     fn max_channel_delta(a: &[u8], b: &[u8]) -> u8 {
         a.iter().zip(b.iter()).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
+    }
+
+    /// A translucent target with nothing painted on it holds the canvas
+    /// multiplied by its own alpha in every pixel — the bytes the window
+    /// server shows as the canvas at that strength over what is behind
+    /// the window. A straight clear would show it at full strength.
+    #[test]
+    fn a_translucent_target_clears_to_the_premultiplied_canvas() {
+        if !device_present() {
+            return;
+        }
+        let (gpu, cpu) = translucent_scene_bytes(
+            &empty().frame(1.0, 1.0),
+            Size { width: 8.0, height: 8.0 },
+            1,
+            Color::rgba(200, 100, 50, 128),
+        );
+        assert_eq!(&gpu[..4], &[100, 50, 25, 128], "the first pixel of the target");
+        assert!(gpu == cpu, "an empty scene diverged (max channel delta {})", max_channel_delta(&gpu, &cpu));
+    }
+
+    /// Paint over a translucent ground adds to the ground's alpha and
+    /// stays premultiplied, on the GPU as in the raster: flat fills,
+    /// solid and translucent, land on the same bytes.
+    #[test]
+    fn flat_fills_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(120.0, 40.0).background_color(Color::rgba(255, 255, 255, 128)),
+            empty()
+                .frame(80.0, 24.0)
+                .background_color(Color::rgba(24, 24, 29, 90))
+                .padding_length(10.0)
+                .background_color(Color::rgba(221, 225, 233, 160)),
+        ));
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 200.0, height: 160.0 },
+            2,
+            Color::rgba(16, 16, 20, 153),
+        );
+        assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
+        assert!(
+            gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 153),
+            "the bare ground keeps the canvas's own alpha"
+        );
+        assert!(
+            gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255),
+            "a solid fill is solid"
+        );
+    }
+
+    /// Text and a rounded shape over a translucent ground: coverage and
+    /// alpha meet at the edges, where the two conventions differ most.
+    #[test]
+    fn soft_edges_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("the ground shows through").foreground_color(Color::WHITE),
+            empty()
+                .frame(120.0, 48.0)
+                .background_color(Color::rgba(59, 130, 246, 150))
+                .corner_radius(14.0)
+                .shadow(8.0),
+        ))
+        .padding_length(16.0);
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 220.0, height: 140.0 },
+            2,
+            Color::rgba(16, 16, 20, 120),
+        );
+        assert_close(&gpu, &cpu, 3, "soft edges over a translucent ground");
     }
 
     /// The parity gate for anti-aliased scenes: every channel within

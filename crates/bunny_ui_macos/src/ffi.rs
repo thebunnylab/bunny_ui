@@ -63,6 +63,7 @@ pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, rest
 
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
+use bunny_ui::window::WindowBackground;
 
 // Re-declaring `objc_msgSend` with the concrete signature of each message
 // is the runtime's designed usage (the symbol is a trampoline that
@@ -961,7 +962,7 @@ unsafe fn scene_point_under_mouse(left: Id) -> Option<(f64, f64)> {
         }
         // the scene's own window sits at its origin; a panel or a dialog
         // at the origin it was placed at, the one its events translate by
-        let view = msg_id(under, sel("contentView"));
+        let view = scene_view(under);
         let (dx, dy) = if owning_window(under) == under as usize {
             (0.0, 0.0)
         } else {
@@ -1435,12 +1436,12 @@ extern "C" fn bunny_rotate(this: Id, _sel: Sel, event: Id) {
 /// presenter arms its transaction here, so the whole drag runs under
 /// one contract instead of catching up on the second step.
 extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, note: Id) {
-    let view = unsafe { msg_id(msg_id(note, sel("object")), sel("contentView")) };
+    let view = unsafe { scene_view(msg_id(note, sel("object"))) };
     crate::metal::arm_transaction_view(view, true);
 }
 
 extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, note: Id) {
-    let view = unsafe { msg_id(msg_id(note, sel("object")), sel("contentView")) };
+    let view = unsafe { scene_view(msg_id(note, sel("object"))) };
     crate::metal::arm_transaction_view(view, false);
     // the hand let go: one more frame NOW, so everything that held
     // back during the drag — a hosted engine's throttled size, the
@@ -1475,7 +1476,7 @@ extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
 extern "C" fn bunny_window_occlusion_changed(_this: Id, _sel: Sel, note: Id) {
     unsafe {
         let window = msg_id(note, sel("object"));
-        let view = msg_id(window, sel("contentView"));
+        let view = scene_view(window);
         crate::metal::observation_visibility_changed(view);
     }
 }
@@ -1505,7 +1506,7 @@ fn window_frame_changed_inner(note: Id, kind: &str) {
     geometry_ops::notify(window as usize);
     if crate::trace::active() {
         unsafe {
-            let view = msg_id(window, sel("contentView"));
+            let view = scene_view(window);
             if !view.is_null() {
                 let bounds = msg_rect(view, sel("bounds"));
                 let live = msg_bool(view, sel("inLiveResize")).get();
@@ -3198,6 +3199,20 @@ impl WindowHandle {
     pub fn raw_window(&self) -> usize {
         self.window as usize
     }
+
+    /// Dresses the window for a dark scene or a light one — `NSAppearance`
+    /// on this window alone. A blurred window asks for it: the system's
+    /// material takes its tint from the window's appearance, and a dark
+    /// scene over a light material reads as fog. The application's own
+    /// appearance, which the theme may follow, is not touched.
+    pub fn dress(&self, dark: bool) {
+        let name = if dark { "NSAppearanceNameDarkAqua" } else { "NSAppearanceNameAqua" };
+        unsafe {
+            let appearance =
+                msg_id_arg(class("NSAppearance"), sel("appearanceNamed:"), ns_string(name));
+            msg_void_id(self.window, sel("setAppearance:"), appearance);
+        }
+    }
 }
 
 /// The `NSCursor` an outfit wears on this system. A frame's edge wears the
@@ -4135,18 +4150,73 @@ extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
     });
 }
 
+/// `NSViewWidthSizable | NSViewHeightSizable` — a subview that follows
+/// every size its parent takes.
+const VIEW_FILLS_ITS_PARENT: u64 = 2 | 16;
+
+/// `NSVisualEffectMaterialFullScreenUI` — the material the system puts
+/// behind a whole interface. Its tint follows the window's appearance,
+/// and of the materials that do it is the thinnest: measured against
+/// saturated bands it lets through about two and a half times the colour
+/// `UnderWindowBackground` and `Sidebar` do, in light and in dark. The
+/// strength of the tint is the scene's to say, with the alpha of its
+/// canvas, so the system's own share is kept as small as it comes.
+const MATERIAL_BEHIND_A_SCENE: i64 = 15;
+
+/// The view a blurred window stands on: the system's effect view,
+/// blurring what is BEHIND the window. It stays active when the window
+/// is not key — a window that went flat every time the reader looked
+/// away would be two different windows. Where the reader asked the
+/// system to reduce transparency the view answers with a solid colour,
+/// which is the system's promise to that reader and not ours to break.
+///
+/// Returned at +1.
+unsafe fn blur_behind(frame: CGRect) -> Id {
+    unsafe {
+        let view = msg_id(class("NSVisualEffectView"), sel("alloc"));
+        let view = msg_init_rect(view, sel("initWithFrame:"), frame);
+        // NSVisualEffectBlendingModeBehindWindow
+        msg_void_i64(view, sel("setBlendingMode:"), 0);
+        // NSVisualEffectStateActive
+        msg_void_i64(view, sel("setState:"), 1);
+        msg_void_i64(view, sel("setMaterial:"), MATERIAL_BEHIND_A_SCENE);
+        view
+    }
+}
+
+/// The event view of a window — the view its scene presents on. It is
+/// the content view, except in a blurred window, whose content view is
+/// the system's effect view with the event view as its one child.
+unsafe fn scene_view(window: Id) -> Id {
+    unsafe {
+        let content = msg_id(window, sel("contentView"));
+        if content.is_null()
+            || !msg_bool_id(content, sel("isKindOfClass:"), class("NSVisualEffectView")).get()
+        {
+            return content;
+        }
+        msg_id(msg_id(content, sel("subviews")), sel("firstObject"))
+    }
+}
+
 /// Creates the app + the window with the event view, ready for blit.
 /// `scene_chrome` hides the system title bar: full-size content, a
 /// transparent titlebar and no title text — the native traffic lights
 /// stay at the corner and the SCENE draws the bar. `min`, when given, is
 /// the content floor a drag cannot go under — the same
 /// `setContentMinSize:` a dialog is born with.
+///
+/// `background` is what the window shows where its scene paints
+/// nothing, already resolved. A window that is not opaque is composited
+/// by the alpha its scene leaves; a blurred one stands on the system's
+/// own effect view, which blurs what is behind the window.
 pub fn create_window(
     title: &str,
     size: CGSize,
     min: Option<CGSize>,
     scene_chrome: bool,
     manners: Manners,
+    background: WindowBackground,
 ) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -4191,6 +4261,18 @@ pub fn create_window(
         if let Some(min) = min {
             msg_void_size(window, sel("setContentMinSize:"), min);
         }
+        let translucent = background.is_translucent();
+        if translucent {
+            // the window server composites the window by the alpha its
+            // scene leaves; an opaque window would paint its own
+            // background colour under every pixel
+            msg_void_bool(window, sel("setOpaque:"), ObjcBool::NO);
+            msg_void_id(
+                window,
+                sel("setBackgroundColor:"),
+                msg_id(class("NSColor"), sel("clearColor")),
+            );
+        }
 
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
@@ -4214,9 +4296,22 @@ pub fn create_window(
             msg_f64(window, sel("backingScaleFactor")),
             size.width,
             size.height,
+            translucent,
         );
         msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
-        msg_void_id(window, sel("setContentView:"), view);
+        if background == WindowBackground::Blurred {
+            // the blur is the SYSTEM's: its effect view is the content
+            // view, and the event view fills it. The scene composites
+            // over the blur by the alpha it leaves, like any subview
+            let behind = blur_behind(rect);
+            msg_void_u64(view, sel("setAutoresizingMask:"), VIEW_FILLS_ITS_PARENT);
+            msg_void_id(behind, sel("addSubview:"), view);
+            msg_void_id(window, sel("setContentView:"), behind);
+            // the window holds it now; the +1 of the alloc goes
+            msg_void(behind, sel("release"));
+        } else {
+            msg_void_id(window, sel("setContentView:"), view);
+        }
 
         // moved/entered/exited arrive via the tracking area — no first
         // responder dance, and InVisibleRect tracks the resize by itself
@@ -4491,6 +4586,7 @@ pub fn create_dialog(
             msg_f64(parent.window, sel("backingScaleFactor")),
             width,
             height,
+            false,
         );
         msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
         msg_void_id(window, sel("setContentView:"), view);

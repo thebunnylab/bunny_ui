@@ -151,14 +151,24 @@ fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
 }
 
-/// `color` multiplied by its own alpha, packed — what a translucent
-/// ground holds. `blend_px` reads its destination as premultiplied, so
-/// a ground stored straight would show at full strength under a paint
-/// that expected it faint.
-fn premultiplied(color: Color) -> u32 {
+/// `color` multiplied by its own alpha — the ground a translucent
+/// target starts from. `blend_px` reads its destination as
+/// premultiplied, so a ground stored straight would show at full
+/// strength under a paint that expected it faint.
+///
+/// A GPU tier clears a translucent target to this same colour, rounded
+/// by this same rule, so its first pixel and the raster's agree.
+#[must_use]
+pub fn premultiply(color: Color) -> Color {
     let alpha = color.a as u32;
-    let channel = |value: u8| div255(value as u32 * alpha);
-    (channel(color.r) << 24) | (channel(color.g) << 16) | (channel(color.b) << 8) | alpha
+    #[expect(clippy::cast_possible_truncation, reason = "a product over 255 is a byte")]
+    let channel = |value: u8| div255(value as u32 * alpha) as u8;
+    Color { r: channel(color.r), g: channel(color.g), b: channel(color.b), a: color.a }
+}
+
+/// [`premultiply`], packed — the word a translucent ground holds.
+fn premultiplied(color: Color) -> u32 {
+    pack(premultiply(color))
 }
 
 #[expect(clippy::cast_possible_truncation, reason = "each field is one byte of the word")]

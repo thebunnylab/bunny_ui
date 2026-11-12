@@ -381,6 +381,8 @@ impl Chrome {
 /// WindowSpec::titled("Trinity").size(1040.0, 660.0).fixed().no_minimize()
 /// // a window whose chrome stops fitting under 720×480
 /// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
+/// // a window that stands on a blur of what is behind it
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).background(WindowBackground::Blurred)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
@@ -389,6 +391,7 @@ pub struct WindowSpec {
     min: Option<Size>,
     chrome: Chrome,
     manners: ffi::Manners,
+    background: WindowBackground,
 }
 
 impl WindowSpec {
@@ -402,6 +405,7 @@ impl WindowSpec {
             min: None,
             chrome: Chrome::Native,
             manners: ffi::Manners::default(),
+            background: WindowBackground::Opaque,
         }
     }
 
@@ -454,14 +458,45 @@ impl WindowSpec {
         self.manners.minimizable = false;
         self
     }
+
+    /// What the window shows where its scene paints nothing — see
+    /// [`WindowBackground`]. A window is opaque until this says otherwise.
+    ///
+    /// In a window that is not opaque the alpha of the theme's canvas is
+    /// how strongly the canvas lies over what is behind the window: a
+    /// solid canvas hides the blur whole.
+    ///
+    /// ```ignore
+    /// bunny_ui::theme::install(Theme { canvas: theme.canvas.with_alpha(153), ..theme });
+    /// WindowSpec::titled("Trinity").background(WindowBackground::Blurred)
+    /// ```
+    pub fn background(mut self, background: WindowBackground) -> WindowSpec {
+        self.background = background;
+        self
+    }
+
+    /// The background [`WindowSpec::background`] asked for.
+    #[must_use]
+    pub fn asked_background(&self) -> WindowBackground {
+        self.background
+    }
+}
+
+/// The background this system serves for an ask, before a window exists.
+/// macOS composites every window by its own alpha and blurs behind any of
+/// them, so each ask is served as asked. [`App::background`] reports the
+/// background of an open window.
+#[must_use]
+pub fn window_background(asked: WindowBackground) -> WindowBackground {
+    asked.resolve(true, true)
 }
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
 mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
-    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
+    CloseAction, DesktopPosition, DesktopSpace, WindowBackground, WindowError, WindowGeometry,
+    WindowId, WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -474,6 +509,9 @@ type FileDragFn = Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, ffi::FileDrag) -
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
+    /// The background the window was given — what the system served of
+    /// the spec's ask.
+    background: WindowBackground,
     presentation_view: usize,
     presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
     lifecycle: Rc<Lifecycle>,
@@ -730,6 +768,16 @@ impl App {
             return Err(error);
         }
         self.refresh_child_visibility(id)
+    }
+
+    /// Reports the background this window was given: what the system served
+    /// of the ask in its spec. See [`window_background`] for the answer
+    /// before a window exists.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn background(&self, id: WindowId) -> Result<WindowBackground, WindowError> {
+        self.slot(id).map(|slot| slot.background).ok_or(WindowError::StaleWindow)
     }
 
     /// Reports native visibility; this does not mean unobscured or focused.
@@ -1049,6 +1097,13 @@ const fn cg_size(size: Size) -> ffi::CGSize {
     }
 }
 
+/// Is this canvas a dark one? Rec. 601 luma under the midpoint — the same
+/// question the Windows shell asks before it dresses a caption.
+fn is_dark(canvas: bunny_ui::layout::Color) -> bool {
+    let luma = canvas.r as u32 * 299 + canvas.g as u32 * 587 + canvas.b as u32 * 114;
+    luma < 128 * 1000
+}
+
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
@@ -1068,8 +1123,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // the window is raised with the scene's ears closed: AppKit's key
     // notifications are SYNCHRONOUS, and a window opened from inside an
     // event would re-enter the handler that asked for it
+    let background = window_background(spec.background);
     let window = ffi::lend_hand(|| {
-        ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
+        ffi::create_window(
+            title,
+            cg_size(size),
+            spec.min.map(cg_size),
+            chrome.scene(),
+            spec.manners,
+            background,
+        )
     });
     bunny_ui::theme::observe_system_appearance(ffi::os_appearance());
     let accessibility = Rc::new(ffi::Accessibility::new(window));
@@ -1142,12 +1205,28 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let dialog_surfaces = Rc::clone(&dialog_surfaces);
         let segments_kept = Rc::clone(&segments_kept);
         let beneaths = Rc::clone(&beneaths);
+        let translucent = background.is_translucent();
+        let blurred = background == WindowBackground::Blurred;
+        // which way the blurred window was last dressed, dark or light
+        let dressed = Cell::new(None::<bool>);
         move |runtime: &Runtime,
               full_display: bunny_ui::layout::DisplayList,
               via: trace::Origin| {
             let (width, height) = window.content_size();
             let scale = window.scale();
-            let canvas = bunny_ui::theme::canvas();
+            // the alpha of the canvas is real only where the system
+            // composites the window by it. An opaque window, and every
+            // dialog and popover, stands on the canvas at full strength
+            let solid = bunny_ui::theme::canvas().with_alpha(255);
+            let canvas = if translucent { bunny_ui::theme::canvas() } else { solid };
+            if blurred {
+                // the system's material tints itself by the window's
+                // appearance: it follows the scene, not the desktop
+                let dark = is_dark(solid);
+                if dressed.replace(Some(dark)) != Some(dark) {
+                    window.dress(dark);
+                }
+            }
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
             let live_resize = window.in_live_resize();
             // BUNNY_PRESENT_TRACE=1: the tape a trembling resize is
@@ -1400,7 +1479,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             &slice,
                             Size { width: w, height: h },
                             scale,
-                            canvas,
+                            solid,
                             &*runtime.text(),
                             &*runtime.images(),
                             dialog.in_live_resize(),
@@ -1415,7 +1494,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 retained.bitmap().width() != physical.0
                                     || retained.bitmap().height() != physical.1
                                     || *retained_scale != scale
-                                    || *retained_canvas != canvas
+                                    || *retained_canvas != solid
                             }
                             None => true,
                         };
@@ -1424,10 +1503,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 overlay.path.clone(),
                                 (
                                     bunny_ui::raster::Surface::new(
-                                        physical.0, physical.1, scale, canvas,
+                                        physical.0, physical.1, scale, solid,
                                     ),
                                     scale,
-                                    canvas,
+                                    solid,
                                 ),
                             );
                         }
@@ -1510,12 +1589,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             *size != panel_physical || *was != commands
                         });
                         if stale {
+                            // a popover is a panel of its own, with nothing
+                            // blurred behind it: its material reads the
+                            // window as an opaque one
                             let fresh = bunny_ui::raster::rasterize_with(
                                 &base,
                                 panel_physical.0,
                                 panel_physical.1,
                                 scale,
-                                canvas,
+                                solid,
                                 &*runtime.text(),
                                 &*runtime.images(),
                             );
@@ -1669,11 +1751,17 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     None => true,
                 };
                 if stale {
-                    *slot = Some((
-                        bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
-                        scale,
-                        canvas,
-                    ));
+                    // the backing is drawn as a premultiplied image either
+                    // way; a translucent surface is the one that makes the
+                    // bytes agree with that where alpha is not 255
+                    let fresh = if translucent {
+                        bunny_ui::raster::Surface::translucent(
+                            physical.0, physical.1, scale, canvas,
+                        )
+                    } else {
+                        bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas)
+                    };
+                    *slot = Some((fresh, scale, canvas));
                 }
                 let (retained, _, _) = slot.as_mut().expect("surface for the frame");
                 // the CPU surface keeps the same law: the segments'
@@ -2760,6 +2848,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
 
     Rc::new(Slot {
+        background,
         presentation: RefCell::new(None),
         presentation_view: window.view() as usize,
         lifecycle,
@@ -2863,6 +2952,38 @@ mod tests {
         // a size under it is raised on each axis that asked for less
         let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
         assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
+
+    #[test]
+    fn a_window_is_opaque_until_its_spec_names_a_background() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.asked_background(), WindowBackground::Opaque);
+        let blurred = spec.background(WindowBackground::Blurred);
+        assert_eq!(blurred.asked_background(), WindowBackground::Blurred);
+        // the other options a spec carries are untouched by it
+        assert_eq!(blurred.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn this_system_serves_every_background_as_asked() {
+        for asked in
+            [WindowBackground::Opaque, WindowBackground::Clear, WindowBackground::Blurred]
+        {
+            assert_eq!(window_background(asked), asked);
+        }
+    }
+
+    /// The material under a blurred window is dressed by the scene's own
+    /// canvas: both house canvases fall on the side their name says, and
+    /// the alpha of a canvas does not move it across.
+    #[test]
+    fn a_window_is_dressed_by_the_luma_of_its_canvas() {
+        use bunny_ui::layout::Color;
+        assert!(!is_dark(Color::hex(0xF2F3F7)));
+        assert!(is_dark(Color::hex(0x101014)));
+        assert!(is_dark(Color::hex(0x101014).with_alpha(40).with_alpha(255)));
+        assert!(!is_dark(Color::rgb(128, 128, 128)));
+        assert!(is_dark(Color::rgb(127, 127, 127)));
     }
 
     #[test]
