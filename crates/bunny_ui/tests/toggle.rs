@@ -233,8 +233,10 @@ fn a_tool_sees_the_apps_lines_and_none_of_the_frameworks() {
         let Site::Caller(location) = site.site else {
             continue;
         };
+        // a path reads with either separator, by the platform that built it
+        let file = location.file().replace('\\', "/");
         assert!(
-            location.file().ends_with("tests/toggle.rs"),
+            file.ends_with("tests/toggle.rs"),
             "{:?} at {location} is a line of the framework, shown as if the app wrote it",
             site.kind
         );

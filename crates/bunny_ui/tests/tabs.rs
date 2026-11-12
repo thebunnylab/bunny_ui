@@ -229,7 +229,9 @@ fn a_tool_sees_the_tab_view_and_the_page_the_app_wrote() {
     assert!(sites.iter().any(|site| site.kind == NodeKind::Field), "the page's own field is sited");
     for site in &sites {
         if let Site::Caller(location) = site.site {
-            assert!(location.file().ends_with("tests/tabs.rs"), "{:?} at {location}", site.kind);
+            // a path reads with either separator, by the platform that built it
+            let file = location.file().replace('\\', "/");
+            assert!(file.ends_with("tests/tabs.rs"), "{:?} at {location}", site.kind);
         }
     }
 }

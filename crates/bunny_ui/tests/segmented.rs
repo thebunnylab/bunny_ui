@@ -283,7 +283,9 @@ fn it_lowers_to_elements_and_a_tool_sees_only_the_apps_line() {
     assert!(sites.iter().any(|site| site.kind == NodeKind::Segmented));
     for site in &sites {
         if let Site::Caller(location) = site.site {
-            assert!(location.file().ends_with("tests/segmented.rs"), "{:?} at {location}", site.kind);
+            // a path reads with either separator, by the platform that built it
+            let file = location.file().replace('\\', "/");
+            assert!(file.ends_with("tests/segmented.rs"), "{:?} at {location}", site.kind);
         }
     }
 }
