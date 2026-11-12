@@ -2799,6 +2799,8 @@ pub(crate) fn sweep_stale(root: &str) {
         }
     }
     let visit = Visit::now();
+    // paranoid: who the plain rule says leaves, asked while nothing has
+    let foreseen = crate::paranoid::on(crate::paranoid::SWEEP).then(|| foreseen_sweep(root, visit));
     // a top-level entry the root region did not mount again fell, and
     // everything under it with it — unless the walk skipped a boundary
     // between the root and it. Asked first, while nothing has left
@@ -2859,17 +2861,71 @@ pub(crate) fn sweep_stale(root: &str) {
             });
         });
     });
+    if let Some((before, foreseen)) = foreseen {
+        let gone: Vec<Rc<str>> = RETAINED.with(|retained| {
+            let retained = retained.borrow();
+            before.into_iter().filter(|path| !retained.contains_key(&**path)).collect()
+        });
+        assert!(
+            gone == foreseen,
+            "paranoid sweep under {root:?}: the walk took out {gone:?}, and the plain rule says {foreseen:?}"
+        );
+    }
+}
+
+/// `BUNNY_PARANOID=sweep`: the entries under `root` before the sweep, and
+/// the ones that must leave, by the rule asked of each entry on its own —
+/// no ordered walk, no stack, no range.
+///
+/// An entry the pass met stays. One it did not meet looks up its own path
+/// for the nearest boundary the pass met: skipped, it shelters the entry;
+/// ran, its body did not make the entry again and it leaves. With no such
+/// boundary above it the entry fell from the top, or stands under one
+/// that did.
+fn foreseen_sweep(root: &str, visit: Visit) -> (Vec<Rc<str>>, Vec<Rc<str>>) {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let met = |path: &str| {
+            let stamp = retained.get(path)?.slot.visit.get();
+            (stamp == visit.ran || stamp == visit.skipped).then_some(stamp)
+        };
+        let leaves = |path: &str| {
+            if met(path).is_some() {
+                return false;
+            }
+            let mut cut = path.len();
+            while let Some(at) = path[..cut].rfind('/') {
+                if at < root.len() {
+                    break;
+                }
+                if let Some(stamp) = met(&path[..at]) {
+                    return stamp == visit.ran;
+                }
+                cut = at;
+            }
+            true
+        };
+        let before: Vec<Rc<str>> = retained.keys().filter(|path| covers(root, path)).cloned().collect();
+        let foreseen = before.iter().filter(|path| leaves(path)).cloned().collect();
+        (before, foreseen)
+    })
 }
 
 /// Takes out of the retention every entry under `boundary` the pass did
 /// not meet, and hands each to `fall`.
 ///
-/// Alive under a boundary that ran: it ran itself, or it stands at or
-/// under a boundary the walk skipped on purpose BELOW that run. A skipped
-/// ancestor above the run says nothing about what is under the run: the
-/// run rebuilt its subtree, and an entry it did not reach again has left
-/// (a list under a clean page clears, and the page is skipped — its rows
-/// must still go). The entries under one boundary come in one ordered
+/// The rule: the NEAREST boundary the pass met decides. An entry the pass
+/// met stays. An entry it did not meet stays when the nearest boundary
+/// above it that the pass met was skipped (the walk stayed out of it on
+/// purpose), and leaves when that boundary ran (its body made its
+/// children again, and did not make this one). A skipped ancestor above
+/// a run says nothing about what is under the run: a list under a clean
+/// page clears, the page is skipped, and its rows must still go. The
+/// same holds one level down: a list keeps a clean row, a body inside
+/// that row is dirty and runs after the walk, and what that body left
+/// out leaves — the kept row above it does not shelter it.
+///
+/// The entries under one boundary come in one ordered
 /// range — the subtree is contiguous because `/` sorts before every byte
 /// a segment may start with after it — and a skipped entry comes before
 /// its own subtree, so the walk carries the skips it is inside. An entry
@@ -2890,17 +2946,36 @@ fn sweep_under(
     let mut walked = 0;
     {
         let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
-        let mut shelters: Vec<&str> = Vec::new();
+        // the boundaries the walk stands inside that the pass met, each
+        // with what it says of an entry the pass did not meet under it:
+        // `true` shelters it (the walk skipped the boundary and stayed
+        // out), `false` lets it go (the body ran and did not make it)
+        let mut deciders: Vec<(&str, bool)> = Vec::new();
         for (path, entry) in retained.range::<str, _>(range) {
             walked += 1;
-            while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
-                shelters.pop();
+            while deciders.last().is_some_and(|(decider, _)| passed(path, decider)) {
+                deciders.pop();
             }
             let stamp = entry.slot.visit.get();
             if stamp == visit.skipped {
-                shelters.push(path);
-            } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
-                leaving.push(Rc::clone(path));
+                deciders.push((path, true));
+            } else if stamp == visit.ran {
+                // with no shelter open the run of the range says the
+                // same thing, and the walk carries nothing for it
+                if !deciders.is_empty() {
+                    deciders.push((path, false));
+                }
+            } else {
+                // the NEAREST one decides: a body that ran inside a kept
+                // row answers for its own children, not the row above it
+                let sheltered = deciders
+                    .iter()
+                    .rev()
+                    .find(|(decider, _)| covers(decider, path))
+                    .is_some_and(|(_, shelters)| *shelters);
+                if !sheltered {
+                    leaving.push(Rc::clone(path));
+                }
             }
         }
     }
@@ -3882,6 +3957,110 @@ mod tests {
             let held = retained_under("Holders");
             assert!(held.iter().all(|path| !path.contains("[4]")), "and all it held with it (once {once}): {held:?}");
         }
+    }
+
+    /// A component with no state of its own: only this sweep can take it
+    /// out, because the identity sweep knows owners and it owns nothing.
+    #[derive(Clone, Copy)]
+    struct Still {
+        id: usize,
+    }
+
+    impl Component for Still {
+        fn body(self) -> impl View {
+            text(format!("still {}", self.id))
+        }
+    }
+
+    /// Shows the component inside it only while its count is zero.
+    #[derive(Clone)]
+    struct Dropper {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Dropper {
+        fn body(self) -> impl View {
+            let shown = State::new(0usize);
+            self.counts.borrow_mut().insert((self.id, 1), shown);
+            let still = (shown.get() == 0).then_some(Still { id: self.id });
+            (text(format!("dropper {}", self.id)), still)
+        }
+    }
+
+    /// A clean row around a [`Dropper`]: the row reads nothing.
+    #[derive(Clone)]
+    struct DropHolder {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for DropHolder {
+        fn body(self) -> impl View {
+            (text(format!("holder {}", self.id)), Dropper { id: self.id, counts: self.counts })
+        }
+    }
+
+    #[derive(Clone)]
+    struct DropHolders {
+        ids: State<Rc<Vec<usize>>>,
+        counts: Counts,
+    }
+
+    impl Component for DropHolders {
+        fn body(self) -> impl View {
+            let counts = self.counts;
+            crate::views::for_each(self.ids, |id| id.to_string(), move |id: &usize| DropHolder {
+                id: *id,
+                counts: counts.clone(),
+            })
+        }
+    }
+
+    /// The nearest boundary the pass met decides who leaves. A list runs
+    /// and keeps a clean row; a body inside that row is dirty and runs
+    /// after the walk; this time it does not make the component it made
+    /// before. The kept row above shelters what the walk stayed out of —
+    /// it does not shelter what a body below it ran and left out.
+    #[test]
+    fn a_component_dropped_inside_a_kept_row_leaves_in_the_pass_its_list_runs() {
+        // every sweep below is also asked of the plain rule, entry by entry
+        crate::paranoid::force(crate::paranoid::SWEEP);
+        let counts = Counts::default();
+        let page = DropHolders { ids: State::new(Rc::new(vec![1, 2, 3])), counts: Rc::clone(&counts) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let still_of = |id: usize| {
+            retained_under("DropHolders").into_iter().filter(|path| path.contains(&format!("[{id}]")) && path.ends_with("/Still")).count()
+        };
+        assert_eq!([1, 2, 3].map(still_of), [1, 1, 1], "each row holds its still component");
+        let shown = |id: usize| counts.borrow()[&(id, 1)];
+
+        // the body alone: its parent row is skipped, and the child leaves
+        shown(1).set(1);
+        runtime.render(&page);
+        assert_eq!(still_of(1), 0, "dropped while its body ran alone");
+
+        // the list and the body in one pass: row 2 is kept, and its body
+        // runs after the walk
+        page.ids.set(Rc::new(vec![3, 2, 1]));
+        shown(2).set(1);
+        let printed = runtime.render(&page);
+        let runs = runtime.body_runs();
+        assert_eq!(runs.len(), 2, "the list and the one dirty body: {runs:?}");
+        assert!(runs.iter().any(|run| run.ends_with("[2]/DropHolder/#1/Dropper")), "{runs:?}");
+        assert!(!printed.contains("still 2"), "the print no longer shows it: {printed}");
+        assert_eq!(still_of(2), 0, "and the retention no longer holds it");
+        assert_eq!(still_of(3), 1, "a row that only moved keeps what is inside it");
+
+        // a row that leaves takes everything with it, and the list clears
+        page.ids.set(Rc::new(vec![3]));
+        runtime.render(&page);
+        assert_eq!([1, 2, 3].map(still_of), [0, 0, 1]);
+        page.ids.set(Rc::new(Vec::new()));
+        runtime.render(&page);
+        assert_eq!(still_of(3), 0);
+        crate::paranoid::release();
     }
 
     /// The paths retained under a prefix, sorted.

@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/bunny_ui_core-1708d0104968f59e)
+
+running 1 test
+test reconciler::tests::a_component_dropped_inside_a_kept_row_leaves_in_the_pass_its_list_runs ... FAILED
+
+failures:
+
+---- reconciler::tests::a_component_dropped_inside_a_kept_row_leaves_in_the_pass_its_list_runs stdout ----
+
+thread 'reconciler::tests::a_component_dropped_inside_a_kept_row_leaves_in_the_pass_its_list_runs' (15651223) panicked at crates/bunny_ui/src/reconciler.rs:3976:9:
+assertion `left == right` failed: and the retention no longer holds it
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    reconciler::tests::a_component_dropped_inside_a_kept_row_leaves_in_the_pass_its_list_runs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1241 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p bunny-ui-core --lib`
