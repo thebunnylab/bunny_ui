@@ -90,7 +90,12 @@ impl Entry {
                 Role::Text => (29, "label"),
                 Role::Button => (43, "push button"),
                 Role::Checkbox => (7, "check box"),
+                Role::Switch => (62, "toggle button"),
+                Role::RadioButton => (44, "radio button"),
+                Role::Tab => (37, "page tab"),
+                Role::PopUpButton => (11, "combo box"),
                 Role::Slider => (51, "slider"),
+                Role::Stepper => (52, "spin button"),
                 Role::TextField => (79, "entry"),
                 Role::PasswordField => (40, "password text"),
             },
@@ -100,9 +105,14 @@ impl Entry {
         let mut result = vec![ACCESSIBLE, COMPONENT];
         if let Kind::Control(node) = &self.kind {
             match node.role {
-                Role::Button | Role::Checkbox => result.push(ACTION),
+                Role::Button
+                | Role::Checkbox
+                | Role::Switch
+                | Role::RadioButton
+                | Role::Tab
+                | Role::PopUpButton => result.push(ACTION),
                 Role::Text => result.push(TEXT),
-                Role::Slider => result.extend([VALUE, ACTION]),
+                Role::Slider | Role::Stepper => result.extend([VALUE, ACTION]),
                 Role::TextField | Role::PasswordField => result.extend([TEXT, EDITABLE]),
             }
         }
@@ -129,14 +139,30 @@ impl Entry {
             if matches!(node.role, Role::TextField | Role::PasswordField) {
                 bits |= (1 << 7) | (1 << if node.multiline { 17 } else { 26 });
             }
-            if node.role == Role::Slider && node.enabled {
+            if matches!(node.role, Role::Slider | Role::Stepper) && node.enabled {
                 bits |= 1 << 7;
             }
-            if node.checked.is_some() {
-                bits |= 1 << 41;
+            if node.role == Role::Tab {
+                // a page tab is SELECTABLE (22) and SELECTED (23): the
+                // state a tab list reads, where a check mark has no meaning
+                bits |= 1 << 22;
+                if node.checked == Some(true) {
+                    bits |= 1 << 23;
+                }
+            } else {
+                if node.checked.is_some() {
+                    bits |= 1 << 41;
+                }
+                if node.checked == Some(true) {
+                    bits |= 1 << 4;
+                }
             }
-            if node.checked == Some(true) {
-                bits |= 1 << 4;
+            // EXPANDABLE (9) and EXPANDED (10): a button that opens a list
+            if node.expanded.is_some() {
+                bits |= 1 << 9;
+            }
+            if node.expanded == Some(true) {
+                bits |= 1 << 10;
             }
             if node.focused {
                 bits |= 1 << 12;
@@ -153,13 +179,14 @@ impl Entry {
     fn actions(&self) -> &'static [(&'static str, Action)] {
         match &self.kind {
             Kind::Control(node) => match node.role {
-                Role::Slider => &[
+                Role::Slider | Role::Stepper => &[
                     ("increment", Action::Increment),
                     ("decrement", Action::Decrement),
                 ],
-                Role::Checkbox => &[("toggle", Action::Activate)],
-                Role::Button => &[("click", Action::Activate)],
-                _ => &[],
+                Role::Checkbox | Role::Switch => &[("toggle", Action::Activate)],
+                Role::Button | Role::RadioButton | Role::Tab => &[("click", Action::Activate)],
+                Role::PopUpButton => &[("press", Action::Activate)],
+                Role::Text | Role::TextField | Role::PasswordField => &[],
             },
             _ => &[],
         }
@@ -453,8 +480,10 @@ impl Service {
                         (4, "checked"),
                         (7, "editable"),
                         (8, "enabled"),
+                        (10, "expanded"),
                         (11, "focusable"),
                         (12, "focused"),
+                        (23, "selected"),
                         (24, "sensitive"),
                     ] {
                         if (previous.state() ^ current.state()) & (1 << bit) != 0 {

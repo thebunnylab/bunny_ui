@@ -2667,7 +2667,7 @@ impl Runtime {
             };
             if let Some((path, state)) = control
                 && (pattern.key == crate::action::Key::Char(' ')
-                    || (pattern.key == crate::action::Key::Enter && state.checked.is_none()))
+                    || (pattern.key == crate::action::Key::Enter && state.kind.enter_activates()))
                 && reconciler::run_action(&path, 1)
             {
                 self.frame_asked.set(true);

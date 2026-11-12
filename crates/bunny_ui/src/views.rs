@@ -293,6 +293,9 @@ pub struct Button<L, F> {
     action: F,
     disabled: bool,
     checked: Option<bool>,
+    /// What the control is: the keys that activate it and the role
+    /// assistive technology hears follow from it.
+    kind: crate::layout::ControlKind,
     chrome: ButtonChrome,
     site: crate::provenance::Site,
 }
@@ -341,7 +344,12 @@ where
         let semantics = crate::accessibility::capturing().then_some(target.as_ref())
             .flatten().map(|path| Rc::new(
             crate::accessibility::Semantics::Control {
-                path: Rc::clone(path), enabled: !self.disabled, checked: self.checked,
+                path: Rc::clone(path),
+                enabled: !self.disabled,
+                checked: self.checked,
+                role: self.kind.role(),
+                value: None,
+                expanded: None,
             }
         ));
         let content = wrap_layout(layouts);
@@ -368,7 +376,11 @@ where
             hints: crate::layout::ElementHints {
                 semantics,
                 address: Some(crate::layout::Address::shared(crate::layout::Address {
-                    control: Some(crate::layout::ControlState { enabled: !self.disabled, checked: self.checked }),
+                    control: Some(crate::layout::ControlState {
+                        enabled: !self.disabled,
+                        checked: self.checked,
+                        kind: self.kind,
+                    }),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -410,6 +422,10 @@ where
     #[must_use]
     pub const fn checked(mut self, checked: bool) -> Self {
         self.checked = Some(checked);
+        // a button that publishes a checked value is a two-state control
+        if matches!(self.kind, crate::layout::ControlKind::Button) {
+            self.kind = crate::layout::ControlKind::Checkbox;
+        }
         self
     }
 
@@ -424,7 +440,15 @@ where
     L: View,
     F: Fn() + Clone + 'static,
 {
-    Button { label, action, disabled: false, checked: None, chrome: ButtonChrome::Standard, site: crate::provenance::here() }
+    Button {
+        label,
+        action,
+        disabled: false,
+        checked: None,
+        kind: crate::layout::ControlKind::Button,
+        chrome: ButtonChrome::Standard,
+        site: crate::provenance::here(),
+    }
 }
 
 /// A labelled two-state control backed by the application's boolean binding.
@@ -460,6 +484,7 @@ impl<L: View + Clone> View for Checkbox<L> {
             action: move || value.set(!value.wrappedValue()),
             disabled: self.disabled,
             checked: Some(checked),
+            kind: crate::layout::ControlKind::Checkbox,
             chrome: ButtonChrome::Standard,
             site: self.site,
         }

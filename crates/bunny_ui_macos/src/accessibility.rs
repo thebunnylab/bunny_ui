@@ -406,6 +406,7 @@ fn changes(previous: Option<&Node>, current: &Node) -> impl Iterator<Item = Noti
             .is_some_and(|old| {
                 value_of(old) != value_of(current)
                     || old.checked != current.checked
+                    || old.expanded != current.expanded
                     || old.range != current.range
             })
             .then_some(Notification::Value),
@@ -580,19 +581,38 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
         ns_string(match element.node.borrow().role {
             Role::Text => "AXStaticText",
             Role::Button => "AXButton",
-            Role::Checkbox => "AXCheckBox",
+            // a switch is a checkbox with a subrole, and a tab is a radio
+            // button with one: the roles AppKit's own controls report
+            Role::Checkbox | Role::Switch => "AXCheckBox",
+            Role::RadioButton | Role::Tab => "AXRadioButton",
+            Role::PopUpButton => "AXPopUpButton",
             Role::Slider => "AXSlider",
+            Role::Stepper => "AXIncrementor",
             Role::TextField | Role::PasswordField => "AXTextField",
         })
     }
 }
 extern "C" fn element_subrole(this: Id, _: Sel) -> Id {
-    match element(this) {
-        Some(element) if element.node.borrow().role == Role::PasswordField => unsafe {
-            ns_string("AXSecureTextField")
-        },
-        _ => empty(),
-    }
+    let Some(element) = element(this) else {
+        return empty();
+    };
+    let subrole = match element.node.borrow().role {
+        Role::PasswordField => "AXSecureTextField",
+        Role::Switch => "AXSwitch",
+        Role::Tab => "AXTabButton",
+        Role::Text
+        | Role::Button
+        | Role::Checkbox
+        | Role::RadioButton
+        | Role::PopUpButton
+        | Role::Slider
+        | Role::Stepper
+        | Role::TextField => return empty(),
+    };
+    unsafe { ns_string(subrole) }
+}
+extern "C" fn element_expanded(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.node.borrow().expanded == Some(true)))
 }
 extern "C" fn element_description(this: Id, command: Sel) -> Id {
     if element(this).is_none() {
@@ -701,9 +721,12 @@ extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> ObjcBool {
             node.enabled
                 && matches!(
                     node.role,
-                    Role::TextField | Role::PasswordField | Role::Slider
+                    Role::TextField | Role::PasswordField | Role::Slider | Role::Stepper
                 ),
         );
+    }
+    if selector == unsafe { sel("isAccessibilityExpanded") } {
+        return ObjcBool::new(node.expanded.is_some());
     }
     if selector == unsafe { sel("accessibilityPerformIncrement") } {
         return ObjcBool::new(node.supports(&Action::Increment));
@@ -788,6 +811,11 @@ pub(super) unsafe fn register_view(view: Id) {
                 c"@@:",
             ),
             ("accessibilityLabel", element_label as *const c_void, c"@@:"),
+            (
+                "isAccessibilityExpanded",
+                element_expanded as *const c_void,
+                objc_bool::GETTER,
+            ),
             ("accessibilityValue", element_value as *const c_void, c"@@:"),
             (
                 "accessibilityMinValue",

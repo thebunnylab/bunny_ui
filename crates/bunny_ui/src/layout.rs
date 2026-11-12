@@ -1380,11 +1380,42 @@ pub struct ElementHints {
     pub(crate) address: Option<Rc<Address>>,
 }
 
+/// What a built-in activation control IS — said by the control, never
+/// guessed from the state it happens to carry. The keyboard reads it (which
+/// keys activate) and assistive technology reads it (which role it has).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ControlKind {
+    /// A press runs it. Space and Enter activate it.
+    #[default]
+    Button,
+    /// Two states behind a mark. Space toggles it; Enter is left to the
+    /// form around it.
+    Checkbox,
+}
+
+impl ControlKind {
+    /// The role assistive technology hears.
+    pub(crate) const fn role(self) -> crate::accessibility::Role {
+        use crate::accessibility::Role;
+        match self {
+            ControlKind::Button => Role::Button,
+            ControlKind::Checkbox => Role::Checkbox,
+        }
+    }
+
+    /// Does a bare Enter activate it? A two-state control leaves Enter to
+    /// the form around it, as a native checkbox does.
+    pub(crate) const fn enter_activates(self) -> bool {
+        !matches!(self, ControlKind::Checkbox)
+    }
+}
+
 /// State shared by built-in activation controls, keyboard navigation and AT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ControlState {
     pub enabled: bool,
     pub checked: Option<bool>,
+    pub kind: ControlKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7520,6 +7551,7 @@ impl LayoutNode {
                         out.accessibility.push(crate::accessibility::Placed {
                             enabled: true,
                             checked: None,
+                            expanded: None,
                             range: None,
                             path: Rc::from(path.as_str()),
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
@@ -7987,6 +8019,7 @@ impl LayoutNode {
                     out.accessibility.push(crate::accessibility::Placed {
                         enabled: element.element().accepts_keys(),
                         checked: None,
+                        expanded: None,
                         range: Some(range),
                         path: Rc::from(path.as_str()),
                         role: crate::accessibility::Role::Slider,
