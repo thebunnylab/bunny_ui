@@ -22,23 +22,31 @@ thread_local! {
 }
 
 /// The window the shell stands in front of, spoken as the tier's
-/// source — and whether it is a scene (the corner mask).
-fn source(window: usize) -> Option<(SurfaceSource, bool)> {
+/// source — whether it is a scene (the corner mask), and whether the
+/// system composites it by its own alpha.
+fn source(window: usize) -> Option<(SurfaceSource, bool, bool)> {
     use crate::ffi::GpuTargets;
     Some(match crate::ffi::gpu_targets(window)? {
-        GpuTargets::Wayland { display, surface, scene } => {
-            (SurfaceSource::Wayland { display, surface }, scene)
+        GpuTargets::Wayland { display, surface, scene, translucent } => {
+            (SurfaceSource::Wayland { display, surface }, scene, translucent)
         }
-        GpuTargets::X11 { connection, window, scene } => {
-            (SurfaceSource::Xcb { connection, window }, scene)
+        GpuTargets::X11 { connection, window, scene, translucent } => {
+            (SurfaceSource::Xcb { connection, window }, scene, translucent)
         }
     })
 }
 
 fn install(window: usize) -> Option<VkPresenter> {
-    let (source, scene) = source(window)?;
+    let (source, scene, translucent) = source(window)?;
     let (width, height) = crate::ffi::gpu_buffer_size(window);
-    let presenter = VkPresenter::install(source, (width as u32, height as u32), scene)?;
+    let size = (width as u32, height as u32);
+    // a translucent window is said once, here: the tier refuses where
+    // the surface cannot composite by alpha, and the ladder steps down
+    let presenter = if translucent {
+        VkPresenter::install_translucent(source, size, scene)?
+    } else {
+        VkPresenter::install(source, size, scene)?
+    };
     // the compositor must never grow the window past what the device
     // renders — the same ceiling the gl tier declares
     crate::ffi::gpu_limit_size(window, presenter.max_texture_size() as usize);
@@ -69,6 +77,16 @@ pub(crate) fn invalidate(window: usize) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
             presenter.invalidate();
+        }
+    });
+}
+
+/// The compositor took this window's blur away: its presenter fills the
+/// target as an opaque window's does from the next frame.
+pub(crate) fn stand_opaque(window: usize) {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
+            presenter.stand_opaque();
         }
     });
 }

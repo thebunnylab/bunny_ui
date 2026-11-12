@@ -281,8 +281,12 @@ const SHARING_MODE_EXCLUSIVE: u32 = 0;
 const IMAGE_ASPECT_COLOR: u32 = 0x1;
 // VkSurfaceTransformFlagBitsKHR: the one transform the tier asks for
 const TRANSFORM_IDENTITY: u32 = 0x1;
+// VkCompositeAlphaFlagBitsKHR, by the header's values. The tier read
+// 0x4 as premultiplied until a translucent window asked for it by name:
+// 0x4 is POST-multiplied, and a Wayland surface offers 0x1 and 0x2
 const COMPOSITE_ALPHA_OPAQUE: u32 = 0x1;
-const COMPOSITE_ALPHA_PREMULTIPLIED: u32 = 0x4;
+const COMPOSITE_ALPHA_PREMULTIPLIED: u32 = 0x2;
+const COMPOSITE_ALPHA_POSTMULTIPLIED: u32 = 0x4;
 const COMPOSITE_ALPHA_INHERIT: u32 = 0x8;
 const QUEUE_GRAPHICS_BIT: u32 = 0x1;
 
@@ -1548,6 +1552,11 @@ struct VkStack {
     /// The feeds' pipeline: the sprite vertex over the LINEAR sampler.
     live_pipeline: Pipeline,
     mask_pipeline: Pipeline,
+    /// The rect shaders under the erase blend — [`RunKind::Knockout`].
+    /// Built only for a target the system composites by its own alpha,
+    /// and for the offscreen harness; 0 everywhere else, where a knockout
+    /// run is not drawn.
+    erase_pipeline: Pipeline,
     command_pool: CommandPool,
     /// The colour format the target wears — the scene a glass frame
     /// renders into must match it, or no pipeline is compatible.
@@ -1578,15 +1587,21 @@ fn find_memory_type(
 }
 
 impl VkStack {
-    fn create(target: VkTarget, source: Option<SurfaceSource>) -> Option<VkStack> {
-        let result = Self::build(target, source);
+    /// `erase` asks for the erase pipeline too: a target with a clear
+    /// ground draws its knockouts with it.
+    fn create(target: VkTarget, source: Option<SurfaceSource>, erase: bool) -> Option<VkStack> {
+        let result = Self::build(target, source, erase);
         if let Err(reason) = &result {
             eprintln!("bunny_ui vk: {reason} — stepping down the ladder");
         }
         result.ok()
     }
 
-    fn build(target: VkTarget, source: Option<SurfaceSource>) -> Result<VkStack, String> {
+    fn build(
+        target: VkTarget,
+        source: Option<SurfaceSource>,
+        erase: bool,
+    ) -> Result<VkStack, String> {
         let (gipa, create_instance) = loader().ok_or("no libvulkan on this system")?;
         unsafe {
             let app = ApplicationInfo {
@@ -2008,6 +2023,7 @@ impl VkStack {
                 sprite_pipeline: 0,
                 live_pipeline: 0,
                 mask_pipeline: 0,
+                erase_pipeline: 0,
                 command_pool,
                 format,
                 linear_sampler,
@@ -2018,7 +2034,7 @@ impl VkStack {
                 blur_pipeline: 0,
                 blit_pipeline: 0,
             };
-            stack.build_pipelines()?;
+            stack.build_pipelines(erase)?;
             Ok(stack)
         }
     }
@@ -2193,7 +2209,7 @@ impl VkStack {
         Ok(pipeline)
     }
 
-    fn build_pipelines(&mut self) -> Result<(), String> {
+    fn build_pipelines(&mut self, erase: bool) -> Result<(), String> {
         // gamma-space source-over with straight alpha — the blend_px law
         let source_over = ColorBlendAttachment {
             blend_enable: 1,
@@ -2213,6 +2229,19 @@ impl VkStack {
             color_op: BLEND_OP_ADD,
             src_alpha: BLEND_FACTOR_ZERO,
             dst_alpha: BLEND_FACTOR_SRC_ALPHA,
+            alpha_op: BLEND_OP_ADD,
+            write_mask: 0xF,
+        };
+        // dst *= 1 - src.alpha, colour and alpha alike — a knockout over
+        // a clear ground. Nothing is painted: it is source-over with the
+        // source's half dropped, the raster's `Bitmap::take`
+        let erase_blend = ColorBlendAttachment {
+            blend_enable: 1,
+            src_color: BLEND_FACTOR_ZERO,
+            dst_color: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            color_op: BLEND_OP_ADD,
+            src_alpha: BLEND_FACTOR_ZERO,
+            dst_alpha: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
             alpha_op: BLEND_OP_ADD,
             write_mask: 0xF,
         };
@@ -2252,6 +2281,8 @@ impl VkStack {
         ];
         // the feeds ride the sprite's lattice, through another fragment
         let live_binding = VertexInputBinding { ..sprite_binding };
+        // and a knockout rides the rect's, under another blend
+        let erase_binding = VertexInputBinding { ..rect_binding };
         // a pane's instance: six vec4 and two normalized ubyte4, the
         // 112-byte lattice every tier shares
         let glass_binding = VertexInputBinding {
@@ -2304,6 +2335,19 @@ impl VkStack {
         )?;
         self.mask_pipeline =
             self.pipeline(mask_vert, mask_frag, &[], &[], multiply, self.render_pass)?;
+        // the same shaders and the same lattice as the rects: only the
+        // blend differs, so no shader is compiled for it. An opaque
+        // window never draws a knockout run and never builds this
+        if erase {
+            self.erase_pipeline = self.pipeline(
+                rect_vert,
+                rect_frag,
+                &[erase_binding],
+                &rect_attributes,
+                erase_blend,
+                self.render_pass,
+            )?;
+        }
         // the scene passes carry the SAME format as the target, so
         // every pipeline built against one is compatible with all of
         // them — only the pyramid, in its own format, needs its own
@@ -2526,6 +2570,8 @@ impl Drop for VkStack {
                 self.sprite_pipeline,
                 self.live_pipeline,
                 self.mask_pipeline,
+                // 0 where it was never built, which the destroy ignores
+                self.erase_pipeline,
                 self.glass_pipeline,
                 self.blur_pipeline,
                 self.blit_pipeline,
@@ -3269,6 +3315,12 @@ fn draw_runs(
             {
                 continue;
             }
+            // a knockout is drawn where the erase pipeline stands: on a
+            // target the system composites by its own alpha. An opaque
+            // window's walk is told its solid floor and makes no such run
+            if run.kind == RunKind::Knockout && stack.erase_pipeline == 0 {
+                continue;
+            }
             if bound_round != run.round {
                 let round: &RoundClip = &batches.rounds[run.round as usize];
                 push.round_box = round.box4;
@@ -3285,6 +3337,8 @@ fn draw_runs(
             if swap {
                 let pipeline = match run.kind {
                     RunKind::Rects => stack.rect_pipeline,
+                    // the rects again, taken away instead of painted
+                    RunKind::Knockout => stack.erase_pipeline,
                     RunKind::Live(_) => stack.live_pipeline,
                     // the sprite's road, through the composite's fragment
                     RunKind::World(_) => worlds.0,
@@ -3295,11 +3349,9 @@ fn draw_runs(
             match run.kind {
                 // a pane reads the scene: it takes a pass of its own
                 RunKind::Glass => continue,
-                // this tier presents no translucent target yet, so the
-                // walk is never told of a clear ground and makes no such
-                // run
-                RunKind::Knockout => continue,
-                RunKind::Rects => {
+                // a knockout rides the rects' own instances: the erase
+                // pipeline bound above is the whole difference
+                RunKind::Rects | RunKind::Knockout => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
@@ -3850,11 +3902,45 @@ struct Swapchain {
     framebuffers: Vec<Framebuffer>,
 }
 
+/// The `compositeAlpha` a swapchain asks its surface for, out of the
+/// ones the surface supports. `None` refuses the swapchain.
+///
+/// An opaque target takes the first the surface offers of opaque and
+/// inherit, the order it always had, and after them whichever
+/// multiplied alpha the surface names: every pixel of an opaque frame
+/// is solid, so the two read alike. A translucent one holds
+/// premultiplied pixels and wants the system to read them so:
+/// premultiplied, or inherit on the X11 door, where a compositing
+/// manager reads a 32-bit visual as premultiplied and some drivers name
+/// nothing else. Anything less would show the window opaque, so the tier
+/// refuses and the shell steps down the ladder.
+fn pick_composite(supported: u32, translucent: bool, door: Option<Door>) -> Option<u32> {
+    if !translucent {
+        return Some(
+            [
+                COMPOSITE_ALPHA_OPAQUE,
+                COMPOSITE_ALPHA_INHERIT,
+                COMPOSITE_ALPHA_PREMULTIPLIED,
+                COMPOSITE_ALPHA_POSTMULTIPLIED,
+            ]
+            .into_iter()
+            .find(|alpha| supported & alpha != 0)
+            .unwrap_or(COMPOSITE_ALPHA_OPAQUE),
+        );
+    }
+    if supported & COMPOSITE_ALPHA_PREMULTIPLIED != 0 {
+        return Some(COMPOSITE_ALPHA_PREMULTIPLIED);
+    }
+    (door == Some(Door::Xcb) && supported & COMPOSITE_ALPHA_INHERIT != 0)
+        .then_some(COMPOSITE_ALPHA_INHERIT)
+}
+
 fn build_swapchain(
     stack: &VkStack,
     surface: SurfaceKHR,
     wanted: (u32, u32),
     old: SwapchainKHR,
+    translucent: bool,
 ) -> Option<Swapchain> {
     let fns = &stack.fns;
     let wsi = stack.wsi.as_ref()?;
@@ -3914,10 +4000,12 @@ fn build_swapchain(
             } else {
                 capabilities.max_image_count
             });
-        let composite = [COMPOSITE_ALPHA_OPAQUE, COMPOSITE_ALPHA_INHERIT, COMPOSITE_ALPHA_PREMULTIPLIED]
-            .into_iter()
-            .find(|alpha| capabilities.supported_composite_alpha & alpha != 0)
-            .unwrap_or(COMPOSITE_ALPHA_OPAQUE);
+        let Some(composite) =
+            pick_composite(capabilities.supported_composite_alpha, translucent, stack.door)
+        else {
+            eprintln!("bunny_ui vk: the surface composites no alpha of the window's own");
+            return None;
+        };
         let info = SwapchainCreateInfo {
             s_type: ST_SWAPCHAIN_CREATE_KHR,
             p_next: std::ptr::null(),
@@ -4011,6 +4099,11 @@ pub struct VkPresenter {
     /// `None` while detached — a present then paints nothing.
     swapchain: Option<Swapchain>,
     scene: bool,
+    /// The system composites the window by the alpha its frame leaves:
+    /// the swapchain asks for premultiplied alpha, the frame clears to
+    /// the canvas multiplied by its own alpha, and the walk is told of no
+    /// floor. Said once, at [`VkPresenter::install_translucent`].
+    translucent: bool,
     slots: [VkSlot; 3],
     cursor: usize,
     atlas: RunAtlas,
@@ -4122,7 +4215,7 @@ impl VkPresenter {
         self.world.sweep(&self.stack);
         // walk with retries; staging overflow grows the arena, atlas
         // overflow runs the copying collector
-        let floor = bunny_ui::raster::solid_floor(canvas);
+        let floor = self.floor(canvas);
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
@@ -4217,6 +4310,7 @@ impl VkPresenter {
         }
         let corner_mask = self.scene.then_some(8.0 * scale as f64);
         self.ensure_glass();
+        let ground_color = self.ground_color(canvas);
         let swapchain = self.swapchain.as_ref().expect("the image was acquired from a swapchain");
         let drew = record_frame(
             &self.stack,
@@ -4224,7 +4318,7 @@ impl VkPresenter {
             &self.slots[index],
             swapchain.framebuffers[image_index as usize],
             swapchain.extent,
-            canvas,
+            ground_color,
             &self.batches,
             corner_mask,
             self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
@@ -4314,6 +4408,7 @@ impl VkPresenter {
             self.stack.surface,
             (wanted.0 as u32, wanted.1 as u32),
             old,
+            self.translucent,
         ) else {
             return false;
         };
@@ -4457,8 +4552,40 @@ impl VkPresenter {
     /// and one line on stderr says why. `scene` = the window is a scene
     /// of the shell's own chrome, with the 8-point corner mask.
     pub fn install(source: SurfaceSource, size: (u32, u32), scene: bool) -> Option<VkPresenter> {
-        let stack = VkStack::create(VkTarget::Window(Door::of(source)), Some(source))?;
-        let Some(swapchain) = build_swapchain(&stack, stack.surface, size, 0) else {
+        VkPresenter::install_on(source, size, scene, false)
+    }
+
+    /// [`VkPresenter::install`] for a window the system composites by
+    /// its own alpha: one whose background resolved to clear or blurred.
+    ///
+    /// The swapchain asks its surface to read premultiplied alpha, each
+    /// frame clears to the canvas multiplied by its own alpha, the
+    /// rounding the raster starts a translucent bitmap from, and a
+    /// background that replaces what is under it takes the paint away
+    /// instead of painting the canvas. The house blend does not change:
+    /// straight source over a premultiplied destination stays
+    /// premultiplied.
+    ///
+    /// `None` also where the surface cannot composite by alpha. The
+    /// tier then refuses instead of showing the window opaque, and the
+    /// shell steps down the ladder.
+    pub fn install_translucent(
+        source: SurfaceSource,
+        size: (u32, u32),
+        scene: bool,
+    ) -> Option<VkPresenter> {
+        VkPresenter::install_on(source, size, scene, true)
+    }
+
+    fn install_on(
+        source: SurfaceSource,
+        size: (u32, u32),
+        scene: bool,
+        translucent: bool,
+    ) -> Option<VkPresenter> {
+        let stack =
+            VkStack::create(VkTarget::Window(Door::of(source)), Some(source), translucent)?;
+        let Some(swapchain) = build_swapchain(&stack, stack.surface, size, 0, translucent) else {
             eprintln!("bunny_ui vk: no swapchain — stepping down the ladder");
             return None;
         };
@@ -4471,6 +4598,7 @@ impl VkPresenter {
             stack,
             swapchain: Some(swapchain),
             scene,
+            translucent,
             slots,
             cursor: 0,
             atlas: RunAtlas::new(),
@@ -4497,6 +4625,29 @@ impl VkPresenter {
     /// the ack road's skip-breaker, same contract as the gl tier's.
     pub fn invalidate(&mut self) {
         self.retained = None;
+    }
+
+    /// The system stopped serving the background the window was
+    /// installed for (a compositor took its blur away): from the next
+    /// frame the target is filled as an opaque window fills it. The
+    /// swapchain keeps its alpha channel, and every pixel in it is solid
+    /// once the shell hands a solid canvas.
+    pub fn stand_opaque(&mut self) {
+        self.translucent = false;
+        self.retained = None;
+    }
+
+    /// What the frame clears to: the canvas, multiplied by its own alpha
+    /// on a translucent target — the ground the raster starts a
+    /// translucent bitmap from.
+    fn ground_color(&self, canvas: Color) -> Color {
+        if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
+    }
+
+    /// The ground a knockout returns a shape to. A translucent target
+    /// has none of its own.
+    fn floor(&self, canvas: Color) -> Option<Color> {
+        if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) }
     }
 
     /// The window is going away: waits for the device, destroys the
@@ -4535,7 +4686,8 @@ impl VkPresenter {
         // the format was fixed at build; a surface that does not offer
         // it refuses inside build_swapchain
         self.stack.surface = surface;
-        let Some(swapchain) = build_swapchain(&self.stack, surface, size, 0) else {
+        let Some(swapchain) = build_swapchain(&self.stack, surface, size, 0, self.translucent)
+        else {
             destroy_surface_raw(self.stack.wsi.as_ref(), self.stack.instance, surface);
             self.stack.surface = 0;
             return false;
@@ -4592,6 +4744,9 @@ pub struct OffscreenVk {
     /// that carries glass.
     glass: Option<VkGlass>,
     world: world::VkWorld,
+    /// The target stands for a translucent window: it clears to the
+    /// premultiplied canvas and the walk is told of no floor.
+    translucent: bool,
 }
 
 impl OffscreenVk {
@@ -4608,7 +4763,8 @@ impl OffscreenVk {
         if width == 0 || height == 0 {
             return None;
         }
-        let stack = VkStack::create(VkTarget::Offscreen, None)?;
+        // the harness draws every run a window can make, the erase too
+        let stack = VkStack::create(VkTarget::Offscreen, None, true)?;
         let (target, target_memory, view) = unsafe {
             let info = ImageCreateInfo {
                 s_type: ST_IMAGE_CREATE,
@@ -4708,7 +4864,19 @@ impl OffscreenVk {
             batches: FrameBatches::default(),
             glass: None,
             world: world::VkWorld::new(),
+            translucent: false,
         })
+    }
+
+    /// The target of a window the system composites by its own alpha:
+    /// each frame clears to the PREMULTIPLIED canvas, as
+    /// [`VkPresenter::install_translucent`] does for a window, and the
+    /// bytes read back are the premultiplied bytes
+    /// `bunny_ui::raster::rasterize_translucent` paints.
+    #[must_use]
+    pub fn translucent(mut self) -> OffscreenVk {
+        self.translucent = true;
+        self
     }
 
     fn present_inner(
@@ -4724,7 +4892,8 @@ impl OffscreenVk {
         self.cursor = (self.cursor + 1) % self.slots.len();
         wait_slot(&self.stack, &mut self.slots[index]);
         self.world.sweep(&self.stack);
-        let floor = bunny_ui::raster::solid_floor(canvas);
+        let floor =
+            if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) };
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
@@ -4797,7 +4966,7 @@ impl OffscreenVk {
             &self.slots[index],
             self.framebuffer,
             (self.width as u32, self.height as u32),
-            canvas,
+            if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas },
             &self.batches,
             None,
             self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
@@ -5115,6 +5284,163 @@ mod tests {
             scene_bytes(&root, Size { width: 160.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "veils drifted by {delta} (allowed 1)");
+    }
+
+    /// [`scene_bytes`] for a window the system composites by its own
+    /// alpha: the target clears to the premultiplied canvas, the oracle
+    /// is the translucent raster, and both sides hold premultiplied
+    /// bytes.
+    fn translucent_scene_bytes(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let physical = (
+            (logical.width.round() as usize) * scale,
+            (logical.height.round() as usize) * scale,
+        );
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(root, logical);
+        let cpu = bunny_ui::raster::rasterize_translucent(
+            &display,
+            physical.0,
+            physical.1,
+            scale,
+            canvas,
+            &PixelFont,
+            &RawImages::default(),
+        )
+        .to_rgba_bytes();
+        let mut gpu =
+            OffscreenVk::new(physical.0, physical.1).expect("offscreen gpu").translucent();
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
+    /// A translucent target with nothing painted on it holds the canvas
+    /// multiplied by its own alpha in every pixel — the bytes the
+    /// compositor shows as the canvas at that strength over what is
+    /// behind the window. A straight clear would show it at full
+    /// strength.
+    #[test]
+    fn a_translucent_target_clears_to_the_premultiplied_canvas() {
+        if !device_present() {
+            return;
+        }
+        let (gpu, cpu) = translucent_scene_bytes(
+            &empty().frame(1.0, 1.0),
+            Size { width: 8.0, height: 8.0 },
+            1,
+            Color::rgba(200, 100, 50, 128),
+        );
+        assert_eq!(&gpu[..4], &[100, 50, 25, 128], "the first pixel of the target");
+        assert!(gpu == cpu, "an empty scene diverged (max channel delta {})", max_channel_delta(&gpu, &cpu));
+    }
+
+    /// Paint over a translucent ground adds to the ground's alpha and
+    /// stays premultiplied, on the GPU as in the raster: flat fills,
+    /// solid and translucent, land on the same bytes.
+    #[test]
+    fn flat_fills_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(120.0, 40.0).background_color(Color::rgba(255, 255, 255, 128)),
+            empty()
+                .frame(80.0, 24.0)
+                .background_color(Color::rgba(24, 24, 29, 90))
+                .padding_length(10.0)
+                .background_color(Color::rgba(221, 225, 233, 160)),
+        ));
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 200.0, height: 160.0 },
+            2,
+            Color::rgba(16, 16, 20, 153),
+        );
+        assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
+        assert!(
+            gpu.chunks_exact(4).any(|pixel| pixel[3] == 153),
+            "the bare ground keeps the canvas's own alpha"
+        );
+        assert!(gpu.chunks_exact(4).any(|pixel| pixel[3] == 255), "a solid fill is solid");
+    }
+
+    /// One veil around `inside`: rounded, with a halo, meeting what is
+    /// under it by `blend`.
+    fn veil_around(
+        inside: impl View<Arity = bunny_ui::view::Single>,
+        blend: bunny_ui::layout::BackgroundBlend,
+    ) -> impl View<Arity = bunny_ui::view::Single> {
+        inside
+            .padding_length(10.0)
+            .background_color(Color::rgba(255, 255, 255, 110))
+            .corner_radius(9.0)
+            .shadow(6.0)
+            .background_blend(blend)
+    }
+
+    /// Three veils, each inside the one before — the scene a background
+    /// that replaces exists for.
+    fn veils(blend: bunny_ui::layout::BackgroundBlend) -> impl View<Arity = bunny_ui::view::Single> {
+        let core = || empty().frame(60.0, 26.0);
+        let inner = veil_around(core(), blend);
+        let middle = veil_around(vstack((core(), inner)), blend);
+        veil_around(vstack((core(), middle)), blend).padding_length(14.0)
+    }
+
+    /// A background that replaces, over a CLEAR ground, where the
+    /// knockout is the erase blend: the target keeps `1 - alpha` of
+    /// itself under each shape. Every veil then reads back at its own
+    /// alpha, however deep it is, where source-over reads back nearly
+    /// solid at the third.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
+        let deepest = |bytes: &[u8]| bytes.chunks_exact(4).map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.chunks_exact(4).filter(|pixel| pixel[3] == 110).count();
+        // every veil reads back at its own alpha, 110, at all three depths:
+        // together they are most of the picture
+        assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");
+        // and nothing is more solid than a halo over the canvas, 80 over 153
+        assert!(deepest(&gpu) < 200, "no depth adds up: {}", deepest(&gpu));
+        let (over, _) = translucent_scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(deepest(&over) > 225, "source-over is nearly solid three veils in: {}", deepest(&over));
+    }
+
+    /// Text and a rounded shape over a translucent ground: coverage and
+    /// alpha meet at the edges, where the two conventions differ most.
+    #[test]
+    fn soft_edges_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("the ground shows through").foreground_color(Color::WHITE),
+            empty()
+                .frame(120.0, 48.0)
+                .background_color(Color::rgba(59, 130, 246, 150))
+                .corner_radius(14.0)
+                .shadow(8.0),
+        ))
+        .padding_length(16.0);
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 220.0, height: 140.0 },
+            2,
+            Color::rgba(16, 16, 20, 120),
+        );
+        assert_close(&gpu, &cpu, 3, "soft edges over a translucent ground");
     }
 
     #[test]
@@ -5821,5 +6147,80 @@ mod tests {
         for door in [Some(Door::Xcb), Some(Door::Android), None] {
             assert!(!moved(door, (816, 986), (1680, 1050)));
         }
+    }
+
+    const OPAQUE: u32 = COMPOSITE_ALPHA_OPAQUE;
+    const PREMULTIPLIED: u32 = COMPOSITE_ALPHA_PREMULTIPLIED;
+    const POSTMULTIPLIED: u32 = COMPOSITE_ALPHA_POSTMULTIPLIED;
+    const INHERIT: u32 = COMPOSITE_ALPHA_INHERIT;
+    const DOORS: [Option<Door>; 3] = [Some(Door::Xcb), Some(Door::Wayland), Some(Door::Android)];
+
+    /// The four bits are `VkCompositeAlphaFlagBitsKHR` as the header
+    /// numbers them. Mesa's Wayland surface offers opaque and
+    /// premultiplied, 0x1 and 0x2: a premultiplied read as 0x4 finds
+    /// nothing there, and a translucent window is refused for it.
+    #[test]
+    fn the_composite_alpha_bits_are_the_headers() {
+        assert_eq!([OPAQUE, PREMULTIPLIED, POSTMULTIPLIED, INHERIT], [0x1, 0x2, 0x4, 0x8]);
+        assert_eq!(
+            pick_composite(0x1 | 0x2, true, Some(Door::Wayland)),
+            Some(0x2),
+            "what Mesa's Wayland surface offers serves a translucent window"
+        );
+    }
+
+    /// An opaque target asks what it always asked: the first the surface
+    /// offers of opaque and inherit, on every door, then a multiplied
+    /// alpha where the surface names nothing else, and opaque when it
+    /// names none at all.
+    #[test]
+    fn an_opaque_target_keeps_the_order_it_always_had() {
+        for door in DOORS {
+            assert_eq!(pick_composite(OPAQUE | PREMULTIPLIED, false, door), Some(OPAQUE));
+            assert_eq!(pick_composite(OPAQUE | INHERIT, false, door), Some(OPAQUE));
+            assert_eq!(pick_composite(INHERIT | PREMULTIPLIED, false, door), Some(INHERIT));
+            assert_eq!(pick_composite(INHERIT | POSTMULTIPLIED, false, door), Some(INHERIT));
+            assert_eq!(pick_composite(PREMULTIPLIED, false, door), Some(PREMULTIPLIED));
+            assert_eq!(pick_composite(POSTMULTIPLIED, false, door), Some(POSTMULTIPLIED));
+            assert_eq!(pick_composite(0, false, door), Some(OPAQUE));
+        }
+    }
+
+    /// A translucent target holds premultiplied pixels, and asks the
+    /// surface to read them so wherever the surface can.
+    #[test]
+    fn a_translucent_target_asks_for_premultiplied_alpha() {
+        for door in DOORS {
+            assert_eq!(pick_composite(OPAQUE | PREMULTIPLIED, true, door), Some(PREMULTIPLIED));
+            assert_eq!(
+                pick_composite(OPAQUE | INHERIT | PREMULTIPLIED, true, door),
+                Some(PREMULTIPLIED)
+            );
+        }
+    }
+
+    /// Inherit is an answer on the X11 door alone, where a compositing
+    /// manager reads the window's 32-bit visual as premultiplied. On the
+    /// other doors it says nothing about the alpha.
+    #[test]
+    fn a_translucent_target_inherits_on_the_x11_door_alone() {
+        assert_eq!(pick_composite(OPAQUE | INHERIT, true, Some(Door::Xcb)), Some(INHERIT));
+        assert_eq!(pick_composite(OPAQUE | INHERIT, true, Some(Door::Wayland)), None);
+        assert_eq!(pick_composite(OPAQUE | INHERIT, true, Some(Door::Android)), None);
+    }
+
+    /// A surface that composites opaque alone refuses a translucent
+    /// target, so the shell steps down the ladder: an opaque swapchain
+    /// would show a window that asked to be clear as a solid one. A
+    /// surface that reads its pixels as post-multiplied refuses too: the
+    /// frame is premultiplied.
+    #[test]
+    fn a_surface_with_no_alpha_refuses_a_translucent_target() {
+        for door in DOORS {
+            assert_eq!(pick_composite(OPAQUE, true, door), None);
+            assert_eq!(pick_composite(OPAQUE | POSTMULTIPLIED, true, door), None);
+            assert_eq!(pick_composite(0, true, door), None);
+        }
+        assert_eq!(pick_composite(OPAQUE | INHERIT, true, None), None, "no door, no inherit");
     }
 }

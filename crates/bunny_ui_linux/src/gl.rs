@@ -643,7 +643,8 @@ unsafe fn build_program(
 enum TargetKind {
     /// An opaque window buffer (XRGB — the CPU road's twin).
     Window,
-    /// A window buffer with alpha: the scene's corners fade through it.
+    /// A window buffer with alpha: a scene's corners fade through it,
+    /// and a translucent window is composited by it.
     SceneWindow,
     /// A surfaceless/pbuffer context rendering into an FBO.
     Offscreen,
@@ -694,7 +695,9 @@ impl GlStack {
                 return Err("EGL has no OpenGL API".to_string());
             }
             // NON-sRGB config forever — the parity law. The scene asks
-            // for alpha (its corners fade); everything else is opaque.
+            // for alpha (its corners fade) and so does a translucent
+            // window (the system composites it by that alpha);
+            // everything else is opaque.
             let surface_bit = match kind {
                 TargetKind::Offscreen => EGL_PBUFFER_BIT,
                 _ => EGL_WINDOW_BIT,
@@ -1045,7 +1048,10 @@ impl GlStack {
                 };
                 if swap_kind {
                     match run.kind {
-                        RunKind::Rects => {
+                        // a knockout is the rects again, taken away
+                        // instead of painted: the blend below is the
+                        // whole difference
+                        RunKind::Rects | RunKind::Knockout => {
                             (gl.use_program)(self.rect_program);
                             (gl.bind_vertex_array)(self.vao_rect);
                         }
@@ -1060,10 +1066,6 @@ impl GlStack {
                         }
                         // handled above, in a pass of its own
                         RunKind::Glass => continue,
-                        // this tier presents no translucent target yet,
-                        // so the walk is never told of a clear ground
-                        // and makes no such run
-                        RunKind::Knockout => continue,
                         // a world's target, composited with the box's
                         // veil and its clip: the sprite's road
                         RunKind::World(index) => {
@@ -1075,8 +1077,8 @@ impl GlStack {
                 }
                 match run.kind {
                     // handled above, in a pass of its own
-                    RunKind::Glass | RunKind::Knockout => continue,
-                    RunKind::Rects => {
+                    RunKind::Glass => continue,
+                    RunKind::Rects | RunKind::Knockout => {
                         // the run's base = the byte offset every attrib
                         // pointer carries — the SV_InstanceID trap of
                         // the windows port, dissolved
@@ -1109,6 +1111,27 @@ impl GlStack {
                     }
                 }
                 bound = Some(run.kind);
+                if run.kind == RunKind::Knockout {
+                    // the erase: nothing is painted, and the target keeps
+                    // `1 - alpha` of itself, colour and alpha alike —
+                    // source-over with the source's half dropped, the
+                    // raster's `Bitmap::take`. The house blend comes back
+                    // for the run that follows
+                    (gl.blend_func_separate)(
+                        GL_ZERO,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ZERO,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
+                    (gl.blend_func_separate)(
+                        GL_SRC_ALPHA,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    continue;
+                }
                 (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
             }
             if let Some(radius) = corner_mask {
@@ -2124,6 +2147,11 @@ struct GlPresenter {
     buffer: (usize, usize),
     /// The scene draws its own rounded corners — the mask pass.
     scene: bool,
+    /// The system composites the window by the alpha its frame leaves:
+    /// the frame clears to the canvas multiplied by its own alpha, and
+    /// the walk is told of no floor. Said once, when the presenter is
+    /// installed.
+    translucent: bool,
     slots: [FrameSlot; 3],
     cursor: usize,
     atlas: RunAtlas,
@@ -2145,6 +2173,19 @@ struct GlPresenter {
 }
 
 impl GlPresenter {
+    /// What the frame clears to: the canvas, multiplied by its own alpha
+    /// on a translucent target — the ground the raster starts a
+    /// translucent bitmap from.
+    fn ground_color(&self, canvas: Color) -> Color {
+        if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
+    }
+
+    /// The ground a knockout returns a shape to. A translucent target
+    /// has none of its own.
+    fn floor(&self, canvas: Color) -> Option<Color> {
+        if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) }
+    }
+
     /// Makes the glass targets if this frame needs them and the ones in
     /// hand are the wrong size.
     fn ensure_glass(&mut self, physical: (usize, usize)) {
@@ -2306,14 +2347,7 @@ impl GlPresenter {
             }
             self.buffer = physical;
         }
-        self.build_with_retries(
-            display,
-            scale,
-            physical,
-            text,
-            images,
-            bunny_ui::raster::solid_floor(canvas),
-        );
+        self.build_with_retries(display, scale, physical, text, images, self.floor(canvas));
         let index = acquire_slot(&self.stack.gl, &mut self.slots, &mut self.cursor);
         if !upload_frame(&mut self.slots[index], &self.stack.gl, &self.batches) {
             return Presented::DeviceLost;
@@ -2343,7 +2377,7 @@ impl GlPresenter {
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
             self.stack.encode_frame(
                 (physical.0 as f32, physical.1 as f32),
-                canvas,
+                self.ground_color(canvas),
                 &self.slots[index],
                 &self.batches.runs,
                 &self.batches.rounds,
@@ -2388,11 +2422,18 @@ impl GlPresenter {
 fn install(window: usize) -> Option<GlPresenter> {
     use crate::ffi::GpuTargets;
     let targets = crate::ffi::gpu_targets(window)?;
-    let (platform, native_display, scene) = match &targets {
-        GpuTargets::Wayland { display, scene, .. } => (EGL_PLATFORM_WAYLAND, *display, *scene),
-        GpuTargets::X11 { connection, scene, .. } => (EGL_PLATFORM_XCB_EXT, *connection, *scene),
+    let (platform, native_display, scene, translucent) = match &targets {
+        GpuTargets::Wayland { display, scene, translucent, .. } => {
+            (EGL_PLATFORM_WAYLAND, *display, *scene, *translucent)
+        }
+        GpuTargets::X11 { connection, scene, translucent, .. } => {
+            (EGL_PLATFORM_XCB_EXT, *connection, *scene, *translucent)
+        }
     };
-    let kind = if scene { TargetKind::SceneWindow } else { TargetKind::Window };
+    // one config with alpha serves both: the corners a scene fades and
+    // the ground a translucent window leaves clear
+    let kind =
+        if scene || translucent { TargetKind::SceneWindow } else { TargetKind::Window };
     let mut stack = GlStack::create(kind, platform, native_display)?;
     let (width, height) = crate::ffi::gpu_buffer_size(window);
     let loader = stack.egl;
@@ -2472,6 +2513,7 @@ fn install(window: usize) -> Option<GlPresenter> {
             native_window,
             buffer: (width, height),
             scene,
+            translucent,
             slots: [FrameSlot::empty(), FrameSlot::empty(), FrameSlot::empty()],
             cursor: 0,
             atlas: RunAtlas::new(),
@@ -2516,6 +2558,20 @@ pub(crate) fn active(window: usize) -> bool {
 pub(crate) fn invalidate(window: usize) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
+            presenter.retained = None;
+        }
+    });
+}
+
+/// The system stopped serving the background this window was installed
+/// for (a compositor took its blur away): from the next frame the target
+/// is filled as an opaque window fills it. The buffer keeps its alpha
+/// channel, and every pixel in it is solid once the shell hands a solid
+/// canvas.
+pub(crate) fn stand_opaque(window: usize) {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
+            presenter.translucent = false;
             presenter.retained = None;
         }
     });
@@ -2618,6 +2674,9 @@ pub struct OffscreenGl {
     glass: Option<GlassTargets>,
     #[cfg(feature = "3d")]
     world: Option<GlWorld<Gl33>>,
+    /// The target stands for a translucent window: it clears to the
+    /// premultiplied canvas and the walk is told of no floor.
+    translucent: bool,
 }
 
 impl OffscreenGl {
@@ -2665,7 +2724,19 @@ impl OffscreenGl {
             shared: None,
             batches: FrameBatches::default(),
             glass: None,
+            translucent: false,
         })
+    }
+
+    /// The target of a window the system composites by its own alpha:
+    /// each frame clears to the PREMULTIPLIED canvas, as the window
+    /// presenter does when it is installed for a translucent window, and
+    /// the bytes read back are the premultiplied bytes
+    /// `bunny_ui::raster::rasterize_translucent` paints.
+    #[must_use]
+    pub fn translucent(mut self) -> OffscreenGl {
+        self.translucent = true;
+        self
     }
 
     /// Who renders — `GL_RENDERER`, the driver's own name for itself
@@ -2687,7 +2758,8 @@ impl OffscreenGl {
         images: &dyn ImageEngine,
         wait: bool,
     ) {
-        let floor = bunny_ui::raster::solid_floor(canvas);
+        let floor =
+            if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) };
         for attempt in 0..3 {
             let mut ground = GlGround {
                 gl: &self.stack.gl,
@@ -2749,7 +2821,7 @@ impl OffscreenGl {
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
             self.stack.encode_frame(
                 (self.width as f32, self.height as f32),
-                canvas,
+                if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas },
                 &self.slots[index],
                 &self.batches.runs,
                 &self.batches.rounds,
@@ -3044,6 +3116,163 @@ mod tests {
             scene_bytes(&root, Size { width: 160.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "veils drifted by {delta} (allowed 1)");
+    }
+
+    /// [`scene_bytes`] for a window the system composites by its own
+    /// alpha: the target clears to the premultiplied canvas, the oracle
+    /// is the translucent raster, and both sides hold premultiplied
+    /// bytes.
+    fn translucent_scene_bytes(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let physical = (
+            (logical.width.round() as usize) * scale,
+            (logical.height.round() as usize) * scale,
+        );
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(root, logical);
+        let cpu = bunny_ui::raster::rasterize_translucent(
+            &display,
+            physical.0,
+            physical.1,
+            scale,
+            canvas,
+            &PixelFont,
+            &RawImages::default(),
+        )
+        .to_rgba_bytes();
+        let mut gpu =
+            OffscreenGl::new(physical.0, physical.1).expect("offscreen gpu").translucent();
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
+    /// A translucent target with nothing painted on it holds the canvas
+    /// multiplied by its own alpha in every pixel — the bytes the
+    /// compositor shows as the canvas at that strength over what is
+    /// behind the window. A straight clear would show it at full
+    /// strength.
+    #[test]
+    fn a_translucent_target_clears_to_the_premultiplied_canvas() {
+        if !device_present() {
+            return;
+        }
+        let (gpu, cpu) = translucent_scene_bytes(
+            &empty().frame(1.0, 1.0),
+            Size { width: 8.0, height: 8.0 },
+            1,
+            Color::rgba(200, 100, 50, 128),
+        );
+        assert_eq!(&gpu[..4], &[100, 50, 25, 128], "the first pixel of the target");
+        assert!(gpu == cpu, "an empty scene diverged (max channel delta {})", max_channel_delta(&gpu, &cpu));
+    }
+
+    /// Paint over a translucent ground adds to the ground's alpha and
+    /// stays premultiplied, on the GPU as in the raster: flat fills,
+    /// solid and translucent, land on the same bytes.
+    #[test]
+    fn flat_fills_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(120.0, 40.0).background_color(Color::rgba(255, 255, 255, 128)),
+            empty()
+                .frame(80.0, 24.0)
+                .background_color(Color::rgba(24, 24, 29, 90))
+                .padding_length(10.0)
+                .background_color(Color::rgba(221, 225, 233, 160)),
+        ));
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 200.0, height: 160.0 },
+            2,
+            Color::rgba(16, 16, 20, 153),
+        );
+        assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
+        assert!(
+            gpu.chunks_exact(4).any(|pixel| pixel[3] == 153),
+            "the bare ground keeps the canvas's own alpha"
+        );
+        assert!(gpu.chunks_exact(4).any(|pixel| pixel[3] == 255), "a solid fill is solid");
+    }
+
+    /// One veil around `inside`: rounded, with a halo, meeting what is
+    /// under it by `blend`.
+    fn veil_around(
+        inside: impl View<Arity = bunny_ui::view::Single>,
+        blend: bunny_ui::layout::BackgroundBlend,
+    ) -> impl View<Arity = bunny_ui::view::Single> {
+        inside
+            .padding_length(10.0)
+            .background_color(Color::rgba(255, 255, 255, 110))
+            .corner_radius(9.0)
+            .shadow(6.0)
+            .background_blend(blend)
+    }
+
+    /// Three veils, each inside the one before — the scene a background
+    /// that replaces exists for.
+    fn veils(blend: bunny_ui::layout::BackgroundBlend) -> impl View<Arity = bunny_ui::view::Single> {
+        let core = || empty().frame(60.0, 26.0);
+        let inner = veil_around(core(), blend);
+        let middle = veil_around(vstack((core(), inner)), blend);
+        veil_around(vstack((core(), middle)), blend).padding_length(14.0)
+    }
+
+    /// A background that replaces, over a CLEAR ground, where the
+    /// knockout is the erase blend: the target keeps `1 - alpha` of
+    /// itself under each shape. Every veil then reads back at its own
+    /// alpha, however deep it is, where source-over reads back nearly
+    /// solid at the third.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
+        let deepest = |bytes: &[u8]| bytes.chunks_exact(4).map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.chunks_exact(4).filter(|pixel| pixel[3] == 110).count();
+        // every veil reads back at its own alpha, 110, at all three depths:
+        // together they are most of the picture
+        assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");
+        // and nothing is more solid than a halo over the canvas, 80 over 153
+        assert!(deepest(&gpu) < 200, "no depth adds up: {}", deepest(&gpu));
+        let (over, _) = translucent_scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(deepest(&over) > 225, "source-over is nearly solid three veils in: {}", deepest(&over));
+    }
+
+    /// Text and a rounded shape over a translucent ground: coverage and
+    /// alpha meet at the edges, where the two conventions differ most.
+    #[test]
+    fn soft_edges_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("the ground shows through").foreground_color(Color::WHITE),
+            empty()
+                .frame(120.0, 48.0)
+                .background_color(Color::rgba(59, 130, 246, 150))
+                .corner_radius(14.0)
+                .shadow(8.0),
+        ))
+        .padding_length(16.0);
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 220.0, height: 140.0 },
+            2,
+            Color::rgba(16, 16, 20, 120),
+        );
+        assert_close(&gpu, &cpu, 3, "soft edges over a translucent ground");
     }
 
     #[test]

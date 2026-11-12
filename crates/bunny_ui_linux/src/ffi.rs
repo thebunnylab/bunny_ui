@@ -26,6 +26,8 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
+use bunny_ui::window::WindowBackground;
+
 #[path = "accessibility_bus.rs"]
 mod bus;
 #[path = "appearance.rs"]
@@ -207,6 +209,7 @@ unsafe extern "C" {
     static wl_data_source_interface: WlInterface;
     static wl_subcompositor_interface: WlInterface;
     static wl_subsurface_interface: WlInterface;
+    static wl_region_interface: WlInterface;
 }
 
 // MARK: - libwayland-cursor ABI (theme files arrive as ready wl_buffers)
@@ -314,10 +317,13 @@ enum Iface {
     Pinch,
     FractionalScale,
     ActivationToken,
+    BackgroundEffect,
+    KdeBlur,
     CoreSurface,
     CoreSeat,
     CoreOutput,
     CorePointer,
+    CoreRegion,
 }
 
 /// The built tables, leaked to `'static` — libwayland keeps pointers
@@ -338,6 +344,10 @@ pub(crate) struct Protocols {
     fractional: &'static WlInterface,
     activation: &'static WlInterface,
     activation_token: &'static WlInterface,
+    background_effect_manager: &'static WlInterface,
+    background_effect: &'static WlInterface,
+    kde_blur_manager: &'static WlInterface,
+    kde_blur: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -548,7 +558,64 @@ fn fractional_scale_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
     ]
 }
 
-/// Builds the thirteen `WlInterface` tables and leaks them. Two passes:
+/// background-effect v1, transcribed from the staging XML in opcode
+/// order: the compositor blurs what is behind a region of a surface. The
+/// manager says what it can do in `capabilities`, a bitfield where 1 is
+/// the blur; the region is surface state, applied by the next commit.
+fn background_effect_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"ext_background_effect_manager_v1",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"get_background_effect", c"no", &[Some(BackgroundEffect), Some(CoreSurface)]),
+            ],
+            vec![Msg(c"capabilities", c"u", &[None])],
+        ),
+        (
+            c"ext_background_effect_surface_v1",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"set_blur_region", c"?o", &[Some(CoreRegion)]),
+            ],
+            vec![],
+        ),
+    ]
+}
+
+/// The KDE blur protocol, transcribed from `blur.xml` of
+/// plasma-wayland-protocols in opcode order: the same service where the
+/// compositor does not speak background-effect yet. The region is set
+/// on the blur object, then `commit`, then the surface's own commit.
+fn kde_blur_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"org_kde_kwin_blur_manager",
+            1,
+            vec![
+                Msg(c"create", c"no", &[Some(KdeBlur), Some(CoreSurface)]),
+                Msg(c"unset", c"o", &[Some(CoreSurface)]),
+            ],
+            vec![],
+        ),
+        (
+            c"org_kde_kwin_blur",
+            1,
+            vec![
+                Msg(c"commit", c"", &[]),
+                Msg(c"set_region", c"?o", &[Some(CoreRegion)]),
+                Msg(c"release", c"", &[]),
+            ],
+            vec![],
+        ),
+    ]
+}
+
+/// Builds the nineteen `WlInterface` tables and leaks them. Two passes:
 /// the interfaces are allocated first so the message rows can point at
 /// each other (popup → positioner, xdg_surface → toplevel, …).
 fn build_protocols() -> Protocols {
@@ -560,9 +627,11 @@ fn build_protocols() -> Protocols {
             .chain(pointer_gestures_spec())
             .chain(fractional_scale_spec())
             .chain(window_ops::activation_spec())
+            .chain(background_effect_spec())
+            .chain(kde_blur_spec())
             .collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 15] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 19] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -584,10 +653,13 @@ fn build_protocols() -> Protocols {
             Iface::Pinch => unsafe { base.add(10) },
             Iface::FractionalScale => unsafe { base.add(12) },
             Iface::ActivationToken => unsafe { base.add(14) },
+            Iface::BackgroundEffect => unsafe { base.add(16) },
+            Iface::KdeBlur => unsafe { base.add(18) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
             Iface::CorePointer => &raw const wl_pointer_interface,
+            Iface::CoreRegion => &raw const wl_region_interface,
         }
     };
     let build_rows = |rows: &[Msg]| -> (*const WlMessage, c_int) {
@@ -637,6 +709,10 @@ fn build_protocols() -> Protocols {
         fractional: &slots[12],
         activation: &slots[13],
         activation_token: &slots[14],
+        background_effect_manager: &slots[15],
+        background_effect: &slots[16],
+        kde_blur_manager: &slots[17],
+        kde_blur: &slots[18],
     }
 }
 
@@ -780,6 +856,7 @@ const TAG_DECORATION: usize = 17;
 const TAG_TOUCH: usize = 18;
 const TAG_PINCH: usize = 19;
 const TAG_FRACTIONAL: usize = 20;
+const TAG_BACKGROUND_EFFECT: usize = 21;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 /// Panel proxies encode index and role: base | (index << 2) | kind.
 const PANEL_TAG_BASE: usize = 0x1000_0000;
@@ -831,6 +908,9 @@ enum Ev {
     /// is told directly (tier 2).
     PreferredScale { fractional_ptr: usize, v120: u32 },
     PreferredBufferScale { surface_ptr: usize, scale: i32 },
+    /// What the background-effect manager can do, as it stands now: a
+    /// bitfield, 1 is the blur. Sent at bind and again when it changes.
+    EffectCapabilities { flags: u32 },
     /// The seat said what it has — the touch device is asked for here.
     SeatCapabilities { caps: u32 },
     TouchDown { serial: u32, surface_ptr: usize, id: i32, x: f64, y: f64 },
@@ -947,6 +1027,11 @@ unsafe extern "C" fn dispatcher(
         TAG_FRACTIONAL => {
             if opcode == 0 {
                 push_ev(Ev::PreferredScale { fractional_ptr: proxy as usize, v120: unsafe { arg(0).u } });
+            }
+        }
+        TAG_BACKGROUND_EFFECT => {
+            if opcode == 0 {
+                push_ev(Ev::EffectCapabilities { flags: unsafe { arg(0).u } });
             }
         }
         TAG_SEAT => {
@@ -1465,6 +1550,25 @@ struct Window {
     preferred_120: Option<u32>,
     preferred_buffer: Option<i32>,
     factor: f64,
+    /// The background the window was given: what the compositor serves
+    /// of the spec's ask. It falls to opaque when the compositor takes
+    /// its blur away.
+    background: WindowBackground,
+    /// The window was born translucent: its buffers carry the alpha the
+    /// compositor reads. Fixed at birth; where `background` has fallen
+    /// to opaque since, the same buffers hold solid pixels.
+    alpha: bool,
+    /// The protocol a blurred window asks its blur through (`None` for a
+    /// window that is not blurred), and its object there: the
+    /// `ext_background_effect_surface_v1` the surface keeps for life, or
+    /// the `org_kde_kwin_blur` that carries the region last sent. Null
+    /// where the other protocol is the one in use.
+    blur_via: Option<BlurVia>,
+    effect: *mut Proxy,
+    kde_blur: *mut Proxy,
+    /// The logical size and the corner radius the blur region was last
+    /// sent for; a present at another size sends it again.
+    blur_sent: Option<(i32, i32, i32)>,
 }
 
 struct CursorState {
@@ -1756,6 +1860,12 @@ struct Client {
     /// `wp_fractional_scale_manager_v1` — null on a compositor that
     /// speaks only whole scales.
     fractional_manager: *mut Proxy,
+    /// `ext_background_effect_manager_v1` (null where unspoken) and what
+    /// its last `capabilities` said it can do.
+    effect_manager: *mut Proxy,
+    effect_capabilities: u32,
+    /// `org_kde_kwin_blur_manager` — null where unspoken.
+    kde_blur_manager: *mut Proxy,
     protocols: &'static Protocols,
     outputs: Vec<OutputInfo>,
     globals: Vec<(u32, String, u32)>,
@@ -2053,6 +2163,20 @@ fn connect() {
         TAG_SYNC,
     );
     let activation = bind(c"xdg_activation_v1", protocols.activation, 1, TAG_SYNC);
+    // the blur behind a window, where the compositor can give one: the
+    // cross-desktop protocol first, KDE's own where that is all there is
+    let effect_manager = bind(
+        c"ext_background_effect_manager_v1",
+        protocols.background_effect_manager as *const WlInterface,
+        1,
+        TAG_BACKGROUND_EFFECT,
+    );
+    let kde_blur_manager = bind(
+        c"org_kde_kwin_blur_manager",
+        protocols.kde_blur_manager as *const WlInterface,
+        1,
+        TAG_SYNC,
+    );
     assert!(!compositor.is_null(), "wl_compositor is mandatory");
     assert!(!shm.is_null(), "wl_shm is mandatory");
     assert!(!wm_base.is_null(), "xdg_wm_base is mandatory");
@@ -2196,6 +2320,9 @@ fn connect() {
             wm_base,
             decoration_manager,
             fractional_manager,
+            effect_manager,
+            effect_capabilities: 0,
+            kde_blur_manager,
             protocols,
             outputs,
             globals,
@@ -2329,6 +2456,13 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 decoration
             }
         };
+        // the background: a Wayland compositor composites every buffer
+        // by its own alpha, so the alpha is always there; the blur is
+        // there where one of the two protocols is spoken
+        let background = options.background.resolve(true, blur_offered(client));
+        let blur_via =
+            if background == WindowBackground::Blurred { blur_via(client) } else { None };
+        let effect = unsafe { attach_effect(client, blur_via, surface) };
         // the exact scale, asked before the first commit — the answer
         // arrives with the compositor's first word on the surface
         let fractional = if client.fractional_manager.is_null() {
@@ -2380,6 +2514,12 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             preferred_120: None,
             preferred_buffer: None,
             factor: 1.0,
+            background,
+            alpha: background.is_translucent(),
+            blur_via,
+            effect,
+            kde_blur: std::ptr::null_mut(),
+            blur_sent: None,
         });
         surface as usize
     });
@@ -2522,14 +2662,305 @@ pub fn show_window(window: WindowHandle) {
 }
 
 /// What a window is asked to be at creation, beyond its size and its
-/// title: who draws its top edge, its manners, and the floor a resizable
-/// one may not be dragged under, in logical points.
+/// title: who draws its top edge, its manners, the floor a resizable
+/// one may not be dragged under, in logical points, and the background
+/// it asks the system for.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowOptions {
     pub scene: bool,
     pub resizable: bool,
     pub minimizable: bool,
     pub min: Option<(f64, f64)>,
+    /// The ask. The door resolves it against what the compositor (or
+    /// the server) can do, and the window keeps what it was given —
+    /// [`window_background`].
+    pub background: WindowBackground,
+}
+
+// MARK: - the background (what shows where the scene paints nothing)
+
+/// `ext_background_effect_manager_v1.capability`: the blur.
+const EFFECT_CAPABILITY_BLUR: u32 = 1;
+
+/// The protocol a blur is asked through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlurVia {
+    /// `ext_background_effect_manager_v1`: one object per surface, whose
+    /// region is surface state.
+    Effect,
+    /// `org_kde_kwin_blur_manager`: one object per region.
+    Kde,
+}
+
+/// The protocol this compositor gives a blur through: background-effect
+/// where its manager is bound AND says it can blur, else KDE's where its
+/// manager is bound, else none.
+fn blur_via(client: &Client) -> Option<BlurVia> {
+    if !client.effect_manager.is_null()
+        && client.effect_capabilities & EFFECT_CAPABILITY_BLUR != 0
+    {
+        Some(BlurVia::Effect)
+    } else if !client.kde_blur_manager.is_null() {
+        Some(BlurVia::Kde)
+    } else {
+        None
+    }
+}
+
+/// Whether the compositor can blur what is behind a window.
+fn blur_offered(client: &Client) -> bool {
+    blur_via(client).is_some()
+}
+
+/// The background-effect object of `surface`, for a window that asks its
+/// blur that way; null for any other. A surface has one for life.
+unsafe fn attach_effect(
+    client: &Client,
+    via: Option<BlurVia>,
+    surface: *mut Proxy,
+) -> *mut Proxy {
+    if via != Some(BlurVia::Effect) {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        construct(
+            client.effect_manager,
+            1, // get_background_effect(new, surface)
+            client.protocols.background_effect as *const WlInterface,
+            &mut [arg_n(), arg_o(surface)],
+            TAG_SYNC,
+        )
+    }
+}
+
+/// What a blur region is sent through, copied out of the client so a
+/// window can be borrowed beside it.
+#[derive(Clone, Copy)]
+struct BlurDoor {
+    compositor: *mut Proxy,
+    kde_manager: *mut Proxy,
+    kde_blur: *const WlInterface,
+}
+
+fn blur_door(client: &Client) -> BlurDoor {
+    BlurDoor {
+        compositor: client.compositor,
+        kde_manager: client.kde_blur_manager,
+        kde_blur: client.protocols.kde_blur as *const WlInterface,
+    }
+}
+
+/// The rects a blur lies behind, for a window of `width` × `height`
+/// whose corners round at `radius`, all in one unit: surface points on
+/// the Wayland door, device pixels on the X11 one.
+///
+/// A blur region is a set of rects, and a window with rounded corners is
+/// transparent outside its curve: one rect of the whole window would
+/// show a blurred square behind each transparent corner. The rows a
+/// corner touches are strips instead, each as wide as the curve at that
+/// row, where the curve is the line of half coverage [`mask_corners`]
+/// cuts. Rows of one width are one rect.
+pub(crate) fn blur_rects(width: i32, height: i32, radius: f64) -> Vec<(i32, i32, i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let r = radius.max(0.0).min(width as f64 / 2.0).min(height as f64 / 2.0);
+    // the rows a corner touches; the two corners of a side never cross
+    let span = (r.ceil() as i32).min((height + 1) / 2);
+    // what a row loses at each end: the pixels whose centre is outside
+    // the quarter circle
+    let inset = |from_edge: i32| -> i32 {
+        let dy = r - (from_edge as f64 + 0.5);
+        if dy <= 0.0 {
+            return 0;
+        }
+        let reach = (r * r - dy * dy).max(0.0).sqrt();
+        ((r - reach - 0.5).ceil() as i32).clamp(0, width / 2)
+    };
+    // bands of rows (first row, row after the last, inset), top to bottom
+    let mut bands: Vec<(i32, i32, i32)> = Vec::new();
+    let mut push = |y0: i32, y1: i32, inset: i32| {
+        if y1 <= y0 {
+            return;
+        }
+        match bands.last_mut() {
+            Some(last) if last.2 == inset && last.1 == y0 => last.1 = y1,
+            _ => bands.push((y0, y1, inset)),
+        }
+    };
+    for row in 0..span {
+        push(row, row + 1, inset(row));
+    }
+    let low = (height - span).max(span);
+    push(span, low, 0);
+    for row in low..height {
+        push(row, row + 1, inset(height - 1 - row));
+    }
+    bands
+        .into_iter()
+        .filter(|&(_, _, inset)| width - 2 * inset > 0)
+        .map(|(y0, y1, inset)| (inset, y0, width - 2 * inset, y1 - y0))
+        .collect()
+}
+
+/// Sends the blur region of a blurred window, when its size or its
+/// corners moved since the last one sent. The region is surface state:
+/// the caller's commit, the one that presents the frame of that size,
+/// applies it with the buffer.
+unsafe fn sync_blur(door: BlurDoor, win: &mut Window) {
+    let Some(via) = win.blur_via else { return };
+    if win.background != WindowBackground::Blurred {
+        return;
+    }
+    let radius = if win.scene { 8 } else { 0 };
+    let size = (win.logical.0.round() as i32, win.logical.1.round() as i32, radius);
+    if win.blur_sent == Some(size) {
+        return;
+    }
+    unsafe {
+        let region = construct(
+            door.compositor,
+            1, // wl_compositor.create_region(new)
+            &raw const wl_region_interface,
+            &mut [arg_n()],
+            TAG_SYNC,
+        );
+        if region.is_null() {
+            return;
+        }
+        for (x, y, w, h) in blur_rects(size.0, size.1, f64::from(radius)) {
+            request(region, 1, &mut [arg_i(x), arg_i(y), arg_i(w), arg_i(h)]); // add
+        }
+        match via {
+            BlurVia::Effect if !win.effect.is_null() => {
+                request(win.effect, 1, &mut [arg_o(region)]); // set_blur_region
+            }
+            BlurVia::Effect => {}
+            BlurVia::Kde if !door.kde_manager.is_null() => {
+                // the compositor reads a region when a blur object is
+                // set on the surface, so each region is a new object —
+                // the way KDE's own clients send one — and the object
+                // before it is released
+                let fresh = construct(
+                    door.kde_manager,
+                    0, // create(new, surface)
+                    door.kde_blur,
+                    &mut [arg_n(), arg_o(win.surface)],
+                    TAG_SYNC,
+                );
+                if !fresh.is_null() {
+                    request(fresh, 1, &mut [arg_o(region)]); // set_region
+                    request(fresh, 0, &mut no_args()); // commit
+                    let before = std::mem::replace(&mut win.kde_blur, fresh);
+                    if !before.is_null() {
+                        destroy(before, 2); // release
+                    }
+                }
+            }
+            BlurVia::Kde => {}
+        }
+        // the compositor copied the region at the request: it can go
+        destroy(region, 0);
+    }
+    win.blur_sent = Some(size);
+}
+
+/// Lets a window's blur objects go — before the surface they blur.
+unsafe fn release_blur(win: &mut Window) {
+    unsafe {
+        if !win.effect.is_null() {
+            destroy(std::mem::replace(&mut win.effect, std::ptr::null_mut()), 0);
+        }
+        if !win.kde_blur.is_null() {
+            destroy(std::mem::replace(&mut win.kde_blur, std::ptr::null_mut()), 2); // release
+        }
+    }
+    win.blur_via = None;
+    win.blur_sent = None;
+}
+
+/// The compositor's blur moved under the windows that stand on it: a
+/// global went, or the manager's capabilities changed. A blurred window
+/// whose blur is gone becomes an opaque one — never a clear one — and
+/// one whose protocol went while the other stayed moves to the other,
+/// which is sent the region at the window's next present. Answers the
+/// windows that became opaque: their presenters are told and each draws
+/// again, outside this borrow.
+fn settle_blur(client: &mut Client) -> Vec<usize> {
+    let stands = blur_via(client);
+    let kde_stands = !client.kde_blur_manager.is_null();
+    let mut fallen = Vec::new();
+    for index in 0..client.windows.len() {
+        let win = &client.windows[index];
+        if win.background != WindowBackground::Blurred {
+            continue;
+        }
+        let kept = match win.blur_via {
+            Some(BlurVia::Effect) => stands == Some(BlurVia::Effect),
+            Some(BlurVia::Kde) => kde_stands,
+            None => false,
+        };
+        if kept {
+            continue;
+        }
+        let surface = win.surface;
+        unsafe { release_blur(&mut client.windows[index]) };
+        let effect = unsafe { attach_effect(client, stands, surface) };
+        let win = &mut client.windows[index];
+        win.blur_via = stands;
+        win.effect = effect;
+        if stands.is_none() {
+            win.background = WindowBackground::Opaque;
+            fallen.push(surface as usize);
+        }
+    }
+    fallen
+}
+
+/// Tells the presenters of the windows [`settle_blur`] answered, and
+/// asks each for a frame: the scene's guard now paints the canvas solid.
+fn fall_opaque(windows: Vec<usize>) {
+    for window in windows {
+        eprintln!("bunny_ui_linux: the compositor took the blur away — the window stands opaque");
+        crate::vk::stand_opaque(window);
+        crate::gl::stand_opaque(window);
+        dispatch_at(window, AppEvent::Redraw);
+    }
+}
+
+/// The background the open door serves for an ask, before a window
+/// exists. Only the live compositor (or the X server) can say, so the
+/// first call opens the connection, the one the first window uses. An
+/// opaque ask needs no answer from anyone, and with no display to open
+/// every ask is opaque.
+pub fn serve_background(asked: WindowBackground) -> WindowBackground {
+    if asked == WindowBackground::Opaque {
+        return asked;
+    }
+    let display = resolve_backend(
+        std::env::var("BUNNY_BACKEND").ok().as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+        std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()),
+    );
+    if display.is_none() {
+        return WindowBackground::Opaque;
+    }
+    if is_x11() {
+        return crate::x11::serve_background(asked);
+    }
+    if CLIENT.with(|slot| slot.borrow().is_none()) {
+        connect();
+    }
+    with_client(|client| asked.resolve(true, blur_offered(client)))
+}
+
+/// The background an open window was given. `None` for a window that
+/// is not open.
+pub fn window_background(window: usize) -> Option<WindowBackground> {
+    if is_x11() {
+        return crate::x11::window_background(window as u32);
+    }
+    with_client(|client| window_ref(client, window).map(|win| win.background))
 }
 
 /// Who draws the window's frame, as far as the door knows.
@@ -2704,6 +3135,12 @@ unsafe fn destroy_window_proxies(win: Window) {
         }
         if !win.fractional.is_null() {
             destroy(win.fractional, 0); // before the surface it watches
+        }
+        if !win.effect.is_null() {
+            destroy(win.effect, 0); // before the surface it blurs
+        }
+        if !win.kde_blur.is_null() {
+            destroy(win.kde_blur, 2); // release
         }
         if !win.toplevel.is_null() {
             destroy(win.toplevel, 0);
@@ -3414,19 +3851,93 @@ fn ensure_backing(client: &mut Client, addr: usize, width: usize, height: usize)
     }
     const XRGB8888: u32 = 1;
     const ARGB8888: u32 = 0;
-    // a scene-chrome window carries alpha: its corners round by mask
-    let format = if win.scene { ARGB8888 } else { XRGB8888 };
+    // a scene-chrome window carries alpha: its corners round by mask.
+    // So does a translucent one: the compositor reads the alpha its
+    // frame leaves
+    let format = if win.scene || win.alpha { ARGB8888 } else { XRGB8888 };
     win.backing = make_backing(shm, width, height, format, TAG_BUFFER);
     win.backing.is_some()
 }
 
+/// One box of a frame into a backing: RGBA into the shm lattice, the
+/// little-endian bytes B, G, R and then X or A. The box is (x, y,
+/// width, height) in pixels and lies inside the frame.
+///
+/// `keep_alpha` is a window the system composites by its own alpha: the
+/// frame holds premultiplied pixels, and the alpha of each goes with it.
+/// Every other window writes its pixels solid.
+pub(crate) fn copy_box(
+    map: *mut u8,
+    rgba: &[u8],
+    width: usize,
+    (x, y, w, h): (usize, usize, usize, usize),
+    keep_alpha: bool,
+) {
+    for row in y..y + h {
+        let start = (row * width + x) * 4;
+        let source = &rgba[start..start + w * 4];
+        let target = unsafe { std::slice::from_raw_parts_mut(map.add(start), w * 4) };
+        if keep_alpha {
+            for (source_px, target_px) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+                target_px[0] = source_px[2];
+                target_px[1] = source_px[1];
+                target_px[2] = source_px[0];
+                target_px[3] = source_px[3];
+            }
+            continue;
+        }
+        for (source_px, target_px) in
+            source.chunks_exact(4).zip(target.chunks_exact_mut(4))
+        {
+            target_px[0] = source_px[2];
+            target_px[1] = source_px[1];
+            target_px[2] = source_px[0];
+            target_px[3] = 0xFF;
+        }
+    }
+}
+
+/// The radius [`mask_corners`] rounds a frame of this size at, and how
+/// many pixels of each edge a corner takes.
+fn corner_span(width: usize, height: usize, radius: f64) -> (f64, usize) {
+    let r = radius.min(width as f64 / 2.0).min(height as f64 / 2.0);
+    (r, r.ceil() as usize)
+}
+
+/// The corners of a presented frame: each corner box copied again from
+/// the frame, then rounded.
+///
+/// The mask multiplies in place and the backing is retained, so a
+/// corner the damage did not rewrite would be rounded again over its own
+/// result, and darken a little more with every present. The copy gives
+/// the mask the frame's own pixels each time; a corner nothing changed
+/// lands on the bytes it already held.
+pub(crate) fn round_corners(
+    map: *mut u8,
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    radius: f64,
+    keep_alpha: bool,
+) {
+    let (_, span) = corner_span(width, height, radius);
+    for (x0, y0) in [(0, 0), (width - span, 0), (0, height - span), (width - span, height - span)] {
+        copy_box(map, rgba, width, (x0, y0, span, span), keep_alpha);
+    }
+    mask_corners(map, width, height, radius);
+}
+
 /// The rounded corners the platforms give their windows — here the
 /// shell earns them: an anti-aliased quarter-circle mask over each
-/// corner, premultiplied because the surface carries real alpha.
-/// Runs only over the corner boxes a damage rect touched.
+/// corner, premultiplied because the surface carries real alpha. Every
+/// channel is multiplied by the coverage, the alpha too: a pixel of a
+/// translucent window keeps the alpha its frame left, scaled, and a
+/// solid one ends at the coverage itself.
+///
+/// It multiplies what the backing holds, so it runs ONCE over a corner
+/// the frame just wrote — [`round_corners`].
 pub(crate) fn mask_corners(map: *mut u8, width: usize, height: usize, radius: f64) {
-    let r = radius.min(width as f64 / 2.0).min(height as f64 / 2.0);
-    let span = r.ceil() as usize;
+    let (r, span) = corner_span(width, height, radius);
     // center and the OUTWARD signs per corner: a pixel rounds only
     // when it sits beyond the center toward its corner
     let corners = [
@@ -3453,7 +3964,8 @@ pub(crate) fn mask_corners(map: *mut u8, width: usize, height: usize, radius: f6
                     *px = (*px as u32 * alpha / 255) as u8;
                     *px.add(1) = (*px.add(1) as u32 * alpha / 255) as u8;
                     *px.add(2) = (*px.add(2) as u32 * alpha / 255) as u8;
-                    *px.add(3) = alpha as u8;
+                    // the coverage itself where the pixel was solid
+                    *px.add(3) = (*px.add(3) as u32 * alpha / 255) as u8;
                 }
             }
         }
@@ -3569,32 +4081,28 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
         }
         wait_release(client, addr);
         let display = client.display;
+        let blur = blur_door(client);
         let win = window_at(client, addr).expect("window for the present");
+        // a window born translucent presents premultiplied pixels, and
+        // their alpha goes into the buffer with them
+        let keep_alpha = win.alpha;
         let backing = win.backing.as_mut().expect("backing for the present");
         // damage rows: RGBA → XRGB (little-endian bytes B,G,R,X) in one pass
         for &rect in damage {
             let Some((x, y, w, h)) = damage_to_buffer(rect, width, height) else {
                 continue;
             };
-            for row in y..y + h {
-                let start = (row as usize * width + x as usize) * 4;
-                let source = &rgba[start..start + w as usize * 4];
-                let target = unsafe {
-                    std::slice::from_raw_parts_mut(backing.map.add(start), w as usize * 4)
-                };
-                for (source_px, target_px) in
-                    source.chunks_exact(4).zip(target.chunks_exact_mut(4))
-                {
-                    target_px[0] = source_px[2];
-                    target_px[1] = source_px[1];
-                    target_px[2] = source_px[0];
-                    target_px[3] = 0xFF;
-                }
-            }
+            copy_box(
+                backing.map,
+                rgba,
+                width,
+                (x as usize, y as usize, w as usize, h as usize),
+                keep_alpha,
+            );
         }
         backing.released = false;
         if win.scene {
-            mask_corners(backing.map, width, height, 8.0 * win.scale as f64);
+            round_corners(backing.map, rgba, width, height, 8.0 * win.scale as f64, keep_alpha);
         }
         let buffer = backing.buffer;
         unsafe {
@@ -3636,6 +4144,9 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
                     TAG_FRAME,
                 );
             }
+            // the blur follows the frame: its region rides the commit
+            // that presents the size it was built for
+            sync_blur(blur, win);
             request(win.surface, 6, &mut no_args());
             wl_display_flush(display);
         }
@@ -4769,9 +5280,13 @@ pub fn install_gpu(window: &WindowHandle) {
 }
 
 /// What the GPU surface wraps — one variant per door.
+///
+/// `scene` is a window with the shell's own rounded corners (the corner
+/// mask). `translucent` is a window the system composites by its own
+/// alpha: the presenter is told once, here, when it is installed.
 pub(crate) enum GpuTargets {
-    Wayland { display: *mut c_void, surface: *mut c_void, scene: bool },
-    X11 { connection: *mut c_void, window: u32, scene: bool },
+    Wayland { display: *mut c_void, surface: *mut c_void, scene: bool, translucent: bool },
+    X11 { connection: *mut c_void, window: u32, scene: bool, translucent: bool },
 }
 
 pub(crate) fn gpu_targets(window: usize) -> Option<GpuTargets> {
@@ -4783,6 +5298,7 @@ pub(crate) fn gpu_targets(window: usize) -> Option<GpuTargets> {
             display: client.display as *mut c_void,
             surface: win.surface as *mut c_void,
             scene: win.scene,
+            translucent: win.background.is_translucent(),
         })
     })
 }
@@ -4815,6 +5331,7 @@ pub(crate) fn gpu_pre_present(window: usize, scale: usize) -> bool {
         return crate::x11::gpu_can_present(window as u32);
     }
     with_client(|client| {
+        let blur = blur_door(client);
         let Some(win) = window_at(client, window) else { return false };
         if !win.map.can_attach() {
             return false;
@@ -4835,6 +5352,8 @@ pub(crate) fn gpu_pre_present(window: usize, scale: usize) -> bool {
                     TAG_FRAME,
                 );
             }
+            // the blur follows the frame: the swap's commit applies it
+            sync_blur(blur, win);
         }
         true
     })
@@ -5361,7 +5880,43 @@ fn drain_protocol_events() {
                 // late arrivals join the census; later phases bind on demand
                 client.globals.push((name, interface, version));
             }),
+            Ev::EffectCapabilities { flags } => {
+                // the manager says again what it can do: a blur it took
+                // back leaves the windows that stood on it opaque
+                let fallen = with_client(|client| {
+                    client.effect_capabilities = flags;
+                    settle_blur(client)
+                });
+                fall_opaque(fallen);
+            }
             Ev::GlobalRemove { name } => {
+                // a blur global that goes (the compositor's effect was
+                // switched off) takes its manager with it
+                let fallen = with_client(|client| {
+                    let gone = client
+                        .globals
+                        .iter()
+                        .find(|&&(id, _, _)| id == name)
+                        .map(|(_, interface, _)| interface.clone());
+                    match gone.as_deref() {
+                        Some("ext_background_effect_manager_v1")
+                            if !client.effect_manager.is_null() =>
+                        {
+                            unsafe { destroy(client.effect_manager, 0) };
+                            client.effect_manager = std::ptr::null_mut();
+                            client.effect_capabilities = 0;
+                        }
+                        Some("org_kde_kwin_blur_manager")
+                            if !client.kde_blur_manager.is_null() =>
+                        {
+                            // the manager has no destructor request
+                            unsafe { wl_proxy_destroy(client.kde_blur_manager) };
+                            client.kde_blur_manager = std::ptr::null_mut();
+                        }
+                        _ => return Vec::new(),
+                    }
+                    settle_blur(client)
+                });
                 // outputs genuinely unplug (an RDP resize can); drop it
                 // from the census and let the scale re-resolve
                 let removed = with_client(|client| {
@@ -5379,6 +5934,7 @@ fn drain_protocol_events() {
                 if removed {
                     update_scale_all();
                 }
+                fall_opaque(fallen);
             }
             Ev::BufferRelease { buffer_ptr } => with_client(|client| {
                 if let Some(backing) = window_where(client, |w| {
@@ -6001,6 +6557,8 @@ pub fn set_window_visibility(
         match visibility {
             WindowVisibility::Hidden => {
                 let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+                // a remapped surface is sent its blur region again
+                win.blur_sent = None;
                 unsafe {
                     win.map = MapState::Hidden;
                     if !win.frame_callback.is_null() {
@@ -6285,6 +6843,194 @@ mod tests {
                 assert_eq!(types.len(), arg_count(signature), "{}.{}", name.to_string_lossy(), msg.to_string_lossy());
             }
         }
+    }
+
+    /// One protocol's tables against its XML: every message of ours is in
+    /// its interface block, in our opcode order, and every row has one
+    /// types slot per argument.
+    fn assert_tables_match(xml: &str, spec: [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2]) {
+        for (name, _, methods, events) in &spec {
+            let open = format!("<interface name=\"{}\"", name.to_string_lossy());
+            let start = xml.find(&open).expect("interface present in the XML");
+            let block = &xml[start..];
+            let end = block.find("</interface>").expect("interface block closes");
+            let block = &block[..end];
+            for (kind, rows) in [("request", methods), ("event", events)] {
+                assert_eq!(
+                    block.matches(&format!("<{kind} name=")).count(),
+                    rows.len(),
+                    "{}: every {kind} of the XML has its row",
+                    name.to_string_lossy()
+                );
+                let mut cursor = 0;
+                for Msg(msg, _, _) in rows {
+                    let needle = format!("<{kind} name=\"{}\"", msg.to_string_lossy());
+                    let at = block[cursor..]
+                        .find(&needle)
+                        .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                    cursor += at + needle.len();
+                }
+            }
+        }
+        assert_rows_match_their_signatures(spec);
+    }
+
+    fn assert_rows_match_their_signatures(spec: [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2]) {
+        for (name, _, methods, events) in spec {
+            for Msg(msg, signature, types) in methods.iter().chain(events.iter()) {
+                assert_eq!(types.len(), arg_count(signature), "{}.{}", name.to_string_lossy(), msg.to_string_lossy());
+            }
+        }
+    }
+
+    /// The background-effect tables against their own XML, where the
+    /// installed wayland-protocols is new enough to carry it (1.44 is
+    /// not). Without the file the rows are still checked against their
+    /// own signatures.
+    #[test]
+    fn the_background_effect_tables_match_the_installed_xml() {
+        assert_rows_match_their_signatures(background_effect_spec());
+        let path = "/usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        assert_tables_match(&xml, background_effect_spec());
+        assert!(
+            xml.contains("<entry name=\"blur\" value=\"1\""),
+            "the blur is capability 1"
+        );
+    }
+
+    /// The KDE blur tables against their own XML, where
+    /// plasma-wayland-protocols is installed.
+    #[test]
+    fn the_kde_blur_tables_match_the_installed_xml() {
+        assert_rows_match_their_signatures(kde_blur_spec());
+        let path = "/usr/share/plasma-wayland-protocols/blur.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        assert_tables_match(&xml, kde_blur_spec());
+    }
+
+    /// A window with square corners is blurred behind one rect: itself.
+    #[test]
+    fn a_square_window_is_blurred_behind_one_rect() {
+        assert_eq!(blur_rects(640, 480, 0.0), vec![(0, 0, 640, 480)]);
+        assert_eq!(blur_rects(640, 480, -3.0), vec![(0, 0, 640, 480)], "no radius under zero");
+        assert!(blur_rects(0, 480, 8.0).is_empty(), "no window, no blur");
+        assert!(blur_rects(640, -1, 8.0).is_empty());
+    }
+
+    /// The strips of a rounded window cover every row once, each one
+    /// centred, narrowest at the edge and whole where the corner ends.
+    #[test]
+    fn a_rounded_window_is_blurred_behind_strips_that_follow_its_corners() {
+        let (width, height) = (100, 60);
+        let rects = blur_rects(width, height, 8.0);
+        let mut next_row = 0;
+        for &(x, y, w, h) in &rects {
+            assert_eq!(y, next_row, "the strips stack with no gap and no overlap");
+            assert!(w > 0 && h > 0);
+            assert_eq!(x * 2 + w, width, "each strip is centred");
+            next_row = y + h;
+        }
+        assert_eq!(next_row, height, "every row is covered");
+        assert_eq!(rects.first(), Some(&(5, 0, 90, 1)), "the first row starts where the curve does");
+        assert_eq!(rects.last(), Some(&(5, 59, 90, 1)), "and the last row mirrors it");
+        assert!(rects.contains(&(0, 5, 100, 50)), "the rows between the corners are one rect: {rects:?}");
+        // rows of one width are one rect: nine rects for sixty rows
+        assert_eq!(rects.len(), 9, "{rects:?}");
+    }
+
+    /// The region is the shape the corner mask leaves visible: a pixel
+    /// is blurred behind exactly where the mask keeps half of it or more.
+    #[test]
+    fn the_blur_follows_the_corner_the_mask_cuts() {
+        for (width, height, radius) in [(64usize, 40usize, 8.0), (61, 33, 16.0), (40, 24, 24.0), (9, 7, 8.0)] {
+            let mut solid = vec![255u8; width * height * 4];
+            mask_corners(solid.as_mut_ptr(), width, height, radius);
+            let rects = blur_rects(width as i32, height as i32, radius);
+            for y in 0..height {
+                for x in 0..width {
+                    let visible = solid[(y * width + x) * 4 + 3] >= 128;
+                    let blurred = rects.iter().any(|&(rx, ry, rw, rh)| {
+                        (rx..rx + rw).contains(&(x as i32)) && (ry..ry + rh).contains(&(y as i32))
+                    });
+                    assert_eq!(blurred, visible, "{width}x{height} r{radius}: pixel ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    /// The mask multiplies the alpha a pixel has. A pixel of a
+    /// translucent window stays translucent where the corner does not
+    /// reach and fades from its own alpha where it does; a solid pixel
+    /// ends at the coverage itself, the byte the mask always wrote.
+    #[test]
+    fn the_mask_keeps_a_translucent_pixel_translucent_and_a_solid_one_as_it_was() {
+        let (width, height, radius) = (32usize, 32usize, 8.0);
+        let pixel = |map: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let at = (y * width + x) * 4;
+            [map[at], map[at + 1], map[at + 2], map[at + 3]]
+        };
+        // premultiplied half-strength white, as a translucent frame holds it
+        let mut veil = [128u8, 128, 128, 128].repeat(width * height);
+        mask_corners(veil.as_mut_ptr(), width, height, radius);
+        assert_eq!(pixel(&veil, 16, 16), [128; 4], "the middle of the window is untouched");
+        assert_eq!(pixel(&veil, 7, 7), [128; 4], "and so is a pixel inside the curve");
+        assert_eq!(pixel(&veil, 0, 0), [0; 4], "outside the curve nothing is left");
+        let mut solid = [200u8, 100, 50, 255].repeat(width * height);
+        mask_corners(solid.as_mut_ptr(), width, height, radius);
+        assert_eq!(pixel(&solid, 16, 16), [200, 100, 50, 255], "a solid pixel stays as it was");
+        // on the curve: the coverage is the solid pixel's alpha, and the
+        // translucent pixel keeps its own alpha times that coverage
+        let mut edges = 0;
+        for y in 0..8 {
+            for x in 0..8 {
+                let coverage = u32::from(pixel(&solid, x, y)[3]);
+                let faded = pixel(&veil, x, y);
+                assert_eq!(u32::from(faded[3]), 128 * coverage / 255, "alpha at ({x}, {y})");
+                assert_eq!(faded[0], faded[3], "still premultiplied at ({x}, {y})");
+                assert_eq!(u32::from(pixel(&solid, x, y)[0]), 200 * coverage / 255);
+                edges += usize::from(coverage > 0 && coverage < 255);
+            }
+        }
+        assert!(edges > 4, "the curve has soft pixels: {edges}");
+    }
+
+    /// The backing is retained and the mask multiplies in place: a
+    /// corner the damage did not rewrite is copied from the frame again
+    /// before it is rounded, so a second present leaves the bytes of the
+    /// first. Rounded twice over its own result, the soft edge darkens.
+    #[test]
+    fn a_corner_presented_twice_is_rounded_once() {
+        let (width, height, radius) = (40usize, 30usize, 8.0);
+        let frame = [50u8, 100, 200, 255].repeat(width * height);
+        for keep_alpha in [false, true] {
+            let mut backing = vec![0u8; width * height * 4];
+            copy_box(backing.as_mut_ptr(), &frame, width, (0, 0, width, height), keep_alpha);
+            round_corners(backing.as_mut_ptr(), &frame, width, height, radius, keep_alpha);
+            let first = backing.clone();
+            // a present whose damage is elsewhere: the corners are not rewritten
+            round_corners(backing.as_mut_ptr(), &frame, width, height, radius, keep_alpha);
+            assert!(backing == first, "the second present changed a corner");
+            // what the old order did: the mask alone, over its own result
+            mask_corners(backing.as_mut_ptr(), width, height, radius);
+            assert!(backing != first, "the mask alone is not idempotent — the reason for the copy");
+        }
+    }
+
+    /// The copy keeps the alpha of a translucent frame and writes every
+    /// other frame solid, in the shm byte order: B, G, R, then A or X.
+    #[test]
+    fn a_translucent_frame_keeps_its_alpha_in_the_buffer() {
+        let frame = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let mut backing = [0u8; 8];
+        copy_box(backing.as_mut_ptr(), &frame, 2, (0, 0, 2, 1), true);
+        assert_eq!(backing, [30, 20, 10, 40, 70, 60, 50, 80]);
+        copy_box(backing.as_mut_ptr(), &frame, 2, (0, 0, 2, 1), false);
+        assert_eq!(backing, [30, 20, 10, 255, 70, 60, 50, 255]);
+        // a box inside the frame touches nothing outside it
+        let mut backing = [9u8; 8];
+        copy_box(backing.as_mut_ptr(), &frame, 2, (1, 0, 1, 1), true);
+        assert_eq!(backing, [9, 9, 9, 9, 70, 60, 50, 80]);
     }
 
     #[test]

@@ -17,6 +17,7 @@ fn buffer_scale_reset_reaches_the_wayland_wire() {
                 resizable: true,
                 minimizable: true,
                 min: None,
+                background: bunny_ui::window::WindowBackground::Opaque,
             },
         );
         let window = handle.window;

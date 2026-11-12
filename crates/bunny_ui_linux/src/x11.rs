@@ -32,6 +32,8 @@ use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
+use bunny_ui::window::WindowBackground;
+
 use crate::ffi::{
     close, deliver_key, dispatch, key_road, pipe2, poll, read, AppEvent, ClickClock, Cursor,
     Keyboard, PollFd, O_CLOEXEC, O_NONBLOCK, POLLIN,
@@ -213,6 +215,12 @@ unsafe extern "C" {
         selection: u32,
         time: u32,
     ) -> Cookie;
+    fn xcb_get_selection_owner(connection: *mut Connection, selection: u32) -> Cookie;
+    fn xcb_get_selection_owner_reply(
+        connection: *mut Connection,
+        cookie: Cookie,
+        error: *mut *mut GenericEvent,
+    ) -> *mut GetSelectionOwnerReply;
     fn xcb_convert_selection(
         connection: *mut Connection,
         requestor: u32,
@@ -510,6 +518,17 @@ struct InternAtomReply {
     atom: u32,
 }
 
+/// `xcb_get_selection_owner_reply_t` — per xproto.h: the owner's
+/// window, or 0 when nobody owns the selection.
+#[repr(C)]
+struct GetSelectionOwnerReply {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    length: u32,
+    owner: u32,
+}
+
 #[repr(C)]
 struct GetPropertyReply {
     response_type: u8,
@@ -733,6 +752,7 @@ const EVENT_MASK_FOCUS_CHANGE: u32 = 0x0020_0000;
 const EVENT_MASK_PROPERTY_CHANGE: u32 = 0x0040_0000;
 const IMAGE_FORMAT_Z_PIXMAP: u8 = 2;
 const ATOM_ATOM: u32 = 4;
+const ATOM_CARDINAL: u32 = 6;
 const ATOM_STRING: u32 = 31;
 const ATOM_WM_NAME: u32 = 39;
 const ATOM_WM_CLASS: u32 = 67;
@@ -803,9 +823,15 @@ pub(crate) struct Atoms {
     /// `create_dialog` for why not `DIALOG`).
     pub(crate) net_wm_window_type: u32,
     pub(crate) net_wm_window_type_normal: u32,
+    /// The selection a compositing manager owns on the first screen
+    /// while it runs: only then is a window's alpha composited.
+    pub(crate) net_wm_cm_s0: u32,
+    /// KDE's blur behind a window: a property the compositor announces
+    /// on the root while it can blur, and the region a window asks for.
+    pub(crate) kde_blur_behind_region: u32,
 }
 
-const ATOM_NAMES: [&CStr; 17] = [
+const ATOM_NAMES: [&CStr; 19] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -823,6 +849,8 @@ const ATOM_NAMES: [&CStr; 17] = [
     c"_NET_WM_WINDOW_TYPE",
     c"_NET_WM_WINDOW_TYPE_NORMAL",
     c"_NET_ACTIVE_WINDOW",
+    c"_NET_WM_CM_S0",
+    c"_KDE_NET_WM_BLUR_BEHIND_REGION",
 ];
 
 use std::ffi::CStr;
@@ -862,6 +890,8 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         wm_change_state: atoms[13],
         net_wm_window_type: atoms[14],
         net_wm_window_type_normal: atoms[15],
+        net_wm_cm_s0: atoms[17],
+        kde_blur_behind_region: atoms[18],
     }
 }
 
@@ -937,6 +967,9 @@ struct Window {
     /// honour them, and the hints told the window manager.
     resizable: bool,
     minimizable: bool,
+    /// The background the window was given: what the server and its
+    /// compositing manager serve of the spec's ask.
+    background: WindowBackground,
 }
 
 pub(crate) struct XClient {
@@ -1682,6 +1715,117 @@ fn read_scale(client: &mut XClient) -> usize {
     }
 }
 
+// MARK: - The background (what shows where the scene paints nothing)
+
+/// Whether a compositing manager runs: it owns the `_NET_WM_CM_S0`
+/// selection while it does. Without one the server shows a 32-bit
+/// window's colour and drops its alpha.
+fn composited(client: &XClient) -> bool {
+    if client.atoms.net_wm_cm_s0 == 0 {
+        return false;
+    }
+    unsafe {
+        let cookie = xcb_get_selection_owner(client.connection, client.atoms.net_wm_cm_s0);
+        let reply =
+            xcb_get_selection_owner_reply(client.connection, cookie, std::ptr::null_mut());
+        if reply.is_null() {
+            return false;
+        }
+        let owner = (*reply).owner;
+        free(reply.cast());
+        owner != 0
+    }
+}
+
+/// Whether the compositor can blur what is behind a window: KWin
+/// announces it by a `_KDE_NET_WM_BLUR_BEHIND_REGION` property on the
+/// root while its blur is on, which is the test KDE's own clients make.
+fn blur_offered(client: &XClient) -> bool {
+    if client.atoms.kde_blur_behind_region == 0 {
+        return false;
+    }
+    unsafe {
+        // zero words of any type: the reply names the property's type,
+        // and no type is no property
+        let cookie = xcb_get_property(
+            client.connection,
+            0,
+            client.root,
+            client.atoms.kde_blur_behind_region,
+            0,
+            0,
+            0,
+        );
+        let reply = xcb_get_property_reply(client.connection, cookie, std::ptr::null_mut());
+        if reply.is_null() {
+            return false;
+        }
+        let announced = (*reply).kind != 0;
+        free(reply.cast());
+        announced
+    }
+}
+
+/// What this server serves of an ask: the alpha needs the 32-bit visual
+/// AND a compositing manager to read it; the blur needs KWin's.
+fn resolve_background(client: &XClient, asked: WindowBackground) -> WindowBackground {
+    if asked == WindowBackground::Opaque {
+        return asked;
+    }
+    asked.resolve(client.argb.is_some() && composited(client), blur_offered(client))
+}
+
+/// The background this server serves for an ask, before a window
+/// exists — the door's half of [`crate::ffi::serve_background`].
+pub(crate) fn serve_background(asked: WindowBackground) -> WindowBackground {
+    if X_CLIENT.with(|slot| slot.borrow().is_none()) {
+        connect();
+    }
+    with_x(|client| resolve_background(client, asked))
+}
+
+/// The background an open window was given.
+pub(crate) fn window_background(window: u32) -> Option<WindowBackground> {
+    with_x(|client| window_ref(client, window).map(|win| win.background))
+}
+
+/// The words of `_KDE_NET_WM_BLUR_BEHIND_REGION` for a window of this
+/// size in device pixels: x, y, width and height of each rect the blur
+/// lies behind. A scene window rounds its corners, and the rects follow
+/// them ([`crate::ffi::blur_rects`]).
+fn blur_region_words(width: u32, height: u32, scene: bool, scale: usize) -> Vec<u32> {
+    let radius = if scene { 8.0 * scale as f64 } else { 0.0 };
+    crate::ffi::blur_rects(width as i32, height as i32, radius)
+        .into_iter()
+        .flat_map(|(x, y, w, h)| [x as u32, y as u32, w as u32, h as u32])
+        .collect()
+}
+
+/// Writes the blur region of a blurred window: at its birth, and again
+/// when its size moves.
+unsafe fn write_blur_region(
+    connection: *mut Connection,
+    property: u32,
+    window: u32,
+    size: (u32, u32),
+    scene: bool,
+    scale: usize,
+) {
+    let words = blur_region_words(size.0, size.1, scene, scale);
+    unsafe {
+        xcb_change_property(
+            connection,
+            PROP_MODE_REPLACE,
+            window,
+            property,
+            ATOM_CARDINAL,
+            32,
+            words.len() as u32,
+            words.as_ptr().cast(),
+        );
+    }
+}
+
 // MARK: - Window
 
 pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate::ffi::WindowOptions) -> u32 {
@@ -1692,6 +1836,7 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
     with_x(|client| {
         let scale = read_scale(client);
         let physical = ((width * scale as f64) as u16, (height * scale as f64) as u16);
+        let background = resolve_background(client, options.background);
         unsafe {
             let id = xcb_generate_id(client.connection);
             // anti-flash: the background pixel IS the canvas — a map
@@ -1713,9 +1858,11 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
             const CW_COLORMAP: u32 = 0x2000;
             // the scene rounds its corners — it needs the ARGB ground
             // (with the border-pixel/colormap pair a foreign depth
-            // demands); everything else stays on the root visual
-            let scene_ground = scene.then_some(client.argb).flatten();
-            let (depth, visual, mask, values): (u8, u32, u32, Vec<u32>) = match scene_ground {
+            // demands), and so does a window the compositing manager
+            // reads by its alpha; everything else stays on the root visual
+            let alpha_ground =
+                (scene || background.is_translucent()).then_some(client.argb).flatten();
+            let (depth, visual, mask, values): (u8, u32, u32, Vec<u32>) = match alpha_ground {
                 Some((depth, visual, colormap)) => (
                     depth,
                     visual,
@@ -1845,6 +1992,17 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 class.len() as u32,
                 class.as_ptr().cast(),
             );
+            if background == WindowBackground::Blurred {
+                // the blur behind the window, asked before it is mapped
+                write_blur_region(
+                    client.connection,
+                    client.atoms.kde_blur_behind_region,
+                    id,
+                    (physical.0.max(1) as u32, physical.1.max(1) as u32),
+                    scene,
+                    scale,
+                );
+            }
             xcb_flush(client.connection);
             client.windows.push(Window {
                 id,
@@ -1861,6 +2019,7 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 maximized: false,
                 resizable: options.resizable,
                 minimizable: options.minimizable,
+                background,
             });
             id
         }
@@ -1980,29 +2139,27 @@ pub(crate) fn present_rows(
         let argb = client.argb.is_some();
         let win = window_at(client, window).expect("window for the present");
         let depth = win.depth;
+        // a translucent window presents premultiplied pixels, and their
+        // alpha goes into the image with them
+        let keep_alpha = win.background.is_translucent();
         let backing = win.backing.as_ref().expect("backing for the present");
         for &rect in damage {
-            let Some((x, y, w, h)) = clamp_rect(rect, width, height) else { continue };
-            for row in y..y + h {
-                let start = (row * width + x) * 4;
-                let source = &rgba[start..start + w * 4];
-                let target = unsafe {
-                    std::slice::from_raw_parts_mut(backing.map.add(start), w * 4)
-                };
-                for (source_px, target_px) in
-                    source.chunks_exact(4).zip(target.chunks_exact_mut(4))
-                {
-                    target_px[0] = source_px[2];
-                    target_px[1] = source_px[1];
-                    target_px[2] = source_px[0];
-                    target_px[3] = 0xFF;
-                }
-            }
+            let Some(rect) = clamp_rect(rect, width, height) else { continue };
+            crate::ffi::copy_box(backing.map, rgba, width, rect, keep_alpha);
         }
         // the scene's corners round through the same premultiplied
-        // mask the wayland door wears — only on the ARGB ground
+        // mask the wayland door wears — only on the ARGB ground. Each
+        // corner is copied from the frame again first: the mask
+        // multiplies in place, and the image is retained
         if win.scene && argb {
-            crate::ffi::mask_corners(backing.map, width, height, 8.0 * win.scale as f64);
+            crate::ffi::round_corners(
+                backing.map,
+                rgba,
+                width,
+                height,
+                8.0 * win.scale as f64,
+                keep_alpha,
+            );
         }
         for &rect in damage {
             let Some((x, y, w, h)) = clamp_rect(rect, width, height) else { continue };
@@ -3011,6 +3168,7 @@ pub(crate) fn gpu_targets(window: u32) -> Option<crate::ffi::GpuTargets> {
             connection: client.connection.cast(),
             window: win.id,
             scene: win.scene,
+            translucent: win.background.is_translucent(),
         })
     })
 }
@@ -3168,6 +3326,8 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 };
             }
             let resized = with_x(|client| {
+                let connection = client.connection;
+                let property = client.atoms.kde_blur_behind_region;
                 let Some(win) = window_at(client, window) else { return false };
                 let logical = (
                     width as f64 / win.scale as f64,
@@ -3175,6 +3335,20 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 );
                 if logical != win.logical && width > 0 && height > 0 {
                     win.logical = logical;
+                    if win.background == WindowBackground::Blurred {
+                        // the blur follows the window to its new size
+                        unsafe {
+                            write_blur_region(
+                                connection,
+                                property,
+                                win.id,
+                                (width as u32, height as u32),
+                                win.scene,
+                                win.scale,
+                            );
+                            xcb_flush(connection);
+                        }
+                    }
                     true
                 } else {
                     false
@@ -3900,5 +4074,24 @@ mod tests {
         assert_eq!(clamp_rect((90, 90, 200, 200), 100, 100), Some((90, 90, 10, 10)));
         assert_eq!(clamp_rect((50, 50, 50, 50), 100, 100), None, "empty is nothing");
         assert_eq!(clamp_rect((200, 0, 300, 10), 100, 100), None, "outside is nothing");
+    }
+
+    /// The blur property is rects of four words each, in device pixels:
+    /// the whole window under the manager's frame, and strips that
+    /// follow the 8-point corner, at the window's scale, for a scene.
+    #[test]
+    fn the_blur_property_holds_its_rects_in_device_pixels() {
+        assert_eq!(blur_region_words(800, 600, false, 2), vec![0, 0, 800, 600]);
+        let words = blur_region_words(800, 600, true, 2);
+        let rects = crate::ffi::blur_rects(800, 600, 16.0);
+        assert_eq!(words.len(), rects.len() * 4, "four words a rect");
+        assert_eq!(&words[..4], &[12, 0, 776, 1], "the first row starts where a 16-pixel curve does");
+        assert!(words.chunks_exact(4).any(|rect| rect == [0, 12, 800, 576]), "{words:?}");
+    }
+
+    #[test]
+    fn the_selection_owner_reply_holds_its_layout() {
+        assert_eq!(std::mem::size_of::<GetSelectionOwnerReply>(), 12);
+        assert_eq!(std::mem::offset_of!(GetSelectionOwnerReply, owner), 8);
     }
 }
