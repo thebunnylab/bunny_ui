@@ -210,6 +210,9 @@ const GL_DEPTH_TEST: GlEnum = 0x0B71;
 const GL_CULL_FACE: GlEnum = 0x0B44;
 const GL_SRC_ALPHA: GlEnum = 0x0302;
 const GL_ONE_MINUS_SRC_ALPHA: GlEnum = 0x0303;
+/// The alpha of a fragment's SECOND output, as a blend factor: core
+/// since 3.3, and what a pane's blend takes its alpha from.
+const GL_SRC1_ALPHA: GlEnum = 0x8589;
 const GL_ONE: GlEnum = 1;
 const GL_ZERO: GlEnum = 0;
 const GL_TRIANGLES: GlEnum = 0x0004;
@@ -514,6 +517,49 @@ use bunny_ui::gpu::shaders::{
 };
 use bunny_ui::image_engine::PixelFormat;
 
+// MARK: - The pane's fragment (the shared body, with a second output)
+
+// The glass body is one text for this tier and for the browser's, and
+// the browser has no second output to blend with: the shared body
+// writes ONE colour, straight, for the house blend. A pane on this tier
+// takes the place of what it covers (`GlStack::draw_glass`), and for
+// that its fragment says two things: the pixel with the coverage in its
+// alpha, and how solid that pixel is. The two lines that differ are
+// rewritten here, by text, when the program is built. A body that no
+// longer holds one of them refuses the pipeline instead of compiling
+// the old fragment under the new blend.
+
+/// The one output the shared glass body declares.
+const SHARED_PANE_OUT: &str = "out vec4 out_color;\n";
+/// The two a pane declares on this tier: one colour attachment, two
+/// sources for its blend.
+const PANE_OUT: &str = "layout(location = 0, index = 0) out vec4 out_color;\n\
+layout(location = 0, index = 1) out vec4 out_solid;\n";
+/// What the shared body writes: straight alpha, for the house blend.
+const SHARED_PANE_WRITE: &str =
+    "out_color = vec4(color.rgb, color.a * coverage * v_opacity * clip_cov(p));";
+/// What a pane writes on this tier: the colour lands by the coverage,
+/// and the alpha that lands is the pixel's own.
+const PANE_WRITE: &str = "out_color = vec4(color.rgb, coverage * v_opacity * clip_cov(p));\n    \
+out_solid = vec4(0.0, 0.0, 0.0, color.a);";
+
+/// The glass fragment this tier compiles: `body` (the shared
+/// `GLASS_FRAG_BODY`) with the output a pane's blend reads added.
+/// `Err` names the text that is gone when the body has changed under
+/// the rewrite.
+fn pane_fragment(body: &str) -> Result<String, String> {
+    let mut source = body.to_owned();
+    for (shared, pane) in [(SHARED_PANE_OUT, PANE_OUT), (SHARED_PANE_WRITE, PANE_WRITE)] {
+        if body.matches(shared).count() != 1 {
+            return Err(format!(
+                "the shared glass body does not hold `{}` exactly once",
+                shared.trim_end()
+            ));
+        }
+        source = source.replacen(shared, pane, 1);
+    }
+    Ok(source)
+}
 
 // MARK: - The stack (display, context, pipelines, fixed state)
 
@@ -857,10 +903,12 @@ impl GlStack {
             .map_err(|log| format!("mask pipeline refused: {}", log.trim()))?;
             (gl.use_program)(self.mask_program);
             self.mask_quad = (gl.get_uniform_location)(self.mask_program, c"u_quad".as_ptr());
+            let pane_frag = pane_fragment(GLASS_FRAG_BODY)
+                .map_err(|reason| format!("glass pipeline refused: {reason}"))?;
             self.glass_program = build_program(
                 gl,
                 &[SHADER_PRELUDE, GLASS_VERT],
-                &[SHADER_PRELUDE, SHARED_FRAG, GLASS_FRAG_BODY],
+                &[SHADER_PRELUDE, SHARED_FRAG, &pane_frag],
                 &[
                     c"a_rect",
                     c"a_clip",
@@ -1240,7 +1288,29 @@ impl GlStack {
             glass_attribs(gl, run.base as usize * std::mem::size_of::<GlassInstance>());
             (gl.active_texture)(GL_TEXTURE0);
             (gl.bind_texture)(GL_TEXTURE_2D, targets.ping);
+            // the pane's own blend. The scene a pane reads may not be
+            // solid, on a target the system composites by its own alpha,
+            // and the pixel it answers is then premultiplied with an
+            // alpha of its own: it takes the PLACE of what the pane
+            // covers, the raster's `Bitmap::set_replaced`. The colour
+            // lands by the coverage in the first output's alpha, and the
+            // alpha that lands is the second output's:
+            // rgb = s·t + d·(1−t); a = sa·t + da·(1−t). Over a solid
+            // scene the second alpha is 1 and this is the house blend,
+            // which comes back for the run that follows
+            (gl.blend_func_separate)(
+                GL_SRC_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+                GL_SRC1_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+            );
             (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
+            (gl.blend_func_separate)(
+                GL_SRC_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+                GL_ONE,
+                GL_ONE_MINUS_SRC_ALPHA,
+            );
         }
     }
 
@@ -3911,6 +3981,82 @@ mod tests {
         let centre = (160 * 480 + 240) * 4;
         let apart = gpu[centre].abs_diff(stacked[centre]);
         assert!(apart > 30, "the outer tint is gone from under the pane that shares: {apart}");
+    }
+
+    /// The pane's fragment is the shared glass body with two lines
+    /// rewritten, by text. This is the sentence that says so on a box
+    /// with no context at all: an edit of the shared body that moves one
+    /// of the two lines fails here, before any driver is asked.
+    #[test]
+    fn the_pane_fragment_is_the_shared_body_with_a_second_output() {
+        let source = pane_fragment(GLASS_FRAG_BODY)
+            .expect("the shared glass body holds the two lines the pane's fragment rewrites");
+        assert!(source.contains("layout(location = 0, index = 1) out vec4 out_solid;"));
+        assert!(source.contains("out_solid = vec4(0.0, 0.0, 0.0, color.a);"));
+        assert!(
+            !source.contains("color.a * coverage"),
+            "the first output carries the coverage alone"
+        );
+        // and nothing else moved: the two lines put back are the shared body
+        let back = source.replace(PANE_OUT, SHARED_PANE_OUT).replace(PANE_WRITE, SHARED_PANE_WRITE);
+        assert_eq!(back, GLASS_FRAG_BODY);
+    }
+
+    /// A body that lost one of the two lines refuses the pipeline by
+    /// name, where a silent pass would compile the old fragment under
+    /// the pane's blend.
+    #[test]
+    fn a_shared_body_that_moved_refuses_the_pane_fragment() {
+        let moved = GLASS_FRAG_BODY.replace("color.a * coverage", "coverage * color.a");
+        let refusal = pane_fragment(&moved).expect_err("the write is gone");
+        assert!(refusal.contains("out_color = vec4(color.rgb"), "the refusal names the line: {refusal}");
+        let doubled = format!("{GLASS_FRAG_BODY}{SHARED_PANE_OUT}");
+        assert!(pane_fragment(&doubled).is_err(), "an output declared twice is not the body it knew");
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on this tier by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        // llvmpipe answers within 8, with 8.3% of channels beyond one
+        // step; under the house blend the same scene is 89 apart
+        let (worst, share) = glass_gate((6, 0.02), (11, 0.11));
+        assert_glass_close(&gpu, &cpu, worst, share, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(
+            gpu[end].abs_diff(cpu[end]) <= worst,
+            "and it is the raster's: {} vs {}",
+            gpu[end],
+            cpu[end]
+        );
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]

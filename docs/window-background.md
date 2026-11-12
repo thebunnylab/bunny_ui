@@ -254,11 +254,13 @@ same strength.
   caption tint or its buttons through the scene. The three switches
   that answer it are constants in `apply_backdrop`, all off, and
   `blur_window --scene` is the probe.
-- Only the raster and the Metal tier make a pane of glass take the place
-  of what it covers over a clear ground. On the D3D11, GL and Vulkan
-  tiers a pane there is still laid over the ground, so it is more solid
-  than its tint says and the sharp scene shows faintly through it. A
-  background that replaces is exact on every tier.
+- A pane of glass takes the place of what it covers over a clear ground
+  on the raster and on the Metal, D3D11, GL and Vulkan tiers. Two roads
+  still lay it over the ground, so the pane there is more solid than its
+  tint says and the sharp scene shows faintly through it: the WebGL
+  tier, which has no second source to blend with, and a Vulkan device
+  without `dualSrcBlend`. The D3D11 blend is type-checked and has not
+  run. A background that replaces is exact on every tier.
 - A window that is not opaque costs more to compose on macOS than an
   opaque one, because it gives up the native roads.
 - `Blurred` where the system has no blur is `Opaque`: Windows 10, a

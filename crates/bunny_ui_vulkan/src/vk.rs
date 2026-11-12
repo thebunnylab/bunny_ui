@@ -84,6 +84,9 @@ const MASK_FRAG_SPV: &[u8] = include_bytes!("shaders/mask.frag.spv");
 // offscreen scene onto the target a frame with glass cannot draw into
 const GLASS_VERT_SPV: &[u8] = include_bytes!("shaders/glass.vert.spv");
 const GLASS_FRAG_SPV: &[u8] = include_bytes!("shaders/glass.frag.spv");
+// the same source baked with `-DPANE`: the pane's fragment with the
+// second output its own blend reads (`VkStack::pane_blend`)
+const GLASS_PANE_FRAG_SPV: &[u8] = include_bytes!("shaders/glass_pane.frag.spv");
 const FULL_VERT_SPV: &[u8] = include_bytes!("shaders/full.vert.spv");
 const BLUR_FRAG_SPV: &[u8] = include_bytes!("shaders/blur.frag.spv");
 const BLIT_FRAG_SPV: &[u8] = include_bytes!("shaders/blit.frag.spv");
@@ -248,6 +251,10 @@ const BLEND_FACTOR_ZERO: u32 = 0;
 const BLEND_FACTOR_ONE: u32 = 1;
 const BLEND_FACTOR_SRC_ALPHA: u32 = 6;
 const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
+/// `VK_BLEND_FACTOR_SRC1_ALPHA`: the alpha of a fragment's second
+/// output. A pipeline names it only on a device created with
+/// `dualSrcBlend`.
+const BLEND_FACTOR_SRC1_ALPHA: u32 = 17;
 const BLEND_OP_ADD: u32 = 0;
 
 const VERTEX_INPUT_RATE_INSTANCE: u32 = 1;
@@ -1035,6 +1042,18 @@ const _: () = {
     assert!(std::mem::offset_of!(PhysicalDeviceProperties, sparse) == 800);
 };
 
+/// `VkPhysicalDeviceFeatures`: fifty-five `VkBool32` in header order,
+/// what a device can do on the way in and what it is asked to do on the
+/// way out. The tier names one of them.
+#[repr(C)]
+struct PhysicalDeviceFeatures([u32; 55]);
+
+/// `dualSrcBlend`, the eighth member: a blend may take a factor from a
+/// fragment's second output.
+const FEATURE_DUAL_SRC_BLEND: usize = 7;
+
+const _: () = assert!(std::mem::size_of::<PhysicalDeviceFeatures>() == 220);
+
 // MARK: - The function table (one resolve through GetInstanceProcAddr)
 
 type GipaFn = unsafe extern "C" fn(Instance, *const c_char) -> *mut c_void;
@@ -1113,6 +1132,11 @@ struct VkFns {
         unsafe extern "C" fn(Instance, *mut u32, *mut PhysicalDevice) -> VkResult,
     get_physical_device_properties:
         unsafe extern "C" fn(PhysicalDevice, *mut PhysicalDeviceProperties),
+    /// Asked only for a target that may stand on a clear ground, which
+    /// wants `dualSrcBlend` for its panes. No other target calls it, so
+    /// a loader that did not answer the name refuses nothing.
+    get_physical_device_features:
+        Option<unsafe extern "C" fn(PhysicalDevice, *mut PhysicalDeviceFeatures)>,
     get_queue_family_properties:
         unsafe extern "C" fn(PhysicalDevice, *mut u32, *mut QueueFamilyProperties),
     get_memory_properties:
@@ -1329,6 +1353,12 @@ fn resolve_fns(gipa: GipaFn, instance: Instance) -> Option<VkFns> {
         destroy_instance: vk!(c"vkDestroyInstance"),
         enumerate_physical_devices: vk!(c"vkEnumeratePhysicalDevices"),
         get_physical_device_properties: vk!(c"vkGetPhysicalDeviceProperties"),
+        get_physical_device_features: sym(c"vkGetPhysicalDeviceFeatures").map(|address| unsafe {
+            std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(PhysicalDevice, *mut PhysicalDeviceFeatures),
+            >(address)
+        }),
         get_queue_family_properties: vk!(c"vkGetPhysicalDeviceQueueFamilyProperties"),
         get_memory_properties: vk!(c"vkGetPhysicalDeviceMemoryProperties"),
         create_device: vk!(c"vkCreateDevice"),
@@ -1571,6 +1601,13 @@ struct VkStack {
     /// One level of the blur pyramid.
     pyramid_pass: RenderPass,
     glass_pipeline: Pipeline,
+    /// The glass pipeline is the pane's own: its fragment writes a second
+    /// output and its blend takes the alpha from it, so a pane over a
+    /// ground that is not solid takes the place of what it covers. True
+    /// only for a target that may stand on a clear ground, on a device
+    /// with `dualSrcBlend`. Everywhere else the pipeline is the one the
+    /// tier always built, under the house blend.
+    pane_blend: bool,
     blur_pipeline: Pipeline,
     blit_pipeline: Pipeline,
 }
@@ -1587,10 +1624,18 @@ fn find_memory_type(
 }
 
 impl VkStack {
-    /// `erase` asks for the erase pipeline too: a target with a clear
-    /// ground draws its knockouts with it.
-    fn create(target: VkTarget, source: Option<SurfaceSource>, erase: bool) -> Option<VkStack> {
-        let result = Self::build(target, source, erase);
+    /// `clear_ground` says the target may stand on a ground that is not
+    /// solid: a window the system composites by its own alpha, or the
+    /// offscreen harness. It asks for the erase pipeline, which draws
+    /// the knockouts of such a target, and for the pane's own blend
+    /// where the device has `dualSrcBlend`. A target without it builds
+    /// the pipelines, and creates the device, the tier always did.
+    fn create(
+        target: VkTarget,
+        source: Option<SurfaceSource>,
+        clear_ground: bool,
+    ) -> Option<VkStack> {
+        let result = Self::build(target, source, clear_ground);
         if let Err(reason) = &result {
             eprintln!("bunny_ui vk: {reason} — stepping down the ladder");
         }
@@ -1600,7 +1645,7 @@ impl VkStack {
     fn build(
         target: VkTarget,
         source: Option<SurfaceSource>,
-        erase: bool,
+        clear_ground: bool,
     ) -> Result<VkStack, String> {
         let (gipa, create_instance) = loader().ok_or("no libvulkan on this system")?;
         unsafe {
@@ -1739,6 +1784,22 @@ impl VkStack {
                 VkTarget::Offscreen => vec![],
                 _ => vec![c"VK_KHR_swapchain".as_ptr()],
             };
+            // A pane over a clear ground takes a blend that reads the
+            // fragment's second output, and Vulkan gives that only to a
+            // device created with `dualSrcBlend`. It is asked of the
+            // device, and enabled, for a target that may stand on a clear
+            // ground and for no other: every other target creates its
+            // device with no feature at all, as it always did. A device
+            // that does not have it still shows the window, with its
+            // panes under the house blend (`build_pipelines`)
+            let pane_blend = clear_ground
+                && fns.get_physical_device_features.is_some_and(|features_of| {
+                    let mut features = PhysicalDeviceFeatures([0; 55]);
+                    features_of(physical, &mut features);
+                    features.0[FEATURE_DUAL_SRC_BLEND] != 0
+                });
+            let mut enabled = PhysicalDeviceFeatures([0; 55]);
+            enabled.0[FEATURE_DUAL_SRC_BLEND] = 1;
             let device_info = DeviceCreateInfo {
                 s_type: ST_DEVICE_CREATE,
                 p_next: std::ptr::null(),
@@ -1753,7 +1814,11 @@ impl VkStack {
                 } else {
                     device_extensions.as_ptr()
                 },
-                features: std::ptr::null(),
+                features: if pane_blend {
+                    std::ptr::from_ref(&enabled).cast()
+                } else {
+                    std::ptr::null()
+                },
             };
             let mut device: Device = std::ptr::null_mut();
             if !ok((fns.create_device)(physical, &device_info, std::ptr::null(), &mut device)) {
@@ -2031,10 +2096,11 @@ impl VkStack {
                 scene_pass,
                 pyramid_pass,
                 glass_pipeline: 0,
+                pane_blend,
                 blur_pipeline: 0,
                 blit_pipeline: 0,
             };
-            stack.build_pipelines(erase)?;
+            stack.build_pipelines(clear_ground)?;
             Ok(stack)
         }
     }
@@ -2209,6 +2275,8 @@ impl VkStack {
         Ok(pipeline)
     }
 
+    /// `erase` asks for the erase pipeline too; the glass pipeline is the
+    /// pane's own where [`VkStack::pane_blend`] says so.
     fn build_pipelines(&mut self, erase: bool) -> Result<(), String> {
         // gamma-space source-over with straight alpha — the blend_px law
         let source_over = ColorBlendAttachment {
@@ -2304,8 +2372,30 @@ impl VkStack {
         // a pass that covers its whole destination has nothing to blend
         // with: the blur and the blit REPLACE what they write
         let replace = ColorBlendAttachment { blend_enable: 0, ..source_over };
+        // A pane takes the PLACE of what it covers. The scene it reads
+        // may not be solid, on a target the system composites by its own
+        // alpha, and the pixel it answers is then premultiplied with an
+        // alpha of its own: the colour lands by the coverage in the first
+        // output's alpha, and the alpha that lands is the second
+        // output's, the raster's `Bitmap::set_replaced`:
+        // rgb = s·t + d·(1−t); a = sa·t + da·(1−t). Over a solid scene
+        // the second alpha is 1 and this is source-over.
+        //
+        // It stands only where `pane_blend` does. A translucent window on
+        // a device with no `dualSrcBlend` keeps the fragment with one
+        // output and the house blend: its panes are laid OVER a clear
+        // ground, an approximate picture that adds the pane's alpha to
+        // the ground's a second time. The window is shown that way
+        // instead of being refused. An opaque window, and every window
+        // of the Android shell, builds that same pipeline because it
+        // always did, and over its solid scene the two are one picture.
+        let pane = ColorBlendAttachment { src_alpha: BLEND_FACTOR_SRC1_ALPHA, ..source_over };
         let glass_vert = self.shader(GLASS_VERT_SPV)?;
-        let glass_frag = self.shader(GLASS_FRAG_SPV)?;
+        let (glass_frag, glass_blend) = if self.pane_blend {
+            (self.shader(GLASS_PANE_FRAG_SPV)?, pane)
+        } else {
+            (self.shader(GLASS_FRAG_SPV)?, source_over)
+        };
         let full_vert = self.shader(FULL_VERT_SPV)?;
         let blur_frag = self.shader(BLUR_FRAG_SPV)?;
         let blit_frag = self.shader(BLIT_FRAG_SPV)?;
@@ -2356,7 +2446,7 @@ impl VkStack {
             glass_frag,
             &[glass_binding],
             &glass_attributes,
-            source_over,
+            glass_blend,
             self.scene_pass,
         )?;
         self.blur_pipeline =
@@ -4568,7 +4658,10 @@ impl VkPresenter {
     /// background that replaces what is under it takes the paint away
     /// instead of painting the canvas. The house blend does not change:
     /// straight source over a premultiplied destination stays
-    /// premultiplied.
+    /// premultiplied. A pane of glass alone takes a blend of its own on
+    /// such a window, and with it the place of what it covers; that
+    /// blend needs `dualSrcBlend`, and a device without it lays the pane
+    /// over the ground as before.
     ///
     /// `None` also where the surface cannot composite by alpha. The
     /// tier then refuses instead of showing the window opaque, and the
@@ -4767,7 +4860,8 @@ impl OffscreenVk {
         if width == 0 || height == 0 {
             return None;
         }
-        // the harness draws every run a window can make, the erase too
+        // the harness draws every run a window can make: the erase, and
+        // a pane under its own blend where the device has one
         let stack = VkStack::create(VkTarget::Offscreen, None, true)?;
         let (target, target_memory, view) = unsafe {
             let info = ImageCreateInfo {
@@ -5891,6 +5985,22 @@ mod tests {
             return;
         }
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        // one source bakes one blob, or one more per define it is baked with
+        let bake = |source: &str, define: Option<&str>, blob: &str| {
+            let out = std::env::temp_dir().join(format!("bunny-drift-{blob}"));
+            let mut compiler = std::process::Command::new("glslangValidator");
+            compiler.arg("-V");
+            if let Some(define) = define {
+                compiler.arg(format!("-D{define}"));
+            }
+            let status =
+                compiler.arg(base.join(source)).arg("-o").arg(&out).status().expect("the compiler runs");
+            assert!(status.success(), "{source} no longer compiles into {blob}");
+            let fresh = std::fs::read(&out).expect("the baked file exists");
+            let committed = std::fs::read(base.join(blob)).expect("blob");
+            assert_eq!(fresh, committed, "{blob} drifted from its source - re-bake it");
+            let _ = std::fs::remove_file(out);
+        };
         for stage in [
             "rect.vert",
             "rect.frag",
@@ -5917,20 +6027,26 @@ mod tests {
             "world_bloom_up.frag",
             "world_bloom_spill.frag",
         ] {
-            let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));
-            let status = std::process::Command::new("glslangValidator")
-                .arg("-V")
-                .arg(base.join(stage))
-                .arg("-o")
-                .arg(&out)
-                .status()
-                .expect("the compiler runs");
-            assert!(status.success(), "{stage} no longer compiles");
-            let fresh = std::fs::read(&out).expect("the baked file exists");
-            let committed = std::fs::read(base.join(format!("{stage}.spv"))).expect("blob");
-            assert_eq!(fresh, committed, "{stage}.spv drifted from its source - re-bake it");
-            let _ = std::fs::remove_file(out);
+            bake(stage, None, &format!("{stage}.spv"));
         }
+        // the pane's fragment is the glass source again, under its define
+        bake("glass.frag", Some("PANE"), "glass_pane.frag.spv");
+    }
+
+    /// The pane's module is not the other glass fragment under a second
+    /// name: it names the second output, and the other does not. A box
+    /// without the compiler can say this much of the two committed
+    /// blobs; the drift gate says the rest where the compiler is.
+    #[test]
+    fn the_pane_fragment_is_a_module_of_its_own() {
+        for (name, blob) in [("glass.frag.spv", GLASS_FRAG_SPV), ("glass_pane.frag.spv", GLASS_PANE_FRAG_SPV)] {
+            assert_eq!(blob.len() % 4, 0, "{name} is whole words");
+            assert_eq!(&blob[..4], &0x0723_0203u32.to_le_bytes(), "{name} opens with the magic");
+        }
+        assert_ne!(GLASS_FRAG_SPV, GLASS_PANE_FRAG_SPV);
+        // the name of the second output is in the pane's module alone
+        let names = |blob: &[u8]| blob.windows(9).any(|window| window == b"out_solid");
+        assert!(names(GLASS_PANE_FRAG_SPV) && !names(GLASS_FRAG_SPV));
     }
 
     #[test]
@@ -6139,6 +6255,57 @@ mod tests {
         let centre = (160 * 480 + 240) * 4;
         let apart = gpu[centre].abs_diff(stacked[centre]);
         assert!(apart > 30, "the outer tint is gone from under the pane that shares: {apart}");
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on this tier by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once. A
+    /// device with no `dualSrcBlend` keeps the house blend for its panes
+    /// and has no such picture to show, so it skips.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        if !OffscreenVk::new(4, 4).is_some_and(|gpu| gpu.stack.pane_blend) {
+            eprintln!("no dualSrcBlend on this device — skipping");
+            return;
+        }
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        // lavapipe answers within 8, with 8.3% of channels beyond one
+        // step; under the house blend the same scene is 89 apart
+        let (worst, share) = glass_gate((6, 0.02), (11, 0.11));
+        assert_glass_close(&gpu, &cpu, worst, share, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(
+            gpu[end].abs_diff(cpu[end]) <= worst,
+            "and it is the raster's: {} vs {}",
+            gpu[end],
+            cpu[end]
+        );
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]

@@ -31,7 +31,9 @@
 //! on the software rasterizer, and a lost device is rebuilt every time.
 //! The frame of such a target clears to the premultiplied canvas and a
 //! knockout is drawn with an erase blend; the house blend does not
-//! change.
+//! change. A pane of glass has a blend of its own on every target: it
+//! takes the place of what it covers, which over a solid scene is the
+//! house blend and over a clear ground is not.
 //!
 //! The LAW of the port: every policy decision — snapping, radius
 //! clamps, stroke thickness, shadow reach, the clip stack — is resolved
@@ -168,6 +170,9 @@ const BLEND_ZERO: u32 = 1;
 const BLEND_ONE: u32 = 2;
 const BLEND_SRC_ALPHA: u32 = 5;
 const BLEND_INV_SRC_ALPHA: u32 = 6;
+/// `D3D11_BLEND_SRC1_ALPHA`: the alpha of a pixel shader's second
+/// output (`SV_Target1`), from feature level 10.0 up.
+const BLEND_SRC1_ALPHA: u32 = 18;
 const BLEND_OP_ADD: u32 = 1;
 const FILL_SOLID: u32 = 3;
 const CULL_NONE: u32 = 1;
@@ -1400,7 +1405,20 @@ GlassVary glass_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return vary;
 }
 
-float4 glass_fragment(GlassVary vary) : SV_Target {
+// What a pane writes: its pixel, and how solid that pixel is. The scene a
+// pane reads may not be solid, in a window the system composites by its
+// own alpha, and the pixel it answers is then premultiplied with an alpha
+// of its own. It takes the PLACE of what the pane covers: the first alpha
+// is how much of the destination gives way, the second is the alpha the
+// new pixel brings. Both go to the one target; the second is a source of
+// the pane's blend and is written nowhere. Over a solid scene it is 1 and
+// this is source-over.
+struct PaneOut {
+    float4 color : SV_Target0;
+    float4 solid : SV_Target1;
+};
+
+PaneOut glass_fragment(GlassVary vary) {
     GlassInstance pane = panes[vary.id];
     float2 p = vary.position.xy;
 
@@ -1490,9 +1508,13 @@ float4 glass_fragment(GlassVary vary) : SV_Target {
         color = float4(saturate(color.rgb + touch), color.a);
     }
 
-    // straight alpha out — the blend state premultiplies, exactly as it
-    // does for a rect
-    return float4(color.rgb, color.a * coverage * pane.opacity * clip_cov(p));
+    // the pane's own blend (`D3dStack::pane`): the colour lands by the
+    // coverage, the destination keeps the rest, and the alpha that lands
+    // is the pixel's own
+    PaneOut written;
+    written.color = float4(color.rgb, coverage * pane.opacity * clip_cov(p));
+    written.solid = float4(0.0, 0.0, 0.0, color.a);
+    return written;
 }
 "#;
 
@@ -1520,6 +1542,12 @@ struct D3dStack {
     /// The erase blend a [`RunKind::Knockout`] run is drawn with, under
     /// the rect shaders: the target keeps `1 - alpha` of itself.
     erase: Com<BlendState>,
+    /// The blend a pane of glass is drawn with: the pixel it answers
+    /// takes the place of what it covers, by the coverage in the first
+    /// output's alpha, and brings the alpha in the SECOND output's — the
+    /// raster's `Bitmap::set_replaced`. Where that alpha is 1, every
+    /// scene an opaque window paints, this is the house blend.
+    pane: Com<BlendState>,
     rasterizer: Com<RasterizerState>,
     sampler: Com<SamplerState>,
     /// 16 bytes per draw: the viewport and the run's base index.
@@ -1778,6 +1806,25 @@ impl D3dStack {
             }
             let erase = Com::from_raw(erase).ok_or("null erase blend state")?;
 
+            // The pane: rgb = s·t + d·(1−t); a = sa·t + da·(1−t), with t
+            // the first output's alpha and sa the second's. The colour
+            // half is the house blend's; the alpha half takes its source
+            // factor from the second output, which is dual-source
+            // blending and belongs to the first target alone, so the
+            // seven beside it keep the house blend.
+            let mut pane_targets = [target; 8];
+            pane_targets[0] = RenderTargetBlendDesc { src_blend_alpha: BLEND_SRC1_ALPHA, ..target };
+            let pane_desc = BlendDesc {
+                alpha_to_coverage: 0,
+                independent_blend: 0,
+                render_target: pane_targets,
+            };
+            let mut pane: *mut BlendState = null_mut();
+            if !com_ok(((*(*d).vtbl).create_blend_state)(d, &pane_desc, &mut pane)) {
+                return Err("pane blend state refused".to_string());
+            }
+            let pane = Com::from_raw(pane).ok_or("null pane blend state")?;
+
             let rasterizer_desc = RasterizerDesc {
                 fill_mode: FILL_SOLID,
                 cull_mode: CULL_NONE,
@@ -1833,6 +1880,7 @@ impl D3dStack {
                 blur_ps,
                 blend,
                 erase,
+                pane,
                 rasterizer,
                 sampler,
                 frame_cb,
@@ -2151,7 +2199,9 @@ impl D3dStack {
                 max_depth: 1.0,
             };
             (vtbl.rs_set_viewports)(context, 1, &port);
-            (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
+            // the pane's own blend: over a ground that is not solid the
+            // pixel it answers takes the place of what it covers
+            (vtbl.om_set_blend_state)(context, self.pane.as_ptr(), null(), 0xFFFF_FFFF);
             let round = &rounds[run.round as usize];
             let bytes = std::slice::from_raw_parts(
                 round as *const RoundClip as *const u8,
@@ -2172,6 +2222,8 @@ impl D3dStack {
             let sampler = self.sampler.as_ptr();
             (vtbl.ps_set_samplers)(context, 0, 1, &sampler);
             (vtbl.draw_instanced)(context, 6, run.count, 0, 0);
+            // the house blend comes back for the run that follows
+            (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
             let none: *mut Srv = null_mut();
             (vtbl.ps_set_shader_resources)(context, 1, 1, &none);
         }
@@ -5075,6 +5127,44 @@ mod tests {
             // from the failure it was built to catch.
             assert_glass_close(&gpu, &cpu, 4, 0.0075, label);
         }
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on this tier by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once. The bar
+    /// is the one the mac tier holds for this scene.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        assert_glass_close(&gpu, &cpu, 6, 0.02, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(gpu[end].abs_diff(cpu[end]) <= 6, "and it is the raster's: {} vs {}", gpu[end], cpu[end]);
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]
