@@ -743,9 +743,10 @@ const _: () = assert!(
 // A window the system composites by its own alpha presents through a
 // composition swapchain, and DirectComposition is what puts that
 // swapchain on the window. The three vtables below were written from the
-// order of the methods in `dcomp.h`. They were type-checked and NOT run
-// before they were committed: the slot numbers are the header's order,
-// counted by hand, and the first run on Windows is their proof.
+// order of the methods in `dcomp.h`, the slot numbers counted by hand,
+// and committed before they had run. Their first run was the CI job on
+// `windows-2025`, where a composed window was built through every one of
+// them; a wrong slot there is an access violation, not a failed test.
 
 /// `IDCompositionDevice` — commits the tree and makes its two parts.
 #[repr(C)]
