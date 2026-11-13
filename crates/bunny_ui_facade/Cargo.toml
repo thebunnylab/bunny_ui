@@ -90,6 +90,10 @@ name = "counter"
 required-features = ["shell"]
 
 [[example]]
+name = "controls"
+required-features = ["shell", "canvas"]
+
+[[example]]
 name = "preview"
 required-features = ["shell", "preview"]
 
