@@ -2533,6 +2533,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
+        AppEvent::Back => {
+            // a menu, the overlay on top or the page on top goes; with
+            // nothing to go back from, the press does nothing
+            if runtime.navigate_back() {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
         AppEvent::ButtonUp { x, y, button } => {
             // the end of a drag a box held with that button
             if runtime.button_released(x, y, button) {
