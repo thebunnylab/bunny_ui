@@ -1335,6 +1335,34 @@ pub struct DomHints {
     pub address: Option<std::rc::Rc<crate::layout::Address>>,
 }
 
+thread_local! {
+    /// Is the pass that is building the tree an element frame? A page has
+    /// no accessibility tree, so the names and the voices a view carries
+    /// are kept in the tree only while one is being lowered to elements —
+    /// a pixel frame with no capture still allocates none of them.
+    static SPEAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An element frame, for as long as it is held ([`speaking`]).
+pub(crate) struct SpeakScope(bool);
+
+impl SpeakScope {
+    pub(crate) fn enter() -> Self {
+        Self(SPEAKING.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for SpeakScope {
+    fn drop(&mut self) {
+        SPEAKING.with(|flag| flag.set(self.0));
+    }
+}
+
+/// Whether the bodies that run now are lowered to elements.
+pub(crate) fn speaking() -> bool {
+    SPEAKING.with(std::cell::Cell::get)
+}
+
 impl DomHints {
     pub fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
@@ -1355,6 +1383,17 @@ impl DomHints {
             .as_deref()
             .and_then(|address| address.control)
             .map_or(0, crate::layout::ControlState::wire)
+    }
+
+    /// The name the element answers to, when a view gave it one.
+    pub fn label(&self) -> Option<&str> {
+        self.address.as_deref().and_then(|address| address.label.as_deref())
+    }
+
+    /// What else the element says of itself, as the wire's one byte
+    /// (`Voice::wire`); zero for an element that says nothing.
+    pub fn voice(&self) -> u8 {
+        self.address.as_deref().map_or(0, |address| address.voice.wire())
     }
 }
 
@@ -3019,6 +3058,10 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     // a copy wears its template's attributes: what a control publishes
     // is part of the shape, so a checked row is never cloned unchecked
     node.hints.control().hash(hasher);
+    // …and so are its name and its voice: a row named for its own record
+    // is not a copy of the row before it
+    node.hints.voice().hash(hasher);
+    node.hints.label().hash(hasher);
     // the action path is the row's own; that there IS one is the shape
     node.style.interactive.is_some().hash(hasher);
     // a binding reads its own value; that there is one is the shape
@@ -4330,7 +4373,17 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// on Enter and Space. Focus (op 28: u8 select) moves the browser's
 /// focus to a field the engine gave the keyboard to — `.auto_focus()`
 /// and the beats — and selects its text when the beat asked.
-pub const ABI_VERSION: u32 = 25;
+///
+/// 26 (2026-11-13): an element says the rest of what it is. The control
+/// byte's bits 6–7 carry the expanded state (0 publishes none, 1
+/// collapsed, 2 expanded), written as `aria-expanded`. After the control
+/// byte, Create (op 1) and SetHints (op 15) carry one u8 of voice
+/// (`Voice::wire`: bit 0 hidden, bits 1–2 live — 1 polite, 2 assertive)
+/// and the element's name as a u16-length string, empty for none. The
+/// glue writes them as `aria-hidden`, `role="status"` / `role="alert"`
+/// with `aria-live`, and `aria-label`; a focused control whose element
+/// leaves hands the focus back to the control that had it before.
+pub const ABI_VERSION: u32 = 26;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4510,6 +4563,8 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_hint(&mut out, hints.dom_id());
                 push_bytes_u16(&mut out, hints.href().unwrap_or("").as_bytes());
                 out.push(hints.control());
+                out.push(hints.voice());
+                push_bytes_u16(&mut out, hints.label().unwrap_or("").as_bytes());
                 out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
@@ -4792,6 +4847,11 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     address
                         .and_then(|address| address.control)
                         .map_or(0, crate::layout::ControlState::wire),
+                );
+                out.push(address.map_or(0, |address| address.voice.wire()));
+                push_bytes_u16(
+                    &mut out,
+                    address.and_then(|address| address.label.as_deref()).unwrap_or("").as_bytes(),
                 );
             }
             DomPatch::SetLanguage { id, lang, dir } => {
@@ -5941,18 +6001,162 @@ mod tests {
     fn a_controls_state_is_one_byte_of_the_wire() {
         let address = crate::layout::Address::controlling(
             &None,
-            crate::layout::ControlState { enabled: true, checked: Some(true), kind: crate::layout::ControlKind::Switch },
+            crate::layout::ControlState { enabled: true, checked: Some(true), expanded: None, kind: crate::layout::ControlKind::Switch },
         );
         let hints = DomHints { address: Some(address.clone()), ..DomHints::default() };
         let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
-        // count, op, id, parent, before, tag, class, id, href(u16), control, kind
+        // count, op, id, parent, before, tag, class, id, href(u16),
+        // control, voice, name(u16), kind
         assert_eq!(created[4], 1);
-        assert_eq!(created[created.len() - 2], 3 | 8 | 2 << 4);
+        assert_eq!(created[created.len() - 5..], [3 | 8 | 2 << 4, 0, 0, 0, 1]);
         let live = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
         assert_eq!(live[4], 15);
-        assert_eq!(live.last(), Some(&(3 | 8 | 2 << 4)));
+        assert_eq!(live[live.len() - 4..], [3 | 8 | 2 << 4, 0, 0, 0]);
         let plain = encode(&[DomPatch::SetHints { id: 7, class: None, address: None }]);
-        assert_eq!(plain.last(), Some(&0), "an element that is no control says zero");
+        assert_eq!(plain[plain.len() - 4..], [0, 0, 0, 0], "an element that is no control and says nothing");
+    }
+
+    /// The rest of what an element says (ABI 26): whether what a control
+    /// opens is open rides the control's byte; decoration and a live
+    /// region are one byte of voice; the name follows as a string.
+    #[test]
+    fn a_name_a_voice_and_an_open_list_are_on_the_wire() {
+        use crate::layout::{Address, ControlKind, ControlState, Voice};
+        let opener = ControlState { enabled: true, checked: None, expanded: Some(true), kind: ControlKind::Button };
+        assert_eq!(opener.wire(), 1 | 8 | 2 << 6);
+        assert_eq!(ControlState { expanded: Some(false), ..opener }.wire(), 1 | 8 | 1 << 6);
+        assert_eq!(Voice::default().wire(), 0);
+        assert_eq!(Voice { hidden: true, live: None }.wire(), 1);
+        assert_eq!(Voice { hidden: false, live: Some(crate::accessibility::Live::Polite) }.wire(), 1 << 1);
+        assert_eq!(Voice { hidden: false, live: Some(crate::accessibility::Live::Assertive) }.wire(), 2 << 1);
+
+        let address = Address::named(&Some(Address::controlling(&None, opener)), Rc::from("Language"));
+        let address = Address::voiced(&Some(address), |voice| voice.live = Some(crate::accessibility::Live::Polite));
+        let said = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
+        let tail = &said[said.len() - 12..];
+        assert_eq!(tail[..2], [1 | 8 | 2 << 6, 1 << 1], "the control, then the voice");
+        assert_eq!(tail[2..4], 8u16.to_le_bytes(), "then the name's length");
+        assert_eq!(&tail[4..], b"Language");
+    }
+
+    /// A page has no accessibility tree, so what a view says of an
+    /// element is written on the element: the name on the control that
+    /// answers the press (or on the one element named), decoration and a
+    /// live region on what they wrap — and a name that moves
+    /// re-attributes in place. A field keeps wearing its own name.
+    #[test]
+    fn what_a_view_says_of_an_element_is_on_the_element() {
+        use crate::accessibility::Live;
+
+        #[derive(Clone)]
+        struct Page {
+            open: State<bool>,
+            email: State<String>,
+        }
+
+        impl Component for Page {
+            fn body(self) -> impl View {
+                let open = self.open;
+                vstack!(
+                    button(text("×"), || {}).plain().accessibility_label("Close"),
+                    button(text("English"), move || open.set(!open.get()))
+                        .plain()
+                        .expanded(open.get())
+                        .accessibility_label(if open.get() { "Language, list shown" } else { "Language" }),
+                    text("✦").accessibility_hidden(),
+                    text("saved").accessibility_live(Live::Polite),
+                    vstack!(text("access"), text("billing")).element("nav").accessibility_label("Pages"),
+                    text_field("you@example.com", self.email.binding()).accessibility_label("Email"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Page { open: State::new(false), email: State::new(String::new()) };
+        let size = Size { width: 300.0, height: 300.0 };
+        let mount = runtime.dom_frame(&view, size);
+        assert!(!speaking(), "the element frame is over");
+        let said: Vec<(Option<String>, u8, u8, Option<String>)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { hints, .. } if hints.label().is_some() || hints.voice() != 0 => Some((
+                    hints.label().map(str::to_owned),
+                    hints.voice(),
+                    hints.control(),
+                    hints.tag.as_deref().map(str::to_owned),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (Some("Close".to_owned()), 0, 1 | 8, None),
+                // a button that opens something: collapsed
+                (Some("Language".to_owned()), 0, 1 | 8 | 1 << 6, None),
+                (None, 1, 0, None),
+                (None, 1 << 1, 0, None),
+                (Some("Pages".to_owned()), 0, 0, Some("nav".to_owned())),
+            ],
+            "{mount:?}"
+        );
+        assert!(
+            mount.iter().any(|patch| matches!(patch, DomPatch::SetField { field, .. } if field.label.as_deref() == Some("Email"))),
+            "a field wears its own name: {mount:?}"
+        );
+
+        view.open.set(true);
+        let moved = runtime.dom_frame(&view, size);
+        let renamed: Vec<(Option<String>, u8)> = moved
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetHints { address, .. } => {
+                    let address = address.as_deref()?;
+                    Some((address.label.as_deref().map(str::to_owned), address.control.map_or(0, crate::layout::ControlState::wire)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            renamed,
+            [(Some("Language, list shown".to_owned()), 1 | 8 | 2 << 6)],
+            "the name and the open list re-attribute in place: {moved:?}"
+        );
+    }
+
+    /// One of a set, drawn by the page: a radio to the keyboard and to
+    /// assistive technology, where a two-state control is a checkbox.
+    #[test]
+    fn a_page_drawn_choice_is_a_radio() {
+        #[derive(Clone)]
+        struct Languages {
+            chosen: State<u8>,
+        }
+
+        impl Component for Languages {
+            fn body(self) -> impl View {
+                let chosen = self.chosen;
+                vstack!(
+                    button(text("English"), move || chosen.set(0)).plain().selected(chosen.get() == 0),
+                    button(text("日本語"), move || chosen.set(1)).plain().selected(chosen.get() == 1),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Languages { chosen: State::new(0) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let controls: Vec<u8> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { hints, .. } if hints.control() != 0 => Some(hints.control()),
+                _ => None,
+            })
+            .collect();
+        // kind 4 is the radio: the chosen one, then the other
+        assert_eq!(controls, [4 | 8 | 2 << 4, 4 | 8 | 1 << 4], "{mount:?}");
+        assert!(crate::layout::ControlKind::Radio.enter_activates(), "Enter chooses, as Space does");
     }
 
     /// The browser owns every `<input>` in this mode, so a field the
@@ -7219,8 +7423,11 @@ mod tests {
             &0u32.to_le_bytes()[..],
             &[0, 0, 0],
             &0u16.to_le_bytes()[..],
-            // no control (ABI 25), then the kind
+            // no control (ABI 25), no voice and no name (ABI 26), then
+            // the kind
             &[0],
+            &[0],
+            &0u16.to_le_bytes()[..],
             &[1],
             &[3],
             &7u32.to_le_bytes()[..],
@@ -8194,10 +8401,8 @@ mod tests {
                 tag: Some(tag.into()),
                 class: Some(class.into()),
                 address: Some(Rc::new(crate::layout::Address {
-                    control: None,
-                    group: None,
                     dom_id: Some(id.into()),
-                    href: None,
+                    ..Default::default()
                 })),
             };
             node.binding = bound.then(|| match &binding {

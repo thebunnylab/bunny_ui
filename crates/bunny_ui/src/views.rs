@@ -384,6 +384,7 @@ where
                     control: Some(crate::layout::ControlState {
                         enabled: !self.disabled,
                         checked: self.checked,
+                        expanded: self.expanded,
                         kind: self.kind,
                     }),
                     ..Default::default()
@@ -431,6 +432,28 @@ where
         if matches!(self.kind, crate::layout::ControlKind::Button) {
             self.kind = crate::layout::ControlKind::Checkbox;
         }
+        self
+    }
+
+    /// Expose a custom one-of-a-set control: a row of a list the
+    /// application draws, a language among languages. It is a radio to
+    /// the keyboard and to assistive technology — Enter and Space choose
+    /// it, where a two-state control (`checked`) answers Space alone —
+    /// and it says whether it is the one chosen. The application owns
+    /// the choice and draws it in the label.
+    #[must_use]
+    pub const fn selected(mut self, selected: bool) -> Self {
+        self.checked = Some(selected);
+        self.kind = crate::layout::ControlKind::Radio;
+        self
+    }
+
+    /// Say whether what the button opens is open — a list it discloses,
+    /// a panel under it. The button stays a button; assistive technology
+    /// hears "collapsed" or "expanded" with its name.
+    #[must_use]
+    pub const fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
         self
     }
 

@@ -6149,6 +6149,9 @@ impl Runtime {
         root: &R,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
+        // the bodies this frame runs are lowered to elements: the names
+        // and voices their views carry stay in the tree for the flow
+        let _speaking = crate::dom::SpeakScope::enter();
         self.note_viewport(crate::layout::Proposal::exact(size));
         // the bindings a write reached go stale before anything reads
         // them: a walk that meets one reads it again, and the ones no

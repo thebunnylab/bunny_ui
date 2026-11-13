@@ -1452,11 +1452,39 @@ impl ControlKind {
     }
 }
 
+/// What an element says of itself that is neither what it is nor its
+/// name: that it is decoration, or that it changes by itself. Two rare
+/// words, held beside the name in the element's [`Address`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Voice {
+    /// Decoration: assistive technology passes over it (`aria-hidden`).
+    pub hidden: bool,
+    /// A region read out when it changes (`aria-live`).
+    pub live: Option<crate::accessibility::Live>,
+}
+
+impl Voice {
+    /// The voice as one byte of the element wire (`dom::ABI_VERSION` 26);
+    /// zero says nothing. Bit 0: hidden. Bits 1–2: live (0 none, 1
+    /// polite, 2 assertive).
+    pub(crate) const fn wire(self) -> u8 {
+        let live = match self.live {
+            None => 0,
+            Some(crate::accessibility::Live::Polite) => 1,
+            Some(crate::accessibility::Live::Assertive) => 2,
+        };
+        self.hidden as u8 | live << 1
+    }
+}
+
 /// State shared by built-in activation controls, keyboard navigation and AT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ControlState {
     pub enabled: bool,
     pub checked: Option<bool>,
+    /// Whether what the control opens is open — a pop-up's list, a
+    /// disclosure's panel. `None` for a control that opens nothing.
+    pub expanded: Option<bool>,
     pub kind: ControlKind,
 }
 
@@ -1465,6 +1493,7 @@ impl ControlState {
     /// never zero — zero is an element that is no control. Bits 0–2: the
     /// kind, one past its place in [`ControlKind`]. Bit 3: enabled. Bits
     /// 4–5: the checked value (0 publishes none, 1 unchecked, 2 checked).
+    /// Bits 6–7, since ABI 26: the expanded state, counted the same way.
     pub(crate) const fn wire(self) -> u8 {
         let kind = match self.kind {
             ControlKind::Button => 1,
@@ -1479,7 +1508,12 @@ impl ControlState {
             Some(false) => 1,
             Some(true) => 2,
         };
-        kind | (self.enabled as u8) << 3 | checked << 4
+        let expanded = match self.expanded {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        kind | (self.enabled as u8) << 3 | checked << 4 | expanded << 6
     }
 }
 
@@ -1551,6 +1585,11 @@ impl ElementHints {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Address {
     pub(crate) control: Option<ControlState>,
+    /// The name the element answers to (`.accessibility_label`), said on
+    /// a page as `aria-label`.
+    pub(crate) label: Option<Rc<str>>,
+    /// What else the element says of itself to assistive technology.
+    pub(crate) voice: Voice,
     /// The controls under this node travel as one group ([`GroupSpec`]).
     pub(crate) group: Option<GroupSpec>,
     pub dom_id: Option<Rc<str>>,
@@ -1598,6 +1637,22 @@ impl Address {
     pub(crate) fn controlling(base: &Option<Rc<Address>>, control: ControlState) -> Rc<Address> {
         let mut address = base.as_deref().cloned().unwrap_or_default();
         address.control = Some(control);
+        Address::shared(address)
+    }
+
+    /// `base` answering to `label`. The element lowering has no
+    /// accessibility tree to hang a name on, so the name rides the
+    /// address of the element it names.
+    pub(crate) fn named(base: &Option<Rc<Address>>, label: Rc<str>) -> Rc<Address> {
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        address.label = Some(label);
+        Address::shared(address)
+    }
+
+    /// `base` with `say` applied to what it says of itself.
+    pub(crate) fn voiced(base: &Option<Rc<Address>>, say: impl FnOnce(&mut Voice)) -> Rc<Address> {
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        say(&mut address.voice);
         Address::shared(address)
     }
 

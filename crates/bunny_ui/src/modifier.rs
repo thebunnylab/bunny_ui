@@ -69,6 +69,8 @@ pub enum Modifier {
     AccessibilityLabel(crate::bind::TextSource),
     /// Decorative content excluded from the accessibility tree.
     AccessibilityHidden,
+    /// A region read out when it changes by itself.
+    AccessibilityLive(crate::accessibility::Live),
     Equatable,
 
     // MARK: - Visuals (pure data → `Styled` in the scene)
@@ -306,6 +308,7 @@ impl Modifier {
             Modifier::Sticky(_) => "sticky",
             Modifier::AccessibilityLabel { .. } => "accessibility_label",
             Modifier::AccessibilityHidden => "accessibility_hidden",
+            Modifier::AccessibilityLive { .. } => "accessibility_live",
             Modifier::Equatable => "equatable",
             Modifier::BackgroundColor { .. } => "background_color",
             Modifier::BackgroundGradient { .. } => "background_gradient",
@@ -434,6 +437,7 @@ impl Modifier {
             Modifier::IgnoresSafeArea => " [.ignoresSafeArea()]".into(),
             Modifier::AccessibilityLabel(_) => " [.accessibility_label()]".into(),
             Modifier::AccessibilityHidden => " [.accessibility_hidden()]".into(),
+            Modifier::AccessibilityLive(live) => format!(" [.accessibility_live({live:?})]"),
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::AllowsHitTesting(on) => format!(" [.allowsHitTesting({on})]"),
             Modifier::Sticky(top) => format!(" [.sticky(top: {top})]"),
@@ -988,6 +992,7 @@ pub(crate) fn apply(
             if crate::accessibility::capturing() || out.layout_mark() > mark =>
         {
             let capturing = crate::accessibility::capturing();
+            let speaking = crate::dom::speaking();
             let label = {
                 let _scope = motor::identity::enter("#accessibility-label");
                 // a capture places the source, so the name follows its
@@ -998,24 +1003,35 @@ pub(crate) fn apply(
             // a field keeps its name on its own node: the element lowering
             // has no accessibility tree to ask, and says the name as the
             // input's `aria-label`
-            rewrite_leaf(out.base_from(mark), &mut |node| match node {
+            let field = rewrite_leaf(out.base_from(mark), &mut |node| match node {
                 LayoutNode::Field { label: name, .. } => {
                     *name = Some(label.get());
                     true
                 }
                 _ => false,
             });
-            if capturing {
+            // anything else is named where its element is made: a capture
+            // hangs the name on the tree, and a page — which has no tree —
+            // on the element the flow lowers this node to
+            if capturing || (speaking && !field) {
                 out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
                     semantics: crate::accessibility::Semantics::Label(label.clone()),
                     child: Box::new(node),
                 });
             }
         }
-        Modifier::AccessibilityHidden if crate::accessibility::capturing() => out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
-            semantics: crate::accessibility::Semantics::Hidden,
-            child: Box::new(node),
-        }),
+        Modifier::AccessibilityHidden if crate::accessibility::capturing() || crate::dom::speaking() => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
+                semantics: crate::accessibility::Semantics::Hidden,
+                child: Box::new(node),
+            })
+        }
+        Modifier::AccessibilityLive(live) if crate::accessibility::capturing() || crate::dom::speaking() => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
+                semantics: crate::accessibility::Semantics::Live(*live),
+                child: Box::new(node),
+            })
+        }
         Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
         Modifier::Effect { effect, .. } => {
             // The effect sees the subtree's environment — the pump only

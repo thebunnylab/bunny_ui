@@ -1306,8 +1306,14 @@ impl Walk<'_> {
             // would mean observing the element, which is a road of its
             // own — and a number invented here would be worse than no
             // number at all.
-            LayoutNode::Accessible { child, .. }
-            | LayoutNode::Sited { child, .. }
+            // a page has no accessibility tree: what a view says of the
+            // element below it is written on that element
+            LayoutNode::Accessible { semantics, child } => {
+                let opened = out.len();
+                self.lower_into(child, out);
+                Self::say(semantics, &mut out[opened..]);
+            }
+            LayoutNode::Sited { child, .. }
             | LayoutNode::Placed { child, .. }
             | LayoutNode::Spanned { child, .. }
             | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
@@ -1570,6 +1576,42 @@ impl Walk<'_> {
                 self.lower_into(overlay, &mut popover.children);
                 self.overlays.push(popover);
             }
+        }
+    }
+
+    /// What a semantic decorator says, written on what its child lowered
+    /// to. A name names one element — the one that answers a press when
+    /// there is one, else the only one — and never a field, which wears
+    /// its own. Decoration and a live region mark every element lowered.
+    /// The decorators a capture alone makes (a text, a control) say
+    /// nothing here: the element is its own semantics.
+    fn say(semantics: &crate::accessibility::Semantics, lowered: &mut [DomNode]) {
+        use crate::accessibility::Semantics;
+        use crate::layout::Address;
+        match semantics {
+            Semantics::Label(label) => {
+                let named = lowered
+                    .iter()
+                    .position(|node| node.style.interactive.is_some())
+                    .or((lowered.len() == 1).then_some(0));
+                if let Some(node) = named.map(|at| &mut lowered[at])
+                    && !matches!(node.kind, DomKind::Field(_))
+                {
+                    let label: std::rc::Rc<str> = std::rc::Rc::from(&*label.get());
+                    node.hints.address = Some(Address::named(&node.hints.address, label));
+                }
+            }
+            Semantics::Hidden => {
+                for node in lowered {
+                    node.hints.address = Some(Address::voiced(&node.hints.address, |voice| voice.hidden = true));
+                }
+            }
+            Semantics::Live(live) => {
+                for node in lowered {
+                    node.hints.address = Some(Address::voiced(&node.hints.address, |voice| voice.live = Some(*live)));
+                }
+            }
+            Semantics::Text { .. } | Semantics::Button { .. } | Semantics::Control { .. } | Semantics::Labeled => {}
         }
     }
 
