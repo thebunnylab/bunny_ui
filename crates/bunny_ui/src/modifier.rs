@@ -260,7 +260,7 @@ pub enum Modifier {
 
     // MARK: - Inert parity
     Searchable(Binding<String>),
-    Refreshable,
+    Refreshable(crate::nav::Refresh),
     Toolbar(crate::nav::BarItems),
     AttachEnvironmentOverrides,
     AttachEnvironmentOverridesOnChange,
@@ -377,7 +377,7 @@ impl Modifier {
             Modifier::EnvSet { .. } => "inject",
             Modifier::Custom { .. } => "modifier",
             Modifier::Searchable(_) => "searchable",
-            Modifier::Refreshable => "refreshable",
+            Modifier::Refreshable(_) => "refreshable",
             Modifier::Toolbar(_) => "toolbar",
             Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
             Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
@@ -567,7 +567,7 @@ impl Modifier {
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Custom(custom) => format!(" [.modifier({})]", custom.name()),
             Modifier::Searchable(_) => " [.searchable(text: $…)]".into(),
-            Modifier::Refreshable => " [.refreshable { … }]".into(),
+            Modifier::Refreshable(_) => " [.refreshable { … }]".into(),
             Modifier::Toolbar(_) => " [.toolbar { … }]".into(),
             Modifier::AttachEnvironmentOverrides => " [.attachEnvironmentOverrides()]".into(),
             Modifier::AttachEnvironmentOverridesOnChange => {
@@ -1766,6 +1766,13 @@ pub(crate) fn apply(
             // the page's query: the stack puts a search field for it in the bar
             if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
                 stack.tell(&crate::nav::PageWord::Search(query.clone()));
+            }
+        }
+        Modifier::Refreshable(work) => {
+            // the work that loads the page again: the stack gives it a
+            // button in the bar, and a key
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.tell(&crate::nav::PageWord::Refresh(Rc::clone(work)));
             }
         }
         Modifier::KeyContextFocused(name) => {

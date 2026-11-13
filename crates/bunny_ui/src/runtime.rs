@@ -2063,6 +2063,11 @@ impl Runtime {
                 .entry(crate::action::NAV_FIND_CONTEXT)
                 .or_default()
                 .insert(KeyPattern::command(Key::Char('f')), crate::action::NAV_FIND);
+            // "refresh", while the page on top of a stack can load again
+            scoped
+                .entry(crate::action::NAV_REFRESH_CONTEXT)
+                .or_default()
+                .insert(KeyPattern::command(Key::Char('r')), crate::action::NAV_REFRESH);
         }
         runtime
     }

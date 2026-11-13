@@ -1,6 +1,7 @@
 //! `navigation_stack(path, root).destination(…)`: a stack of pages.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use bunny_ui::accessibility::Role;
 use bunny_ui::action::ActionId;
@@ -771,6 +772,206 @@ fn the_field_is_the_page_on_tops_and_a_page_with_none_has_none() {
     let back = elements(&runtime, &catalog);
     assert!(back.iter().any(|(role, label, _)| *role == Role::TextField && label == "Search"));
     assert_eq!(catalog.query.get(), "as", "the query was the app's all the time");
+}
+
+/// The runs of a refresh that started, and the door each one waits at.
+#[derive(Clone, Default)]
+struct Doors(Rc<RefCell<Vec<task::Sender<()>>>>);
+
+impl Doors {
+    /// Work that waits at a new door, and counts in `done` when it is let through.
+    fn work(&self, done: State<u32>) -> impl AsyncFn() + 'static {
+        let doors = self.clone();
+        async move || {
+            let (send, door) = task::channel::<()>();
+            doors.0.borrow_mut().push(send);
+            if door.recv().await.is_some() {
+                done.update(|runs| *runs += 1);
+            }
+        }
+    }
+
+    fn started(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// `true` while the last run that started is still waiting.
+    fn waits(&self) -> bool {
+        self.0.borrow().last().is_some_and(task::Sender::is_connected)
+    }
+
+    /// Lets the last run that started end.
+    fn open(&self) {
+        self.0.borrow().last().expect("a run started").send(()).expect("the run waits");
+    }
+}
+
+/// A root that loads again, and pages over it that load again too.
+#[derive(Clone)]
+struct Feed {
+    path: State<Vec<Route>>,
+    loaded: State<u32>,
+    pages_loaded: State<u32>,
+    doors: Doors,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self { path: State::new(Vec::new()), loaded: State::new(0), pages_loaded: State::new(0), doors: Doors::default() }
+    }
+}
+
+impl Component for Feed {
+    fn body(self) -> impl View {
+        let (doors, pages_loaded) = (self.doors.clone(), self.pages_loaded);
+        let root = vstack!(text!("Loaded {}", self.loaded), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Feed")
+            .refreshable(self.doors.work(self.loaded));
+        navigation_stack(self.path, root)
+            .destination(move |_| text!("Pages loaded {}", pages_loaded).navigation_title("Other").refreshable(doors.work(pages_loaded)))
+    }
+}
+
+fn refresh_key() -> KeyPattern {
+    KeyPattern::command(Key::Char('r'))
+}
+
+/// Whether the button that refreshes takes a press, as assistive technology has it.
+fn can_refresh(runtime: &Runtime, view: &impl View) -> bool {
+    runtime.display_frame(view, SIZE);
+    let tree = runtime.accessibility_tree();
+    tree.nodes().iter().find(|node| &*node.label == "Refresh").expect("the bar has the button").enabled
+}
+
+#[test]
+fn a_page_that_loads_again_has_a_button_for_it_in_the_bar() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    let all = elements(&runtime, &feed);
+    let button = all.iter().find(|(_, label, _)| label == "Refresh").expect("the bar has the button");
+    assert_eq!(button.0, Role::Button);
+    let (title, first) = (element(&runtime, &feed, "Feed"), element(&runtime, &feed, "Loaded 0"));
+    assert!(button.2.origin.x > title.origin.x + title.size.width, "at the trailing edge: {all:?}");
+    assert!(button.2.origin.y + button.2.size.height <= first.origin.y, "in the bar, over the page");
+
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 1, "a press starts the page's work");
+    feed.doors.open();
+    assert!(titles(&runtime, &feed).contains(&"Loaded 1".to_string()), "and the page shows what the work loaded");
+}
+
+#[test]
+fn one_run_at_a_time_the_button_waits_for_the_one_on_its_way() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    assert!(can_refresh(&runtime, &feed));
+    press_on(&runtime, &feed, "Refresh");
+    assert!(!can_refresh(&runtime, &feed), "the button is disabled while the work is not done");
+    press_on(&runtime, &feed, "Refresh");
+    assert!(runtime.offer_key(refresh_key()), "the key is still the stack's");
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.doors.started(), 1, "and neither starts a second run");
+
+    feed.doors.open();
+    assert!(can_refresh(&runtime, &feed), "the work is done: the button is back");
+    assert_eq!(feed.loaded.get(), 1);
+}
+
+#[test]
+fn the_key_of_refresh_starts_the_work_of_the_page_on_top() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    runtime.display_frame(&feed, SIZE);
+    assert!(runtime.offer_key(refresh_key()), "the stack takes the key of refresh");
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.doors.started(), 1);
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!((feed.loaded.get(), feed.pages_loaded.get()), (1, 0));
+
+    // over the root, the key is the page's on top
+    feed.path.push(Route::Item(1));
+    runtime.display_frame(&feed, SIZE);
+    assert!(runtime.offer_key(refresh_key()));
+    runtime.display_frame(&feed, SIZE);
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!((feed.loaded.get(), feed.pages_loaded.get()), (1, 1));
+}
+
+#[test]
+fn the_work_is_the_pages_it_goes_on_under_a_cover_and_stops_when_the_page_leaves() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 1);
+
+    // a page covers the root while the root's work is on its way
+    feed.path.push(Route::Item(1));
+    assert!(can_refresh(&runtime, &feed), "the page on top has no run of its own");
+    assert!(feed.doors.waits(), "the root's work goes on under the page");
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.loaded.get(), 1, "and it ends there");
+
+    // the page on top starts its own, and leaves before it is done
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 2);
+    assert!(feed.doors.waits());
+    feed.path.pop();
+    assert!(can_refresh(&runtime, &feed), "the root's run ended while it was covered");
+    assert!(!feed.doors.waits(), "the work of the page that left was cancelled with it");
+    assert_eq!(feed.pages_loaded.get(), 0);
+}
+
+#[test]
+fn the_work_is_the_one_the_page_gave_last() {
+    /// A page that gives work holding a value of its state.
+    #[derive(Clone, Copy)]
+    struct Stepped {
+        step: State<u32>,
+        seen: State<u32>,
+    }
+
+    impl Component for Stepped {
+        fn body(self) -> impl View {
+            // held by value: work from an earlier run of this body holds an old step
+            let (step, seen) = (self.step.get(), self.seen);
+            button(text!("Step {}", self.step), move || self.step.add(1))
+                .navigation_title("Steps")
+                .refreshable(async move || seen.set(step))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Walk {
+        page: Stepped,
+    }
+
+    impl Component for Walk {
+        fn body(self) -> impl View {
+            count(&APP_RUNS);
+            navigation_stack_content(self.page)
+        }
+    }
+
+    let runtime = runtime();
+    let walk = Walk { page: Stepped { step: State::new(1), seen: State::new(0) } };
+    runtime.display_frame(&walk, SIZE);
+    press_on(&runtime, &walk, "Step 1");
+    press_on(&runtime, &walk, "Step 2");
+    assert!(runtime.offer_key(refresh_key()));
+    runtime.display_frame(&walk, SIZE);
+    assert_eq!(walk.page.seen.get(), 3, "the work the page gave in its last run, not the one the bar was made with");
+}
+
+#[test]
+fn a_page_with_no_work_has_no_button_and_the_key_is_not_the_stacks() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    let all = elements(&runtime, &catalog);
+    assert!(!all.iter().any(|(_, label, _)| label == "Refresh"), "{all:?}");
+    assert!(!runtime.offer_key(refresh_key()), "an app's own binding of the key is free to take it");
 }
 
 #[test]

@@ -14,8 +14,11 @@
 //!
 //! The list is searchable: the stack puts the field in its bar.
 //!
+//! It loads again too: the bar has the button, and the key is the
+//! accelerator with `R`.
+//!
 //! Limitations of this phase (noted, not hidden):
-//! `.refreshable` is inert; images are 40×40 boxes.
+//! images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "ios"), allow(dead_code, unused_imports))]
 

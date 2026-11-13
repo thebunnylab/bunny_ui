@@ -78,7 +78,23 @@
 //! it is `.leading()`. The items are the page's too: a page says them
 //! each time its body runs, and the bar shows the last ones it said.
 //!
-//! A root that says no title and no item has no bar.
+//! ```ignore
+//! page.searchable(self.query.binding())
+//!     .refreshable(async move || model.reload().await)
+//! ```
+//!
+//! `.searchable(…)` puts a search field in the bar, under the title. The
+//! binding holds the query and the page filters by it; the accelerator
+//! with `F` takes the keyboard to the field.
+//!
+//! `.refreshable(…)` gives the page work that loads its content again.
+//! The bar gets a button for it, named "Refresh" in the reader's
+//! language, and the accelerator with `R` starts it too. One run at a
+//! time: the button is disabled until the work is done. The work is the
+//! page's, as its tasks are: it continues under another page, and it is
+//! cancelled when the page leaves the stack.
+//!
+//! A root that says none of these has no bar.
 //!
 //! ## Back
 //!
@@ -92,10 +108,12 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use motor::state::{Binding, Context, LayoutDirection, Locale, Navigator, State};
+use motor::task::Spawned;
 use motor::view::RenderNode;
 use motor::views::Edge;
 
@@ -371,6 +389,24 @@ pub(crate) enum PageWord {
     Items(BarItems),
     /// `.searchable(…)`.
     Search(Binding<String>),
+    /// `.refreshable(…)`.
+    Refresh(Refresh),
+}
+
+/// One run of the work a page gave to `.refreshable(…)`.
+type Run = Pin<Box<dyn Future<Output = ()>>>;
+
+/// The work of `.refreshable(…)`: each call starts one run.
+pub(crate) type Refresh = Rc<dyn Fn() -> Run>;
+
+/// Keeps `action` so that it can run more than one time. Each run holds
+/// the action while it borrows from it.
+pub(crate) fn refresh<F: AsyncFn() + 'static>(action: F) -> Refresh {
+    let action = Rc::new(action);
+    Rc::new(move || {
+        let action = Rc::clone(&action);
+        Box::pin(async move { action().await })
+    })
 }
 
 /// One view of a bar, made when the bar is.
@@ -401,22 +437,32 @@ struct Said {
     title: Option<Arc<str>>,
     items: BarItems,
     search: Option<Binding<String>>,
+    refresh: Option<Refresh>,
 }
 
 impl Said {
     /// A page that said nothing has no bar over it.
     fn is_nothing(&self) -> bool {
-        self.title.is_none() && self.items.is_empty() && self.search.is_none()
+        self.title.is_none() && self.items.is_empty() && self.search.is_none() && self.refresh.is_none()
     }
 }
 
+/// What the stack keeps of one page, in the page's own scope: it is
+/// there while the page is, covered or not, and it leaves with the page.
 #[derive(Clone, Default)]
-struct Told(Rc<RefCell<Said>>);
+struct Told {
+    said: Rc<RefCell<Said>>,
+    /// `true` while a run of the page's refresh is not done.
+    busy: Rc<Cell<bool>>,
+    /// That run. To drop it is to cancel it, so a page that leaves the
+    /// stack stops the work it started.
+    running: Rc<RefCell<Option<Spawned>>>,
+}
 
 impl Told {
     /// Keeps the word. `true` when what the bar shows is different now.
     fn hear(&self, word: &PageWord) -> bool {
-        let mut said = self.0.borrow_mut();
+        let mut said = self.said.borrow_mut();
         match word {
             PageWord::Title(title) if said.title.as_ref() == Some(title) => false,
             PageWord::Title(title) => {
@@ -431,7 +477,43 @@ impl Told {
             // the binding a page gives is the same door on every run:
             // only the first one changes what the bar shows
             PageWord::Search(query) => said.search.replace(query.clone()).is_none(),
+            // the last work is kept, because it holds what the page holds
+            // now. The bar shows one button for any of them
+            PageWord::Refresh(work) => said.refresh.replace(Rc::clone(work)).is_none(),
         }
+    }
+}
+
+/// The refresh of the page on top, for the button of the bar and the key.
+#[derive(Clone)]
+struct Reload {
+    told: Told,
+    /// The page's count of words: a move of it runs the stack again.
+    spoke: State<u64>,
+}
+
+impl Reload {
+    /// Starts a run of the page's work. One run at a time: while one is
+    /// not done, this does nothing.
+    fn start(&self) {
+        // read when the reader asks, not when the bar was made: a page
+        // gives its work again each time its body runs
+        let Some(work) = self.told.said.borrow().refresh.clone() else { return };
+        if self.told.busy.replace(true) {
+            return;
+        }
+        let run = work();
+        let (busy, spoke) = (Rc::clone(&self.told.busy), self.spoke);
+        let task = motor::task::spawn(async move {
+            run.await;
+            busy.set(false);
+            spoke.update(|times| *times += 1);
+        });
+        // out of the cell before it drops: a cancel runs the future's
+        // own drop, which must not find the cell borrowed
+        let before = self.told.running.borrow_mut().replace(task);
+        drop(before);
+        self.spoke.update(|times| *times += 1);
     }
 }
 
@@ -615,6 +697,7 @@ where
         let mut prints = Vec::with_capacity(depth + 2);
         let mut top = Vec::new();
         let mut bar = Said::default();
+        let mut reload = None;
         for place in 0..=depth {
             let covered = place < depth;
             let key: Cow<'static, str> =
@@ -630,7 +713,8 @@ where
                 // is still here
                 let told = State::new(Told::default()).get();
                 // moved when the page speaks while the stack is not making
-                // its pages: the stack reads it, and so runs after the page
+                // its pages, and when its refresh starts or ends: the
+                // stack reads it, and so runs after the page
                 let spoke = State::new(0u64);
                 let hear = {
                     let (told, making) = (told.clone(), Rc::clone(&self.making));
@@ -665,7 +749,8 @@ where
                     // this pass has just spoken. The count is read so
                     // that a page that speaks later runs the stack
                     spoke.get();
-                    bar = told.0.borrow().clone();
+                    bar = told.said.borrow().clone();
+                    reload = Some(Reload { told, spoke });
                 }
             }
             // EVERY page is made, so a covered one stays mounted with its
@@ -696,7 +781,10 @@ where
             let mut whole = NodeList::new();
             // the bar is the stack's own: under its own key, beside the pages
             let _frame = motor::identity::enter_key("bar");
-            self.under_a_bar(ctx, bar, page).render_into(ctx, &mut whole);
+            // the work is the page's, so only a page that gave some has
+            // a button for it
+            let reload = reload.filter(|_| bar.refresh.is_some());
+            self.under_a_bar(ctx, bar, reload, page).render_into(ctx, &mut whole);
             let (print, layout) = whole.into_parts();
             prints.push(RenderNode::branch(print_label("Bar"), print));
             wrap_layout(layout)
@@ -721,11 +809,18 @@ where
 {
     /// The page on top with the stack's bar over it: the button that goes
     /// back, where there is a page to leave, the page's leading items,
-    /// its title, and its other items at the trailing edge.
-    fn under_a_bar(&self, ctx: &Context, said: Said, page: LayoutNode) -> impl View<Arity = Single> + use<R, Root, V> {
+    /// its title, and at the trailing edge the button that refreshes the
+    /// page and the page's other items.
+    fn under_a_bar(
+        &self,
+        ctx: &Context,
+        said: Said,
+        reload: Option<Reload>,
+        page: LayoutNode,
+    ) -> impl View<Arity = Single> + use<R, Root, V> {
         let theme = crate::theme::current();
+        let words = Words::for_locale(&ctx.environment::<Locale>());
         let back = (!self.pages.is_empty()).then(|| {
-            let words = Words::for_locale(&ctx.environment::<Locale>());
             // the arrow points where the page under this one is
             let glyph = if ctx.environment::<LayoutDirection>().is_rtl() { symbol::CHEVRON_RIGHT } else { symbol::CHEVRON_LEFT };
             let doors = self.doors.clone();
@@ -740,7 +835,22 @@ where
             .frame_height(1.0)
             .background_color(theme.divider);
         let title = text(said.title.as_deref().unwrap_or("")).bold().truncation_mode(Truncation::End);
-        let bar = hstack((back, Items(said.items.leading, "l"), title, spacer(), Items(said.items.trailing, "t")))
+        let again = reload.map(|reload| {
+            if let Some(scope) = motor::identity::cursor_scope() {
+                // the key is the stack's while the page on top can load
+                // again, a run on its way or not
+                let by_key = reload.clone();
+                crate::reconciler::attribute_context(scope.clone(), crate::action::NAV_REFRESH_CONTEXT, false);
+                crate::reconciler::attribute_handler(scope, crate::action::NAV_REFRESH, Rc::new(move || by_key.start()));
+            }
+            // one run at a time: the button waits for the one on its way
+            let busy = reload.told.busy.get();
+            button(icon(symbol::REFRESH).frame(28.0, 28.0), move || reload.start())
+                .plain()
+                .disabled(busy)
+                .accessibility_label(&*words.get(Word::Refresh))
+        });
+        let bar = hstack((back, Items(said.items.leading, "l"), title, spacer(), again, Items(said.items.trailing, "t")))
             .spacing(4.0)
             .padding_edge(Edge::Leading, BAR_INSET)
             .padding_edge(Edge::Trailing, BAR_INSET)

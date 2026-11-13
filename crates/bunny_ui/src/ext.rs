@@ -1603,10 +1603,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Searchable(text))
     }
 
-    /// `.refreshable { … }` — a user gesture; inert headless.
+    /// Work that loads a page of a navigation stack again:
+    /// `.refreshable(async move || model.reload().await)`.
+    ///
+    /// The stack puts a button for it in its bar, at the trailing edge,
+    /// and the accelerator with `R` — ⌘R on the Mac — starts it too. The
+    /// work is an `async` closure, and the refresh is done when the
+    /// closure is. One run at a time: until then the button is disabled
+    /// and the key starts nothing.
+    ///
+    /// The work is the page's. It continues while another page covers
+    /// the page, and it is cancelled when the page leaves the stack.
+    /// Outside a stack it does nothing.
     #[track_caller]
-    fn refreshable(self, _action: impl Fn() + 'static) -> Modified<Self> {
-        Modified::new(self, Modifier::Refreshable)
+    fn refreshable<F>(self, action: F) -> Modified<Self>
+    where
+        F: AsyncFn() + 'static,
+    {
+        Modified::new(self, Modifier::Refreshable(crate::nav::refresh(action)))
     }
 
     /// `.sheet(isPresented: $flag) { … }` — the content is the erased

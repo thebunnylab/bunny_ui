@@ -1,4 +1,4 @@
-//! The house glyphs on one screen: sixteen symbols, three fonts,
+//! The house glyphs on one screen: seventeen symbols, three fonts,
 //! three inks, a hover — the whole icon story in a window.
 //!
 //! ```sh
@@ -35,9 +35,9 @@ fn main() {
 
     bunny_ui_windows::run_window(
         "bunny_ui — icons",
-        Size { width: 460.0, height: 560.0 },
+        Size { width: 460.0, height: 624.0 },
         vstack!(
-            text("sixteen glyphs the house draws").bold(),
+            text("seventeen glyphs the house draws").bold(),
             // the gallery: hover any tile for the accent ink
             for_each(
                 rows,
