@@ -1,4 +1,4 @@
-//! The house set — sixteen glyphs of generic UI furniture, drawn by
+//! The house set — seventeen glyphs of generic UI furniture, drawn by
 //! hand on the grid. Stroke 2, round pen, the metrics of one family.
 //!
 //! These are the glyphs a shell needs before it has any art of its
@@ -297,6 +297,27 @@ const ELLIPSIS_GLYPH: Glyph = Glyph {
 /// `…` — more.
 pub const ELLIPSIS: Symbol = Symbol::new("ellipsis", &ELLIPSIS_GLYPH);
 
+const REFRESH_GLYPH: Glyph = Glyph {
+    draws: &[Draw {
+        paint: STROKE,
+        path: &[
+            // five sixths of a circle (r 6.5), from the upper right the
+            // long way round to the top…
+            Move(17.63, 8.75),
+            Cubic(18.2, 9.74, 18.5, 10.86, 18.5, 12.0),
+            Cubic(18.5, 15.59, 15.59, 18.5, 12.0, 18.5),
+            Cubic(8.41, 18.5, 5.5, 15.59, 5.5, 12.0),
+            Cubic(5.5, 8.41, 8.41, 5.5, 12.0, 5.5),
+            // …and the head of the arrow, at the end of the turn
+            Move(9.5, 3.0),
+            Line(12.0, 5.5),
+            Line(9.5, 8.0),
+        ], tint: None,
+    }],
+};
+/// `↻` — load again.
+pub const REFRESH: Symbol = Symbol::new("refresh", &REFRESH_GLYPH);
+
 /// The whole set, for galleries and for the tests that walk it.
 pub const ALL: &[Symbol] = &[
     CHEVRON_RIGHT,
@@ -315,6 +336,7 @@ pub const ALL: &[Symbol] = &[
     INFO,
     WARNING,
     ELLIPSIS,
+    REFRESH,
 ];
 
 #[cfg(test)]
@@ -323,7 +345,7 @@ mod tests {
     use crate::layout::Color;
 
     #[test]
-    fn the_sixteen_keys_never_collide() {
+    fn the_keys_of_the_set_never_collide() {
         for (i, a) in ALL.iter().enumerate() {
             for b in &ALL[i + 1..] {
                 assert_ne!(a.key, b.key, "{} and {} share a key", a.name, b.name);

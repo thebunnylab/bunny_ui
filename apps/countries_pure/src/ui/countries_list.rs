@@ -158,7 +158,7 @@ impl CountriesList {
                 |country| nav_link_value(CountryCell::new(country.clone()), country.clone()),
             )
             .searchable(self.search_text.binding())
-            .refreshable(move || self.load_countries_list(&refresh_injected, true))
+            .refreshable(async move || self.load_countries_list(&refresh_injected, true))
             .toolbar(toolbar_item(self.permissions_button()))
             .on_change(
                 move || self.routing_state.get().country_code.clone(),

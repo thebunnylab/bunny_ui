@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use motor::state::{Binding, Context, Locale, State};
 
+use crate::beat::Beat;
 use crate::ext::ViewExt;
 use crate::icon::house as symbol;
 use crate::layout::{Color, Edges};
@@ -62,10 +63,28 @@ pub struct SearchField {
     text: Binding<String>,
     prompt: Option<Arc<str>>,
     submit: Option<Rc<dyn Fn()>>,
+    /// The beat the field answers, and whether a ring selects its text.
+    summon: Option<(Beat, bool)>,
     site: Site,
 }
 
 impl SearchField {
+    /// The field takes the keyboard on each new ring of `beat`
+    /// ([`TextField::focus_on`](crate::views::TextField::focus_on)).
+    #[must_use]
+    pub fn focus_on(mut self, beat: Beat) -> Self {
+        self.summon = Some((beat, false));
+        self
+    }
+
+    /// [`SearchField::focus_on`], and each ring also selects the whole
+    /// query, so the next keys replace it: what a "find" shortcut wants.
+    #[must_use]
+    pub fn select_on(mut self, beat: Beat) -> Self {
+        self.summon = Some((beat, true));
+        self
+    }
+
     /// The words shown while the field is empty, in place of "Search".
     /// They are also the field's name for assistive technology.
     #[must_use]
@@ -93,6 +112,7 @@ impl View for SearchField {
             prompt: self.prompt.clone().unwrap_or_else(|| Arc::from(&*words.get(Word::Search))),
             clear: Arc::from(&*words.get(Word::Clear)),
             submit: self.submit.clone(),
+            summon: self.summon,
         }
         .render_into(ctx, out);
         crate::provenance::seal(ctx, out, mark, self.site, NodeKind::SearchField, None);
@@ -107,6 +127,7 @@ struct Body {
     prompt: Arc<str>,
     clear: Arc<str>,
     submit: Option<Rc<dyn Fn()>>,
+    summon: Option<(Beat, bool)>,
 }
 
 impl Component for Body {
@@ -120,6 +141,11 @@ impl Component for Body {
             .on_focus(move |has| focused.set(has));
         let field = match self.submit {
             Some(submit) => field.on_submit(move || submit()),
+            None => field,
+        };
+        let field = match self.summon {
+            Some((beat, true)) => field.select_on(beat),
+            Some((beat, false)) => field.focus_on(beat),
             None => field,
         };
         // the button exists only while there is something to empty
@@ -148,5 +174,5 @@ impl Component for Body {
 /// [The module](self) has the prompt, the keys and how it is made.
 #[track_caller]
 pub fn search_field(text: Binding<String>) -> SearchField {
-    SearchField { text, prompt: None, submit: None, site: crate::provenance::here() }
+    SearchField { text, prompt: None, submit: None, summon: None, site: crate::provenance::here() }
 }

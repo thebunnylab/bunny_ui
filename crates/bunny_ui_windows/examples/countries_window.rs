@@ -9,11 +9,16 @@
 //! country as a page over the list, and a neighbour in the details opens
 //! another page over that one.
 //!
-//! The stack's bar shows the title of the page and the button that goes
-//! back.
+//! The stack's bar shows the title of the page, the button that goes back
+//! and the items the page puts in it.
+//!
+//! The list is searchable: the stack puts the field in its bar.
+//!
+//! It loads again too: the bar has the button, and the key is the
+//! accelerator with `R`.
 //!
 //! Limitations of this phase (noted, not hidden):
-//! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
+//! images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
 

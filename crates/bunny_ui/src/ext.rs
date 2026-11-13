@@ -1587,16 +1587,40 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Effect { name: "task", detail: if id.is_some() { "(id:)" } else { "()" }, effect: effects::task_effect(site.into(), id, start), })
     }
 
-    /// `.searchable(text: $searchText)`
+    /// A search field for a page of a navigation stack:
+    /// `.searchable(self.query.binding())`.
+    ///
+    /// The stack puts the field in its bar, under the title. The binding
+    /// holds the query, and the page reads the same binding to filter
+    /// what it shows; the field filters nothing by itself. The
+    /// accelerator with `F` — ⌘F on the Mac — takes the keyboard to the
+    /// field and selects the query. Outside a stack it does nothing: a
+    /// page that is in no stack writes [`search_field`] itself.
+    ///
+    /// [`search_field`]: crate::search_field::search_field
     #[track_caller]
-    fn searchable(self, _text: Binding<String>) -> Modified<Self> {
-        Modified::new(self, Modifier::Searchable)
+    fn searchable(self, text: Binding<String>) -> Modified<Self> {
+        Modified::new(self, Modifier::Searchable(text))
     }
 
-    /// `.refreshable { … }` — a user gesture; inert headless.
+    /// Work that loads a page of a navigation stack again:
+    /// `.refreshable(async move || model.reload().await)`.
+    ///
+    /// The stack puts a button for it in its bar, at the trailing edge,
+    /// and the accelerator with `R` — ⌘R on the Mac — starts it too. The
+    /// work is an `async` closure, and the refresh is done when the
+    /// closure is. One run at a time: until then the button is disabled
+    /// and the key starts nothing.
+    ///
+    /// The work is the page's. It continues while another page covers
+    /// the page, and it is cancelled when the page leaves the stack.
+    /// Outside a stack it does nothing.
     #[track_caller]
-    fn refreshable(self, _action: impl Fn() + 'static) -> Modified<Self> {
-        Modified::new(self, Modifier::Refreshable)
+    fn refreshable<F>(self, action: F) -> Modified<Self>
+    where
+        F: AsyncFn() + 'static,
+    {
+        Modified::new(self, Modifier::Refreshable(crate::nav::refresh(action)))
     }
 
     /// `.sheet(isPresented: $flag) { … }` — the content is the erased
@@ -1763,10 +1787,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Popover { is_presented, side, focus: crate::layout::PopoverFocus::Scope, on_dismiss: Some(Rc::new(on_dismiss)), content: Rc::new(content), })
     }
 
-    /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
+    /// The views a page puts in the bar of its navigation stack:
+    /// `.toolbar((toolbar_item(edit).leading(), toolbar_item(add)))`.
+    ///
+    /// An item stands at the trailing edge of the bar, or after the
+    /// button that goes back when it is `.leading()`. Write it on a view
+    /// of the page; the items are the page's, so they may read its state
+    /// and they change with it. A page says its items every time its body
+    /// runs, and the last ones it said are the ones in the bar. Outside a
+    /// stack it does nothing.
     #[track_caller]
-    fn toolbar(self, _items: impl View) -> Modified<Self> {
-        Modified::new(self, Modifier::Toolbar)
+    fn toolbar(self, items: impl crate::nav::ToolbarItems) -> Modified<Self> {
+        Modified::new(self, Modifier::Toolbar(items.into_bar()))
     }
 
     // MARK: - Data & environment

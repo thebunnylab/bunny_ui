@@ -304,8 +304,10 @@ pub enum NodeKind {
     DatePicker,
     /// `navigation_stack(…)`.
     NavigationStack,
-    /// `nav_link_value(…)`.
+    /// `nav_link(…)`.
     NavLink,
+    /// `nav_link_value(…)`.
+    NavLinkValue,
 }
 
 impl NodeKind {
@@ -342,7 +344,8 @@ impl NodeKind {
             Self::Calendar => "calendar",
             Self::DatePicker => "date_picker",
             Self::NavigationStack => "navigation_stack",
-            Self::NavLink => "nav_link_value",
+            Self::NavLink => "nav_link",
+            Self::NavLinkValue => "nav_link_value",
         }
     }
 }

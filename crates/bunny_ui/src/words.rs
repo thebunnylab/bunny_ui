@@ -31,7 +31,7 @@ use motor::state::Locale;
 use crate::catalog::{Catalog, Key, Strings, Table, fill};
 
 /// How many words the framework owns — the length of every table.
-pub const WORDS: usize = 26;
+pub const WORDS: usize = 27;
 
 /// One of the framework's own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -85,6 +85,8 @@ pub enum Word {
     NextMonth,
     /// The button of a navigation bar that leaves the page.
     Back,
+    /// The button of a navigation bar that loads the page's content again.
+    Refresh,
 }
 
 impl Word {
@@ -116,6 +118,7 @@ impl Word {
         Self::PreviousMonth,
         Self::NextMonth,
         Self::Back,
+        Self::Refresh,
     ];
 
     /// Does the word name the app — is its entry a template with `{app}`?
@@ -135,7 +138,7 @@ impl Key for Word {
 /// One language's words.
 pub type WordTable = Table<WORDS>;
 
-// Every table lists the words in this order, on these seven lines:
+// Every table lists the words in this order, on these nine lines:
 //   About, Settings, Services, Hide, HideOthers, ShowAll, Quit
 //   Window, Minimize, Zoom, BringAllToFront
 //   Undo, Redo, Cut, Copy, Paste, SelectAll
@@ -144,6 +147,7 @@ pub type WordTable = Table<WORDS>;
 //   Search, Clear
 //   PreviousMonth, NextMonth
 //   Back
+//   Refresh
 #[rustfmt::skip]
 const EN: WordTable = Table { tag: "en", entries: [
     "About {app}", "Settings…", "Services", "Hide {app}", "Hide Others", "Show All", "Quit {app}",
@@ -154,6 +158,7 @@ const EN: WordTable = Table { tag: "en", entries: [
     "Search", "Clear",
     "Previous month", "Next month",
     "Back",
+    "Refresh",
 ]};
 
 /// Brazilian Portuguese, tagged `pt`: `pt-BR` and bare `pt` both land
@@ -168,6 +173,7 @@ const PT: WordTable = Table { tag: "pt", entries: [
     "Buscar", "Limpar",
     "Mês anterior", "Próximo mês",
     "Voltar",
+    "Atualizar",
 ]};
 
 #[rustfmt::skip]
@@ -180,6 +186,7 @@ const PT_PT: WordTable = Table { tag: "pt-PT", entries: [
     "Pesquisar", "Limpar",
     "Mês anterior", "Mês seguinte",
     "Retroceder",
+    "Atualizar",
 ]};
 
 #[rustfmt::skip]
@@ -192,6 +199,7 @@ const ES: WordTable = Table { tag: "es", entries: [
     "Buscar", "Borrar",
     "Mes anterior", "Mes siguiente",
     "Atrás",
+    "Actualizar",
 ]};
 
 #[rustfmt::skip]
@@ -204,6 +212,7 @@ const FR: WordTable = Table { tag: "fr", entries: [
     "Rechercher", "Effacer",
     "Mois précédent", "Mois suivant",
     "Retour",
+    "Actualiser",
 ]};
 
 #[rustfmt::skip]
@@ -216,6 +225,7 @@ const DE: WordTable = Table { tag: "de", entries: [
     "Suchen", "Löschen",
     "Vorheriger Monat", "Nächster Monat",
     "Zurück",
+    "Aktualisieren",
 ]};
 
 #[rustfmt::skip]
@@ -228,6 +238,7 @@ const IT: WordTable = Table { tag: "it", entries: [
     "Cerca", "Cancella",
     "Mese precedente", "Mese successivo",
     "Indietro",
+    "Aggiorna",
 ]};
 
 #[rustfmt::skip]
@@ -240,6 +251,7 @@ const JA: WordTable = Table { tag: "ja", entries: [
     "検索", "消去",
     "前の月", "次の月",
     "戻る",
+    "更新",
 ]};
 
 #[rustfmt::skip]
@@ -252,6 +264,7 @@ const ZH_HANS: WordTable = Table { tag: "zh-Hans", entries: [
     "搜索", "清除",
     "上个月", "下个月",
     "返回",
+    "刷新",
 ]};
 
 #[rustfmt::skip]
@@ -264,6 +277,7 @@ const ZH_HANT: WordTable = Table { tag: "zh-Hant", entries: [
     "搜尋", "清除",
     "上個月", "下個月",
     "返回",
+    "重新整理",
 ]};
 
 #[rustfmt::skip]
@@ -276,6 +290,7 @@ const KO: WordTable = Table { tag: "ko", entries: [
     "검색", "지우기",
     "이전 달", "다음 달",
     "뒤로",
+    "새로 고침",
 ]};
 
 #[rustfmt::skip]
@@ -288,6 +303,7 @@ const NL: WordTable = Table { tag: "nl", entries: [
     "Zoek", "Wis",
     "Vorige maand", "Volgende maand",
     "Terug",
+    "Vernieuw",
 ]};
 
 #[rustfmt::skip]
@@ -300,6 +316,7 @@ const RU: WordTable = Table { tag: "ru", entries: [
     "Поиск", "Очистить",
     "Предыдущий месяц", "Следующий месяц",
     "Назад",
+    "Обновить",
 ]};
 
 /// Turkish inflects what it attaches to, and a suffix cannot attach to
@@ -315,6 +332,7 @@ const TR: WordTable = Table { tag: "tr", entries: [
     "Ara", "Temizle",
     "Önceki ay", "Sonraki ay",
     "Geri",
+    "Yenile",
 ]};
 
 #[rustfmt::skip]
@@ -327,6 +345,7 @@ const PL: WordTable = Table { tag: "pl", entries: [
     "Szukaj", "Wyczyść",
     "Poprzedni miesiąc", "Następny miesiąc",
     "Wstecz",
+    "Odśwież",
 ]};
 
 #[rustfmt::skip]
@@ -339,6 +358,7 @@ const SV: WordTable = Table { tag: "sv", entries: [
     "Sök", "Rensa",
     "Föregående månad", "Nästa månad",
     "Tillbaka",
+    "Uppdatera",
 ]};
 
 /// The sixteen tables, English first — the source every other falls to.

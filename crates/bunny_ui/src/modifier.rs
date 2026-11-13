@@ -259,9 +259,9 @@ pub enum Modifier {
     Custom(Rc<dyn CustomModifier>),
 
     // MARK: - Inert parity
-    Searchable,
-    Refreshable,
-    Toolbar,
+    Searchable(Binding<String>),
+    Refreshable(crate::nav::Refresh),
+    Toolbar(crate::nav::BarItems),
     AttachEnvironmentOverrides,
     AttachEnvironmentOverridesOnChange,
 
@@ -376,9 +376,9 @@ impl Modifier {
             Modifier::Popover { .. } => "popover",
             Modifier::EnvSet { .. } => "inject",
             Modifier::Custom { .. } => "modifier",
-            Modifier::Searchable => "searchable",
-            Modifier::Refreshable => "refreshable",
-            Modifier::Toolbar => "toolbar",
+            Modifier::Searchable(_) => "searchable",
+            Modifier::Refreshable(_) => "refreshable",
+            Modifier::Toolbar(_) => "toolbar",
             Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
             Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
             Modifier::FlipsForRightToLeftLayoutDirection { .. } => "flips_for_right_to_left_layout_direction",
@@ -566,9 +566,9 @@ impl Modifier {
             Modifier::Popover { side, .. } => format!(" [.popover(.{side:?})]"),
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Custom(custom) => format!(" [.modifier({})]", custom.name()),
-            Modifier::Searchable => " [.searchable(text: $…)]".into(),
-            Modifier::Refreshable => " [.refreshable { … }]".into(),
-            Modifier::Toolbar => " [.toolbar { … }]".into(),
+            Modifier::Searchable(_) => " [.searchable(text: $…)]".into(),
+            Modifier::Refreshable(_) => " [.refreshable { … }]".into(),
+            Modifier::Toolbar(_) => " [.toolbar { … }]".into(),
             Modifier::AttachEnvironmentOverrides => " [.attachEnvironmentOverrides()]".into(),
             Modifier::AttachEnvironmentOverridesOnChange => {
                 " [.attachEnvironmentOverrides(onChange: …)]".into()
@@ -1753,7 +1753,26 @@ pub(crate) fn apply(
             // page of shows that in its bar. Outside a stack nobody
             // hears it, and the title stays a word of the print
             if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
-                stack.set_title(title);
+                stack.tell(&crate::nav::PageWord::Title(std::sync::Arc::from(title.as_str())));
+            }
+        }
+        Modifier::Toolbar(items) => {
+            // the items of the page's bar, by the same road as its title
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.tell(&crate::nav::PageWord::Items(items.clone()));
+            }
+        }
+        Modifier::Searchable(query) => {
+            // the page's query: the stack puts a search field for it in the bar
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.tell(&crate::nav::PageWord::Search(query.clone()));
+            }
+        }
+        Modifier::Refreshable(work) => {
+            // the work that loads the page again: the stack gives it a
+            // button in the bar, and a key
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.tell(&crate::nav::PageWord::Refresh(Rc::clone(work)));
             }
         }
         Modifier::KeyContextFocused(name) => {

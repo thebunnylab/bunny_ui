@@ -1,6 +1,7 @@
 //! `navigation_stack(path, root).destination(…)`: a stack of pages.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use bunny_ui::accessibility::Role;
 use bunny_ui::action::ActionId;
@@ -457,6 +458,522 @@ fn the_back_button_is_named_in_the_readers_language_and_changes_sides_right_to_l
     assert!(right_to_left.origin.x > SIZE.width / 2.0, "the leading edge is on the right");
 }
 
+thread_local! {
+    static ROWS_RUNS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A page with items in its bar: one that is always there, at the
+/// leading side, and one that reads the page's state and can leave.
+#[derive(Clone, Copy)]
+struct Rows {
+    added: State<u32>,
+    edited: State<u32>,
+    locked: State<bool>,
+    titled: bool,
+}
+
+impl Component for Rows {
+    fn body(self) -> impl View {
+        count(&ROWS_RUNS);
+        let rows = self.added.get();
+        let page = vstack!(
+            text!("Rows {}", self.added),
+            button(text("Lock"), move || self.locked.set(!self.locked.get())),
+        )
+        .toolbar((
+            toolbar_item(button(text("Edit"), move || self.edited.add(1))).leading(),
+            toolbar_item((!self.locked.get()).then(|| button(text(format!("Add {rows}")), move || self.added.add(1)))),
+        ));
+        if self.titled { Either::First(page.navigation_title("All rows")) } else { Either::Second(page) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Table {
+    path: State<Vec<Route>>,
+    rows: Rows,
+}
+
+impl Table {
+    fn new(titled: bool) -> Self {
+        Self {
+            path: State::new(Vec::new()),
+            rows: Rows { added: State::new(0), edited: State::new(0), locked: State::new(false), titled },
+        }
+    }
+}
+
+impl Component for Table {
+    fn body(self) -> impl View {
+        let rows = self.rows;
+        navigation_stack(self.path, rows).destination(move |_| rows)
+    }
+}
+
+/// The elements of the frame, in the order assistive technology has them.
+fn elements(runtime: &Runtime, view: &impl View) -> Vec<(Role, String, Rect)> {
+    runtime.display_frame(view, SIZE);
+    runtime.accessibility_tree().nodes().iter().map(|node| (node.role, node.label.to_string(), node.bounds)).collect()
+}
+
+fn element(runtime: &Runtime, view: &impl View, label: &str) -> Rect {
+    elements(runtime, view)
+        .into_iter()
+        .find(|(_, name, _)| name == label)
+        .unwrap_or_else(|| panic!("nothing is named {label:?}"))
+        .2
+}
+
+fn press_on(runtime: &Runtime, view: &impl View, label: &str) {
+    let rect = element(runtime, view, label);
+    let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+    runtime.pointer_pressed(x, y);
+    runtime.pointer_released(x, y);
+    runtime.display_frame(view, SIZE);
+}
+
+#[test]
+fn a_page_puts_its_items_in_the_bar_on_the_side_it_names() {
+    let runtime = runtime();
+    let table = Table::new(true);
+    let (edit, title, add) = (element(&runtime, &table, "Edit"), element(&runtime, &table, "All rows"), element(&runtime, &table, "Add 0"));
+    assert!(edit.origin.x < title.origin.x, "a leading item stands before the title");
+    assert!(title.origin.x < add.origin.x, "and the other at the trailing edge");
+    assert!(add.origin.x + add.size.width > SIZE.width - 20.0);
+    for item in [edit, add] {
+        assert!(item.origin.y + item.size.height <= 44.0, "inside the bar");
+    }
+    assert!(element(&runtime, &table, "Lock").origin.y >= 45.0, "the page is under the bar");
+
+    // over a page that was pushed: the button that goes back, then the leading item
+    table.path.push(Route::About);
+    let (back, edit) = (element(&runtime, &table, "Back"), element(&runtime, &table, "Edit"));
+    assert!(back.origin.x < edit.origin.x);
+    // Tab: the bar from its leading edge, then the page
+    let mut stops = Vec::new();
+    for _ in 0..4 {
+        assert!(runtime.offer_key(KeyPattern::key(Key::Tab)));
+        runtime.display_frame(&table, SIZE);
+        let tree = runtime.accessibility_tree();
+        stops.push(tree.nodes().iter().find(|node| node.focused).map(|node| node.label.to_string()).unwrap_or_default());
+    }
+    assert_eq!(stops, ["Back", "Edit", "Add 0", "Lock"]);
+}
+
+#[test]
+fn the_items_are_the_pages_own_and_follow_its_state() {
+    let runtime = runtime();
+    let table = Table::new(true);
+    runtime.display_frame(&table, SIZE);
+    let made = runs(&ROWS_RUNS);
+
+    press_on(&runtime, &table, "Edit");
+    assert_eq!(table.rows.edited.get(), 1, "an item runs its action");
+    press_on(&runtime, &table, "Add 0");
+    assert_eq!(table.rows.added.get(), 1);
+    // the page ran because its state moved, and said its items again:
+    // the bar shows the new ones
+    let labels: Vec<_> = elements(&runtime, &table).into_iter().map(|(_, label, _)| label).collect();
+    assert!(labels.iter().any(|label| label == "Add 1") && !labels.iter().any(|label| label == "Add 0"), "{labels:?}");
+    assert_eq!(runs(&ROWS_RUNS), made + 1, "one run of the page for one change of its state");
+
+    // an item that the page stops making leaves the bar
+    press_on(&runtime, &table, "Lock");
+    let labels: Vec<_> = elements(&runtime, &table).into_iter().map(|(_, label, _)| label).collect();
+    assert!(labels.iter().any(|label| label == "Edit") && !labels.iter().any(|label| label.starts_with("Add")), "{labels:?}");
+}
+
+#[test]
+fn a_root_with_items_and_no_title_has_a_bar() {
+    let runtime = runtime();
+    let table = Table::new(false);
+    let add = element(&runtime, &table, "Add 0");
+    assert!(add.origin.y + add.size.height <= 44.0);
+    assert!(element(&runtime, &table, "Lock").origin.y >= 45.0);
+}
+
+/// A page that no route names: a link makes it.
+#[derive(Clone, Copy)]
+struct Notes;
+
+impl Component for Notes {
+    fn body(self) -> impl View {
+        let taps = State::new(0u32);
+        vstack!(
+            text!("Notes taps {}", taps),
+            button(text("Tap notes"), move || taps.add(1)),
+            nav_link_value("Open item 9", Route::Item(9)),
+        )
+        .navigation_title("Notes")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Shop {
+    path: State<Vec<Route>>,
+}
+
+impl Component for Shop {
+    fn body(self) -> impl View {
+        let root = vstack!(nav_link("About the shop", || Notes), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Shop");
+        navigation_stack(self.path, root).destination(|route| match route {
+            Route::Item(number) => Either::First(
+                vstack!(text!("Item {}", number), nav_link(text("Notes on it"), || Notes)).navigation_title("An item"),
+            ),
+            Route::About => Either::Second(text("About this app")),
+        })
+    }
+}
+
+fn titles(runtime: &Runtime, view: &impl View) -> Vec<String> {
+    elements(runtime, view).into_iter().filter(|(role, _, _)| *role == Role::Text).map(|(_, label, _)| label).collect()
+}
+
+#[test]
+fn a_link_opens_a_page_that_has_no_route() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(Vec::new()) };
+    // the label is words: a button named by them
+    assert!(elements(&runtime, &shop).iter().any(|(role, label, _)| *role == Role::Button && label == "About the shop"));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+    assert!(shop.path.get().is_empty(), "the page is not in the path");
+
+    // the button of the bar leaves it, and so do "back" and its keys
+    press_on(&runtime, &shop, "Back");
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(runtime.navigate_back());
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(runtime.offer_key(KeyPattern::command(Key::Char('['))));
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    assert!(!runtime.navigate_back(), "and then the root has nothing under it");
+    // the same link again makes a new page
+    press_on(&runtime, &shop, "About the shop");
+    press_on(&runtime, &shop, "Tap notes");
+    press_on(&runtime, &shop, "Back");
+    press_on(&runtime, &shop, "About the shop");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+}
+
+#[test]
+fn a_route_goes_over_a_page_with_no_route_and_back_returns_to_it() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(vec![Route::Item(1)]) };
+    press_on(&runtime, &shop, "Notes on it");
+    press_on(&runtime, &shop, "Tap notes");
+    press_on(&runtime, &shop, "Tap notes");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 2".to_string()));
+
+    // a route pushed from it stands over it
+    press_on(&runtime, &shop, "Open item 9");
+    assert_eq!(shop.path.get(), [Route::Item(1), Route::Item(9)]);
+    assert!(titles(&runtime, &shop).contains(&"Item 9".to_string()));
+    // back: the page with no route again, as it was left
+    assert!(runtime.navigate_back());
+    assert_eq!(shop.path.get(), [Route::Item(1)]);
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 2".to_string()));
+    assert!(runtime.navigate_back());
+    assert!(titles(&runtime, &shop).contains(&"Item 1".to_string()));
+    assert_eq!(shop.path.get(), [Route::Item(1)], "leaving it wrote nothing to the path");
+}
+
+#[test]
+fn a_write_that_changes_a_route_under_it_takes_a_page_with_no_route_away() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(vec![Route::Item(1)]) };
+    press_on(&runtime, &shop, "Notes on it");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+    // the app's own pop does not see the page: it takes the route under it
+    assert!(shop.path.pop());
+    let shown = titles(&runtime, &shop);
+    assert!(shown.contains(&"Shop".to_string()) && !shown.iter().any(|title| title.starts_with("Notes taps")), "{shown:?}");
+
+    // over the root there is no route under it: a route that comes and goes leaves it there
+    press_on(&runtime, &shop, "About the shop");
+    shop.path.push(Route::Item(4));
+    assert!(titles(&runtime, &shop).contains(&"Item 4".to_string()));
+    shop.path.pop_to_root();
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+}
+
+/// A root that can be searched, and a page over it that cannot.
+#[derive(Clone, Copy)]
+struct Catalog {
+    path: State<Vec<Route>>,
+    query: State<String>,
+}
+
+impl Component for Catalog {
+    fn body(self) -> impl View {
+        let query = self.query.get().to_lowercase();
+        let found: Vec<_> =
+            ["Alder", "Ash", "Birch"].iter().filter(|name| name.to_lowercase().contains(&query)).map(|name| text(*name)).collect();
+        let root = vstack!(vstack(found), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Trees")
+            .searchable(self.query.binding());
+        navigation_stack(self.path, root).destination(|_| button(text("Plain"), || {}).navigation_title("Other"))
+    }
+}
+
+fn find_key() -> KeyPattern {
+    KeyPattern::command(Key::Char('f'))
+}
+
+#[test]
+fn a_page_that_can_be_searched_has_a_field_in_the_bar() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    let all = elements(&runtime, &catalog);
+    let field = all.iter().find(|(role, _, _)| *role == Role::TextField).expect("the bar has a field");
+    assert_eq!(field.1, "Search", "named by its prompt");
+    let (title, first) = (element(&runtime, &catalog, "Trees"), element(&runtime, &catalog, "Alder"));
+    assert!(field.2.origin.y >= title.origin.y + title.size.height, "under the title");
+    assert!(field.2.origin.y + field.2.size.height < first.origin.y, "and over the page");
+    assert!(field.2.size.width > SIZE.width / 2.0, "as wide as the bar lets it be");
+}
+
+#[test]
+fn find_takes_the_keyboard_to_the_field_and_the_page_filters_by_the_same_binding() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    runtime.display_frame(&catalog, SIZE);
+    assert!(!runtime.focus_takes_text());
+    assert!(runtime.offer_key(find_key()), "the stack takes the key of find");
+    runtime.display_frame(&catalog, SIZE);
+    assert!(runtime.focus_takes_text(), "and the keyboard is in the field");
+    assert!(runtime.key(EditCommand::Insert("bi".into())).applied);
+    assert_eq!(catalog.query.get(), "bi");
+    let shown = titles(&runtime, &catalog);
+    assert!(shown.contains(&"Birch".to_string()) && !shown.contains(&"Alder".to_string()), "{shown:?}");
+
+    // find again selects the query: the next keys replace it
+    assert!(runtime.offer_key(find_key()));
+    runtime.display_frame(&catalog, SIZE);
+    assert!(runtime.key(EditCommand::Insert("a".into())).applied);
+    assert_eq!(catalog.query.get(), "a");
+    let shown = titles(&runtime, &catalog);
+    assert!(shown.contains(&"Alder".to_string()) && shown.contains(&"Ash".to_string()) && !shown.contains(&"Birch".to_string()));
+}
+
+#[test]
+fn the_field_is_the_page_on_tops_and_a_page_with_none_has_none() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new("as".into()) };
+    runtime.display_frame(&catalog, SIZE);
+    catalog.path.push(Route::Item(1));
+    let over = elements(&runtime, &catalog);
+    assert!(!over.iter().any(|(role, _, _)| *role == Role::TextField), "the page on top said no search: {over:?}");
+    assert!(!runtime.offer_key(find_key()), "and the key of find is not the stack's");
+
+    catalog.path.pop();
+    let back = elements(&runtime, &catalog);
+    assert!(back.iter().any(|(role, label, _)| *role == Role::TextField && label == "Search"));
+    assert_eq!(catalog.query.get(), "as", "the query was the app's all the time");
+}
+
+/// The runs of a refresh that started, and the door each one waits at.
+#[derive(Clone, Default)]
+struct Doors(Rc<RefCell<Vec<task::Sender<()>>>>);
+
+impl Doors {
+    /// Work that waits at a new door, and counts in `done` when it is let through.
+    fn work(&self, done: State<u32>) -> impl AsyncFn() + 'static {
+        let doors = self.clone();
+        async move || {
+            let (send, door) = task::channel::<()>();
+            doors.0.borrow_mut().push(send);
+            if door.recv().await.is_some() {
+                done.update(|runs| *runs += 1);
+            }
+        }
+    }
+
+    fn started(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// `true` while the last run that started is still waiting.
+    fn waits(&self) -> bool {
+        self.0.borrow().last().is_some_and(task::Sender::is_connected)
+    }
+
+    /// Lets the last run that started end.
+    fn open(&self) {
+        self.0.borrow().last().expect("a run started").send(()).expect("the run waits");
+    }
+}
+
+/// A root that loads again, and pages over it that load again too.
+#[derive(Clone)]
+struct Feed {
+    path: State<Vec<Route>>,
+    loaded: State<u32>,
+    pages_loaded: State<u32>,
+    doors: Doors,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self { path: State::new(Vec::new()), loaded: State::new(0), pages_loaded: State::new(0), doors: Doors::default() }
+    }
+}
+
+impl Component for Feed {
+    fn body(self) -> impl View {
+        let (doors, pages_loaded) = (self.doors.clone(), self.pages_loaded);
+        let root = vstack!(text!("Loaded {}", self.loaded), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Feed")
+            .refreshable(self.doors.work(self.loaded));
+        navigation_stack(self.path, root)
+            .destination(move |_| text!("Pages loaded {}", pages_loaded).navigation_title("Other").refreshable(doors.work(pages_loaded)))
+    }
+}
+
+fn refresh_key() -> KeyPattern {
+    KeyPattern::command(Key::Char('r'))
+}
+
+/// Whether the button that refreshes takes a press, as assistive technology has it.
+fn can_refresh(runtime: &Runtime, view: &impl View) -> bool {
+    runtime.display_frame(view, SIZE);
+    let tree = runtime.accessibility_tree();
+    tree.nodes().iter().find(|node| &*node.label == "Refresh").expect("the bar has the button").enabled
+}
+
+#[test]
+fn a_page_that_loads_again_has_a_button_for_it_in_the_bar() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    let all = elements(&runtime, &feed);
+    let button = all.iter().find(|(_, label, _)| label == "Refresh").expect("the bar has the button");
+    assert_eq!(button.0, Role::Button);
+    let (title, first) = (element(&runtime, &feed, "Feed"), element(&runtime, &feed, "Loaded 0"));
+    assert!(button.2.origin.x > title.origin.x + title.size.width, "at the trailing edge: {all:?}");
+    assert!(button.2.origin.y + button.2.size.height <= first.origin.y, "in the bar, over the page");
+
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 1, "a press starts the page's work");
+    feed.doors.open();
+    assert!(titles(&runtime, &feed).contains(&"Loaded 1".to_string()), "and the page shows what the work loaded");
+}
+
+#[test]
+fn one_run_at_a_time_the_button_waits_for_the_one_on_its_way() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    assert!(can_refresh(&runtime, &feed));
+    press_on(&runtime, &feed, "Refresh");
+    assert!(!can_refresh(&runtime, &feed), "the button is disabled while the work is not done");
+    press_on(&runtime, &feed, "Refresh");
+    assert!(runtime.offer_key(refresh_key()), "the key is still the stack's");
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.doors.started(), 1, "and neither starts a second run");
+
+    feed.doors.open();
+    assert!(can_refresh(&runtime, &feed), "the work is done: the button is back");
+    assert_eq!(feed.loaded.get(), 1);
+}
+
+#[test]
+fn the_key_of_refresh_starts_the_work_of_the_page_on_top() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    runtime.display_frame(&feed, SIZE);
+    assert!(runtime.offer_key(refresh_key()), "the stack takes the key of refresh");
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.doors.started(), 1);
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!((feed.loaded.get(), feed.pages_loaded.get()), (1, 0));
+
+    // over the root, the key is the page's on top
+    feed.path.push(Route::Item(1));
+    runtime.display_frame(&feed, SIZE);
+    assert!(runtime.offer_key(refresh_key()));
+    runtime.display_frame(&feed, SIZE);
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!((feed.loaded.get(), feed.pages_loaded.get()), (1, 1));
+}
+
+#[test]
+fn the_work_is_the_pages_it_goes_on_under_a_cover_and_stops_when_the_page_leaves() {
+    let runtime = runtime();
+    let feed = Feed::new();
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 1);
+
+    // a page covers the root while the root's work is on its way
+    feed.path.push(Route::Item(1));
+    assert!(can_refresh(&runtime, &feed), "the page on top has no run of its own");
+    assert!(feed.doors.waits(), "the root's work goes on under the page");
+    feed.doors.open();
+    runtime.display_frame(&feed, SIZE);
+    assert_eq!(feed.loaded.get(), 1, "and it ends there");
+
+    // the page on top starts its own, and leaves before it is done
+    press_on(&runtime, &feed, "Refresh");
+    assert_eq!(feed.doors.started(), 2);
+    assert!(feed.doors.waits());
+    feed.path.pop();
+    assert!(can_refresh(&runtime, &feed), "the root's run ended while it was covered");
+    assert!(!feed.doors.waits(), "the work of the page that left was cancelled with it");
+    assert_eq!(feed.pages_loaded.get(), 0);
+}
+
+#[test]
+fn the_work_is_the_one_the_page_gave_last() {
+    /// A page that gives work holding a value of its state.
+    #[derive(Clone, Copy)]
+    struct Stepped {
+        step: State<u32>,
+        seen: State<u32>,
+    }
+
+    impl Component for Stepped {
+        fn body(self) -> impl View {
+            // held by value: work from an earlier run of this body holds an old step
+            let (step, seen) = (self.step.get(), self.seen);
+            button(text!("Step {}", self.step), move || self.step.add(1))
+                .navigation_title("Steps")
+                .refreshable(async move || seen.set(step))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Walk {
+        page: Stepped,
+    }
+
+    impl Component for Walk {
+        fn body(self) -> impl View {
+            count(&APP_RUNS);
+            navigation_stack_content(self.page)
+        }
+    }
+
+    let runtime = runtime();
+    let walk = Walk { page: Stepped { step: State::new(1), seen: State::new(0) } };
+    runtime.display_frame(&walk, SIZE);
+    press_on(&runtime, &walk, "Step 1");
+    press_on(&runtime, &walk, "Step 2");
+    assert!(runtime.offer_key(refresh_key()));
+    runtime.display_frame(&walk, SIZE);
+    assert_eq!(walk.page.seen.get(), 3, "the work the page gave in its last run, not the one the bar was made with");
+}
+
+#[test]
+fn a_page_with_no_work_has_no_button_and_the_key_is_not_the_stacks() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    let all = elements(&runtime, &catalog);
+    assert!(!all.iter().any(|(_, label, _)| label == "Refresh"), "{all:?}");
+    assert!(!runtime.offer_key(refresh_key()), "an app's own binding of the key is free to take it");
+}
+
 #[test]
 fn a_root_with_no_title_has_no_bar() {
     #[derive(Clone, Copy)]
@@ -510,7 +1027,7 @@ fn it_lowers_the_page_on_top_to_the_web_and_a_tool_sees_only_the_apps_lines() {
     let sites = runtime.sites();
     runtime.record_sites(false);
     assert!(sites.iter().any(|site| site.kind == NodeKind::NavigationStack));
-    assert!(sites.iter().any(|site| site.kind == NodeKind::NavLink));
+    assert!(sites.iter().any(|site| site.kind == NodeKind::NavLinkValue));
     for site in &sites {
         if let Site::Caller(location) = site.site {
             // a path reads with either separator, by the platform that built it

@@ -104,6 +104,24 @@ pub const NAV_BACK: ActionId = ActionId("bunny.nav.back");
 /// Escape is not bound: it never leaves a page.
 pub const NAV_CONTEXT: &str = "bunny.nav";
 
+/// "Find" in a navigation stack: the keyboard goes to the search field
+/// of the page on top, and the field's text is selected.
+pub const NAV_FIND: ActionId = ActionId("bunny.nav.find");
+
+/// The key context a navigation stack declares while the page on top has
+/// a search field (`.searchable(…)`). The runtime pre-binds the
+/// accelerator with `F` here, which is ⌘F on the Mac.
+pub const NAV_FIND_CONTEXT: &str = "bunny.nav.find";
+
+/// "Refresh" in a navigation stack: the page on top loads its content
+/// again, by the work it gave to `.refreshable(…)`.
+pub const NAV_REFRESH: ActionId = ActionId("bunny.nav.refresh");
+
+/// The key context a navigation stack declares while the page on top can
+/// be refreshed (`.refreshable(…)`). The runtime pre-binds the
+/// accelerator with `R` here, which is ⌘R on the Mac.
+pub const NAV_REFRESH_CONTEXT: &str = "bunny.nav.refresh";
+
 /// The key context the days of a calendar declare while the keyboard is
 /// on one of them. The runtime pre-binds here the keys that leave the
 /// month: an arrow at the edge of the days, Page Up and Page Down. An
