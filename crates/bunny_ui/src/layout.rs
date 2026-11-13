@@ -861,13 +861,14 @@ pub enum LayoutNode {
     /// `turn` is radians clockwise about the glyph's centre — zero for
     /// the upright glyph, which paints the bytes it always did.
     Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool, turn: f32 },
-    /// A view whose resolved size goes back to the app (`.on_measure`).
+    /// A view whose resolved size (`.on_measure`) or frame (`.on_frame`)
+    /// goes back to the app.
     ///
     /// Transparent to the layout in both directions: it measures as its
     /// child and places at the frame it is given. All it adds is the
     /// RECORD — the frame lands in [`LayoutResult::frames`] under
     /// `path`, which is the only thing the runtime needs to hand the
-    /// size over.
+    /// size or the frame over. The last segment of the path says which.
     Measured { path: String, child: Box<LayoutNode> },
     /// Semantic information with no effect on geometry or paint.
     Accessible { semantics: crate::accessibility::Semantics, child: Box<LayoutNode> },
@@ -5129,6 +5130,11 @@ pub fn hit_test(hits: &[(String, Rect)], x: Px, y: Px) -> Option<&str> {
 /// probe's record can never be confused with a boundary's.
 pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 
+/// [`MEASURE_SEGMENT`] for a probe that hears the whole frame
+/// (`.on_frame`). A segment of its own: one view may carry both probes,
+/// and each keeps its own address.
+pub(crate) const FRAME_SEGMENT: &str = "/#frame";
+
 /// The absolute frames the placement pass produces, addressable by the
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
@@ -5149,11 +5155,11 @@ impl Frames {
     }
 
     /// The probes' own frames — the entries a `Measured` node recorded,
-    /// told apart by the segment only that node writes.
+    /// told apart by the segments only that node writes.
     pub(crate) fn measured(&self) -> impl Iterator<Item = (&str, &Rect)> {
         self.entries
             .iter()
-            .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT))
+            .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT) || path.ends_with(FRAME_SEGMENT))
             .map(|(path, frame)| (&**path, frame))
     }
 

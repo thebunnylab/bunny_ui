@@ -1087,6 +1087,46 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::OnMeasure(Rc::new(report)))
     }
 
+    /// `.on_frame(|frame| …)` — the FRAME this view was placed at, its
+    /// origin and its size, handed back as it changes.
+    ///
+    /// [`ViewExt::on_measure`] says how big a view is. Some shapes must
+    /// also know WHERE it is: a list of suggestions that hangs under a
+    /// text field, a mark that points at a control in another part of
+    /// the window. Without the origin, the app adds up the sizes and the
+    /// spacings of everything before the view, and the sum is wrong as
+    /// soon as one of them changes.
+    ///
+    /// ```ignore
+    /// let field = State::new(Rect::default());
+    /// vstack!(
+    ///     toolbar(text_field("Address", address).on_frame(move |frame| field.set(frame))),
+    ///     page(),
+    /// )
+    /// .overlay(UnitPoint::TOP_LEADING, suggestions(field.get()))
+    /// ```
+    ///
+    /// The frame is in the WINDOW's coordinates, in points — the same
+    /// space as the point of a press. It is where the layout placed the
+    /// view: the travel of every scroll region around it is in it, and
+    /// a frame that a region scrolled out of sight is still reported. A
+    /// layer that hangs from a view at the window's origin (the root, as
+    /// above) can use the frame as it is; a layer that hangs from
+    /// another view subtracts that view's own frame.
+    ///
+    /// The rules are the rules of `.on_measure`. It fires only when the
+    /// frame CHANGES — the origin or the size — so a view at rest costs
+    /// nothing. The report lands inside the SAME frame, and a body that
+    /// reacts runs again before anything is painted. A handler that
+    /// moves the view it just heard about settles on the next frame.
+    ///
+    /// Not in flow mode: there the BROWSER lays out, so this side has
+    /// no resolved frame to hand over and the probe stays quiet.
+    #[track_caller]
+    fn on_frame(self, report: impl Fn(crate::layout::Rect) + 'static) -> Modified<Self> {
+        Modified::new(self, Modifier::OnFrame(Rc::new(report)))
+    }
+
     /// Paints stretches of the TEXT in another color (byte ranges into
     /// the content) — a finder's match highlight. Only affects `text(…)`
     /// and fields; the measure stays intact.

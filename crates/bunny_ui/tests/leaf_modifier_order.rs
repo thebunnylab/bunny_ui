@@ -75,6 +75,7 @@ a_field_ask_crosses! {
     a_field_beat_written_after_ignores_safe_area_takes_the_keyboard: { .ignores_safe_area() }
     a_field_beat_written_after_a_tooltip_takes_the_keyboard: { .tooltip("Find in file") }
     a_field_beat_written_after_on_measure_takes_the_keyboard: { .on_measure(|_| {}) }
+    a_field_beat_written_after_on_frame_takes_the_keyboard: { .on_frame(|_| {}) }
     a_field_beat_written_after_a_hover_group_takes_the_keyboard: { .hover_group() }
     a_field_beat_written_after_a_drag_region_takes_the_keyboard: { .window_drag_region() }
     a_field_beat_written_after_exact_layout_takes_the_keyboard: { .layout(LayoutMode::Exact) }

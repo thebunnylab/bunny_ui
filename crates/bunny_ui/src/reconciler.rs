@@ -105,9 +105,14 @@ pub(crate) type SplitEntry = (String, SplitFn);
 /// landed goes back to the binding the app is holding it in.
 pub(crate) type ScrollFn = Rc<dyn Fn(crate::layout::Point)>;
 pub(crate) type ScrollEntry = (String, ScrollFn);
-/// A measurement probe registered at render: the size a view resolved
-/// to goes back to the app that asked for it.
-pub(crate) type MeasureFn = Rc<dyn Fn(crate::layout::Size)>;
+/// A measurement probe registered at render: what a view resolved to
+/// goes back to the app that asked for it — its size (`.on_measure`),
+/// or its whole frame (`.on_frame`).
+#[derive(Clone)]
+pub(crate) enum MeasureFn {
+    Size(Rc<dyn Fn(crate::layout::Size)>),
+    Frame(Rc<dyn Fn(crate::layout::Rect)>),
+}
 pub(crate) type MeasureEntry = (String, MeasureFn);
 
 /// A key context declared at render: the declaring view's path, what it
@@ -635,7 +640,7 @@ impl Live {
                 self.scrolls.insert(key.clone(), Rc::clone(scroll));
             }
             for (key, measure) in &rare.measures {
-                self.measures.insert(key.clone(), Rc::clone(measure));
+                self.measures.insert(key.clone(), measure.clone());
             }
             for (key, hooks) in &rare.webviews {
                 self.webviews.insert(key.clone(), hooks.clone());
@@ -2078,13 +2083,18 @@ pub(crate) fn has_measures() -> bool {
     LIVE.with(|live| !live.borrow().measures.is_empty())
 }
 
-/// Hands a view's resolved size to the probe that asked for it.
+/// Hands a view's resolved frame to the probe that asked for it: the
+/// size alone to a size probe, the whole frame to a frame probe.
 /// `false` = no probe at the path.
-pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
+pub(crate) fn run_measure(path: &str, frame: crate::layout::Rect) -> bool {
     let measure = LIVE.with(|live| live.borrow().measures.get(path).cloned());
     match measure {
-        Some(measure) => {
-            measure(size);
+        Some(MeasureFn::Size(report)) => {
+            report(frame.size);
+            true
+        }
+        Some(MeasureFn::Frame(report)) => {
+            report(frame);
             true
         }
         None => false,
@@ -2229,6 +2239,16 @@ fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
     Rc::as_ptr(shared) as *const () as usize as u64
 }
 
+impl MeasureFn {
+    /// The identity of the closure behind the probe, whatever it hears.
+    fn fingerprint(&self) -> u64 {
+        match self {
+            MeasureFn::Size(report) => fingerprint_ptr(report),
+            MeasureFn::Frame(report) => fingerprint_ptr(report),
+        }
+    }
+}
+
 /// The fingerprint of the path-keyed tables: every key, and the identity
 /// of every closure behind it. Order never matters inside a table: a sum
 /// is the same in any order. `without_root` leaves the root region's
@@ -2284,7 +2304,7 @@ fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
         if skip(|region| &region.measures, key) {
             sum
         } else {
-            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure))
+            sum.wrapping_add(fingerprint_key(key) ^ measure.fingerprint())
         }
     }));
     mix(live.webviews.keys().fold(0u64, |sum, key| {

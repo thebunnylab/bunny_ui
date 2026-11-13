@@ -461,10 +461,11 @@ pub struct Runtime {
     overlay_layers: Cell<bool>,
     /// Can the shell show a scrollbar's thumb on a layer of its own?
     thumb_layers: Cell<bool>,
-    /// The size last HANDED to each measurement probe. A probe fires on
-    /// change and only on change: a view at rest costs nothing, and a
-    /// handler that writes state cannot spin against its own report.
-    measures: RefCell<HashMap<String, crate::layout::Size>>,
+    /// What was last HANDED to each measurement probe: the size, at a
+    /// zero origin, for `.on_measure`; the frame for `.on_frame`. A probe
+    /// fires on change and only on change: a view at rest costs nothing,
+    /// and a handler that writes state cannot spin against its own report.
+    measures: RefCell<HashMap<String, Rect>>,
     /// The offset last PUBLISHED to each region's binding. It is what
     /// tells a value the app WROTE apart from the value the region
     /// itself landed on and reported: only one of the two can differ
@@ -7670,8 +7671,8 @@ impl Runtime {
         moved
     }
 
-    /// Hands every probe the size its view resolved to, when that size
-    /// CHANGED since the last time it heard.
+    /// Hands every probe what its view resolved to — the size, or the
+    /// frame — when that CHANGED since the last time it heard.
     ///
     /// `true` = a probe fired, so the caller relayouts — which is what
     /// puts the report and the reaction to it in the SAME frame. A body
@@ -7693,14 +7694,21 @@ impl Runtime {
         let mut seen: Vec<String> = Vec::new();
         for (path, rect) in result.frames.measured() {
             seen.push(path.to_string());
+            // a size probe hears the size alone: a view that moved and
+            // kept its size has nothing new to tell it
+            let heard = if path.ends_with(crate::layout::FRAME_SEGMENT) {
+                *rect
+            } else {
+                Rect { origin: Point::ZERO, size: rect.size }
+            };
             let last = self.measures.borrow().get(path).copied();
-            if last == Some(rect.size) {
+            if last == Some(heard) {
                 continue;
             }
-            self.measures.borrow_mut().insert(path.to_string(), rect.size);
+            self.measures.borrow_mut().insert(path.to_string(), heard);
             // outside the borrow: the handler writes state, and the
             // write is the whole point
-            fired |= reconciler::run_measure(path, rect.size);
+            fired |= reconciler::run_measure(path, heard);
         }
         self.measures.borrow_mut().retain(|path, _| seen.iter().any(|kept| kept == path));
         fired
