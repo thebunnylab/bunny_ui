@@ -259,7 +259,7 @@ pub enum Modifier {
     Custom(Rc<dyn CustomModifier>),
 
     // MARK: - Inert parity
-    Searchable,
+    Searchable(Binding<String>),
     Refreshable,
     Toolbar(crate::nav::BarItems),
     AttachEnvironmentOverrides,
@@ -376,7 +376,7 @@ impl Modifier {
             Modifier::Popover { .. } => "popover",
             Modifier::EnvSet { .. } => "inject",
             Modifier::Custom { .. } => "modifier",
-            Modifier::Searchable => "searchable",
+            Modifier::Searchable(_) => "searchable",
             Modifier::Refreshable => "refreshable",
             Modifier::Toolbar(_) => "toolbar",
             Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
@@ -566,7 +566,7 @@ impl Modifier {
             Modifier::Popover { side, .. } => format!(" [.popover(.{side:?})]"),
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Custom(custom) => format!(" [.modifier({})]", custom.name()),
-            Modifier::Searchable => " [.searchable(text: $…)]".into(),
+            Modifier::Searchable(_) => " [.searchable(text: $…)]".into(),
             Modifier::Refreshable => " [.refreshable { … }]".into(),
             Modifier::Toolbar(_) => " [.toolbar { … }]".into(),
             Modifier::AttachEnvironmentOverrides => " [.attachEnvironmentOverrides()]".into(),
@@ -1760,6 +1760,12 @@ pub(crate) fn apply(
             // the items of the page's bar, by the same road as its title
             if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
                 stack.tell(&crate::nav::PageWord::Items(items.clone()));
+            }
+        }
+        Modifier::Searchable(query) => {
+            // the page's query: the stack puts a search field for it in the bar
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.tell(&crate::nav::PageWord::Search(query.clone()));
             }
         }
         Modifier::KeyContextFocused(name) => {

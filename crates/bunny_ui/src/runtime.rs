@@ -2058,6 +2058,11 @@ impl Runtime {
             let mut alt_left = KeyPattern::key(Key::Left);
             alt_left.option = true;
             nav.insert(alt_left, crate::action::NAV_BACK);
+            // "find", while the page on top of a stack has a search field
+            scoped
+                .entry(crate::action::NAV_FIND_CONTEXT)
+                .or_default()
+                .insert(KeyPattern::command(Key::Char('f')), crate::action::NAV_FIND);
         }
         runtime
     }

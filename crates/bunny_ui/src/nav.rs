@@ -100,11 +100,13 @@ use motor::view::RenderNode;
 use motor::views::Edge;
 
 use crate::action::NAV_BACK;
+use crate::beat::Beat;
 use crate::erased::Erased;
 use crate::ext::ViewExt;
 use crate::icon::house as symbol;
 use crate::layout::{ControlKind, LayoutNode, Truncation};
 use crate::provenance::{NodeKind, Site};
+use crate::search_field::search_field;
 use crate::state_ext::StateExt;
 use crate::view::{Component, NodeList, Single, View, print_label};
 use crate::views::{Alignment, ControlSpec, EmptyView, button, control, empty, hstack, icon, spacer, text, vstack, wrap_layout};
@@ -367,6 +369,8 @@ pub(crate) enum PageWord {
     Title(Arc<str>),
     /// `.toolbar(…)`.
     Items(BarItems),
+    /// `.searchable(…)`.
+    Search(Binding<String>),
 }
 
 /// One view of a bar, made when the bar is.
@@ -396,6 +400,14 @@ impl BarItems {
 struct Said {
     title: Option<Arc<str>>,
     items: BarItems,
+    search: Option<Binding<String>>,
+}
+
+impl Said {
+    /// A page that said nothing has no bar over it.
+    fn is_nothing(&self) -> bool {
+        self.title.is_none() && self.items.is_empty() && self.search.is_none()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -416,6 +428,9 @@ impl Told {
                 said.items = items.clone();
                 true
             }
+            // the binding a page gives is the same door on every run:
+            // only the first one changes what the bar shows
+            PageWord::Search(query) => said.search.replace(query.clone()).is_none(),
         }
     }
 }
@@ -677,7 +692,7 @@ where
         let page = wrap_layout(top);
         // a root that says nothing has no bar: a stack that only holds
         // one untitled view adds nothing to it
-        let laid = if depth > 0 || bar.title.is_some() || !bar.items.is_empty() {
+        let laid = if depth > 0 || !bar.is_nothing() {
             let mut whole = NodeList::new();
             // the bar is the stack's own: under its own key, beside the pages
             let _frame = motor::identity::enter_key("bar");
@@ -730,9 +745,24 @@ where
             .padding_edge(Edge::Leading, BAR_INSET)
             .padding_edge(Edge::Trailing, BAR_INSET)
             .frame_height(BAR_HEIGHT);
+        let find = said.search.map(|query| {
+            // the bar's own beat: "find" rings it and the field answers
+            let beat = Beat::new();
+            if let Some(scope) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_context(scope.clone(), crate::action::NAV_FIND_CONTEXT, false);
+                crate::reconciler::attribute_handler(scope, crate::action::NAV_FIND, Rc::new(move || {
+                    beat.ring();
+                }));
+            }
+            search_field(query)
+                .select_on(beat)
+                .padding_edge(Edge::Leading, BAR_INSET)
+                .padding_edge(Edge::Trailing, BAR_INSET)
+                .padding_edge(Edge::Bottom, BAR_INSET)
+        });
         // the page takes all the room under the bar, and starts at its top
         let page = Made(Rc::new(RefCell::new(Some(page)))).frame_max(f64::INFINITY, f64::INFINITY, Alignment::TopLeading);
-        crate::provenance::Quiet(vstack((bar, line, page)).spacing(0.0))
+        crate::provenance::Quiet(vstack((bar, find, line, page)).spacing(0.0))
     }
 }
 

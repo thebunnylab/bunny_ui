@@ -12,8 +12,10 @@
 //! The stack's bar shows the title of the page, the button that goes back
 //! and the items the page puts in it.
 //!
+//! The list is searchable: the stack puts the field in its bar.
+//!
 //! Limitations of this phase (noted, not hidden):
-//! `.searchable`/`.refreshable` are inert; images are 40×40 boxes.
+//! `.refreshable` is inert; images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports, unused_variables))]
 

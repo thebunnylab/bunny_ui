@@ -698,6 +698,81 @@ fn a_write_that_changes_a_route_under_it_takes_a_page_with_no_route_away() {
     assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
 }
 
+/// A root that can be searched, and a page over it that cannot.
+#[derive(Clone, Copy)]
+struct Catalog {
+    path: State<Vec<Route>>,
+    query: State<String>,
+}
+
+impl Component for Catalog {
+    fn body(self) -> impl View {
+        let query = self.query.get().to_lowercase();
+        let found: Vec<_> =
+            ["Alder", "Ash", "Birch"].iter().filter(|name| name.to_lowercase().contains(&query)).map(|name| text(*name)).collect();
+        let root = vstack!(vstack(found), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Trees")
+            .searchable(self.query.binding());
+        navigation_stack(self.path, root).destination(|_| button(text("Plain"), || {}).navigation_title("Other"))
+    }
+}
+
+fn find_key() -> KeyPattern {
+    KeyPattern::command(Key::Char('f'))
+}
+
+#[test]
+fn a_page_that_can_be_searched_has_a_field_in_the_bar() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    let all = elements(&runtime, &catalog);
+    let field = all.iter().find(|(role, _, _)| *role == Role::TextField).expect("the bar has a field");
+    assert_eq!(field.1, "Search", "named by its prompt");
+    let (title, first) = (element(&runtime, &catalog, "Trees"), element(&runtime, &catalog, "Alder"));
+    assert!(field.2.origin.y >= title.origin.y + title.size.height, "under the title");
+    assert!(field.2.origin.y + field.2.size.height < first.origin.y, "and over the page");
+    assert!(field.2.size.width > SIZE.width / 2.0, "as wide as the bar lets it be");
+}
+
+#[test]
+fn find_takes_the_keyboard_to_the_field_and_the_page_filters_by_the_same_binding() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new(String::new()) };
+    runtime.display_frame(&catalog, SIZE);
+    assert!(!runtime.focus_takes_text());
+    assert!(runtime.offer_key(find_key()), "the stack takes the key of find");
+    runtime.display_frame(&catalog, SIZE);
+    assert!(runtime.focus_takes_text(), "and the keyboard is in the field");
+    assert!(runtime.key(EditCommand::Insert("bi".into())).applied);
+    assert_eq!(catalog.query.get(), "bi");
+    let shown = titles(&runtime, &catalog);
+    assert!(shown.contains(&"Birch".to_string()) && !shown.contains(&"Alder".to_string()), "{shown:?}");
+
+    // find again selects the query: the next keys replace it
+    assert!(runtime.offer_key(find_key()));
+    runtime.display_frame(&catalog, SIZE);
+    assert!(runtime.key(EditCommand::Insert("a".into())).applied);
+    assert_eq!(catalog.query.get(), "a");
+    let shown = titles(&runtime, &catalog);
+    assert!(shown.contains(&"Alder".to_string()) && shown.contains(&"Ash".to_string()) && !shown.contains(&"Birch".to_string()));
+}
+
+#[test]
+fn the_field_is_the_page_on_tops_and_a_page_with_none_has_none() {
+    let runtime = runtime();
+    let catalog = Catalog { path: State::new(Vec::new()), query: State::new("as".into()) };
+    runtime.display_frame(&catalog, SIZE);
+    catalog.path.push(Route::Item(1));
+    let over = elements(&runtime, &catalog);
+    assert!(!over.iter().any(|(role, _, _)| *role == Role::TextField), "the page on top said no search: {over:?}");
+    assert!(!runtime.offer_key(find_key()), "and the key of find is not the stack's");
+
+    catalog.path.pop();
+    let back = elements(&runtime, &catalog);
+    assert!(back.iter().any(|(role, label, _)| *role == Role::TextField && label == "Search"));
+    assert_eq!(catalog.query.get(), "as", "the query was the app's all the time");
+}
+
 #[test]
 fn a_root_with_no_title_has_no_bar() {
     #[derive(Clone, Copy)]

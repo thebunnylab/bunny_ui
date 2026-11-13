@@ -1587,10 +1587,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Effect { name: "task", detail: if id.is_some() { "(id:)" } else { "()" }, effect: effects::task_effect(site.into(), id, start), })
     }
 
-    /// `.searchable(text: $searchText)`
+    /// A search field for a page of a navigation stack:
+    /// `.searchable(self.query.binding())`.
+    ///
+    /// The stack puts the field in its bar, under the title. The binding
+    /// holds the query, and the page reads the same binding to filter
+    /// what it shows; the field filters nothing by itself. The
+    /// accelerator with `F` — ⌘F on the Mac — takes the keyboard to the
+    /// field and selects the query. Outside a stack it does nothing: a
+    /// page that is in no stack writes [`search_field`] itself.
+    ///
+    /// [`search_field`]: crate::search_field::search_field
     #[track_caller]
-    fn searchable(self, _text: Binding<String>) -> Modified<Self> {
-        Modified::new(self, Modifier::Searchable)
+    fn searchable(self, text: Binding<String>) -> Modified<Self> {
+        Modified::new(self, Modifier::Searchable(text))
     }
 
     /// `.refreshable { … }` — a user gesture; inert headless.
