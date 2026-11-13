@@ -496,8 +496,11 @@ pub struct Navigator {
     pop: Rc<dyn Fn() -> bool>,
     depth: Rc<dyn Fn() -> usize>,
     /// Where the page this navigator was handed to says its title.
-    title: Option<Rc<dyn Fn(&str)>>,
+    title: Option<TitleSink>,
 }
+
+/// What hears a page say its title.
+type TitleSink = Rc<dyn Fn(&str)>;
 
 impl Navigator {
     /// A stack's own three doors. `push` answers `false` for a value that
