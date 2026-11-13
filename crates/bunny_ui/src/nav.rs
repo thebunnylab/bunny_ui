@@ -43,6 +43,19 @@
 //! `[a, b]` to `[a, c]` keeps the page of `a` and makes a new one for
 //! `c`; the page of `b` leaves with its state.
 //!
+//! ## The bar
+//!
+//! ```ignore
+//! CountryDetails::new(country).navigation_title("Details")
+//! ```
+//!
+//! The stack draws a bar over the page on top: the button that goes
+//! back, where there is a page to leave, and the title the page gave
+//! itself with `.navigation_title(…)`. The title is the page's, so it
+//! may read the page's state and it changes with it. A root with no
+//! title has no bar. The button is named "Back" in the reader's
+//! language, and it is the first Tab stop of a page.
+//!
 //! ## Back
 //!
 //! The platform's "back" takes the page on top away
@@ -56,16 +69,21 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use motor::state::{Binding, Context, Navigator, State};
+use motor::state::{Binding, Context, LayoutDirection, Locale, Navigator, State};
 use motor::view::RenderNode;
+use motor::views::Edge;
 
 use crate::action::NAV_BACK;
-use crate::layout::ControlKind;
+use crate::ext::ViewExt;
+use crate::icon::house as symbol;
+use crate::layout::{ControlKind, LayoutNode, Truncation};
 use crate::provenance::{NodeKind, Site};
 use crate::state_ext::StateExt;
 use crate::view::{Component, NodeList, Single, View, print_label};
-use crate::views::{ControlSpec, EmptyView, control, wrap_layout};
+use crate::views::{Alignment, ControlSpec, EmptyView, button, control, empty, hstack, icon, spacer, text, vstack, wrap_layout};
+use crate::words::{Word, Words};
 
 /// What a stack's path is given as: the app's `State<Vec<R>>`, or a
 /// `Binding<Vec<R>>` to routes that live somewhere else.
@@ -273,13 +291,11 @@ where
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let depth = self.routes.len();
-        // the pages read their stack from the environment; the app's
-        // other values pass through as they are
-        let mut inside = ctx.clone();
-        Rc::make_mut(&mut inside.values).navigation = Some(navigator(&self.path));
+        let stack = navigator(&self.path);
 
-        let mut prints = Vec::with_capacity(depth + 1);
+        let mut prints = Vec::with_capacity(depth + 2);
         let mut top = Vec::new();
+        let mut title = None;
         for place in 0..=depth {
             let covered = place < depth;
             let key: Cow<'static, str> =
@@ -289,6 +305,18 @@ where
                 // a page is its own scope: its state lives under its key,
                 // and leaves with it when the route leaves the path
                 let _frame = motor::identity::enter_key(&key);
+                // what the page calls itself. It is state of the page's
+                // scope: a page whose body is kept from an earlier run
+                // says nothing in this one, and its title is still here
+                let called = State::new(None::<Arc<str>>);
+                // the pages read their stack from the environment; the
+                // app's other values pass through as they are
+                let mut inside = ctx.clone();
+                Rc::make_mut(&mut inside.values).navigation = Some(stack.clone().for_page(move |words| {
+                    // a write that compares and records no read: the page
+                    // that says its title must not come to depend on it
+                    called.set_if_changed(Some(Arc::from(words)));
+                }));
                 if let Some(scope) = motor::identity::cursor_scope() {
                     if covered {
                         crate::reconciler::attribute_context(scope.clone(), crate::reconciler::NAV_COVERED, false);
@@ -303,6 +331,11 @@ where
                     self.root.render_into(&inside, &mut page);
                 } else {
                     (self.destination)(self.routes[place - 1].clone()).render_into(&inside, &mut page);
+                }
+                if !covered {
+                    // read AFTER the page was made: a page that ran in
+                    // this pass has just said its title
+                    title = called.get();
                 }
             }
             // EVERY page is made, so a covered one stays mounted with its
@@ -324,8 +357,80 @@ where
                 path.pop();
             }));
         }
+        let page = wrap_layout(top);
+        // a root that has no title has no bar: a stack that only holds
+        // one untitled view adds nothing to it
+        let laid = if depth > 0 || title.is_some() {
+            let mut whole = NodeList::new();
+            // the bar is the stack's own: under its own key, beside the pages
+            let _frame = motor::identity::enter_key("bar");
+            self.under_a_bar(ctx, title, page).render_into(ctx, &mut whole);
+            let (print, layout) = whole.into_parts();
+            prints.push(RenderNode::branch(print_label("Bar"), print));
+            wrap_layout(layout)
+        } else {
+            page
+        };
         out.push(RenderNode::branch(crate::view::print_line(|| format!("NavigationStack (path: {depth})")), prints));
-        out.push_layout(wrap_layout(top));
+        out.push_layout(laid);
+    }
+}
+
+/// The bar, from edge to edge.
+const BAR_HEIGHT: f64 = 44.0;
+/// Between the bar's edge and what it holds.
+const BAR_INSET: f64 = 8.0;
+
+impl<R, Root, V> Laid<R, Root, V>
+where
+    R: Clone + PartialEq + 'static,
+    Root: View + Clone + 'static,
+    V: View + 'static,
+{
+    /// The page on top with the stack's bar over it: the button that goes
+    /// back, where there is a page to leave, and the page's title.
+    fn under_a_bar(&self, ctx: &Context, title: Option<Arc<str>>, page: LayoutNode) -> impl View<Arity = Single> + use<R, Root, V> {
+        let theme = crate::theme::current();
+        let back = (!self.routes.is_empty()).then(|| {
+            let words = Words::for_locale(&ctx.environment::<Locale>());
+            // the arrow points where the page under this one is
+            let glyph = if ctx.environment::<LayoutDirection>().is_rtl() { symbol::CHEVRON_RIGHT } else { symbol::CHEVRON_LEFT };
+            let path = self.path.clone();
+            button(icon(glyph).frame(28.0, 28.0), move || {
+                path.pop();
+            })
+            .plain()
+            .accessibility_label(&*words.get(Word::Back))
+        });
+        let line = empty()
+            .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center)
+            .frame_height(1.0)
+            .background_color(theme.divider);
+        let bar = hstack((back, text(title.as_deref().unwrap_or("")).bold().truncation_mode(Truncation::End), spacer()))
+            .spacing(4.0)
+            .padding_edge(Edge::Leading, BAR_INSET)
+            .padding_edge(Edge::Trailing, BAR_INSET)
+            .frame_height(BAR_HEIGHT);
+        // the page takes all the room under the bar, and starts at its top
+        let page = Made(Rc::new(RefCell::new(Some(page)))).frame_max(f64::INFINITY, f64::INFINITY, Alignment::TopLeading);
+        crate::provenance::Quiet(vstack((bar, line, page)).spacing(0.0))
+    }
+}
+
+/// Layout that is made already, put where a view is expected. The stack
+/// makes a page first, to hear its title, and lays it under the bar after.
+#[derive(Clone)]
+struct Made(Rc<RefCell<Option<LayoutNode>>>);
+
+impl View for Made {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        // its lines are printed with the stack's pages
+        out.push(RenderNode::leaf(print_label("Page")));
+        if let Some(node) = self.0.borrow_mut().take() {
+            out.push_layout(node);
+        }
     }
 }
 

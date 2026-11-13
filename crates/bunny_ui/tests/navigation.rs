@@ -54,6 +54,7 @@ impl Component for Home {
             nav_link_value(text("Open about"), Route::About),
         )
         .on_action(PING, || count(&PINGS))
+        .navigation_title("Home")
     }
 }
 
@@ -76,6 +77,8 @@ impl Component for Item {
                 erased(text("More about it").padding())
             }),
         )
+        // the title reads the page's own state: it changes with it
+        .navigation_title(format!("Item {}, {} taps", self.number, taps.get()))
     }
 }
 
@@ -277,13 +280,13 @@ fn a_covered_page_is_not_on_the_screen_for_the_keyboard_or_for_assistive_technol
         assert!(!elements.iter().any(|(_, label)| label == gone), "{gone} is under the page: {elements:?}");
     }
 
-    // Tab goes round the page on top and never into the root
+    // Tab goes round the bar and the page on top, and never into the root
     let mut stops = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         assert!(runtime.offer_key(KeyPattern::key(Key::Tab)));
         stops.push(keyboard(&runtime, &app).expect("a stop of the page on top"));
     }
-    assert_eq!(stops, ["Tap item", "Open next", "More", "Tap item"]);
+    assert_eq!(stops, ["Back", "Tap item", "Open next", "More", "Back"]);
     assert!(!runtime.focus_named("note"), "a field under the page cannot take the keyboard");
 }
 
@@ -357,9 +360,80 @@ fn the_keyboard_goes_back_to_the_link_when_its_page_leaves_holding_it() {
     runtime.display_frame(&app, SIZE);
     // the reader walks into the page, then goes back
     runtime.offer_key(KeyPattern::key(Key::Tab));
+    runtime.offer_key(KeyPattern::key(Key::Tab));
     assert_eq!(keyboard(&runtime, &app).as_deref(), Some("Tap item"));
     assert!(runtime.navigate_back());
     assert_eq!(keyboard(&runtime, &app).as_deref(), Some("Open item 1"));
+}
+
+#[test]
+fn the_bar_shows_the_title_of_the_page_on_top_and_a_button_that_goes_back() {
+    let runtime = runtime();
+    let app = App::new();
+    let root = heard(&runtime, &app);
+    assert!(root.contains(&(Role::Text, "Home".into())), "{root:?}");
+    assert!(!root.iter().any(|(_, label)| label == "Back"), "the root has no page to go back to");
+
+    app.path.push(Route::Item(1));
+    let pushed = heard(&runtime, &app);
+    assert!(pushed.contains(&(Role::Button, "Back".into())), "{pushed:?}");
+    assert!(pushed.contains(&(Role::Text, "Item 1, 0 taps".into())));
+    assert!(!pushed.contains(&(Role::Text, "Home".into())), "one title: the page's on top");
+    // the bar is over the page, from edge to edge
+    let (back, title, first) = (named(&runtime, &app, "Back"), named(&runtime, &app, "Item 1, 0 taps"), named(&runtime, &app, "Tap item"));
+    assert!(back.origin.x < title.origin.x, "the button, then the title");
+    assert!(back.origin.y + back.size.height <= 44.0 && title.origin.y + title.size.height <= 44.0);
+    assert!(first.origin.y >= 45.0, "the page starts under the bar and its line");
+
+    // the title is the page's: it follows the page's state
+    press(&runtime, &app, "Tap item");
+    assert!(heard(&runtime, &app).contains(&(Role::Text, "Item 1, 1 taps".into())));
+
+    press(&runtime, &app, "Back");
+    assert!(app.path.get().is_empty());
+    assert!(heard(&runtime, &app).contains(&(Role::Text, "Home".into())));
+}
+
+#[test]
+fn the_back_button_is_named_in_the_readers_language_and_changes_sides_right_to_left() {
+    let runtime = runtime();
+    runtime.set_locale(Some(Locale::new("pt-BR")));
+    let app = App::new();
+    app.path.push(Route::About);
+    assert!(heard(&runtime, &app).contains(&(Role::Button, "Voltar".into())));
+    let left_to_right = named(&runtime, &app, "Voltar");
+    assert!(left_to_right.origin.x < SIZE.width / 2.0);
+
+    runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+    let right_to_left = named(&runtime, &app, "Voltar");
+    assert!(right_to_left.origin.x > SIZE.width / 2.0, "the leading edge is on the right");
+}
+
+#[test]
+fn a_root_with_no_title_has_no_bar() {
+    #[derive(Clone, Copy)]
+    struct Bare {
+        path: State<Vec<Route>>,
+    }
+    impl Component for Bare {
+        fn body(self) -> impl View {
+            navigation_stack(self.path, text("Only this").frame_max(f64::INFINITY, f64::INFINITY, Alignment::TopLeading))
+                .destination(|_| text("A page"))
+        }
+    }
+    let runtime = runtime();
+    let bare = Bare { path: State::new(Vec::new()) };
+    runtime.display_frame(&bare, SIZE);
+    let tree = runtime.accessibility_tree();
+    let only = tree.nodes().iter().find(|node| &*node.label == "Only this").expect("the root");
+    assert_eq!(only.bounds.origin.y, 0.0, "nothing was put over the root");
+    drop(tree);
+
+    // a page over it has the button, with or without a title
+    bare.path.push(Route::About);
+    runtime.display_frame(&bare, SIZE);
+    let tree = runtime.accessibility_tree();
+    assert!(tree.nodes().iter().any(|node| node.role == Role::Button && &*node.label == "Back"));
 }
 
 #[test]

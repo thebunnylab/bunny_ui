@@ -9,8 +9,10 @@
 //! country as a page over the list, and a neighbour in the details opens
 //! another page over that one.
 //!
-//! Limitations of this phase (noted, not hidden): the stack draws no bar
-//! yet, so a page has no title and no back button on the screen;
+//! The stack's bar shows the title of the page and the button that goes
+//! back.
+//!
+//! Limitations of this phase (noted, not hidden):
 //! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "ios"), allow(dead_code, unused_imports))]

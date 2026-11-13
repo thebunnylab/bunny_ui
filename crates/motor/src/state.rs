@@ -495,6 +495,8 @@ pub struct Navigator {
     push: Rc<dyn Fn(Box<dyn Any>) -> bool>,
     pop: Rc<dyn Fn() -> bool>,
     depth: Rc<dyn Fn() -> usize>,
+    /// Where the page this navigator was handed to says its title.
+    title: Option<Rc<dyn Fn(&str)>>,
 }
 
 impl Navigator {
@@ -505,7 +507,22 @@ impl Navigator {
         pop: impl Fn() -> bool + 'static,
         depth: impl Fn() -> usize + 'static,
     ) -> Self {
-        Self { push: Rc::new(push), pop: Rc::new(pop), depth: Rc::new(depth) }
+        Self { push: Rc::new(push), pop: Rc::new(pop), depth: Rc::new(depth), title: None }
+    }
+
+    /// The same navigator for ONE page: `title` hears what that page
+    /// calls itself, for the stack's bar.
+    #[must_use]
+    pub fn for_page(mut self, title: impl Fn(&str) + 'static) -> Self {
+        self.title = Some(Rc::new(title));
+        self
+    }
+
+    /// The page says its title. Outside a page of a stack nobody hears it.
+    pub fn set_title(&self, title: &str) {
+        if let Some(hear) = &self.title {
+            hear(title);
+        }
     }
 
     /// Puts the page of `route` on top. `false` when the stack holds

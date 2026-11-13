@@ -1748,6 +1748,14 @@ pub(crate) fn apply(
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, crate::reconciler::FOCUS_RETURN, false);
         }
+        Modifier::NavigationTitle(title) => {
+            // the page says what it is called, and the stack it is a
+            // page of shows that in its bar. Outside a stack nobody
+            // hears it, and the title stays a word of the print
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.set_title(title);
+            }
+        }
         Modifier::KeyContextFocused(name) => {
             // the same declaration, with the view it hangs on: it counts
             // while the focused field or box is somewhere below it
