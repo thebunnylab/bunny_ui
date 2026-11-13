@@ -23,7 +23,21 @@ layout(location = 6) flat in vec4 v_highlight;
 layout(location = 7) flat in float v_spot_alpha;
 layout(location = 8) flat in float v_opacity;
 
+// One source, two modules. Baked as it stands, the fragment writes one
+// colour with straight alpha, for the house blend. Baked with `-DPANE`
+// (`glass_pane.frag.spv`) it writes what a pane's own blend reads: the
+// pixel with the coverage in its alpha, and in a second output how
+// solid that pixel is. The scene a pane reads may not be solid, in a
+// window the system composites by its own alpha, and the pixel it
+// answers then takes the PLACE of what the pane covers. The second
+// output is a blend source, which a device gives only with
+// `dualSrcBlend`.
+#ifdef PANE
+layout(location = 0, index = 0) out vec4 out_color;
+layout(location = 0, index = 1) out vec4 out_solid;
+#else
 layout(location = 0) out vec4 out_color;
+#endif
 
 const float GLASS_SIGMA_L0 = 5.2;
 const float GLASS_MAX_LEVEL = 3.0;
@@ -172,7 +186,15 @@ void main() {
         color = vec4(clamp(color.rgb + touch, 0.0, 1.0), color.a);
     }
 
+#ifdef PANE
+    // the pane's own blend: the colour lands by the coverage, the
+    // destination keeps the rest, and the alpha that lands is the
+    // pixel's own
+    out_color = vec4(color.rgb, coverage * v_opacity * clip_cov(p));
+    out_solid = vec4(0.0, 0.0, 0.0, color.a);
+#else
     // straight alpha out — the blend state premultiplies, exactly as it
     // does for a rect
     out_color = vec4(color.rgb, color.a * coverage * v_opacity * clip_cov(p));
+#endif
 }

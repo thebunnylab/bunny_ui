@@ -173,6 +173,7 @@ mod tests {
             resizable: true,
             minimizable: true,
             min: None,
+            background: bunny_ui::window::WindowBackground::Opaque,
         };
         let parent = create_window("Relationship property parent", 200.0, 100.0, options);
         let child = create_window("Relationship property child", 200.0, 100.0, options);

@@ -4,7 +4,7 @@
 //! in one transaction, keeping the native cover until a GPU frame succeeds.
 
 use super::*;
-use bunny_ui::raster::{Bitmap, rasterize_with};
+use bunny_ui::raster::{Bitmap, rasterize_translucent, rasterize_with};
 use std::sync::Arc;
 
 const MAX_BASE_PIXELS: usize = 8 * 1024 * 1024;
@@ -169,15 +169,23 @@ struct BaseLayer {
 }
 
 impl BaseLayer {
-    unsafe fn new(root: Id) -> Option<Self> {
+    /// `translucent` is a window the system composites by its own alpha:
+    /// the base is then not opaque, and it is born holding the canvas at
+    /// the canvas's own strength instead of a solid one.
+    unsafe fn new(root: Id, translucent: bool) -> Option<Self> {
         unsafe {
-            let backing = BaseBacking::new(Bitmap::new(1, 1, bunny_ui::theme::canvas()))?;
+            let canvas = bunny_ui::theme::canvas();
+            let backing = BaseBacking::new(if translucent {
+                Bitmap::translucent(1, 1, canvas)
+            } else {
+                Bitmap::new(1, 1, canvas)
+            })?;
             let raw = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             if raw.is_null() {
                 return None;
             }
             kill_layer_actions(raw);
-            msg_void_bool(raw, sel("setOpaque:"), 1);
+            msg_void_bool(raw, sel("setOpaque:"), i8::from(!translucent));
             msg_void_id(raw, sel("setContents:"), backing.raw());
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), raw, 0);
             Some(Self {
@@ -547,7 +555,7 @@ impl Native {
     ) -> bool {
         let ink = if let Some(paint) = scene.ink {
             let bitmap = paint.raster(text, images);
-            let Some(mut layer) = (unsafe { BaseLayer::new(self.base.raw) }) else {
+            let Some(mut layer) = (unsafe { BaseLayer::new(self.base.raw, false) }) else {
                 return false;
             };
             let frame = Patch::frame(paint.bounds(), scene.physical, scale);
@@ -638,6 +646,9 @@ impl Drop for MetalLayer {
 unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn layer_is_kind_of(layer: Id, selector: Sel, class: Id) -> i8;
+    #[cfg(test)]
+    #[link_name = "objc_msgSend"]
+    fn layer_is_opaque(layer: Id, selector: Sel) -> i8;
 }
 
 /// The native cover remains owned until the first GPU frame succeeds.
@@ -650,7 +661,7 @@ struct Metal {
 }
 
 impl Metal {
-    unsafe fn attach(root: Id, scale: f64, size: Size) -> Option<Self> {
+    unsafe fn attach(root: Id, scale: f64, size: Size, translucent: bool) -> Option<Self> {
         unsafe {
             let layer = if layer_is_kind_of(root, sel("isKindOfClass:"), class("CAMetalLayer")) != 0
             {
@@ -659,7 +670,7 @@ impl Metal {
                 Some(MetalLayer::new(root, size)?)
             };
             let target = layer.as_ref().map_or(root, |layer| layer.raw);
-            let presenter = MetalPresenter::attach(target, scale)?;
+            let presenter = MetalPresenter::attach_with(target, scale, translucent)?;
             Some(Self {
                 presenter,
                 cover: None,
@@ -716,6 +727,11 @@ pub struct WindowPresenter {
     observation: Option<bunny_ui::presentation::backend::PresentationSender>,
     observation_visible: bool,
     layer: Id,
+    /// The system composites this window by its own alpha. Every native
+    /// road here declares opaque pixels, so such a window takes none of
+    /// them: its first frame promotes to Metal, and a refused Metal
+    /// leaves the software base, not opaque, holding premultiplied pixels.
+    translucent: bool,
     strategy: Strategy,
 }
 
@@ -752,19 +768,31 @@ impl WindowPresenter {
     /// `layer` must be a live `CALayer` (or an existing `CAMetalLayer`) owned
     /// by the calling main thread and must outlive this presenter.
     pub unsafe fn attach(layer: Id, scale: f64) -> Option<Self> {
+        unsafe { Self::attach_with(layer, scale, false) }
+    }
+
+    /// [`WindowPresenter::attach`], for a window whose background is not
+    /// opaque when `translucent` is true. The root and the base are then
+    /// not opaque, the frame clears to the premultiplied canvas, and the
+    /// alpha the scene leaves reaches the window server.
+    ///
+    /// # Safety
+    /// The same as [`WindowPresenter::attach`].
+    pub unsafe fn attach_with(layer: Id, scale: f64, translucent: bool) -> Option<Self> {
         if layer.is_null() || std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
             return None;
         }
-        let base = unsafe { BaseLayer::new(layer)? };
+        let base = unsafe { BaseLayer::new(layer, translucent)? };
         unsafe {
             kill_layer_actions(layer);
-            msg_void_bool(layer, sel("setOpaque:"), 1);
+            msg_void_bool(layer, sel("setOpaque:"), i8::from(!translucent));
             msg_void_f64(layer, sel("setContentsScale:"), scale.round().max(1.0));
         }
         Some(Self {
             observation: None,
             observation_visible: true,
             layer,
+            translucent,
             strategy: Strategy::Native(Box::new(Native {
                 base,
                 ink: None,
@@ -845,6 +873,7 @@ impl WindowPresenter {
         if scale == 0 || physical.0 == 0 || physical.1 == 0 {
             return;
         }
+        let translucent = self.translucent;
         let Strategy::Native(native) = &mut self.strategy else {
             return;
         };
@@ -868,7 +897,10 @@ impl WindowPresenter {
             return;
         }
         native.boxes.begin_frame();
-        let bands = matches!(native.state, NativeState::Choosing)
+        // bands, a sparse foreground and native patches all declare opaque
+        // pixels: a translucent window is never offered one
+        let choosing = matches!(native.state, NativeState::Choosing) && !translucent;
+        let bands = choosing
             && !live
             && physical
                 .0
@@ -888,7 +920,7 @@ impl WindowPresenter {
             native.state = NativeState::Bands((Rc::new(display.clone()), physical, scale, canvas));
             return;
         }
-        if matches!(native.state, NativeState::Choosing)
+        if choosing
             && !live
             && !bands
             && let Some(scene) = SparseScene::new(display, physical, scale, text, &native.boxes)
@@ -897,7 +929,7 @@ impl WindowPresenter {
             native.state = NativeState::Sparse((Rc::new(display.clone()), physical, scale, canvas));
             return;
         }
-        if matches!(native.state, NativeState::Choosing)
+        if choosing
             && !live
             && !bands
             && let Some(scene) =
@@ -969,9 +1001,18 @@ impl WindowPresenter {
             NativeState::Sparse(_) | NativeState::Patched(_) => false,
             NativeState::Software(_) => true,
         };
+        // the software base of a translucent window holds premultiplied
+        // pixels over a clear ground, which is what a layer that is not
+        // opaque shows
+        let raster = |display: &DisplayList| {
+            if translucent {
+                rasterize_translucent(display, physical.0, physical.1, scale, canvas, text, images)
+            } else {
+                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images)
+            }
+        };
         if admitted {
-            let bitmap =
-                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
+            let bitmap = raster(display);
             if unsafe { native.base.paint(bitmap, size, scale) } {
                 let kept = (Rc::new(display.clone()), physical, scale, canvas);
                 native.state = match native.state {
@@ -981,13 +1022,14 @@ impl WindowPresenter {
                 return;
             }
         }
-        let Some(metal) = (unsafe { Metal::attach(self.layer, scale as f64, size) }) else {
+        let Some(metal) =
+            (unsafe { Metal::attach(self.layer, scale as f64, size, translucent) })
+        else {
             // The Metal backend already reports why it refused. Keep the
             // software fallback, including after a previously native frame.
             native.state = NativeState::Software(None);
             unsafe { native.bands.hide() };
-            let bitmap =
-                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
+            let bitmap = raster(display);
             if unsafe { native.base.paint(bitmap, size, scale) } {
                 native.ink = None;
                 native.state = NativeState::Software(Some((
@@ -1108,6 +1150,74 @@ mod tests {
             corner_radius: Corners::ZERO,
         });
         DisplayList::from(commands)
+    }
+
+    /// Every native road declares opaque pixels: the bands, the sparse
+    /// foreground and the patched base. The scene the bands admit in an
+    /// opaque window therefore takes none of them in a translucent one.
+    /// Its root is not opaque, and its first frame is Metal's, or the
+    /// software base when Metal is refused.
+    #[test]
+    fn a_translucent_window_takes_no_opaque_road() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let size = Size {
+                width: 180.0,
+                height: 130.0,
+            };
+            let present = |presenter: &mut WindowPresenter, canvas: Color| {
+                presenter.present(
+                    &scene(0.0),
+                    size,
+                    1,
+                    canvas,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+            };
+
+            let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut opaque = WindowPresenter::attach(layer, 1.0).unwrap();
+            assert_ne!(layer_is_opaque(layer, sel("isOpaque")), 0);
+            present(&mut opaque, Color::WHITE);
+            assert!(
+                matches!(&opaque.strategy, Strategy::Native(native)
+                    if !matches!(native.state, NativeState::Software(_))),
+                "the opaque window keeps its native road"
+            );
+            drop(opaque);
+            msg_void(layer, sel("release"));
+
+            let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut translucent = WindowPresenter::attach_with(layer, 1.0, true).unwrap();
+            assert_eq!(layer_is_opaque(layer, sel("isOpaque")), 0, "the root is not opaque");
+            if let Strategy::Native(native) = &translucent.strategy {
+                assert_eq!(
+                    layer_is_opaque(native.base.raw, sel("isOpaque")),
+                    0,
+                    "the base is not opaque"
+                );
+            }
+            present(&mut translucent, Color::rgba(16, 16, 20, 153));
+            match &translucent.strategy {
+                Strategy::Metal(metal) => {
+                    let target = metal.layer.as_ref().expect("a Metal layer under a plain root");
+                    assert_eq!(
+                        layer_is_opaque(target.raw, sel("isOpaque")),
+                        0,
+                        "the drawable is not opaque"
+                    );
+                }
+                Strategy::Native(native) => assert!(
+                    matches!(native.state, NativeState::Software(_)),
+                    "without Metal the software base stands, and no opaque road"
+                ),
+            }
+            drop(translucent);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
     }
 
     #[test]
@@ -1945,7 +2055,7 @@ mod tests {
                 let layer = msg_id(msg_id(class(root_kind), sel("alloc")), sel("init"));
                 let native = Native {
                     ink: None,
-                    base: BaseLayer::new(layer).unwrap(),
+                    base: BaseLayer::new(layer, false).unwrap(),
                     bands: scroll_bands::Presenter::default(),
                     outside_checked: false,
                     boxes: MeasureCache::default(),
@@ -1958,6 +2068,7 @@ mod tests {
                         width: 180.0,
                         height: 130.0,
                     },
+                    false,
                 )
                 .unwrap();
                 metal.cover = Some(Box::new(native));

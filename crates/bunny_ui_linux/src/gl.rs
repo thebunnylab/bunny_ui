@@ -210,6 +210,9 @@ const GL_DEPTH_TEST: GlEnum = 0x0B71;
 const GL_CULL_FACE: GlEnum = 0x0B44;
 const GL_SRC_ALPHA: GlEnum = 0x0302;
 const GL_ONE_MINUS_SRC_ALPHA: GlEnum = 0x0303;
+/// The alpha of a fragment's SECOND output, as a blend factor: core
+/// since 3.3, and what a pane's blend takes its alpha from.
+const GL_SRC1_ALPHA: GlEnum = 0x8589;
 const GL_ONE: GlEnum = 1;
 const GL_ZERO: GlEnum = 0;
 const GL_TRIANGLES: GlEnum = 0x0004;
@@ -514,6 +517,49 @@ use bunny_ui::gpu::shaders::{
 };
 use bunny_ui::image_engine::PixelFormat;
 
+// MARK: - The pane's fragment (the shared body, with a second output)
+
+// The glass body is one text for this tier and for the browser's, and
+// the browser has no second output to blend with: the shared body
+// writes ONE colour, straight, for the house blend. A pane on this tier
+// takes the place of what it covers (`GlStack::draw_glass`), and for
+// that its fragment says two things: the pixel with the coverage in its
+// alpha, and how solid that pixel is. The two lines that differ are
+// rewritten here, by text, when the program is built. A body that no
+// longer holds one of them refuses the pipeline instead of compiling
+// the old fragment under the new blend.
+
+/// The one output the shared glass body declares.
+const SHARED_PANE_OUT: &str = "out vec4 out_color;\n";
+/// The two a pane declares on this tier: one colour attachment, two
+/// sources for its blend.
+const PANE_OUT: &str = "layout(location = 0, index = 0) out vec4 out_color;\n\
+layout(location = 0, index = 1) out vec4 out_solid;\n";
+/// What the shared body writes: straight alpha, for the house blend.
+const SHARED_PANE_WRITE: &str =
+    "out_color = vec4(color.rgb, color.a * coverage * v_opacity * clip_cov(p));";
+/// What a pane writes on this tier: the colour lands by the coverage,
+/// and the alpha that lands is the pixel's own.
+const PANE_WRITE: &str = "out_color = vec4(color.rgb, coverage * v_opacity * clip_cov(p));\n    \
+out_solid = vec4(0.0, 0.0, 0.0, color.a);";
+
+/// The glass fragment this tier compiles: `body` (the shared
+/// `GLASS_FRAG_BODY`) with the output a pane's blend reads added.
+/// `Err` names the text that is gone when the body has changed under
+/// the rewrite.
+fn pane_fragment(body: &str) -> Result<String, String> {
+    let mut source = body.to_owned();
+    for (shared, pane) in [(SHARED_PANE_OUT, PANE_OUT), (SHARED_PANE_WRITE, PANE_WRITE)] {
+        if body.matches(shared).count() != 1 {
+            return Err(format!(
+                "the shared glass body does not hold `{}` exactly once",
+                shared.trim_end()
+            ));
+        }
+        source = source.replacen(shared, pane, 1);
+    }
+    Ok(source)
+}
 
 // MARK: - The stack (display, context, pipelines, fixed state)
 
@@ -643,7 +689,8 @@ unsafe fn build_program(
 enum TargetKind {
     /// An opaque window buffer (XRGB — the CPU road's twin).
     Window,
-    /// A window buffer with alpha: the scene's corners fade through it.
+    /// A window buffer with alpha: a scene's corners fade through it,
+    /// and a translucent window is composited by it.
     SceneWindow,
     /// A surfaceless/pbuffer context rendering into an FBO.
     Offscreen,
@@ -694,7 +741,9 @@ impl GlStack {
                 return Err("EGL has no OpenGL API".to_string());
             }
             // NON-sRGB config forever — the parity law. The scene asks
-            // for alpha (its corners fade); everything else is opaque.
+            // for alpha (its corners fade) and so does a translucent
+            // window (the system composites it by that alpha);
+            // everything else is opaque.
             let surface_bit = match kind {
                 TargetKind::Offscreen => EGL_PBUFFER_BIT,
                 _ => EGL_WINDOW_BIT,
@@ -854,10 +903,12 @@ impl GlStack {
             .map_err(|log| format!("mask pipeline refused: {}", log.trim()))?;
             (gl.use_program)(self.mask_program);
             self.mask_quad = (gl.get_uniform_location)(self.mask_program, c"u_quad".as_ptr());
+            let pane_frag = pane_fragment(GLASS_FRAG_BODY)
+                .map_err(|reason| format!("glass pipeline refused: {reason}"))?;
             self.glass_program = build_program(
                 gl,
                 &[SHADER_PRELUDE, GLASS_VERT],
-                &[SHADER_PRELUDE, SHARED_FRAG, GLASS_FRAG_BODY],
+                &[SHADER_PRELUDE, SHARED_FRAG, &pane_frag],
                 &[
                     c"a_rect",
                     c"a_clip",
@@ -1045,7 +1096,10 @@ impl GlStack {
                 };
                 if swap_kind {
                     match run.kind {
-                        RunKind::Rects => {
+                        // a knockout is the rects again, taken away
+                        // instead of painted: the blend below is the
+                        // whole difference
+                        RunKind::Rects | RunKind::Knockout => {
                             (gl.use_program)(self.rect_program);
                             (gl.bind_vertex_array)(self.vao_rect);
                         }
@@ -1072,7 +1126,7 @@ impl GlStack {
                 match run.kind {
                     // handled above, in a pass of its own
                     RunKind::Glass => continue,
-                    RunKind::Rects => {
+                    RunKind::Rects | RunKind::Knockout => {
                         // the run's base = the byte offset every attrib
                         // pointer carries — the SV_InstanceID trap of
                         // the windows port, dissolved
@@ -1105,6 +1159,27 @@ impl GlStack {
                     }
                 }
                 bound = Some(run.kind);
+                if run.kind == RunKind::Knockout {
+                    // the erase: nothing is painted, and the target keeps
+                    // `1 - alpha` of itself, colour and alpha alike —
+                    // source-over with the source's half dropped, the
+                    // raster's `Bitmap::take`. The house blend comes back
+                    // for the run that follows
+                    (gl.blend_func_separate)(
+                        GL_ZERO,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ZERO,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
+                    (gl.blend_func_separate)(
+                        GL_SRC_ALPHA,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    continue;
+                }
                 (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
             }
             if let Some(radius) = corner_mask {
@@ -1213,7 +1288,29 @@ impl GlStack {
             glass_attribs(gl, run.base as usize * std::mem::size_of::<GlassInstance>());
             (gl.active_texture)(GL_TEXTURE0);
             (gl.bind_texture)(GL_TEXTURE_2D, targets.ping);
+            // the pane's own blend. The scene a pane reads may not be
+            // solid, on a target the system composites by its own alpha,
+            // and the pixel it answers is then premultiplied with an
+            // alpha of its own: it takes the PLACE of what the pane
+            // covers, the raster's `Bitmap::set_replaced`. The colour
+            // lands by the coverage in the first output's alpha, and the
+            // alpha that lands is the second output's:
+            // rgb = s·t + d·(1−t); a = sa·t + da·(1−t). Over a solid
+            // scene the second alpha is 1 and this is the house blend,
+            // which comes back for the run that follows
+            (gl.blend_func_separate)(
+                GL_SRC_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+                GL_SRC1_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+            );
             (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
+            (gl.blend_func_separate)(
+                GL_SRC_ALPHA,
+                GL_ONE_MINUS_SRC_ALPHA,
+                GL_ONE,
+                GL_ONE_MINUS_SRC_ALPHA,
+            );
         }
     }
 
@@ -1329,7 +1426,11 @@ unsafe fn glass_pass(
     rounds: &[RoundClip],
 ) {
     unsafe {
-        stack.build_pyramid(targets, viewport, run.levels);
+        // a batch that shares reads the pyramid the pane around it had
+        // built: the scene of that moment
+        if !run.reuse {
+            stack.build_pyramid(targets, viewport, run.levels);
+        }
         stack.draw_glass(targets, scene_fbo, viewport, slot, run, rounds);
     }
 }
@@ -2120,6 +2221,11 @@ struct GlPresenter {
     buffer: (usize, usize),
     /// The scene draws its own rounded corners — the mask pass.
     scene: bool,
+    /// The system composites the window by the alpha its frame leaves:
+    /// the frame clears to the canvas multiplied by its own alpha, and
+    /// the walk is told of no floor. Said once, when the presenter is
+    /// installed.
+    translucent: bool,
     slots: [FrameSlot; 3],
     cursor: usize,
     atlas: RunAtlas,
@@ -2141,6 +2247,19 @@ struct GlPresenter {
 }
 
 impl GlPresenter {
+    /// What the frame clears to: the canvas, multiplied by its own alpha
+    /// on a translucent target — the ground the raster starts a
+    /// translucent bitmap from.
+    fn ground_color(&self, canvas: Color) -> Color {
+        if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
+    }
+
+    /// The ground a knockout returns a shape to. A translucent target
+    /// has none of its own.
+    fn floor(&self, canvas: Color) -> Option<Color> {
+        if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) }
+    }
+
     /// Makes the glass targets if this frame needs them and the ones in
     /// hand are the wrong size.
     fn ensure_glass(&mut self, physical: (usize, usize)) {
@@ -2211,6 +2330,7 @@ impl GlPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
+        floor: Option<Color>,
     ) {
         for attempt in 0..3 {
             let mut ground = GlGround {
@@ -2228,6 +2348,7 @@ impl GlPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
@@ -2300,7 +2421,7 @@ impl GlPresenter {
             }
             self.buffer = physical;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(display, scale, physical, text, images, self.floor(canvas));
         let index = acquire_slot(&self.stack.gl, &mut self.slots, &mut self.cursor);
         if !upload_frame(&mut self.slots[index], &self.stack.gl, &self.batches) {
             return Presented::DeviceLost;
@@ -2330,7 +2451,7 @@ impl GlPresenter {
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
             self.stack.encode_frame(
                 (physical.0 as f32, physical.1 as f32),
-                canvas,
+                self.ground_color(canvas),
                 &self.slots[index],
                 &self.batches.runs,
                 &self.batches.rounds,
@@ -2375,11 +2496,18 @@ impl GlPresenter {
 fn install(window: usize) -> Option<GlPresenter> {
     use crate::ffi::GpuTargets;
     let targets = crate::ffi::gpu_targets(window)?;
-    let (platform, native_display, scene) = match &targets {
-        GpuTargets::Wayland { display, scene, .. } => (EGL_PLATFORM_WAYLAND, *display, *scene),
-        GpuTargets::X11 { connection, scene, .. } => (EGL_PLATFORM_XCB_EXT, *connection, *scene),
+    let (platform, native_display, scene, translucent) = match &targets {
+        GpuTargets::Wayland { display, scene, translucent, .. } => {
+            (EGL_PLATFORM_WAYLAND, *display, *scene, *translucent)
+        }
+        GpuTargets::X11 { connection, scene, translucent, .. } => {
+            (EGL_PLATFORM_XCB_EXT, *connection, *scene, *translucent)
+        }
     };
-    let kind = if scene { TargetKind::SceneWindow } else { TargetKind::Window };
+    // one config with alpha serves both: the corners a scene fades and
+    // the ground a translucent window leaves clear
+    let kind =
+        if scene || translucent { TargetKind::SceneWindow } else { TargetKind::Window };
     let mut stack = GlStack::create(kind, platform, native_display)?;
     let (width, height) = crate::ffi::gpu_buffer_size(window);
     let loader = stack.egl;
@@ -2459,6 +2587,7 @@ fn install(window: usize) -> Option<GlPresenter> {
             native_window,
             buffer: (width, height),
             scene,
+            translucent,
             slots: [FrameSlot::empty(), FrameSlot::empty(), FrameSlot::empty()],
             cursor: 0,
             atlas: RunAtlas::new(),
@@ -2503,6 +2632,20 @@ pub(crate) fn active(window: usize) -> bool {
 pub(crate) fn invalidate(window: usize) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
+            presenter.retained = None;
+        }
+    });
+}
+
+/// The system stopped serving the background this window was installed
+/// for (a compositor took its blur away): from the next frame the target
+/// is filled as an opaque window fills it. The buffer keeps its alpha
+/// channel, and every pixel in it is solid once the shell hands a solid
+/// canvas.
+pub(crate) fn stand_opaque(window: usize) {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
+            presenter.translucent = false;
             presenter.retained = None;
         }
     });
@@ -2605,6 +2748,9 @@ pub struct OffscreenGl {
     glass: Option<GlassTargets>,
     #[cfg(feature = "3d")]
     world: Option<GlWorld<Gl33>>,
+    /// The target stands for a translucent window: it clears to the
+    /// premultiplied canvas and the walk is told of no floor.
+    translucent: bool,
 }
 
 impl OffscreenGl {
@@ -2652,7 +2798,19 @@ impl OffscreenGl {
             shared: None,
             batches: FrameBatches::default(),
             glass: None,
+            translucent: false,
         })
+    }
+
+    /// The target of a window the system composites by its own alpha:
+    /// each frame clears to the PREMULTIPLIED canvas, as the window
+    /// presenter does when it is installed for a translucent window, and
+    /// the bytes read back are the premultiplied bytes
+    /// `bunny_ui::raster::rasterize_translucent` paints.
+    #[must_use]
+    pub fn translucent(mut self) -> OffscreenGl {
+        self.translucent = true;
+        self
     }
 
     /// Who renders — `GL_RENDERER`, the driver's own name for itself
@@ -2674,6 +2832,8 @@ impl OffscreenGl {
         images: &dyn ImageEngine,
         wait: bool,
     ) {
+        let floor =
+            if self.translucent { None } else { bunny_ui::raster::solid_floor(canvas) };
         for attempt in 0..3 {
             let mut ground = GlGround {
                 gl: &self.stack.gl,
@@ -2690,6 +2850,7 @@ impl OffscreenGl {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => break,
                 Err(AtlasFull) => {
@@ -2734,7 +2895,7 @@ impl OffscreenGl {
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
             self.stack.encode_frame(
                 (self.width as f32, self.height as f32),
-                canvas,
+                if self.translucent { bunny_ui::raster::premultiply(canvas) } else { canvas },
                 &self.slots[index],
                 &self.batches.runs,
                 &self.batches.rounds,
@@ -3029,6 +3190,164 @@ mod tests {
             scene_bytes(&root, Size { width: 160.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "veils drifted by {delta} (allowed 1)");
+    }
+
+    /// [`scene_bytes`] for a window the system composites by its own
+    /// alpha: the target clears to the premultiplied canvas, the oracle
+    /// is the translucent raster, and both sides hold premultiplied
+    /// bytes.
+    fn translucent_scene_bytes(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let physical = (
+            (logical.width.round() as usize) * scale,
+            (logical.height.round() as usize) * scale,
+        );
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(root, logical);
+        let cpu = bunny_ui::raster::rasterize_translucent(
+            &display,
+            physical.0,
+            physical.1,
+            scale,
+            canvas,
+            &PixelFont,
+            &RawImages::default(),
+        )
+        .to_rgba_bytes();
+        let mut gpu =
+            OffscreenGl::new(physical.0, physical.1).expect("offscreen gpu").translucent();
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
+    /// A translucent target with nothing painted on it holds the canvas
+    /// multiplied by its own alpha in every pixel — the bytes the
+    /// compositor shows as the canvas at that strength over what is
+    /// behind the window. A straight clear would show it at full
+    /// strength.
+    #[test]
+    fn a_translucent_target_clears_to_the_premultiplied_canvas() {
+        if !device_present() {
+            return;
+        }
+        let (gpu, cpu) = translucent_scene_bytes(
+            &empty().frame(1.0, 1.0),
+            Size { width: 8.0, height: 8.0 },
+            1,
+            Color::rgba(200, 100, 50, 128),
+        );
+        assert_eq!(&gpu[..4], &[100, 50, 25, 128], "the first pixel of the target");
+        assert!(gpu == cpu, "an empty scene diverged (max channel delta {})", max_channel_delta(&gpu, &cpu));
+    }
+
+    /// Paint over a translucent ground adds to the ground's alpha and
+    /// stays premultiplied, on the GPU as in the raster: flat fills,
+    /// solid and translucent, land on the same bytes.
+    #[test]
+    fn flat_fills_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(120.0, 40.0).background_color(Color::rgba(255, 255, 255, 128)),
+            empty()
+                .frame(80.0, 24.0)
+                .background_color(Color::rgba(24, 24, 29, 90))
+                .padding_length(10.0)
+                .background_color(Color::rgba(221, 225, 233, 160)),
+        ));
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 200.0, height: 160.0 },
+            2,
+            Color::rgba(16, 16, 20, 153),
+        );
+        assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
+        assert!(
+            gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 153),
+            "the bare ground keeps the canvas's own alpha"
+        );
+        assert!(gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255), "a solid fill is solid");
+    }
+
+    /// One veil around `inside`: rounded, with a halo, meeting what is
+    /// under it by `blend`.
+    fn veil_around(
+        inside: impl View<Arity = bunny_ui::view::Single>,
+        blend: bunny_ui::layout::BackgroundBlend,
+    ) -> impl View<Arity = bunny_ui::view::Single> {
+        inside
+            .padding_length(10.0)
+            .background_color(Color::rgba(255, 255, 255, 110))
+            .corner_radius(9.0)
+            .shadow(6.0)
+            .background_blend(blend)
+    }
+
+    /// Three veils, each inside the one before — the scene a background
+    /// that replaces exists for.
+    fn veils(blend: bunny_ui::layout::BackgroundBlend) -> impl View<Arity = bunny_ui::view::Single> {
+        let core = || empty().frame(60.0, 26.0);
+        let inner = veil_around(core(), blend);
+        let middle = veil_around(vstack((core(), inner)), blend);
+        veil_around(vstack((core(), middle)), blend).padding_length(14.0)
+    }
+
+    /// A background that replaces, over a CLEAR ground, where the
+    /// knockout is the erase blend: the target keeps `1 - alpha` of
+    /// itself under each shape. Every veil then reads back at its own
+    /// alpha, however deep it is, where source-over reads back nearly
+    /// solid at the third.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
+        let deepest =
+            |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.as_chunks::<4>().0.iter().filter(|pixel| pixel[3] == 110).count();
+        // every veil reads back at its own alpha, 110, at all three depths:
+        // together they are most of the picture
+        assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");
+        // and nothing is more solid than a halo over the canvas, 80 over 153
+        assert!(deepest(&gpu) < 200, "no depth adds up: {}", deepest(&gpu));
+        let (over, _) = translucent_scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(deepest(&over) > 225, "source-over is nearly solid three veils in: {}", deepest(&over));
+    }
+
+    /// Text and a rounded shape over a translucent ground: coverage and
+    /// alpha meet at the edges, where the two conventions differ most.
+    #[test]
+    fn soft_edges_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("the ground shows through").foreground_color(Color::WHITE),
+            empty()
+                .frame(120.0, 48.0)
+                .background_color(Color::rgba(59, 130, 246, 150))
+                .corner_radius(14.0)
+                .shadow(8.0),
+        ))
+        .padding_length(16.0);
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 220.0, height: 140.0 },
+            2,
+            Color::rgba(16, 16, 20, 120),
+        );
+        assert_close(&gpu, &cpu, 3, "soft edges over a translucent ground");
     }
 
     #[test]
@@ -3617,6 +3936,127 @@ mod tests {
             let (worst, share) = glass_gate((3, 0.005), (12, 0.10));
             assert_glass_close(&gpu, &cpu, worst, share, label);
         }
+    }
+
+    /// A pane inside a pane, over a ramp. `blend` on the inner one says
+    /// whether it reads the scene as it stands or shares the outer one's
+    /// capture.
+    fn pane_in_a_pane(blend: bunny_ui::layout::BackgroundBlend) -> impl View {
+        use bunny_ui::layout::Glass;
+        let inner = empty()
+            .frame(90.0, 60.0)
+            .corner_radius(18.0)
+            .glass(Glass::regular().tint(Color::rgba(40, 90, 255, 70)))
+            .background_blend(blend);
+        zstack!((
+            empty()
+                .frame_width(240.0)
+                .frame_height(160.0)
+                .background_gradient(bunny_ui::layout::Gradient::linear(
+                    Color::hex(0x102A64),
+                    Color::hex(0xE8D14A),
+                )),
+            zstack!((empty().frame(180.0, 110.0), inner))
+                .corner_radius(28.0)
+                .glass(Glass::regular().tint(Color::rgba(255, 60, 40, 110))),
+        ))
+    }
+
+    /// A pane that shares draws from the pyramid the pane around it had
+    /// built, and no new one: the tier and the raster agree on what that
+    /// scene was, and it is not the scene a pane over a pane compounds.
+    #[test]
+    fn a_pane_that_shares_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 240.0, height: 160.0 };
+        let (gpu, cpu) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Replace), size, 2, Color::CANVAS);
+        let (worst, share) = glass_gate((6, 0.015), (16, 0.15));
+        assert_glass_close(&gpu, &cpu, worst, share, "a pane that shares");
+        let (stacked, _) = scene_bytes(&pane_in_a_pane(BackgroundBlend::Over), size, 2, Color::CANVAS);
+        // at the centre the shared pane has the outer one's red tint under
+        // it no longer: the two pictures are far apart there
+        let centre = (160 * 480 + 240) * 4;
+        let apart = gpu[centre].abs_diff(stacked[centre]);
+        assert!(apart > 30, "the outer tint is gone from under the pane that shares: {apart}");
+    }
+
+    /// The pane's fragment is the shared glass body with two lines
+    /// rewritten, by text. This is the sentence that says so on a box
+    /// with no context at all: an edit of the shared body that moves one
+    /// of the two lines fails here, before any driver is asked.
+    #[test]
+    fn the_pane_fragment_is_the_shared_body_with_a_second_output() {
+        let source = pane_fragment(GLASS_FRAG_BODY)
+            .expect("the shared glass body holds the two lines the pane's fragment rewrites");
+        assert!(source.contains("layout(location = 0, index = 1) out vec4 out_solid;"));
+        assert!(source.contains("out_solid = vec4(0.0, 0.0, 0.0, color.a);"));
+        assert!(
+            !source.contains("color.a * coverage"),
+            "the first output carries the coverage alone"
+        );
+        // and nothing else moved: the two lines put back are the shared body
+        let back = source.replace(PANE_OUT, SHARED_PANE_OUT).replace(PANE_WRITE, SHARED_PANE_WRITE);
+        assert_eq!(back, GLASS_FRAG_BODY);
+    }
+
+    /// A body that lost one of the two lines refuses the pipeline by
+    /// name, where a silent pass would compile the old fragment under
+    /// the pane's blend.
+    #[test]
+    fn a_shared_body_that_moved_refuses_the_pane_fragment() {
+        let moved = GLASS_FRAG_BODY.replace("color.a * coverage", "coverage * color.a");
+        let refusal = pane_fragment(&moved).expect_err("the write is gone");
+        assert!(refusal.contains("out_color = vec4(color.rgb"), "the refusal names the line: {refusal}");
+        let doubled = format!("{GLASS_FRAG_BODY}{SHARED_PANE_OUT}");
+        assert!(pane_fragment(&doubled).is_err(), "an output declared twice is not the body it knew");
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on this tier by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        // llvmpipe answers within 8, with 8.3% of channels beyond one
+        // step; under the house blend the same scene is 89 apart
+        let (worst, share) = glass_gate((6, 0.02), (11, 0.11));
+        assert_glass_close(&gpu, &cpu, worst, share, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(
+            gpu[end].abs_diff(cpu[end]) <= worst,
+            "and it is the raster's: {} vs {}",
+            gpu[end],
+            cpu[end]
+        );
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]

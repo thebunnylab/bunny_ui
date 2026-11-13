@@ -573,6 +573,15 @@ impl GlassFilter {
     }
 }
 
+/// The colour a background that replaces paints on a page: `background`
+/// over the canvas at full strength, which is solid whatever alpha the
+/// background names. With no background of its own, a ramp alone, it is
+/// the canvas the ramp then lies on.
+pub(crate) fn replaced(canvas: Color, background: Option<Color>) -> Color {
+    let ground = Color { a: 255, ..canvas };
+    GlassFilter::under(ground, background).unwrap_or(ground)
+}
+
 /// One text node, whole: the browser re-breaks lines inside the box
 /// with the SAME measures our layout used (the engine is its canvas).
 #[derive(Clone, Debug, PartialEq)]
@@ -970,6 +979,23 @@ impl DomCapture {
                 look.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
             look.pressed_background =
                 look.pressed_background.and_then(|color| GlassFilter::under(tint, Some(color)));
+        }
+        // a background that REPLACES: a page is opaque, so the ground it
+        // replaces down to is the canvas, and what lands on the canvas
+        // alone is one solid colour. An element painted in that colour
+        // hides what its ancestors painted under it — the whole of the
+        // rule, with no layer the browser does not already have
+        if props.blend == Some(crate::layout::BackgroundBlend::Replace)
+            && props.glass.is_none()
+            && (props.background.is_some() || props.gradient.is_some())
+        {
+            let canvas = crate::theme::canvas();
+            look.background = Some(look.background.map_or(replaced(canvas, None), |color| {
+                replaced(canvas, Some(color))
+            }));
+            look.hover_background = look.hover_background.map(|color| replaced(canvas, Some(color)));
+            look.pressed_background =
+                look.pressed_background.map(|color| replaced(canvas, Some(color)));
         }
         if states || inheriting {
             look.color = Some(ink);
@@ -2539,6 +2565,9 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
         .map(|command| match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 DrawCommand::FillRect { rect: shift(rect), color, corner_radius }
+            }
+            DrawCommand::Knockout { rect, corner_radius, opacity } => {
+                DrawCommand::Knockout { rect: shift(rect), corner_radius, opacity }
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 DrawCommand::StrokeRect { rect: shift(rect), color, width, corner_radius }
@@ -7786,6 +7815,22 @@ mod tests {
         // and the bit reaches the stream where the glue reads it
         let bytes = encode(&patches);
         assert!(!bytes.is_empty());
+    }
+
+    /// On a page a background that replaces is ONE solid colour: itself
+    /// over the canvas. Painted solid, an element hides what the elements
+    /// under it painted, so two veils one inside the other show one veil.
+    #[test]
+    fn a_background_that_replaces_is_one_solid_colour_on_a_page() {
+        let canvas = Color::hex(0x101014);
+        let veil = Color { r: 255, g: 255, b: 255, a: 128 };
+        let landed = replaced(canvas, Some(veil));
+        assert_eq!(landed.a, 255, "solid, whatever alpha the veil names");
+        assert_eq!(landed, Color { r: 136, g: 136, b: 138, a: 255 }, "the veil over the canvas alone");
+        // the alpha a theme thinned its canvas to is not the page's
+        assert_eq!(replaced(Color { a: 90, ..canvas }, Some(veil)), landed);
+        assert_eq!(replaced(canvas, None), canvas, "a ramp alone lies on the canvas");
+        assert_eq!(replaced(canvas, Some(Color::hex(0x203040))), Color::hex(0x203040));
     }
 
     #[test]

@@ -138,7 +138,11 @@ impl Scene {
         let mut paint_pixels = 0usize;
         for command in lifted.iter() {
             match command {
-                DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
+                // a knockout over this road's solid canvas is the canvas
+                // painted at a strength: a fill, and it costs a fill
+                DrawCommand::FillRect { rect, .. }
+                | DrawCommand::Knockout { rect, .. }
+                | DrawCommand::StrokeRect { rect, .. } => {
                     if let Some(limit) = budget.paint {
                         if ![
                             rect.origin.x,
@@ -490,6 +494,7 @@ pub(super) fn patch_coordinates(
         .map(|mut command| {
             match &mut command {
                 DrawCommand::FillRect { rect: bounds, .. }
+                | DrawCommand::Knockout { rect: bounds, .. }
                 | DrawCommand::StrokeRect { rect: bounds, .. }
                 | DrawCommand::PushClip { rect: bounds, .. } => *bounds = rect(*bounds),
                 DrawCommand::TextLine {

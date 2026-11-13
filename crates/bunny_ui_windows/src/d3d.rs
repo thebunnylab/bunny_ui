@@ -23,6 +23,18 @@
 //! recreates the whole stack ONCE in silence, and if the device is lost
 //! again the window presents by CPU for the rest of its life.
 //!
+//! A window that is not opaque takes another road, and only such a
+//! window does. The swapchain of an `HWND` ignores alpha, so that window
+//! is created with no redirection bitmap and presents through a
+//! composition swapchain with premultiplied alpha, which
+//! DirectComposition puts on the window. It has no CPU road: it may run
+//! on the software rasterizer, and a lost device is rebuilt every time.
+//! The frame of such a target clears to the premultiplied canvas and a
+//! knockout is drawn with an erase blend; the house blend does not
+//! change. A pane of glass has a blend of its own on every target: it
+//! takes the place of what it covers, which over a solid scene is the
+//! house blend and over a clear ground is not.
+//!
 //! The LAW of the port: every policy decision — snapping, radius
 //! clamps, stroke thickness, shadow reach, the clip stack — is resolved
 //! on the CPU in f64, operation by operation the way raster.rs resolves
@@ -154,9 +166,13 @@ const MAP_WRITE_DISCARD: u32 = 4;
 const SRV_DIMENSION_BUFFER: u32 = 1;
 const TOPOLOGY_TRIANGLELIST: u32 = 4;
 const QUERY_EVENT: u32 = 0;
+const BLEND_ZERO: u32 = 1;
 const BLEND_ONE: u32 = 2;
 const BLEND_SRC_ALPHA: u32 = 5;
 const BLEND_INV_SRC_ALPHA: u32 = 6;
+/// `D3D11_BLEND_SRC1_ALPHA`: the alpha of a pixel shader's second
+/// output (`SV_Target1`), from feature level 10.0 up.
+const BLEND_SRC1_ALPHA: u32 = 18;
 const BLEND_OP_ADD: u32 = 1;
 const FILL_SOLID: u32 = 3;
 const CULL_NONE: u32 = 1;
@@ -168,6 +184,11 @@ const USAGE_RENDER_TARGET_OUTPUT: u32 = 0x20; // DXGI_USAGE_*
 const SCALING_NONE: u32 = 1;
 const SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
 const ALPHA_MODE_IGNORE: u32 = 3;
+// the composition swapchain's three: it takes no other scaling, and it is
+// the only swapchain that reads the alpha its frames carry
+const SCALING_STRETCH: u32 = 0;
+const SWAP_EFFECT_FLIP_SEQUENTIAL: u32 = 3;
+const ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 const MWA_NO_ALT_ENTER: u32 = 2;
 const PRESENT_TEST: u32 = 1;
 /// An S-code, not a failure: the frame was accepted but nobody saw it.
@@ -695,6 +716,209 @@ struct Factory2Vtbl {
         *mut c_void,
         *mut *mut SwapChain1,
     ) -> Hresult,
+    // 16 CreateSwapChainForCoreWindow, 17 GetSharedResourceAdapterLuid,
+    // 18..=20 stereo status, 21..=23 occlusion status
+    _pad_16_23: [usize; 8],
+    // 24 CreateSwapChainForComposition (device is any IUnknown; the last
+    // input restricts the chain to one output, and null does not)
+    create_swap_chain_for_composition: unsafe extern "system" fn(
+        *mut Factory2,
+        *mut c_void,
+        *const SwapChainDesc1,
+        *mut c_void,
+        *mut *mut SwapChain1,
+    ) -> Hresult,
+}
+
+const _: () = assert!(
+    std::mem::offset_of!(Factory2Vtbl, create_swap_chain_for_hwnd) == 15 * std::mem::size_of::<usize>()
+);
+const _: () = assert!(
+    std::mem::offset_of!(Factory2Vtbl, create_swap_chain_for_composition)
+        == 24 * std::mem::size_of::<usize>()
+);
+
+// MARK: - DirectComposition (the tree a composed window shows)
+//
+// A window the system composites by its own alpha presents through a
+// composition swapchain, and DirectComposition is what puts that
+// swapchain on the window. The three vtables below were written from the
+// order of the methods in `dcomp.h`. They were type-checked and NOT run
+// before they were committed: the slot numbers are the header's order,
+// counted by hand, and the first run on Windows is their proof.
+
+/// `IDCompositionDevice` — commits the tree and makes its two parts.
+#[repr(C)]
+struct CompositionDevice {
+    vtbl: *const CompositionDeviceVtbl,
+}
+
+#[repr(C)]
+struct CompositionDeviceVtbl {
+    unknown: UnknownVtbl, // 0..=2
+    // 3 Commit
+    commit: unsafe extern "system" fn(*mut CompositionDevice) -> Hresult,
+    _pad_4_5: [usize; 2], // 4 WaitForCommitCompletion, 5 GetFrameStatistics
+    // 6 CreateTargetForHwnd (the BOOL is `topmost`)
+    create_target_for_hwnd: unsafe extern "system" fn(
+        *mut CompositionDevice,
+        Hwnd,
+        i32,
+        *mut *mut CompositionTarget,
+    ) -> Hresult,
+    // 7 CreateVisual
+    create_visual:
+        unsafe extern "system" fn(*mut CompositionDevice, *mut *mut CompositionVisual) -> Hresult,
+}
+
+/// `IDCompositionTarget` — the binding of a tree to one window.
+#[repr(C)]
+struct CompositionTarget {
+    vtbl: *const CompositionTargetVtbl,
+}
+
+#[repr(C)]
+struct CompositionTargetVtbl {
+    unknown: UnknownVtbl, // 0..=2
+    // 3 SetRoot
+    set_root:
+        unsafe extern "system" fn(*mut CompositionTarget, *mut CompositionVisual) -> Hresult,
+}
+
+/// `IDCompositionVisual` — one node of the tree; its content is the
+/// swapchain.
+#[repr(C)]
+struct CompositionVisual {
+    vtbl: *const CompositionVisualVtbl,
+}
+
+#[repr(C)]
+struct CompositionVisualVtbl {
+    unknown: UnknownVtbl, // 0..=2
+    // 3..=4 SetOffsetX, 5..=6 SetOffsetY, 7..=8 SetTransform (each has a
+    // value overload and an animation overload: two slots, whichever
+    // order the compiler gave the pair), 9 SetTransformParent,
+    // 10 SetEffect, 11 SetBitmapInterpolationMode, 12 SetBorderMode,
+    // 13..=14 SetClip
+    _pad_3_14: [usize; 12],
+    // 15 SetContent (content is any IUnknown: here, the swapchain)
+    set_content: unsafe extern "system" fn(*mut CompositionVisual, *mut c_void) -> Hresult,
+}
+
+const _: () =
+    assert!(std::mem::offset_of!(CompositionDeviceVtbl, commit) == 3 * std::mem::size_of::<usize>());
+const _: () = assert!(
+    std::mem::offset_of!(CompositionDeviceVtbl, create_target_for_hwnd)
+        == 6 * std::mem::size_of::<usize>()
+);
+const _: () = assert!(
+    std::mem::offset_of!(CompositionDeviceVtbl, create_visual) == 7 * std::mem::size_of::<usize>()
+);
+const _: () =
+    assert!(std::mem::offset_of!(CompositionTargetVtbl, set_root) == 3 * std::mem::size_of::<usize>());
+const _: () = assert!(
+    std::mem::offset_of!(CompositionVisualVtbl, set_content) == 15 * std::mem::size_of::<usize>()
+);
+
+/// IID_IDCompositionDevice {c37ea93a-e7aa-450d-b16f-9746cb0407f3}
+const IID_COMPOSITION_DEVICE: Guid = Guid {
+    d1: 0xc37ea93a,
+    d2: 0xe7aa,
+    d3: 0x450d,
+    d4: [0xb1, 0x6f, 0x97, 0x46, 0xcb, 0x04, 0x07, 0xf3],
+};
+
+/// `DCompositionCreateDevice` — resolved at runtime from `dcomp.dll`.
+type CompositionCreateFn = unsafe extern "system" fn(
+    dxgi_device: *mut c_void,
+    iid: *const Guid,
+    device: *mut *mut c_void,
+) -> Hresult;
+
+/// The entry that makes a composition device, or `None` on a system
+/// with no `dcomp.dll`. Resolved once and by name: a hard import would
+/// stop the whole process at load where the library is missing, and a
+/// window that cannot be composed only has to open opaque.
+fn composition_entry() -> Option<CompositionCreateFn> {
+    static CREATE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let address = *CREATE.get_or_init(|| unsafe {
+        let name = crate::ffi::wide("dcomp.dll");
+        let module = LoadLibraryW(name.as_ptr());
+        if module == 0 {
+            return None;
+        }
+        let address =
+            GetProcAddress(module, c"DCompositionCreateDevice".to_bytes_with_nul().as_ptr());
+        (!address.is_null()).then_some(address as usize)
+    });
+    address.map(|address| unsafe { std::mem::transmute::<usize, CompositionCreateFn>(address) })
+}
+
+/// The tree of one composed window: the device, the target that binds
+/// it to the window, and the one visual whose content is the swapchain.
+/// Nothing reads them after the first commit. They are held because the
+/// window shows the swapchain for as long as they live.
+struct Composition {
+    // the fields drop in this order: the target lets go of the window
+    // first, then the visual of the swapchain, then the device
+    #[allow(dead_code)]
+    target: Com<CompositionTarget>,
+    #[allow(dead_code)]
+    visual: Com<CompositionVisual>,
+    #[allow(dead_code)]
+    device: Com<CompositionDevice>,
+}
+
+impl Composition {
+    /// Puts `swapchain` on `hwnd`: a device on the DXGI device that
+    /// renders, a target for the window, one visual with the swapchain
+    /// as its content, and the commit that makes the three take effect.
+    unsafe fn attach(
+        create: CompositionCreateFn,
+        dxgi: &Com<DxgiDevice>,
+        hwnd: Hwnd,
+        swapchain: &Com<SwapChain1>,
+    ) -> Result<Composition, String> {
+        unsafe {
+            let mut device: *mut c_void = null_mut();
+            let hr = create(dxgi.as_ptr().cast(), &IID_COMPOSITION_DEVICE, &mut device);
+            if !com_ok(hr) {
+                return Err(format!("no composition device (hr {hr:#x})"));
+            }
+            let device = Com::from_raw(device.cast::<CompositionDevice>())
+                .ok_or("null composition device")?;
+            let d = device.as_ptr();
+            // topmost FALSE: the tree lies BEHIND the window's child
+            // windows, so a host's own window stays above the scene
+            let mut target: *mut CompositionTarget = null_mut();
+            let hr = ((*(*d).vtbl).create_target_for_hwnd)(d, hwnd, 0, &mut target);
+            if !com_ok(hr) {
+                return Err(format!("no composition target for the window (hr {hr:#x})"));
+            }
+            let target = Com::from_raw(target).ok_or("null composition target")?;
+            let mut visual: *mut CompositionVisual = null_mut();
+            let hr = ((*(*d).vtbl).create_visual)(d, &mut visual);
+            if !com_ok(hr) {
+                return Err(format!("no composition visual (hr {hr:#x})"));
+            }
+            let visual = Com::from_raw(visual).ok_or("null composition visual")?;
+            let v = visual.as_ptr();
+            let hr = ((*(*v).vtbl).set_content)(v, swapchain.as_ptr().cast());
+            if !com_ok(hr) {
+                return Err(format!("the visual refused the swapchain (hr {hr:#x})"));
+            }
+            let t = target.as_ptr();
+            let hr = ((*(*t).vtbl).set_root)(t, v);
+            if !com_ok(hr) {
+                return Err(format!("the target refused its root (hr {hr:#x})"));
+            }
+            let hr = ((*(*d).vtbl).commit)(d);
+            if !com_ok(hr) {
+                return Err(format!("the composition did not commit (hr {hr:#x})"));
+            }
+            Ok(Composition { target, visual, device })
+        }
+    }
 }
 
 /// `IDXGISwapChain1` — present, buffer, resize.
@@ -1181,7 +1405,20 @@ GlassVary glass_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return vary;
 }
 
-float4 glass_fragment(GlassVary vary) : SV_Target {
+// What a pane writes: its pixel, and how solid that pixel is. The scene a
+// pane reads may not be solid, in a window the system composites by its
+// own alpha, and the pixel it answers is then premultiplied with an alpha
+// of its own. It takes the PLACE of what the pane covers: the first alpha
+// is how much of the destination gives way, the second is the alpha the
+// new pixel brings. Both go to the one target; the second is a source of
+// the pane's blend and is written nowhere. Over a solid scene it is 1 and
+// this is source-over.
+struct PaneOut {
+    float4 color : SV_Target0;
+    float4 solid : SV_Target1;
+};
+
+PaneOut glass_fragment(GlassVary vary) {
     GlassInstance pane = panes[vary.id];
     float2 p = vary.position.xy;
 
@@ -1271,9 +1508,13 @@ float4 glass_fragment(GlassVary vary) : SV_Target {
         color = float4(saturate(color.rgb + touch), color.a);
     }
 
-    // straight alpha out — the blend state premultiplies, exactly as it
-    // does for a rect
-    return float4(color.rgb, color.a * coverage * pane.opacity * clip_cov(p));
+    // the pane's own blend (`D3dStack::pane`): the colour lands by the
+    // coverage, the destination keeps the rest, and the alpha that lands
+    // is the pixel's own
+    PaneOut written;
+    written.color = float4(color.rgb, coverage * pane.opacity * clip_cov(p));
+    written.solid = float4(0.0, 0.0, 0.0, color.a);
+    return written;
 }
 "#;
 
@@ -1298,6 +1539,15 @@ struct D3dStack {
     glass_ps: Com<PixelShader>,
     blur_ps: Com<PixelShader>,
     blend: Com<BlendState>,
+    /// The erase blend a [`RunKind::Knockout`] run is drawn with, under
+    /// the rect shaders: the target keeps `1 - alpha` of itself.
+    erase: Com<BlendState>,
+    /// The blend a pane of glass is drawn with: the pixel it answers
+    /// takes the place of what it covers, by the coverage in the first
+    /// output's alpha, and brings the alpha in the SECOND output's — the
+    /// raster's `Bitmap::set_replaced`. Where that alpha is 1, every
+    /// scene an opaque window paints, this is the house blend.
+    pane: Com<BlendState>,
     rasterizer: Com<RasterizerState>,
     sampler: Com<SamplerState>,
     /// 16 bytes per draw: the viewport and the run's base index.
@@ -1536,6 +1786,45 @@ impl D3dStack {
             }
             let blend = Com::from_raw(blend).ok_or("null blend state")?;
 
+            // The erase: nothing of the source is added, and the target
+            // keeps what the source's alpha leaves of it, colour and
+            // alpha alike: rgb = d·(1−sa); a = da·(1−sa). A knockout
+            // over a clear ground is drawn with it.
+            let erased = RenderTargetBlendDesc {
+                src_blend: BLEND_ZERO,
+                src_blend_alpha: BLEND_ZERO,
+                ..target
+            };
+            let erase_desc = BlendDesc {
+                alpha_to_coverage: 0,
+                independent_blend: 0,
+                render_target: [erased; 8],
+            };
+            let mut erase: *mut BlendState = null_mut();
+            if !com_ok(((*(*d).vtbl).create_blend_state)(d, &erase_desc, &mut erase)) {
+                return Err("erase blend state refused".to_string());
+            }
+            let erase = Com::from_raw(erase).ok_or("null erase blend state")?;
+
+            // The pane: rgb = s·t + d·(1−t); a = sa·t + da·(1−t), with t
+            // the first output's alpha and sa the second's. The colour
+            // half is the house blend's; the alpha half takes its source
+            // factor from the second output, which is dual-source
+            // blending and belongs to the first target alone, so the
+            // seven beside it keep the house blend.
+            let mut pane_targets = [target; 8];
+            pane_targets[0] = RenderTargetBlendDesc { src_blend_alpha: BLEND_SRC1_ALPHA, ..target };
+            let pane_desc = BlendDesc {
+                alpha_to_coverage: 0,
+                independent_blend: 0,
+                render_target: pane_targets,
+            };
+            let mut pane: *mut BlendState = null_mut();
+            if !com_ok(((*(*d).vtbl).create_blend_state)(d, &pane_desc, &mut pane)) {
+                return Err("pane blend state refused".to_string());
+            }
+            let pane = Com::from_raw(pane).ok_or("null pane blend state")?;
+
             let rasterizer_desc = RasterizerDesc {
                 fill_mode: FILL_SOLID,
                 cull_mode: CULL_NONE,
@@ -1590,6 +1879,8 @@ impl D3dStack {
                 glass_ps,
                 blur_ps,
                 blend,
+                erase,
+                pane,
                 rasterizer,
                 sampler,
                 frame_cb,
@@ -1621,6 +1912,8 @@ impl D3dStack {
 
     /// One pass over `target`: clear to `canvas`, then the runs in paint
     /// order — the pipeline swaps only where rects and text alternate.
+    /// `canvas` is the word the target clears to, so a translucent
+    /// target hands it in already premultiplied ([`ground_color`]).
     #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame(
         &self,
@@ -1685,13 +1978,24 @@ impl D3dStack {
             (vtbl.ps_set_constant_buffers)(context, 2, 1, &round_cb);
             let mut bound: Option<RunKind> = None;
             let mut bound_round: Option<u32> = None;
+            // the erase blend is bound: the next run of another kind
+            // puts the house blend back before it draws
+            let mut erasing = false;
             for run in runs {
+                if erasing && run.kind != RunKind::Knockout {
+                    (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
+                    erasing = false;
+                }
                 if run.kind == RunKind::Glass {
                     // the pyramid, from the scene as it stands, and then
                     // the panes over it. Both leave the target and the
                     // curve behind them, so the next run rebinds
                     if let Some(targets) = glass {
-                        self.build_pyramid(targets, viewport, run.levels);
+                        // a batch that shares reads the pyramid the pane
+                        // around it had built: the scene of that moment
+                        if !run.reuse {
+                            self.build_pyramid(targets, viewport, run.levels);
+                        }
                         self.draw_glass(targets, glass_srv, *run, rounds, viewport);
                     }
                     bound = None;
@@ -1712,11 +2016,24 @@ impl D3dStack {
                 }
                 if bound != Some(run.kind) {
                     match run.kind {
-                        RunKind::Rects => {
+                        RunKind::Rects | RunKind::Knockout => {
                             (vtbl.vs_set_shader)(context, self.rect_vs.as_ptr(), null(), 0);
                             (vtbl.ps_set_shader)(context, self.rect_ps.as_ptr(), null(), 0);
                             (vtbl.vs_set_shader_resources)(context, 0, 1, &rect_srv);
                             (vtbl.ps_set_shader_resources)(context, 0, 1, &rect_srv);
+                            if run.kind == RunKind::Knockout {
+                                // the same shaders under the erase blend:
+                                // each shape returns to the clear ground by
+                                // the alpha it carries. The walk makes this
+                                // run only over a ground that is not solid
+                                (vtbl.om_set_blend_state)(
+                                    context,
+                                    self.erase.as_ptr(),
+                                    null(),
+                                    0xFFFF_FFFF,
+                                );
+                                erasing = true;
+                            }
                         }
                         RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
                             let pixel = match run.kind {
@@ -1766,6 +2083,11 @@ impl D3dStack {
                 frame[8..12].copy_from_slice(&run.base.to_ne_bytes());
                 self.write_constants(frame_cb, &frame);
                 (vtbl.draw_instanced)(context, 6, run.count, 0, 0);
+            }
+            if erasing {
+                // a frame that ends on a knockout does not leave the erase
+                // bound for whatever draws next
+                (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
             }
             // the scene, onto the target the caller actually presents
             if let Some(targets) = glass {
@@ -1877,7 +2199,9 @@ impl D3dStack {
                 max_depth: 1.0,
             };
             (vtbl.rs_set_viewports)(context, 1, &port);
-            (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
+            // the pane's own blend: over a ground that is not solid the
+            // pixel it answers takes the place of what it covers
+            (vtbl.om_set_blend_state)(context, self.pane.as_ptr(), null(), 0xFFFF_FFFF);
             let round = &rounds[run.round as usize];
             let bytes = std::slice::from_raw_parts(
                 round as *const RoundClip as *const u8,
@@ -1898,6 +2222,8 @@ impl D3dStack {
             let sampler = self.sampler.as_ptr();
             (vtbl.ps_set_samplers)(context, 0, 1, &sampler);
             (vtbl.draw_instanced)(context, 6, run.count, 0, 0);
+            // the house blend comes back for the run that follows
+            (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
             let none: *mut Srv = null_mut();
             (vtbl.ps_set_shader_resources)(context, 1, 1, &none);
         }
@@ -2534,6 +2860,29 @@ struct D3dPresenter {
     /// The compositor said nobody sees the window — probe with a test
     /// present and skip the work until it comes back.
     occluded: bool,
+    /// The system composites the window by the alpha its frames carry:
+    /// the frame clears to the premultiplied canvas and a knockout
+    /// erases. Told once, when the presenter is installed.
+    translucent: bool,
+    /// The tree that puts the swapchain on a composed window. `None` on
+    /// the swapchain an opaque window takes for its `HWND`.
+    #[allow(dead_code)] // held for its lifetime: the window shows what it holds
+    composition: Option<Composition>,
+}
+
+/// What a frame clears to: the canvas, and on a translucent target the
+/// canvas multiplied by its own alpha — the ground the raster starts a
+/// translucent bitmap from, rounded by the raster's rule. The house
+/// blend reads its destination as premultiplied, so every paint after
+/// the clear leaves premultiplied pixels with no change to the blend.
+fn ground_color(translucent: bool, canvas: Color) -> Color {
+    if translucent { bunny_ui::raster::premultiply(canvas) } else { canvas }
+}
+
+/// The ground a knockout returns a shape to, as the walk is told it: the
+/// solid canvas of an opaque target, and none on a translucent one.
+fn floor_of(translucent: bool, canvas: Color) -> Option<Color> {
+    if translucent { None } else { bunny_ui::raster::solid_floor(canvas) }
 }
 
 /// The skip key: the SAME list on the SAME target needs no new frame.
@@ -2583,6 +2932,7 @@ impl D3dPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
+        floor: Option<Color>,
     ) {
         for attempt in 0..3 {
             match build_frame(
@@ -2594,6 +2944,7 @@ impl D3dPresenter {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
@@ -2756,7 +3107,14 @@ impl D3dPresenter {
         } else {
             self.intermediate = None;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(
+            display,
+            scale,
+            physical,
+            text,
+            images,
+            floor_of(self.translucent, canvas),
+        );
         // a frame with glass needs a scene of its own to read; a frame
         // without one never asks for the textures
         if !self.batches.glass.is_empty()
@@ -2780,7 +3138,7 @@ impl D3dPresenter {
         unsafe {
             self.stack.encode_frame(
                 target,
-                canvas,
+                ground_color(self.translucent, canvas),
                 (physical.0 as f32, physical.1 as f32),
                 self.slots[index].rects.srv_ptr(),
                 self.slots[index].sprites.srv_ptr(),
@@ -2931,7 +3289,282 @@ fn install(hwnd: Hwnd) -> Option<D3dPresenter> {
         batches: FrameBatches::default(),
         retained: None,
         occluded: false,
+        translucent: false,
+        composition: None,
     })
+}
+
+/// `BUNNY_PRESENT=cpu`: the GPU road is refused for the whole process.
+fn refused() -> bool {
+    std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu")
+}
+
+/// The walk from a device to the factory that made its adapter: the
+/// device as DXGI sees it, and the factory. The composed road keeps the
+/// first for DirectComposition and asks the second for the swapchain.
+unsafe fn dxgi_factory(device: *mut Device) -> Option<(Com<DxgiDevice>, Com<Factory2>)> {
+    unsafe {
+        let mut dxgi: *mut c_void = null_mut();
+        if !com_ok(((*(*device).vtbl).unknown.query_interface)(
+            device as *mut c_void,
+            &IID_DXGI_DEVICE,
+            &mut dxgi,
+        )) {
+            return None;
+        }
+        let dxgi = Com::from_raw(dxgi as *mut DxgiDevice)?;
+        let mut adapter: *mut DxgiAdapter = null_mut();
+        if !com_ok(((*(*dxgi.as_ptr()).vtbl).get_adapter)(dxgi.as_ptr(), &mut adapter)) {
+            return None;
+        }
+        let adapter = Com::from_raw(adapter)?;
+        let mut factory: *mut c_void = null_mut();
+        if !com_ok(((*(*adapter.as_ptr()).vtbl).get_parent)(
+            adapter.as_ptr(),
+            &IID_FACTORY2,
+            &mut factory,
+        )) {
+            return None;
+        }
+        let factory = Com::from_raw(factory as *mut Factory2)?;
+        Some((dxgi, factory))
+    }
+}
+
+/// A swapchain for composition, `size` in client pixels: the one kind
+/// whose alpha the compositor reads. The swapchain a window takes for
+/// its `HWND` ignores alpha whatever its description says.
+///
+/// B8G8R8A8_UNORM, not sRGB: the parity law does not move. The alpha is
+/// PREMULTIPLIED, which is what the house blend leaves over a
+/// premultiplied clear. A composition swapchain takes the stretch
+/// scaling alone, and no size of zero: the first present resizes it to
+/// the client.
+unsafe fn composition_swapchain(
+    factory: &Com<Factory2>,
+    device: *mut Device,
+    size: (u32, u32),
+) -> Result<Com<SwapChain1>, String> {
+    let desc = SwapChainDesc1 {
+        width: size.0.max(1),
+        height: size.1.max(1),
+        format: FORMAT_BGRA8,
+        stereo: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        buffer_usage: USAGE_RENDER_TARGET_OUTPUT,
+        buffer_count: 2,
+        scaling: SCALING_STRETCH,
+        swap_effect: SWAP_EFFECT_FLIP_SEQUENTIAL,
+        alpha_mode: ALPHA_MODE_PREMULTIPLIED,
+        flags: 0,
+    };
+    unsafe {
+        let mut swapchain: *mut SwapChain1 = null_mut();
+        let hr = ((*(*factory.as_ptr()).vtbl).create_swap_chain_for_composition)(
+            factory.as_ptr(),
+            device as *mut c_void,
+            &desc,
+            null_mut(),
+            &mut swapchain,
+        );
+        if !com_ok(hr) {
+            return Err(format!("the factory refused the composition swapchain (hr {hr:#x})"));
+        }
+        Com::from_raw(swapchain).ok_or_else(|| "null composition swapchain".to_string())
+    }
+}
+
+/// Builds the whole stack for a window the system composites by its own
+/// alpha: device, pipelines, a composition swapchain and the tree that
+/// puts it on the window.
+///
+/// The window was created with no redirection bitmap, so no GDI paint
+/// can ever show on it and the CPU road does not exist for it. That is
+/// why this road, unlike [`install`], takes the software rasterizer when
+/// there is no hardware device: a slow frame is a frame.
+///
+/// `translucent` is false only for a window that lost its backdrop after
+/// it opened: it stays composed and paints as an opaque one.
+fn install_composed(hwnd: Hwnd, translucent: bool) -> Result<D3dPresenter, String> {
+    let create = composition_entry().ok_or("no dcomp.dll on this system")?;
+    let stack = D3dStack::build(true)?;
+    let device = stack.device.as_ptr();
+    let context = stack.context.as_ptr();
+    let (dxgi, factory) =
+        unsafe { dxgi_factory(device) }.ok_or("the device denies its DXGI factory")?;
+    let swapchain =
+        unsafe { composition_swapchain(&factory, device, crate::ffi::client_px_of(hwnd)) }?;
+    let composition = unsafe { Composition::attach(create, &dxgi, hwnd, &swapchain) }?;
+    let ground = D3dGround::new(device, context);
+    Ok(D3dPresenter {
+        stack,
+        swapchain,
+        hwnd,
+        rtv: None,
+        client: (0, 0),
+        intermediate: None,
+        glass: None,
+        slots: [FrameSlot::empty(), FrameSlot::empty(), FrameSlot::empty()],
+        cursor: 0,
+        atlas: RunAtlas::new(),
+        ground,
+        batches: FrameBatches::default(),
+        retained: None,
+        occluded: false,
+        translucent,
+        composition: Some(composition),
+    })
+}
+
+/// What the registry keeps for one composed window.
+#[derive(Clone, Copy)]
+struct Composed {
+    /// False after the window lost its backdrop: composed still, and
+    /// painted as an opaque window.
+    translucent: bool,
+    /// When the last rebuild of its presenter failed, if the last one
+    /// did. The next is not tried before [`RECOMPOSE_AFTER`] has passed.
+    failed: Option<std::time::Instant>,
+}
+
+/// How long a composed window waits between two attempts to rebuild a
+/// presenter that did not come up. A rebuild makes a device and compiles
+/// every shader, and a scene that animates asks for a frame sixty times
+/// a second.
+const RECOMPOSE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+thread_local! {
+    /// The windows that present through a composition swapchain. Such a
+    /// window has no redirection bitmap, so it is on the GPU road for as
+    /// long as it lives, with or without a presenter at this moment.
+    static COMPOSED: RefCell<HashMap<Hwnd, Composed>> = RefCell::new(HashMap::new());
+}
+
+/// Whether the system can show a window by the alpha of its own frames:
+/// the GPU road is not refused, the shader compiler is on the system and
+/// DirectComposition is too. It is the `alpha` fact
+/// `WindowBackground::resolve` takes. A device is not made to answer it;
+/// one that does not come up is found when the window opens, and the
+/// window then opens opaque.
+pub(crate) fn composes() -> bool {
+    !refused() && compiler().is_some() && composition_entry().is_some()
+}
+
+/// Whether this window presents through a composition swapchain.
+pub(crate) fn composed(hwnd: Hwnd) -> bool {
+    COMPOSED.with(|windows| windows.borrow().contains_key(&hwnd))
+}
+
+/// Puts a composed, translucent present on a window that was created
+/// with no redirection bitmap — called by `create_window` itself, after
+/// the metrics exist and before the window shows.
+///
+/// Returns false, and leaves nothing behind, when the road is refused or
+/// any part of it does not come up, the first frame included: the caller
+/// then replaces the window with an opaque one. The first frame is the
+/// canvas alone, as on the opaque road, and it is also the one proof
+/// that the swapchain presents.
+pub(crate) fn try_install_composed(hwnd: Hwnd) -> bool {
+    if refused() {
+        return false;
+    }
+    let mut presenter = match install_composed(hwnd, true) {
+        Ok(presenter) => presenter,
+        Err(reason) => {
+            eprintln!("bunny_ui d3d: {reason} — the window opens opaque");
+            return false;
+        }
+    };
+    let (width, height) = crate::ffi::logical_of(hwnd);
+    let scale = crate::ffi::int_scale_of(hwnd);
+    let first = presenter.present(
+        &DisplayList::default(),
+        Size { width, height },
+        scale,
+        bunny_ui::theme::canvas(),
+        &bunny_ui::text_engine::PixelFont,
+        &bunny_ui::image_engine::RawImages::default(),
+    );
+    if first == Presented::DeviceLost {
+        eprintln!("bunny_ui d3d: the composition swapchain did not present — the window opens opaque");
+        return false;
+    }
+    PRESENTER.with(|slot| {
+        slot.borrow_mut().insert(hwnd, presenter);
+    });
+    COMPOSED.with(|windows| {
+        windows.borrow_mut().insert(hwnd, Composed { translucent: true, failed: None });
+    });
+    true
+}
+
+/// Makes a composed window paint as an opaque one from its next frame:
+/// the clear is the canvas at full strength and a knockout is a rect of
+/// it. For a window that lost the blur it was opened to stand on. The
+/// window stays composed, because its extended style cannot change.
+pub(crate) fn make_opaque(hwnd: Hwnd) {
+    COMPOSED.with(|windows| {
+        if let Some(window) = windows.borrow_mut().get_mut(&hwnd) {
+            window.translucent = false;
+        }
+    });
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&hwnd) {
+            presenter.translucent = false;
+            presenter.retained = None;
+        }
+    });
+}
+
+/// Rebuilds the presenter of a composed window whose device is gone, and
+/// presents the frame in hand on it.
+///
+/// A composed window is never demoted to the CPU road, and its rebuilds
+/// are not counted: with no redirection bitmap there is nothing else
+/// that can show it. A rebuild that does not come up is tried again by a
+/// later frame, no sooner than [`RECOMPOSE_AFTER`].
+fn recompose(
+    hwnd: Hwnd,
+    display: &DisplayList,
+    size: Size,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) {
+    // the old tree goes first: a window takes one composition target
+    PRESENTER.with(|slot| slot.borrow_mut().remove(&hwnd));
+    let Some(window) = COMPOSED.with(|windows| windows.borrow().get(&hwnd).copied()) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if window.failed.is_some_and(|failed| now.duration_since(failed) < RECOMPOSE_AFTER) {
+        return;
+    }
+    let rebuilt = install_composed(hwnd, window.translucent).and_then(|mut presenter| {
+        match presenter.present(display, size, scale, canvas, text, images) {
+            Presented::Ok => Ok(presenter),
+            Presented::DeviceLost => Err("the rebuilt swapchain did not present".to_string()),
+        }
+    });
+    let failed = match rebuilt {
+        Ok(presenter) => {
+            PRESENTER.with(|slot| {
+                slot.borrow_mut().insert(hwnd, presenter);
+            });
+            None
+        }
+        Err(reason) => {
+            eprintln!("bunny_ui d3d: {reason} — the composed window waits for a device");
+            Some(now)
+        }
+    };
+    COMPOSED.with(|windows| {
+        if let Some(window) = windows.borrow_mut().get_mut(&hwnd) {
+            window.failed = failed;
+        }
+    });
 }
 
 /// Grafts the GPU present onto the window — called by `create_window`
@@ -2944,7 +3577,7 @@ fn install(hwnd: Hwnd) -> Option<D3dPresenter> {
 /// DLL, a shader that does not compile) prints one line and falls back
 /// — a window never fails to open because of D3D.
 pub(crate) fn try_install(hwnd: Hwnd) -> bool {
-    if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
+    if refused() {
         return false;
     }
     let Some(mut presenter) = install(hwnd) else {
@@ -2969,9 +3602,12 @@ pub(crate) fn try_install(hwnd: Hwnd) -> bool {
 }
 
 /// True when this window presents by GPU — the shell branches per frame
-/// on this (a lost device may hand the window back to the CPU).
+/// on this (a lost device may hand the window back to the CPU). A
+/// composed window answers true for as long as it lives: with no
+/// redirection bitmap the CPU road cannot show it, and a frame that
+/// finds it without a presenter rebuilds one.
 pub(crate) fn active(hwnd: Hwnd) -> bool {
-    PRESENTER.with(|slot| slot.borrow().contains_key(&hwnd))
+    PRESENTER.with(|slot| slot.borrow().contains_key(&hwnd)) || composed(hwnd)
 }
 
 /// The GPU twin of the Surface + blit path: same display list in, one
@@ -2980,7 +3616,9 @@ pub(crate) fn active(hwnd: Hwnd) -> bool {
 ///
 /// A lost device (driver upgrade mid-run) rebuilds the whole stack once
 /// in silence and re-presents; lost again, the window presents by CPU
-/// for the rest of its life with one line on stderr.
+/// for the rest of its life with one line on stderr. A composed window
+/// is the exception: it has no CPU road, so its stack is rebuilt every
+/// time it is lost ([`recompose`]).
 pub(crate) fn present_window(
     hwnd: Hwnd,
     display: &DisplayList,
@@ -2995,6 +3633,16 @@ pub(crate) fn present_window(
             .get_mut(&hwnd)
             .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
     });
+    if outcome == Some(Presented::Ok) {
+        return;
+    }
+    // only a frame that did not present asks which road the window is on
+    if composed(hwnd) {
+        // no CPU road and no budget of rebuilds: a lost device, or a
+        // rebuild that did not come up before, is rebuilt now
+        recompose(hwnd, display, size, scale, canvas, text, images);
+        return;
+    }
     if outcome != Some(Presented::DeviceLost) {
         return;
     }
@@ -3032,6 +3680,9 @@ pub(crate) fn teardown(hwnd: Hwnd) {
     PRESENTER.with(|slot| {
         slot.borrow_mut().remove(&hwnd);
     });
+    COMPOSED.with(|windows| {
+        windows.borrow_mut().remove(&hwnd);
+    });
 }
 
 // MARK: - Offscreen target (parity tests and the bench)
@@ -3056,6 +3707,9 @@ pub struct OffscreenD3d {
     /// The scene texture and the blur pyramid, made on the first frame
     /// that carries glass.
     glass: Option<GlassTargets>,
+    /// The target stands for a translucent window: it clears to the
+    /// premultiplied canvas and a knockout erases.
+    translucent: bool,
 }
 
 impl OffscreenD3d {
@@ -3135,7 +3789,18 @@ impl OffscreenD3d {
             ground,
             batches: FrameBatches::default(),
             glass: None,
+            translucent: false,
         })
+    }
+
+    /// The same target, standing for a window the system composites by
+    /// its own alpha: it clears to the premultiplied canvas, as the
+    /// presenter of a composed window does, and reads back what
+    /// `bunny_ui::raster::rasterize_translucent` paints.
+    #[must_use]
+    pub fn translucent(mut self) -> OffscreenD3d {
+        self.translucent = true;
+        self
     }
 
     fn present_inner(
@@ -3149,6 +3814,7 @@ impl OffscreenD3d {
     ) {
         let context = self.stack.context.as_ptr();
         let device = self.stack.device.as_ptr();
+        let floor = floor_of(self.translucent, canvas);
         for attempt in 0..3 {
             match build_frame(
                 &mut self.ground,
@@ -3159,6 +3825,7 @@ impl OffscreenD3d {
                 images,
                 &mut self.atlas,
                 &mut self.batches,
+                floor,
             ) {
                 Ok(()) => break,
                 Err(AtlasFull) => {
@@ -3188,7 +3855,7 @@ impl OffscreenD3d {
         unsafe {
             self.stack.encode_frame(
                 self.target_rtv.as_ptr(),
-                canvas,
+                ground_color(self.translucent, canvas),
                 (self.width as f32, self.height as f32),
                 self.slots[index].rects.srv_ptr(),
                 self.slots[index].sprites.srv_ptr(),
@@ -3396,6 +4063,37 @@ mod tests {
         (gpu.read_rgba(), cpu)
     }
 
+    /// [`scene_bytes`] for a window the system composites by its own
+    /// alpha: the target clears to the premultiplied canvas, the oracle
+    /// is the translucent raster, and both sides hold premultiplied
+    /// bytes.
+    fn translucent_scene_bytes(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let physical =
+            ((logical.width.round() as usize) * scale, (logical.height.round() as usize) * scale);
+        let mut gpu =
+            OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu").translucent();
+        report_adapter(&gpu.stack.device);
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(root, logical);
+        let cpu = bunny_ui::raster::rasterize_translucent(
+            &display,
+            gpu.width,
+            gpu.height,
+            scale,
+            canvas,
+            &PixelFont,
+            &RawImages::default(),
+        )
+        .to_rgba_bytes();
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
     fn max_channel_delta(a: &[u8], b: &[u8]) -> u8 {
         a.iter().zip(b.iter()).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
     }
@@ -3512,6 +4210,231 @@ mod tests {
             scene_bytes(&root, Size { width: 160.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "veils drifted by {delta} (allowed 1)");
+    }
+
+    /// A translucent target with nothing painted on it holds the canvas
+    /// multiplied by its own alpha in every pixel — the bytes the
+    /// compositor shows as the canvas at that strength over what is
+    /// behind the window. A straight clear would show it at full
+    /// strength.
+    #[test]
+    fn a_translucent_target_clears_to_the_premultiplied_canvas() {
+        if !device_present() {
+            return;
+        }
+        let (gpu, cpu) = translucent_scene_bytes(
+            &empty().frame(1.0, 1.0),
+            Size { width: 8.0, height: 8.0 },
+            1,
+            Color::rgba(200, 100, 50, 128),
+        );
+        assert_eq!(&gpu[..4], &[100, 50, 25, 128], "the first pixel of the target");
+        assert!(
+            gpu == cpu,
+            "an empty scene diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    /// Paint over a translucent ground adds to the ground's alpha and
+    /// stays premultiplied, on the GPU as in the raster: flat fills,
+    /// solid and translucent, land on the same bytes.
+    #[test]
+    fn flat_fills_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(120.0, 40.0).background_color(Color::rgba(255, 255, 255, 128)),
+            empty()
+                .frame(80.0, 24.0)
+                .background_color(Color::rgba(24, 24, 29, 90))
+                .padding_length(10.0)
+                .background_color(Color::rgba(221, 225, 233, 160)),
+        ));
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 200.0, height: 160.0 },
+            2,
+            Color::rgba(16, 16, 20, 153),
+        );
+        assert_close(&gpu, &cpu, 1, "flat fills over a translucent ground");
+        assert!(
+            gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 153),
+            "the bare ground keeps the canvas's own alpha"
+        );
+        assert!(gpu.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255), "a solid fill is solid");
+    }
+
+    /// One veil around `inside`: rounded, with a halo, meeting what is
+    /// under it by `blend`.
+    fn veil_around(
+        inside: impl View<Arity = bunny_ui::view::Single>,
+        blend: bunny_ui::layout::BackgroundBlend,
+    ) -> impl View<Arity = bunny_ui::view::Single> {
+        inside
+            .padding_length(10.0)
+            .background_color(Color::rgba(255, 255, 255, 110))
+            .corner_radius(9.0)
+            .shadow(6.0)
+            .background_blend(blend)
+    }
+
+    /// Three veils, each inside the one before — the scene a background
+    /// that replaces exists for.
+    fn veils(blend: bunny_ui::layout::BackgroundBlend) -> impl View<Arity = bunny_ui::view::Single> {
+        let core = || empty().frame(60.0, 26.0);
+        let inner = veil_around(core(), blend);
+        let middle = veil_around(vstack((core(), inner)), blend);
+        veil_around(vstack((core(), middle)), blend).padding_length(14.0)
+    }
+
+    /// A background that replaces, over a SOLID canvas: the walk lowers
+    /// the knockout to a rect of the canvas, so this tier draws it with
+    /// the pipeline it always had and agrees with the raster as closely
+    /// as it does on any rounded fill.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_solid_canvas() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::hex(0x101014);
+        let (gpu, cpu) = scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a solid canvas");
+        // and replacing is not the picture source-over paints
+        let (over, _) = scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(max_channel_delta(&gpu, &over) > 40, "the innermost veil stops adding up");
+    }
+
+    /// The same over a CLEAR ground, where the knockout is the erase
+    /// blend: the target keeps `1 - alpha` of itself under each shape.
+    /// Every veil then reads back at its own alpha, however deep it is,
+    /// where source-over reads back nearly solid at the third.
+    #[test]
+    fn backgrounds_that_replace_match_the_raster_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::BackgroundBlend;
+        let size = Size { width: 220.0, height: 200.0 };
+        let canvas = Color::rgba(16, 16, 20, 153);
+        let (gpu, cpu) = translucent_scene_bytes(&veils(BackgroundBlend::Replace), size, 2, canvas);
+        assert_close(&gpu, &cpu, 3, "veils that replace, over a clear ground");
+        let deepest =
+            |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|pixel| pixel[3]).max().unwrap_or(0);
+        let at_the_veil = gpu.as_chunks::<4>().0.iter().filter(|pixel| pixel[3] == 110).count();
+        // every veil reads back at its own alpha, 110, at all three depths:
+        // together they are most of the picture
+        assert!(at_the_veil > gpu.len() / 4 / 4, "the veils hold their own alpha: {at_the_veil} pixels");
+        // and nothing is more solid than a halo over the canvas, 80 over 153
+        assert!(deepest(&gpu) < 200, "no depth adds up: {}", deepest(&gpu));
+        let (over, _) = translucent_scene_bytes(&veils(BackgroundBlend::Over), size, 2, canvas);
+        assert!(deepest(&over) > 225, "source-over is nearly solid three veils in: {}", deepest(&over));
+    }
+
+    /// Text and a rounded shape over a translucent ground: coverage and
+    /// alpha meet at the edges, where the two conventions differ most.
+    #[test]
+    fn soft_edges_over_a_translucent_ground_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("the ground shows through").foreground_color(Color::WHITE),
+            empty()
+                .frame(120.0, 48.0)
+                .background_color(Color::rgba(59, 130, 246, 150))
+                .corner_radius(14.0)
+                .shadow(8.0),
+        ))
+        .padding_length(16.0);
+        let (gpu, cpu) = translucent_scene_bytes(
+            &root,
+            Size { width: 220.0, height: 140.0 },
+            2,
+            Color::rgba(16, 16, 20, 120),
+        );
+        assert_close(&gpu, &cpu, 3, "soft edges over a translucent ground");
+    }
+
+    /// The composed road reaches six methods no other road of this
+    /// crate calls. Their slots are the order of the headers, counted by
+    /// hand; the const asserts gate the build, and this pins the numbers
+    /// in a place a failing CI can point at.
+    #[test]
+    fn the_composition_vtables_hold_their_slots() {
+        let slot = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::offset_of!(Factory2Vtbl, create_swap_chain_for_composition), 24 * slot);
+        assert_eq!(std::mem::offset_of!(CompositionDeviceVtbl, commit), 3 * slot);
+        assert_eq!(std::mem::offset_of!(CompositionDeviceVtbl, create_target_for_hwnd), 6 * slot);
+        assert_eq!(std::mem::offset_of!(CompositionDeviceVtbl, create_visual), 7 * slot);
+        assert_eq!(std::mem::offset_of!(CompositionTargetVtbl, set_root), 3 * slot);
+        assert_eq!(std::mem::offset_of!(CompositionVisualVtbl, set_content), 15 * slot);
+        // the description every swapchain is made from: twelve words
+        assert_eq!(std::mem::size_of::<SwapChainDesc1>(), 48);
+    }
+
+    /// Whether this machine's adapter gives a swapchain for composition
+    /// with premultiplied alpha: the one thing the composed road asks of
+    /// DXGI that the road of an `HWND` never did. No window is needed to
+    /// ask. An adapter that refuses is not a fault of this crate, and a
+    /// window on that machine opens opaque: the test prints the refusal
+    /// and stops there.
+    #[test]
+    fn a_composition_swapchain_takes_premultiplied_alpha() {
+        if !device_present() {
+            return;
+        }
+        let Some(stack) = D3dStack::create(true) else {
+            return;
+        };
+        report_adapter(&stack.device);
+        eprintln!(
+            "DirectComposition entry {}; a window can be composed: {}",
+            if composition_entry().is_some() { "resolved" } else { "missing" },
+            composes(),
+        );
+        let device = stack.device.as_ptr();
+        let Some((_dxgi, factory)) = (unsafe { dxgi_factory(device) }) else {
+            eprintln!("the device denies its DXGI factory — skipping");
+            return;
+        };
+        let swapchain = match unsafe { composition_swapchain(&factory, device, (64, 48)) } {
+            Ok(swapchain) => swapchain,
+            Err(reason) => {
+                eprintln!("{reason} — skipping: a window opens opaque on this adapter");
+                return;
+            }
+        };
+        // a real chain answers with a back buffer the device can draw on
+        unsafe {
+            let mut texture: *mut c_void = null_mut();
+            assert!(
+                com_ok(((*(*swapchain.as_ptr()).vtbl).get_buffer)(
+                    swapchain.as_ptr(),
+                    0,
+                    &IID_TEXTURE2D,
+                    &mut texture,
+                )),
+                "the composition swapchain gives no back buffer"
+            );
+            let texture = Com::from_raw(texture as *mut Texture2d).expect("a back buffer");
+            let mut rtv: *mut Rtv = null_mut();
+            assert!(
+                com_ok(((*(*device).vtbl).create_render_target_view)(
+                    device,
+                    texture.as_ptr() as *mut c_void,
+                    null(),
+                    &mut rtv,
+                )),
+                "the back buffer takes no render target view"
+            );
+            drop(Com::from_raw(rtv));
+        }
+        eprintln!("this adapter takes a composition swapchain with premultiplied alpha");
     }
 
     #[test]
@@ -4204,6 +5127,44 @@ mod tests {
             // from the failure it was built to catch.
             assert_glass_close(&gpu, &cpu, 4, 0.0075, label);
         }
+    }
+
+    /// A pane over a ground that is not solid takes the place of what it
+    /// covers, on this tier by the pane's own blend as in the raster: the
+    /// alpha it leaves is the tint over the blurred ground, once. The bar
+    /// is the one the mac tier holds for this scene.
+    #[test]
+    fn the_material_takes_its_place_over_a_clear_ground() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        // bars narrower than the pane: its two ends lie over bare ground
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty().frame_width(110.0).frame_height(8.0).background_color(if index % 2 == 0 {
+                    Color::hex(0x102A64)
+                } else {
+                    Color::hex(0xE8D14A)
+                })
+            },
+        )
+        .vertical();
+        let root = zstack!((bars, empty().frame(170.0, 90.0).corner_radius(20.0).glass(Glass::frosted())));
+        let canvas = Color::rgba(16, 16, 20, 120);
+        let (gpu, cpu) =
+            translucent_scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, canvas);
+        assert_glass_close(&gpu, &cpu, 6, 0.02, "a pane over a clear ground");
+        // the left end of the pane lies over bare ground, with the bars'
+        // blur reaching in: more solid than the ground, never solid, and
+        // the alpha the raster leaves there
+        let end = (160 * 480 + 90) * 4 + 3;
+        assert!(gpu[end] > 120 && gpu[end] < 250, "the pane is not solid there: {}", gpu[end]);
+        assert!(gpu[end].abs_diff(cpu[end]) <= 6, "and it is the raster's: {} vs {}", gpu[end], cpu[end]);
+        // outside the pane the ground keeps its own alpha
+        assert_eq!(gpu[3], 120);
     }
 
     #[test]
