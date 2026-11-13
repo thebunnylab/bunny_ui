@@ -274,6 +274,30 @@ pub trait CustomElement: 'static {
         true
     }
 
+    /// Does the box take the POINTER? The default is yes: a press on the
+    /// box is the box's, and so are the moves, the wheel, the hover and
+    /// the cursor over it.
+    ///
+    /// A box that only DECORATES answers `false` — a glyph drawn inside a
+    /// button, marks painted over a chart. It still measures and paints,
+    /// and it can still take the keyboard. But the hit test skips it:
+    /// presses, hover, the wheel and the cursor reach what lies under it,
+    /// as if the box were glass. A button around the glyph hears its own
+    /// click.
+    ///
+    /// ```ignore
+    /// fn takes_pointer(&self) -> bool {
+    ///     false
+    /// }
+    /// ```
+    ///
+    /// It is the box's own `.allows_hit_testing(false)`, which a
+    /// `canvas(…)` wears from outside. The answer is read when the box is
+    /// placed, so a change shows on the next layout.
+    fn takes_pointer(&self) -> bool {
+        true
+    }
+
     /// What the platform's input system sees while the box is focused —
     /// the text around the caret, the selection, the live composition
     /// and the caret rect in LOCAL coordinates. `None` = no composition

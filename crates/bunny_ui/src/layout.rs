@@ -4576,6 +4576,12 @@ pub struct CustomPlacement {
     /// Which way the box's scene reads — what its paint and its events
     /// are told, and the direction a menu it opens hangs in.
     pub direction: LayoutDirection,
+    /// Does the box take the pointer? `false` for a box that declines it
+    /// ([`crate::custom::CustomElement::takes_pointer`]) and for one in a
+    /// subtree that declines hit testing (`.allows_hit_testing(false)`).
+    /// Such a box records no hit, and the pointer's roads pass it by even
+    /// when it shares its path with the control around it.
+    pub pointer: bool,
 }
 
 impl CustomPlacement {
@@ -8290,14 +8296,16 @@ impl LayoutNode {
                 };
                 // the box answers for the whole frame: a hit here never
                 // falls through to what is painted underneath, and the
-                // event finds the element by this path
+                // event finds the element by this path — unless the box,
+                // or a subtree around it, declines the pointer
+                let pointer = out.passive == 0 && element.element().takes_pointer();
                 let placed = if path.is_empty() {
                     None
                 } else {
                     let visible = out.current_clip().map_or(Some(frame), |clip| {
                         frame.intersection(clip)
                     });
-                    if let Some(visible) = visible.filter(|_| out.passive == 0) {
+                    if let Some(visible) = visible.filter(|_| pointer) {
                         out.hits.push((path.to_string(), visible));
                     }
                     if visible.is_some() || focusable {
@@ -8315,6 +8323,7 @@ impl LayoutNode {
                             covered: false,
                             slice: (0, 0),
                             direction: env.direction,
+                            pointer,
                         });
                         Some(out.customs.len() - 1)
                     } else { None }
@@ -8337,6 +8346,7 @@ impl LayoutNode {
                             size: window.size,
                         },
                         start,
+                        pointer,
                     );
                 }
                 // the box cannot paint outside itself — the clip is the
@@ -8540,6 +8550,7 @@ impl LayoutNode {
                             covered: false,
                             slice: (overlay_from, overlay_end),
                             direction: env.direction,
+                            pointer,
                         });
                     }
                 }
@@ -9640,7 +9651,7 @@ impl LayoutNode {
                 if out.dom.is_some() {
                         let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
-                        dom.open_canvas(frame, start);
+                        dom.open_canvas(frame, start, true);
                     }
                     child.place(frame, fit, env, out);
                     let end = out.display.len();

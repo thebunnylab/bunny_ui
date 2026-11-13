@@ -461,6 +461,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// zstack!(rooms(), canvas(plants).allows_hit_testing(false))
     /// ```
+    ///
+    /// It holds inside a control too: a canvas drawn as the label of a
+    /// button lets the button hear its own click. A box the app owns can
+    /// say the same of itself with
+    /// [`CustomElement::takes_pointer`](crate::custom::CustomElement::takes_pointer).
     #[track_caller]
     fn allows_hit_testing(self, enabled: bool) -> Modified<Self> {
         Modified::new(self, Modifier::AllowsHitTesting(enabled))
