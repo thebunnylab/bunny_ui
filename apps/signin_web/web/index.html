@@ -32,18 +32,27 @@
         border-radius: 12px;
       }
     </style>
-    <!-- The boot: wasm-bindgen's loader instantiates the module, and the
-         glue takes the instance from there. `attachDom` borrows the
+    <!-- The boot: wasm-bindgen's loader instantiates the module and trunk
+         says so with one event. The module below imports the glue first,
+         and a cached wasm can be instantiated before that import has
+         resolved: a listener the module registered would miss the event
+         and the page would stay blank. So a classic script, which runs as
+         the page is parsed, catches the event and keeps it as a promise. -->
+    <script>
+      window.trunkStarted = new Promise((resolve) => {
+        addEventListener("TrunkApplicationStarted", (event) => resolve(event.detail), { once: true });
+      });
+    </script>
+    <!-- The glue takes the instance from there. `attachDom` borrows the
          element shell and calls the app's own entry with the mount's box
          and the device ratio. -->
     <script type="module">
       import { attachDom } from "./bunny.js";
-      addEventListener("TrunkApplicationStarted", async ({ detail }) => {
-        const started = await attachDom(detail.wasm.memory, detail.wasm, (width, height, scale) =>
-          window.wasmBindings.boot(width, height, scale),
-        );
-        if (!started) console.error("signin: the glue refused the wasm (ABI)");
-      });
+      const { wasm } = await window.trunkStarted;
+      const started = await attachDom(wasm.memory, wasm, (width, height, scale) =>
+        window.wasmBindings.boot(width, height, scale),
+      );
+      if (!started) console.error("signin: the glue refused the wasm (ABI)");
     </script>
   </head>
   <body>
