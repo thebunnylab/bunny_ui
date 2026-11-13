@@ -1101,6 +1101,8 @@ fn start_dom_with(
     if let Some(list) = reported_languages() {
         runtime.set_system_locale(Locale::parse(&list));
     }
+    // and the language the page itself chose before the start, over them
+    settle_locale_choice(&runtime);
     // one context for every island on the page. A canvas per island
     // would hit the browser's context ceiling, and an island that
     // claimed webgl2 could never take putImageData back when the
@@ -1257,6 +1259,9 @@ fn start_dom_with(
                 }
             }
             Event::ImageReady | Event::Wake | Event::Repaint => {
+                // a language the page chose since the last turn is the
+                // environment's before the bodies run
+                settle_locale_choice(&runtime);
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
                 // themselves paint on their own
@@ -1838,6 +1843,38 @@ pub extern "C" fn bunny_set_languages(pointer: *mut u8, len: usize) {
 /// The languages the glue reported before the shell started, if any.
 fn reported_languages() -> Option<String> {
     SYSTEM_LANGUAGES.with(|slot| slot.borrow().clone())
+}
+
+thread_local! {
+    /// The language an element page chose, waiting for the shell's next
+    /// turn: `Some(None)` is "follow the reader again", which is a choice
+    /// too.
+    static LOCALE_CHOICE: RefCell<Option<Option<Locale>>> = const { RefCell::new(None) };
+}
+
+/// An element page's choice of language over the list the browser
+/// reports: `Some` pins it — the language a person picked on the page —
+/// and `None` follows the reader's list again.
+///
+/// [`start_dom`] makes the page's runtime itself, so a page built on it
+/// has no [`Runtime::set_locale`] to call; this is that door. It may be
+/// called before the start (the first frame is then already in the
+/// chosen language) or from any handler: the choice is taken at the
+/// shell's next turn, off the stack of whatever event is running, and
+/// the frame that follows re-runs the bodies that read the locale and
+/// says the mount's `lang` again. A canvas page pins on the runtime it
+/// hands [`start_with`].
+pub fn set_locale(locale: Option<Locale>) {
+    LOCALE_CHOICE.with(|choice| *choice.borrow_mut() = Some(locale));
+    unsafe { js_request_wake() };
+}
+
+/// Hands the runtime the language the page chose since the last turn, if
+/// it chose one.
+fn settle_locale_choice(runtime: &Runtime) {
+    if let Some(choice) = LOCALE_CHOICE.with(|choice| choice.borrow_mut().take()) {
+        runtime.set_locale(choice);
+    }
 }
 
 /// Dom mode: the input edited. Both strings arrive through
