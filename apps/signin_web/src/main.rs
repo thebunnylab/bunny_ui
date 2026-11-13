@@ -91,7 +91,10 @@ mod page {
                     text_field("", self.email.binding())
                         .keyboard_type(KeyboardType::Email)
                         .autocomplete(Autocomplete::Username)
+                        // Enter in either box signs in, and the page
+                        // opens with the keyboard in its first one
                         .on_submit(move || self.submit())
+                        .auto_focus()
                         .accessibility_label("Email")
                         .frame_width(FIELD_WIDTH),
                 )

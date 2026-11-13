@@ -1347,6 +1347,15 @@ impl DomHints {
     pub fn href(&self) -> Option<&str> {
         self.address.as_deref().and_then(|address| address.href.as_deref())
     }
+
+    /// What the control this element answers for IS, as the wire's one
+    /// byte (`ControlState::wire`); zero for an element that is none.
+    pub fn control(&self) -> u8 {
+        self.address
+            .as_deref()
+            .and_then(|address| address.control)
+            .map_or(0, crate::layout::ControlState::wire)
+    }
 }
 
 // MARK: - Patches
@@ -1516,9 +1525,9 @@ pub enum DomPatch {
     /// element `anchor`'s real box on `side`, repositioning while
     /// either of them moves. `path` keys the dismissal doors.
     SetAnchor { id: u32, anchor: u32, side: u8, path: String },
-    /// The element's LIVE hints changed — class, id and href
-    /// re-attribute in place (the tag never changes without a
-    /// recreation).
+    /// The element's LIVE hints changed — class, id, href and what a
+    /// control publishes re-attribute in place (the tag never changes
+    /// without a recreation).
     SetHints {
         id: u32,
         class: Option<std::rc::Rc<str>>,
@@ -1532,6 +1541,11 @@ pub enum DomPatch {
     /// (`DomLayout::direction`), because a language has no CSS form and
     /// a direction has.
     SetLanguage { id: u32, lang: std::rc::Rc<str>, dir: motor::state::LayoutDirection },
+    /// The keyboard goes to this field: the engine gave it the keys
+    /// (`.auto_focus()`, a beat) and the browser, which owns every
+    /// `<input>` in this mode, is told to put its focus there. `select`
+    /// selects the field's whole text — a beat that asked to replace it.
+    Focus { id: u32, select: bool },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -2182,6 +2196,20 @@ impl DomLowering {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// The element of the field the engine knows by `path` — what a
+    /// focus the engine moved is addressed to.
+    pub fn field_id(&self, path: &str) -> Option<u32> {
+        fn walk(retained: &DomNode, path: &str) -> Option<u32> {
+            if let DomKind::Field(field) = &retained.kind
+                && field.path == path
+            {
+                return Some(retained.id);
+            }
+            retained.children.iter().find_map(|child| walk(child, path))
+        }
+        self.root.as_ref().and_then(|root| walk(root, path))
     }
 
     /// Every island on the page: element id, origin and size in the
@@ -2988,6 +3016,9 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     geometry.span.hash(hasher);
     node.hints.tag.as_deref().hash(hasher);
     node.hints.class.as_deref().hash(hasher);
+    // a copy wears its template's attributes: what a control publishes
+    // is part of the shape, so a checked row is never cloned unchecked
+    node.hints.control().hash(hasher);
     // the action path is the row's own; that there IS one is the shape
     node.style.interactive.is_some().hash(hasher);
     // a binding reads its own value; that there is one is the shape
@@ -3505,8 +3536,9 @@ fn diff_node(
     }
     let same_binding = same_binding(old, &new);
     if hints_changed(old, &new) {
-        // class and id re-attribute live; a TAG change would need a
-        // recreation and the walk never changes one on a kept identity
+        // class and id re-attribute live; a TAG never changes on a kept
+        // element — a node under another tag is not matched to this one
+        // at all (`same_element`), and mounts fresh
         patches.push(DomPatch::SetHints {
             id,
             class: new.hints.class.clone(),
@@ -3696,13 +3728,8 @@ fn diff_children(
             // mismatched retained goes BACK to its slot so the leftover
             // sweep emits its remove (taking and filtering would drop
             // it silently and leak the element on the browser's side)
-            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
-                Some(old)
-                    if std::mem::discriminant(&old.kind)
-                        == std::mem::discriminant(kind) =>
-                {
-                    Some(old)
-                }
+            _ => by_index.get_mut(index).and_then(|slot| match slot.take() {
+                Some(old) if same_element(&old, &child) => Some(old),
                 Some(old) => {
                     *slot = Some(old);
                     None
@@ -3770,7 +3797,7 @@ fn diff_children_ordered(
     let shortest = old_len.min(new_len);
     // the head: every child that takes the old one at its own place
     let head = (0..shortest)
-        .take_while(|&at| takes_place(&retained.children[at].kind, &new_children[at].kind))
+        .take_while(|&at| takes_place(&retained.children[at], &new_children[at]))
         .count();
     // the ALIGNED fast path: same length, every child matching its
     // old position (groups by path, the rest by kind) — the shape of
@@ -3783,9 +3810,7 @@ fn diff_children_ordered(
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
                 // a reuse promise aligns with the group it promised
                 (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
-                (old_kind, new_kind) => {
-                    std::mem::discriminant(old_kind) == std::mem::discriminant(new_kind)
-                }
+                _ => same_element(&retained.children[at], &new_children[at]),
             }
         });
     if aligned {
@@ -3800,9 +3825,9 @@ fn diff_children_ordered(
     let shifted = old_len != new_len;
     let tail = (0..shortest - head)
         .take_while(|&back| {
-            let was = &retained.children[old_len - 1 - back].kind;
-            let now = &new_children[new_len - 1 - back].kind;
-            (!shifted || matches!(now, DomKind::Group { .. } | DomKind::Reuse { .. }))
+            let was = &retained.children[old_len - 1 - back];
+            let now = &new_children[new_len - 1 - back];
+            (!shifted || matches!(now.kind, DomKind::Group { .. } | DomKind::Reuse { .. }))
                 && takes_place(was, now)
         })
         .count();
@@ -3901,10 +3926,8 @@ fn diff_children_ordered(
                         .remove(path)
                 }
             }
-            kind => (index < old_end
-                && std::mem::discriminant(&retained.children[index].kind)
-                    == std::mem::discriminant(kind))
-            .then_some(index),
+            _ => (index < old_end && same_element(&retained.children[index], &child))
+                .then_some(index),
         };
         match matched {
             Some(position) if !claimed[position - head] => {
@@ -4005,14 +4028,26 @@ fn diff_children_ordered(
 const FRESH: usize = usize::MAX;
 
 /// Does the new child take the old one at its own place? A group or a
-/// reuse promise by its path, anything else by its kind.
-fn takes_place(was: &DomKind, now: &DomKind) -> bool {
-    match now {
+/// reuse promise by its path, anything else by its element.
+fn takes_place(was: &DomNode, now: &DomNode) -> bool {
+    match &now.kind {
         DomKind::Group { path } | DomKind::Reuse { path } => {
-            matches!(was, DomKind::Group { path: there } if there == path)
+            matches!(&was.kind, DomKind::Group { path: there } if there == path)
         }
-        kind => std::mem::discriminant(was) == std::mem::discriminant(kind),
+        _ => same_element(was, now),
     }
+}
+
+/// Is the new node the old one's ELEMENT — the same kind, under the same
+/// tag? A tag is what an element was created as and nothing changes it
+/// afterwards, so a box a view called `<main>` and a later frame calls
+/// `<nav>` is another element: the old one leaves and the new one mounts,
+/// exactly as a kind swap goes. Keeping it would leave a page saying a
+/// landmark it no longer is — two faces of an app that put different
+/// elements in the same place are the ordinary way to meet this.
+fn same_element(was: &DomNode, now: &DomNode) -> bool {
+    std::mem::discriminant(&was.kind) == std::mem::discriminant(&now.kind)
+        && was.hints.tag == now.hints.tag
 }
 
 /// The old groups a new child of the middle may have come from, by
@@ -4037,7 +4072,7 @@ fn rows_that_may_move(
         };
         let waits = position > asking
             && position < new_end
-            && takes_place(&old[position].kind, &ahead[position - asking - 1].kind);
+            && takes_place(&old[position], &ahead[position - asking - 1]);
         if !claimed[position - head] && !waits {
             rows.insert(std::rc::Rc::clone(path), position);
         }
@@ -4283,7 +4318,19 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// stream of its own: `attachDom` borrows the element shell
 /// (`glue_dom.js`) whole, so this number is checked once, by the file
 /// that decodes.
-pub const ABI_VERSION: u32 = 24;
+///
+/// 25 (2026-11-13): a control is a control on the page, and the keyboard
+/// goes where the engine sends it. Create (op 1) and SetHints (op 15)
+/// carry one more u8 after the href — what the control under the element
+/// publishes (`ControlState::wire`: bits 0–2 the kind, bit 3 enabled,
+/// bits 4–5 the checked value; 0 for an element that is none). The glue
+/// writes it as `role`, `tabindex`, `aria-disabled` and `aria-checked`
+/// (`aria-selected` on a tab), leaves the role and the tab stop to an
+/// element whose tag already has them, and activates a focused control
+/// on Enter and Space. Focus (op 28: u8 select) moves the browser's
+/// focus to a field the engine gave the keyboard to — `.auto_focus()`
+/// and the beats — and selects its text when the beat asked.
+pub const ABI_VERSION: u32 = 25;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4462,6 +4509,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_hint(&mut out, hints.class.as_deref());
                 push_hint(&mut out, hints.dom_id());
                 push_bytes_u16(&mut out, hints.href().unwrap_or("").as_bytes());
+                out.push(hints.control());
                 out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
@@ -4740,12 +4788,22 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     &mut out,
                     address.and_then(|address| address.href.as_deref()).unwrap_or("").as_bytes(),
                 );
+                out.push(
+                    address
+                        .and_then(|address| address.control)
+                        .map_or(0, crate::layout::ControlState::wire),
+                );
             }
             DomPatch::SetLanguage { id, lang, dir } => {
                 out.push(27);
                 push_u32(&mut out, *id);
                 out.push(dir.is_rtl() as u8);
                 push_hint(&mut out, Some(lang));
+            }
+            DomPatch::Focus { id, select } => {
+                out.push(28);
+                push_u32(&mut out, *id);
+                out.push(u8::from(*select));
             }
         }
     }
@@ -5339,7 +5397,8 @@ mod tests {
             | DomPatch::Reveal { id, .. }
             | DomPatch::SetAnchor { id, .. }
             | DomPatch::SetHints { id, .. }
-            | DomPatch::SetLanguage { id, .. } => *id,
+            | DomPatch::SetLanguage { id, .. }
+            | DomPatch::Focus { id, .. } => *id,
             DomPatch::DefineRule { .. } => 0,
         }
     }
@@ -5756,6 +5815,225 @@ mod tests {
             !patches.iter().any(|p| matches!(p, DomPatch::SetScroll { .. })),
             "the reported offset never echoes: {patches:?}"
         );
+    }
+
+    /// A control says what it is on the page: the element that answers
+    /// its press carries the kind, whether it is enabled and the checked
+    /// value it publishes, and a state that moves re-attributes it in
+    /// place. A bare `.on_click` is a target and no control — nothing
+    /// said it is a button.
+    #[test]
+    fn a_control_publishes_itself_on_its_element() {
+        #[derive(Clone)]
+        struct Controls {
+            picked: State<bool>,
+        }
+
+        impl Component for Controls {
+            fn body(self) -> impl View {
+                let picked = self.picked;
+                vstack!(
+                    button(text("save"), || {}),
+                    button(text("gone"), || {}).disabled(true),
+                    button(text("pick"), move || picked.set(!picked.get())).plain().checked(picked.get()),
+                    text("bare").on_click(|| {}),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Controls { picked: State::new(false) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let controls: Vec<u8> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { hints, .. } if hints.control() != 0 => Some(hints.control()),
+                _ => None,
+            })
+            .collect();
+        // kind | enabled << 3 | checked << 4: an enabled button, a
+        // disabled one, an unchecked two-state control
+        assert_eq!(controls, [1 | 8, 1, 2 | 8 | 1 << 4], "{mount:?}");
+
+        view.picked.set(true);
+        let moved = runtime.dom_frame(&view, size);
+        let checked: Vec<u8> = moved
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetHints { address, .. } => Some(
+                    address.as_deref().and_then(|address| address.control).map_or(0, crate::layout::ControlState::wire),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checked, [2 | 8 | 2 << 4], "the checked value re-attributes in place: {moved:?}");
+    }
+
+    /// An element's tag is what it was created as. Two faces of an app
+    /// that put different elements in the same place — a door's `<main>`
+    /// where an account's `<nav>` stands — are two elements: the old one
+    /// leaves and the new one mounts under its own tag. Kept in place, the
+    /// page went on saying a landmark it no longer was.
+    #[test]
+    fn a_node_under_another_tag_is_another_element() {
+        #[derive(Clone)]
+        struct Faces {
+            signed_in: State<bool>,
+        }
+
+        impl Component for Faces {
+            fn body(self) -> impl View {
+                if self.signed_in.get() {
+                    erased(hstack!(vstack!(text("rail")).element("nav"), vstack!(text("page")).element("main")))
+                } else {
+                    erased(hstack!(vstack!(text("form")).element("main"), vstack!(text("art"))))
+                }
+            }
+        }
+
+        let tags = |patches: &[DomPatch]| -> Vec<(u32, String)> {
+            patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } => {
+                        hints.tag.as_deref().map(|tag| (*id, tag.to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let runtime = Runtime::new();
+        let view = Faces { signed_in: State::new(false) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let [(door, tag)] = tags(&mount).try_into().expect("one tagged element");
+        assert_eq!(tag, "main");
+
+        view.signed_in.set(true);
+        let swapped = runtime.dom_frame(&view, size);
+        // made back to front, as a fresh list is: the order is the
+        // walk's, the tags are the views'
+        let mut made: Vec<String> = tags(&swapped).into_iter().map(|(_, tag)| tag).collect();
+        made.sort();
+        assert_eq!(made, ["main", "nav"], "each mounts under its own tag: {swapped:?}");
+        assert!(
+            tags(&swapped).iter().all(|(id, _)| *id != door),
+            "the door's element is not handed to the rail: {swapped:?}"
+        );
+        assert!(
+            swapped.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Remove { id } if *id == door
+            ) || matches!(patch, DomPatch::RemoveChildren { .. })),
+            "the door's element leaves: {swapped:?}"
+        );
+
+        // the same face again changes nothing: a tag that did not move
+        // keeps its element
+        let still = runtime.dom_frame(&view, size);
+        assert!(tags(&still).is_empty(), "{still:?}");
+    }
+
+    /// The control byte crosses after the href, on a create and on the
+    /// live hints alike — the two ops the glue reads it from.
+    #[test]
+    fn a_controls_state_is_one_byte_of_the_wire() {
+        let address = crate::layout::Address::controlling(
+            &None,
+            crate::layout::ControlState { enabled: true, checked: Some(true), kind: crate::layout::ControlKind::Switch },
+        );
+        let hints = DomHints { address: Some(address.clone()), ..DomHints::default() };
+        let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
+        // count, op, id, parent, before, tag, class, id, href(u16), control, kind
+        assert_eq!(created[4], 1);
+        assert_eq!(created[created.len() - 2], 3 | 8 | 2 << 4);
+        let live = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
+        assert_eq!(live[4], 15);
+        assert_eq!(live.last(), Some(&(3 | 8 | 2 << 4)));
+        let plain = encode(&[DomPatch::SetHints { id: 7, class: None, address: None }]);
+        assert_eq!(plain.last(), Some(&0), "an element that is no control says zero");
+    }
+
+    /// The browser owns every `<input>` in this mode, so a field the
+    /// engine gave the keyboard to is the browser's focus to move: the
+    /// frame that claims it says so, after the element stands, and says
+    /// it once.
+    #[test]
+    fn a_field_the_engine_focused_is_focused_on_the_page() {
+        #[derive(Clone)]
+        struct Door {
+            email: State<String>,
+        }
+
+        impl Component for Door {
+            fn body(self) -> impl View {
+                text_field("you@example.com", self.email.binding()).auto_focus()
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Door { email: State::new(String::new()) };
+        let size = Size { width: 200.0, height: 60.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let field = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Field, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the field mounts");
+        let place = |wanted: &dyn Fn(&DomPatch) -> bool| mount.iter().position(wanted);
+        let dressed = place(&|patch| matches!(patch, DomPatch::SetField { id, .. } if *id == field));
+        let focused = place(&|patch| *patch == DomPatch::Focus { id: field, select: false });
+        assert!(focused.is_some() && focused > dressed, "said after the element stands: {mount:?}");
+        assert_eq!(encode(&[DomPatch::Focus { id: field, select: true }])[4..], [28, field as u8, 0, 0, 0, 1]);
+        let still = runtime.dom_frame(&view, size);
+        assert!(!still.iter().any(|patch| matches!(patch, DomPatch::Focus { .. })), "asked once: {still:?}");
+    }
+
+    /// Where the keyboard is, is the browser's to decide here, and the
+    /// engine hears it: a focus that left frees the keyboard, and Enter
+    /// in a field runs the field's own `.on_submit` whoever held the
+    /// keys — a field that names none leaves the key to the browser.
+    #[test]
+    fn the_page_tells_the_engine_where_the_keyboard_is_and_what_enter_submits() {
+        #[derive(Clone)]
+        struct Form {
+            email: State<String>,
+            note: State<String>,
+            sent: State<u32>,
+        }
+
+        impl Component for Form {
+            fn body(self) -> impl View {
+                let sent = self.sent;
+                vstack!(
+                    text_field("email", self.email.binding()).on_submit(move || sent.set(sent.get() + 1)),
+                    text_field("note", self.note.binding()),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Form { email: State::new(String::new()), note: State::new(String::new()), sent: State::new(0) };
+        let size = Size { width: 200.0, height: 120.0 };
+        runtime.dom_frame(&view, size);
+        let paths: Vec<String> = runtime.dom_action_paths().into_values().collect();
+        let [email, note] = paths.as_slice() else {
+            panic!("two fields: {paths:?}");
+        };
+
+        assert!(runtime.dom_field_focus(note, true), "the browser's focus is the engine's");
+        assert_eq!(runtime.focused().as_deref(), Some(note.as_str()));
+        assert!(!runtime.dom_submit(note), "a field with no handler leaves Enter to the browser");
+        assert!(runtime.dom_submit(email), "the field the key was typed in submits");
+        assert_eq!(view.sent.get(), 1);
+        assert_eq!(runtime.focused().as_deref(), Some(email.as_str()), "and holds the keyboard");
+        assert!(runtime.dom_field_focus(email, false), "a focus that left frees the keyboard");
+        assert_eq!(runtime.focused(), None);
+        assert!(!runtime.dom_field_focus(email, false), "said once");
+        assert!(!runtime.dom_submit("no/such/field"));
     }
 
     #[test]
@@ -6941,6 +7219,8 @@ mod tests {
             &0u32.to_le_bytes()[..],
             &[0, 0, 0],
             &0u16.to_le_bytes()[..],
+            // no control (ABI 25), then the kind
+            &[0],
             &[1],
             &[3],
             &7u32.to_le_bytes()[..],

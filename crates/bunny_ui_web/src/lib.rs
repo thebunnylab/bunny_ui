@@ -558,6 +558,11 @@ enum Event {
     DomScroll { id: u32, x: f64, y: f64 },
     DomViewport { id: u32, width: f64, height: f64 },
     DomBox { id: u32, width: f64, height: f64 },
+    /// Dom mode: Enter in a one-line `<input>`, or the chord in a field
+    /// of many lines — the field's own word to the app.
+    FieldSubmit { path: String },
+    /// Dom mode: the browser's focus entered or left an `<input>`.
+    FieldFocus { path: String, focused: bool },
     IslandPointer { id: u32, kind: u32, x: f64, y: f64, mods: u32 },
     Action { path: String, clicks: u8 },
     /// Dom mode: the browser's input edited — value + selectionStart.
@@ -1022,7 +1027,9 @@ pub fn start_with(
             | Event::DomBox { .. }
             | Event::IslandPointer { .. }
             | Event::Action { .. }
-            | Event::Field { .. } => {}
+            | Event::Field { .. }
+            | Event::FieldSubmit { .. }
+            | Event::FieldFocus { .. } => {}
         }
         // A frame went up, whoever asked: the asks it carried are served.
         if drew.replace(false) {
@@ -1094,6 +1101,8 @@ fn start_dom_with(
     if let Some(list) = reported_languages() {
         runtime.set_system_locale(Locale::parse(&list));
     }
+    // and the language the page itself chose before the start, over them
+    settle_locale_choice(&runtime);
     // one context for every island on the page. A canvas per island
     // would hit the browser's context ceiling, and an island that
     // claimed webgl2 could never take putImageData back when the
@@ -1216,6 +1225,20 @@ fn start_dom_with(
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
+            Event::FieldSubmit { path } => {
+                // the browser owns the box; the stroke that is the
+                // field's word to the app crosses by the field's name
+                if runtime.dom_submit(&path) {
+                    KEY_TAKEN.with(|taken| taken.set(true));
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::FieldFocus { path, focused } => {
+                // where the keyboard is, as the browser decided it
+                if runtime.dom_field_focus(&path, focused) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
             Event::Resize { width, height, .. } => {
                 size = Size { width, height };
                 present(&runtime, runtime.dom_frame(&root, size), scale);
@@ -1236,6 +1259,9 @@ fn start_dom_with(
                 }
             }
             Event::ImageReady | Event::Wake | Event::Repaint => {
+                // a language the page chose since the last turn is the
+                // environment's before the bodies run
+                settle_locale_choice(&runtime);
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
                 // themselves paint on their own
@@ -1819,6 +1845,38 @@ fn reported_languages() -> Option<String> {
     SYSTEM_LANGUAGES.with(|slot| slot.borrow().clone())
 }
 
+thread_local! {
+    /// The language an element page chose, waiting for the shell's next
+    /// turn: `Some(None)` is "follow the reader again", which is a choice
+    /// too.
+    static LOCALE_CHOICE: RefCell<Option<Option<Locale>>> = const { RefCell::new(None) };
+}
+
+/// An element page's choice of language over the list the browser
+/// reports: `Some` pins it — the language a person picked on the page —
+/// and `None` follows the reader's list again.
+///
+/// [`start_dom`] makes the page's runtime itself, so a page built on it
+/// has no [`Runtime::set_locale`] to call; this is that door. It may be
+/// called before the start (the first frame is then already in the
+/// chosen language) or from any handler: the choice is taken at the
+/// shell's next turn, off the stack of whatever event is running, and
+/// the frame that follows re-runs the bodies that read the locale and
+/// says the mount's `lang` again. A canvas page pins on the runtime it
+/// hands [`start_with`].
+pub fn set_locale(locale: Option<Locale>) {
+    LOCALE_CHOICE.with(|choice| *choice.borrow_mut() = Some(locale));
+    unsafe { js_request_wake() };
+}
+
+/// Hands the runtime the language the page chose since the last turn, if
+/// it chose one.
+fn settle_locale_choice(runtime: &Runtime) {
+    if let Some(choice) = LOCALE_CHOICE.with(|choice| choice.borrow_mut().take()) {
+        runtime.set_locale(choice);
+    }
+}
+
 /// Dom mode: the input edited. Both strings arrive through
 /// `bunny_alloc` buffers (ownership comes back here); `caret` is the
 /// input's `selectionStart` in UTF-16 units.
@@ -1833,6 +1891,28 @@ pub extern "C" fn bunny_field(
     let path = unsafe { String::from_raw_parts(path_pointer, path_len, path_len.max(1)) };
     let value = unsafe { String::from_raw_parts(value_pointer, value_len, value_len.max(1)) };
     dispatch(Event::Field { path, value, caret });
+}
+
+/// Dom mode: Enter in the `<input>` at this path (the chord, in a field
+/// of many lines). Answers 1 when the field's `.on_submit` took it — the
+/// glue prevents the key's default only then, so a field that names no
+/// handler keeps the browser's own Enter. The path arrives through a
+/// `bunny_alloc` buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_submit(pointer: *mut u8, len: usize) -> u32 {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    KEY_TAKEN.with(|taken| taken.set(false));
+    dispatch(Event::FieldSubmit { path });
+    KEY_TAKEN.with(|taken| taken.get()) as u32
+}
+
+/// Dom mode: the browser's focus entered (`focused` = 1) or left (0)
+/// the `<input>` at this path. The path arrives through a `bunny_alloc`
+/// buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_field_focus(pointer: *mut u8, len: usize, focused: u32) {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    dispatch(Event::FieldFocus { path, focused: focused != 0 });
 }
 
 /// The WebGL2 context died. The CPU takes the page this very turn.
