@@ -103,6 +103,8 @@ mod tests {
         });
         let act3 = runtime.render_stable(&root);
         assert!(act3.contains("NavigationStack (path: 1)"), "country pushed");
+        assert!(act3.contains("CountryDetails"), "and the stack itself mounts its page");
+        assert!(act3.contains("Page (covered)"), "over the list, which stays mounted");
 
         // Act 4: the destination — CountryDetails with the ModalFlagView sheet
         let country = ApiModel::mockedCountries().remove(0).dbModel();

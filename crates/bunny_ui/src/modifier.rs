@@ -264,7 +264,6 @@ pub enum Modifier {
     Toolbar,
     AttachEnvironmentOverrides,
     AttachEnvironmentOverridesOnChange,
-    NavigationDestination,
 
     /// `.flipsForRightToLeftLayoutDirection(…)` — the pictures below
     /// mirror in a right-to-left scene (a chevron that points the way,
@@ -382,7 +381,6 @@ impl Modifier {
             Modifier::Toolbar => "toolbar",
             Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
             Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
-            Modifier::NavigationDestination => "navigation_destination",
             Modifier::FlipsForRightToLeftLayoutDirection { .. } => "flips_for_right_to_left_layout_direction",
         }
     }
@@ -578,7 +576,6 @@ impl Modifier {
             Modifier::FlipsForRightToLeftLayoutDirection(flips) => {
                 format!(" [.flipsForRightToLeftLayoutDirection({flips})]")
             }
-            Modifier::NavigationDestination => " [.navigationDestination(for: …)]".into(),
         }
     }
 }

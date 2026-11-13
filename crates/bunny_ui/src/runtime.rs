@@ -987,8 +987,11 @@ impl Runtime {
     /// its last rendered root region. Switching scenes never replaces root
     /// registrations or refills the effect queue.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::assemble_handlers(root);
+        // the contexts first: they hold the marks of the pages a
+        // navigation stack covers, and the handlers under a covered page
+        // are left out by them
         reconciler::assemble_contexts(root);
+        reconciler::assemble_handlers(root);
         reconciler::set_assembled_root(root, had_root_region);
     }
 

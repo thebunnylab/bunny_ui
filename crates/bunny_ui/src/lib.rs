@@ -76,6 +76,7 @@ pub mod menu;
 mod loans;
 pub mod modifier;
 pub mod model;
+pub mod nav;
 pub mod one_of;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -229,6 +230,10 @@ pub mod prelude {
     pub use crate::calendar::{Calendar, DatePicker, calendar, date_picker};
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
     pub use crate::date::{Date, DateNames, Weekday};
+    pub use crate::nav::{
+        IntoRoutes, NavLink, NavPathExt, NavigationStack, NavigationStackContent, nav_link_value,
+        navigation_stack, navigation_stack_content,
+    };
     pub use crate::picker::{Picker, picker};
     pub use crate::search_field::{SearchField, search_field};
     pub use crate::tabs::{TabItem, TabPages, TabView, Tabs, tab, tab_view, tabs};
@@ -286,11 +291,11 @@ pub mod prelude {
     pub use motor::runtime::Site;
     pub use motor::state::{
         environment, Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset,
-        LayoutDirection, Locale, ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport,
+        LayoutDirection, Locale, Navigator, ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport,
         WindowState,
     };
     pub use motor::views::{
-        ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
+        ContentMode, Edge, Font, ListStyle, ProgressViewStyle, Query,
         TextAlignment,
     };
 }

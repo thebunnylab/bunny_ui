@@ -15,7 +15,7 @@
 //! | `VStack(alignment: .leading) { }`| [`vstack((…)).alignment(Leading)`]|
 //! | `List(items, id: \.id) { }`      | [`list(items, id, row)`]          |
 //! | `Section(header: …) { }`         | [`section(header, (…))`]          |
-//! | `NavigationStack(path: $p) { }`  | [`navigation_stack(path.binding(), (…))`] |
+//! | `NavigationStack(path: $p) { }`  | [`navigation_stack(path, root)`](crate::nav::navigation_stack) |
 //! | `Button(action:) { Text(…) }`    | [`button(label, action)`]         |
 //! | `ForEach(items, id: \.id) { }`   | [`for_each(items, id, row)`]      |
 //! | `EmptyView`                      | [`empty()`]                       |
@@ -44,16 +44,15 @@ use std::sync::Arc;
 
 use motor::state::{Binding, Context};
 use motor::view::RenderNode;
-use motor::views::NavigationPath;
 
 use crate::layout::{
     Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
     VisualProps,
 };
 use crate::reconciler::LastRun;
-use crate::state_ext::{BindingExt, StateExt};
+use crate::state_ext::StateExt;
 use crate::erased::{Erased, erased};
-use crate::view::{Either, NodeList, Single, View, render_line};
+use crate::view::{Either, NodeList, Single, View};
 
 /// Several layout nodes becoming ONE (composite labels, sections, explicit
 /// tuples): one child passes straight through; several stack vertically.
@@ -3872,90 +3871,6 @@ pub fn list_content<C: View>(children: C) -> Section<EmptyView, C> {
 }
 
 // MARK: - Navigation
-
-/// `NavigationStack(path: $path) { … }` (or without a binding).
-#[derive(Clone)]
-pub struct NavigationStack<C> {
-    path: Option<Binding<NavigationPath>>,
-    children: C,
-}
-
-impl<C: View> View for NavigationStack<C> {
-    type Arity = Single;
-
-    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let detail = match &self.path {
-            Some(path) => format!(" (path: {})", path.get().count()),
-            None => String::new(),
-        };
-        let mut children = NodeList::new();
-        self.children.render_into(ctx, &mut children);
-        let (prints, layouts) = children.into_parts();
-        out.push(RenderNode::branch(
-            crate::view::print_line(|| format!("NavigationStack{detail}")),
-            prints,
-        ));
-        out.push_layout(wrap_layout(layouts));
-    }
-}
-
-/// `NavigationStack(path: $path) { … }`
-pub fn navigation_stack<C: View>(path: Binding<NavigationPath>, children: C) -> NavigationStack<C> {
-    NavigationStack {
-        path: Some(path),
-        children,
-    }
-}
-
-/// `NavigationStack { … }` (no path binding)
-pub fn navigation_stack_content<C: View>(children: C) -> NavigationStack<C> {
-    NavigationStack {
-        path: None,
-        children,
-    }
-}
-
-/// `NavigationLink(destination:) { label }` / `NavigationLink(value:) { label }`
-#[derive(Clone)]
-pub struct NavigationLink<L> {
-    detail: String,
-    label: L,
-}
-
-impl<L: View> View for NavigationLink<L> {
-    type Arity = Single;
-
-    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let mut label = NodeList::new();
-        self.label.render_into(ctx, &mut label);
-        let (prints, layouts) = label.into_parts();
-        out.push(RenderNode::branch(
-            crate::view::print_line(|| format!("NavigationLink → {}", self.detail)),
-            prints,
-        ));
-        out.push_layout(wrap_layout(layouts));
-    }
-}
-
-/// `NavigationLink(destination: …) { label }` — the destination never mounts
-/// in the fake runtime, it only describes itself.
-pub fn navigation_link<D: View<Arity = Single>, L: View>(
-    destination: D,
-    label: L,
-) -> NavigationLink<L> {
-    NavigationLink {
-        detail: render_line(&destination),
-        label,
-    }
-}
-
-/// `NavigationLink(value: country) { … }`
-pub fn nav_link_value<V: Debug + 'static, L: View>(value: V, label: L) -> NavigationLink<L> {
-    NavigationLink {
-        detail: format!("{value:?}"),
-        label,
-    }
-}
 
 /// `ToolbarItem { … }` — exists in the API; the fake runtime's `.toolbar` is
 /// inert and never mounts it (parity with the engine, which also drops the content).

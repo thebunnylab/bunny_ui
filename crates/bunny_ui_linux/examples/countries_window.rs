@@ -5,8 +5,12 @@
 //! cargo run -p bunny-ui-linux --example countries_window_linux
 //! ```
 //!
-//! Limitations of this phase (noted, not hidden): `navigation_link` does
-//! not mount a destination yet (clicking a row does not navigate);
+//! The list is a navigation stack: clicking a row opens the details of its
+//! country as a page over the list, and a neighbour in the details opens
+//! another page over that one.
+//!
+//! Limitations of this phase (noted, not hidden): the stack draws no bar
+//! yet, so a page has no title and no back button on the screen;
 //! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]

@@ -478,6 +478,57 @@ pub struct EnvironmentValues {
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
     pub querySource: Option<QuerySource>,
+    /// The navigation stack this view is a page of, see [`Navigator`].
+    pub navigation: Option<Navigator>,
+}
+
+/// The navigation stack a view stands in: what a link inside a page
+/// pushes onto, and what "back" pops.
+///
+/// A stack puts one in the environment of its pages. A view reads it
+/// with `environment::<Option<Navigator>>()`; outside every stack there
+/// is none. The stack holds routes of ONE type, and the navigator hides
+/// that type: [`Navigator::push`] takes any value and answers whether the
+/// stack took it.
+#[derive(Clone)]
+pub struct Navigator {
+    push: Rc<dyn Fn(Box<dyn Any>) -> bool>,
+    pop: Rc<dyn Fn() -> bool>,
+    depth: Rc<dyn Fn() -> usize>,
+}
+
+impl Navigator {
+    /// A stack's own three doors. `push` answers `false` for a value that
+    /// is not a route of the stack.
+    pub fn new(
+        push: impl Fn(Box<dyn Any>) -> bool + 'static,
+        pop: impl Fn() -> bool + 'static,
+        depth: impl Fn() -> usize + 'static,
+    ) -> Self {
+        Self { push: Rc::new(push), pop: Rc::new(pop), depth: Rc::new(depth) }
+    }
+
+    /// Puts the page of `route` on top. `false` when the stack holds
+    /// routes of another type, and nothing was pushed.
+    pub fn push<R: 'static>(&self, route: R) -> bool {
+        (self.push)(Box::new(route))
+    }
+
+    /// Takes the page on top away. `false` on the root, which stays.
+    pub fn pop(&self) -> bool {
+        (self.pop)()
+    }
+
+    /// How many pages stand over the root, now.
+    pub fn depth(&self) -> usize {
+        (self.depth)()
+    }
+}
+
+impl FromEnvironment for Option<Navigator> {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.navigation.clone()
+    }
 }
 
 /// Render-time context: environment values + collected effects.

@@ -290,10 +290,6 @@ impl NodeList {
             _ => None,
         }
     }
-
-    pub(crate) fn nodes(&self) -> &[RenderNode] {
-        &self.nodes
-    }
 }
 
 /// The conformance every `struct X: View` writes by hand.
@@ -615,19 +611,6 @@ tuple_view!(A, B, C, D, E, F, G, H, I);
 tuple_view!(A, B, C, D, E, F, G, H, I, J);
 tuple_view!(A, B, C, D, E, F, G, H, I, J, K);
 tuple_view!(A, B, C, D, E, F, G, H, I, J, K, L);
-
-/// Renders a view to its single printed line (used by inert modifiers that
-/// describe content they never mount: `.background { … }`,
-/// `NavigationLink(destination:)`). Expands references: a retained
-/// boundary describes through the cache line, not the marker.
-pub(crate) fn render_line(view: &impl View) -> String {
-    let mut out = NodeList::new();
-    view.render_into(&Context::default(), &mut out);
-    out.nodes()
-        .first()
-        .map(|node| crate::reconciler::expand(node).line)
-        .unwrap_or_default()
-}
 
 pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();

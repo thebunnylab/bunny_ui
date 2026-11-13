@@ -199,15 +199,12 @@ impl CountryDetails {
                         text(country.name_locale(locale.clone())),
                         text(String::new()),
                     );
-                    navigation_link(Self::neighbour_details_view(country.clone()), label)
+                    // the neighbor is a route of the stack this page stands
+                    // in: the list's destination makes its details page
+                    nav_link_value(label, country.clone())
                 },
             ),),
         )
-    }
-
-    /// `neighbourDetailsView(country:)` — the destination of the neighbor's link.
-    fn neighbour_details_view(country: DBModel::Country) -> CountryDetails {
-        CountryDetails::new(country)
     }
 
     /// `modalDetailsView()` — the sheet's content (an erased boundary).

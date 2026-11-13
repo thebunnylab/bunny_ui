@@ -1843,14 +1843,6 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     // MARK: - Inert parity
 
-    /// `.navigationDestination(for:) { … }` — inert (the fake
-    /// NavigationPath carries only descriptions; the destination does not
-    /// mount).
-    #[track_caller]
-    fn navigation_destination(self) -> Modified<Self> {
-        Modified::new(self, Modifier::NavigationDestination)
-    }
-
     /// `.navigationViewStyle(.stack)`
     #[track_caller]
     fn navigation_view_style(self) -> Modified<Self> {

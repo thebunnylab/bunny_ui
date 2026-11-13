@@ -23,7 +23,7 @@ use countries_core::Repositories::Models::DBModel;
 use countries_core::Utilities::Helpers::StringLocalizedStandardContains;
 use bunny_ui::prelude::*;
 
-use crate::ui::{country_cell::CountryCell, error_view::ErrorView};
+use crate::ui::{country_cell::CountryCell, country_details::CountryDetails, error_view::ErrorView};
 
 /// `CountriesList.Routing { var countryCode: String? }`
 #[derive(Clone, Default, PartialEq)]
@@ -37,7 +37,8 @@ pub struct CountriesList {
     countries_state: State<Loadable<()>>,
     can_request_push_permission: State<bool>,
     search_text: State<String>,
-    navigation_path: State<NavigationPath>,
+    /// The countries whose details are open, one over the other.
+    navigation_path: State<Vec<DBModel::Country>>,
     routing_state: State<Routing>,
 }
 
@@ -54,7 +55,7 @@ impl CountriesList {
             countries_state: State::new(state),
             can_request_push_permission: State::new(false),
             search_text: State::new(String::new()),
-            navigation_path: State::new(NavigationPath::new()),
+            navigation_path: State::new(Vec::new()),
             routing_state: State::new(Routing::default()),
         }
     }
@@ -71,16 +72,17 @@ impl Component for CountriesList {
         let injected = environment::<DIContainer>();
 
         navigation_stack(
-            self.navigation_path.binding(),
-            (self
-                .content()
+            self.navigation_path,
+            self.content()
                 .query(
                     self.search_text.get(),
                     self.countries.binding(),
                     build_query,
                 )
-                .navigation_title("Countries"),),
+                .navigation_title("Countries"),
         )
+        // `.navigationDestination(for: DBModel.Country.self) { CountryDetails(country: $0) }`
+        .destination(CountryDetails::new)
         .on_receive(Self::routing_update(&injected), move |routing| {
             self.routing_state.set(Routing {
                 country_code: routing.countryCode,
@@ -153,9 +155,8 @@ impl CountriesList {
             list(
                 self.countries.get(),
                 |country| country.alpha3Code.clone(),
-                |country| nav_link_value(country.clone(), CountryCell::new(country.clone())),
+                |country| nav_link_value(CountryCell::new(country.clone()), country.clone()),
             )
-            .navigation_destination()
             .searchable(self.search_text.binding())
             .refreshable(move || self.load_countries_list(&refresh_injected, true))
             .toolbar(toolbar_item(self.permissions_button()))
@@ -172,7 +173,7 @@ impl CountriesList {
                     else {
                         return;
                     };
-                    self.navigation_path.update(|path| path.append(country));
+                    self.navigation_path.push(country);
                 },
             )
             .on_change(

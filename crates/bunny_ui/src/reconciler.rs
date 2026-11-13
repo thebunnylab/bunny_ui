@@ -153,8 +153,29 @@ impl Declared {
 
     /// A mark rides the table, but no key is ever read in it.
     fn is_mark(&self) -> bool {
-        matches!(self, Declared::Name(KEYBOARD_NEUTRAL | FOCUS_RETURN))
+        matches!(self, Declared::Name(KEYBOARD_NEUTRAL | FOCUS_RETURN | NAV_COVERED))
     }
+}
+
+/// The mark a navigation stack puts on the scope of a page that another
+/// page covers. A covered page stays mounted, and what it declared is
+/// retained with it: its key contexts and its action handlers. They must
+/// answer nothing while the page is not on the screen, so the two
+/// assemblies leave out everything under a scope that carries this mark.
+pub(crate) const NAV_COVERED: &str = "bunny.nav-covered";
+
+/// The scopes among `declared` that a navigation stack marked as covered.
+fn covered_scopes(declared: &[ContextEntry]) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|entry| entry.declared == Declared::Name(NAV_COVERED))
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// Is `path` inside one of the covered scopes?
+fn is_covered(covered: &[String], path: &str) -> bool {
+    covered.iter().any(|scope| covers(scope, path))
 }
 
 /// The mark `.leaves_keyboard()` declares. It rides the key-context table
@@ -1491,6 +1512,12 @@ pub(crate) fn assemble_contexts(root: &str) {
             declared.extend(region.contexts.iter().cloned());
         }
     });
+    // a page under another page declares nothing: its contexts wait with
+    // it. The marks themselves stay, the handlers' assembly reads them
+    let covered = covered_scopes(&declared);
+    if !covered.is_empty() {
+        declared.retain(|entry| entry.declared == Declared::Name(NAV_COVERED) || !is_covered(&covered, &entry.path));
+    }
     // outermost first: a view nearer the root holds the ones below it,
     // and among equals the tree's own order stands (the sort is stable,
     // so one view's declarations keep the order they were made in)
@@ -1656,7 +1683,12 @@ thread_local! {
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
     let mut edits = HashMap::default();
+    // the pages a navigation stack covers: what they mounted answers no
+    // action until they are on the screen again. Read from the contexts
+    // this root has just assembled
+    let covered = DECLARED_CONTEXTS.with(|contexts| covered_scopes(&contexts.borrow()));
     let mut place = |path: &str, id: HandlerId, handler: HandlerFn| match id {
+        _ if is_covered(&covered, path) => {}
         HandlerId::Action(id) => {
             let depth = path.split('/').count();
             match map.get(&id) {
