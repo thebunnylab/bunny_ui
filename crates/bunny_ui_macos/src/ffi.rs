@@ -263,6 +263,9 @@ pub enum AppEvent {
     /// The pointer left the window — without this event the hover would
     /// stay stuck at the edge (the reason for using NSTrackingArea).
     MouseExited,
+    /// A mouse's "back" button went down (button 3): the reader asks to
+    /// go back (`Runtime::navigate_back`).
+    Back,
     /// Scrolling: deltas in points (trackpad arrives precise and with
     /// momentum; the legacy wheel is converted from lines to points on
     /// arrival), what the hand holds, and where the step sits in the
@@ -859,9 +862,14 @@ extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
 }
 
 /// `otherMouseDown:` — every button past the first two. Number 2 is the
-/// middle one; the rest (a mouse's back and forward) say nothing yet.
+/// middle one and number 3 is a mouse's "back"; the rest (its forward)
+/// say nothing yet.
 extern "C" fn bunny_other_mouse_down(this: Id, _sel: Sel, event: Id) {
     let number = unsafe { msg_i64(event, sel("buttonNumber")) };
+    if number == 3 {
+        dispatch(AppEvent::Back);
+        return;
+    }
     if number != 2 {
         return;
     }

@@ -338,6 +338,13 @@ pub struct Runtime {
     last_focus_order: RefCell<Vec<crate::layout::FocusStop>>,
     /// The groups of that order that travel as one Tab stop each.
     last_focus_groups: RefCell<Vec<crate::layout::FocusGroup>>,
+    /// The group whose member died holding the keyboard, by the path its
+    /// members stand under, from the render that found it dead to the
+    /// layout after it.
+    group_orphan: RefCell<Option<String>>,
+    /// A layout gave the keyboard to the heir of a group; the layout is
+    /// run again so its frames show it.
+    keyboard_inherited: Cell<bool>,
     last_focus_floor: Cell<usize>,
     navigation_scopes: RefCell<Vec<(Rc<str>, Option<String>)>>,
     /// The splits of the last layout — a divider drag maps the pointer
@@ -820,7 +827,9 @@ impl Runtime {
         let len = end - start;
         let at = index - start;
         let columns = usize::from(group.spec.columns.max(1));
-        let line = len <= columns || columns == 1;
+        let line = group.spec.round && (len <= columns || columns == 1);
+        // one row of a line is one member; one row of a grid is its columns
+        let row = if line && len <= columns { 1 } else { columns };
         // a step of `by` members: round the ends of a line, never past the edge of a grid
         let step = |by: usize, forward: bool| -> Option<usize> {
             if line {
@@ -837,11 +846,45 @@ impl Runtime {
             Key::Left | Key::Right if columns == 1 && len > 1 => return None,
             Key::Right => step(1, !group.rtl),
             Key::Left => step(1, group.rtl),
-            Key::Down => step(if len <= columns { 1 } else { columns }, true),
-            Key::Up => step(if len <= columns { 1 } else { columns }, false),
+            Key::Down => step(row, true),
+            Key::Up => step(row, false),
             _ => return None,
         }?;
         (target != at).then(|| (order[start + target].clone(), group.spec.selects))
+    }
+
+    /// The name of the group `path` was a member of in the layout before
+    /// ([`group_root`]). Read while that layout's tables are still in
+    /// place.
+    fn group_root_of(&self, path: &str) -> Option<String> {
+        let order = self.last_focus_order.borrow();
+        let index = order.iter().position(|stop| stop.path.as_ref() == path)?;
+        let group = self.last_focus_groups.borrow().iter().find(|group| group.holds(index)).copied()?;
+        group_root(&order, group).map(str::to_string)
+    }
+
+    /// In a group where arriving selects, the keyboard and the selection
+    /// are one thing. When the selection moved and the keyboard did not —
+    /// the app wrote the value, or a key at the edge of a month chose a
+    /// day of the next one — the keyboard goes to the selected member.
+    /// Only while it is inside the group: a selection never takes the
+    /// keyboard from another control. `true` when it moved.
+    fn follow_selection(&self, result: &crate::layout::LayoutResult) -> bool {
+        let Some(held) = self.focused() else { return false };
+        let order = &result.focus_order;
+        let Some(index) = (result.focus_floor..order.len()).find(|&index| order[index].path.as_ref() == held)
+        else { return false };
+        let Some(group) = result.focus_groups.iter().find(|group| group.spec.selects && group.holds(index))
+        else { return false };
+        let selected = (group.start..group.end.min(order.len()))
+            .find(|&member| order[member].control.is_some_and(|state| state.checked == Some(true)));
+        match selected {
+            Some(selected) if selected != index => {
+                self.focus_stop(&order[selected]);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A popup or modal layer owns its controls until it closes. Remember the
@@ -877,9 +920,12 @@ impl Runtime {
             && !held.as_deref().is_some_and(|path| reconciler::declares(path, ALERT_CONTEXT))
         {
             // a layer that opens on a group opens on its selected member:
-            // a list of choices shows the keyboard where the choice is
+            // a list of choices shows the keyboard where the choice is. A
+            // group that leads takes the keyboard from the controls
+            // before it: the days of a calendar, under its two buttons
             let first = result.focus_floor;
-            let entry = result.focus_groups.iter().find(|group| group.holds(first))
+            let entry = result.focus_groups.iter()
+                .find(|group| group.holds(first) || (group.spec.leads && group.start >= first))
                 .map_or(first, |group| group_entry(&result.focus_order, *group));
             if let Some(stop) = result.focus_order.get(entry) { self.focus_stop(stop); }
             else if held.is_some() { self.blur(); }
@@ -941,8 +987,11 @@ impl Runtime {
     /// its last rendered root region. Switching scenes never replaces root
     /// registrations or refills the effect queue.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::assemble_handlers(root);
+        // the contexts first: they hold the marks of the pages a
+        // navigation stack covers, and the handlers under a covered page
+        // are left out by them
         reconciler::assemble_contexts(root);
+        reconciler::assemble_handlers(root);
         reconciler::set_assembled_root(root, had_root_region);
     }
 
@@ -1298,6 +1347,42 @@ impl Runtime {
     /// The screen's scale, as the shell last told it.
     pub fn device_scale(&self) -> Px {
         self.device_scale.get()
+    }
+
+    /// "Back", where the platform has a way to ask for it: the Android
+    /// button, a swipe from the leading edge, a mouse's side button, the
+    /// browser's own arrow.
+    ///
+    /// ONE thing goes back, the nearest to the reader: an open menu; else
+    /// the overlay on top — a popover, an alert (its cancel answer), a
+    /// dialog or a sheet; else the navigation stack with a page to leave.
+    /// `false` when there was nothing to go back from: the shell then
+    /// lets the platform do what it does by default, which on Android is
+    /// to leave the app.
+    ///
+    /// Escape is not this. Escape closes a popover and answers an alert,
+    /// and it never closes a sheet or leaves a page.
+    pub fn navigate_back(&self) -> bool {
+        self.enter_scene();
+        if self.close_menu() {
+            self.frame_asked.set(true);
+            return true;
+        }
+        // the overlays in the order they were placed: the last is on top
+        let top = self.last_overlays.borrow().last().map(|overlay| overlay.path.clone());
+        if let Some(path) = top {
+            // a sheet answers `#back`; the others close by the road their
+            // own close button and their outside press already take
+            let closed = reconciler::run_action(&format!("{path}/#back"), 1)
+                || reconciler::run_action(&format!("{path}/#dismiss"), 1);
+            if closed {
+                self.frame_asked.set(true);
+            }
+            // an overlay that cannot close still stands between the
+            // reader and the pages under it: "back" stops here
+            return closed;
+        }
+        self.dispatch_action(crate::action::NAV_BACK)
     }
 
     /// Closes every open popover, outermost last — the app-switch
@@ -1856,6 +1941,8 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             last_focus_order: RefCell::new(Vec::new()),
             last_focus_groups: RefCell::new(Vec::new()),
+            group_orphan: RefCell::new(None),
+            keyboard_inherited: Cell::new(false),
             last_focus_floor: Cell::new(0),
             navigation_scopes: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
@@ -1953,6 +2040,24 @@ impl Runtime {
             alert.insert(KeyPattern::key(Key::Escape), ALERT_CANCEL);
             alert.insert(KeyPattern::command(Key::Char('.')), ALERT_CANCEL);
             alert.insert(KeyPattern::key(Key::Enter), ALERT_DEFAULT);
+            // the keys that leave the month a calendar shows. The days are
+            // a group, and the group takes an arrow first: one reaches the
+            // keymap only from the edge of the days
+            let calendar = scoped.entry(crate::action::CALENDAR_CONTEXT).or_default();
+            calendar.insert(KeyPattern::key(Key::Up), crate::action::CALENDAR_UP);
+            calendar.insert(KeyPattern::key(Key::Down), crate::action::CALENDAR_DOWN);
+            calendar.insert(KeyPattern::key(Key::Left), crate::action::CALENDAR_LEFT);
+            calendar.insert(KeyPattern::key(Key::Right), crate::action::CALENDAR_RIGHT);
+            calendar.insert(KeyPattern::key(Key::PageUp), crate::action::CALENDAR_PREVIOUS_MONTH);
+            calendar.insert(KeyPattern::key(Key::PageDown), crate::action::CALENDAR_NEXT_MONTH);
+            // "back" by the keyboard, while a navigation stack has a page
+            // to leave: the accelerator with `[`, and Alt with the left
+            // arrow. Never Escape
+            let nav = scoped.entry(crate::action::NAV_CONTEXT).or_default();
+            nav.insert(KeyPattern::command(Key::Char('[')), crate::action::NAV_BACK);
+            let mut alt_left = KeyPattern::key(Key::Left);
+            alt_left.option = true;
+            nav.insert(alt_left, crate::action::NAV_BACK);
         }
         runtime
     }
@@ -7756,7 +7861,13 @@ impl Runtime {
                 | self.apply_measures(&result)
                 | self.apply_row_anchors()
                 | self.apply_tail_follow(&result);
-            let focused = self.sync_navigation_scope(&result) | self.apply_auto_focus(&result);
+            // a member of a group that took the keyboard from one that
+            // left did it INSIDE the layout: the frames it placed drew
+            // the ring where the keyboard was
+            let focused = self.sync_navigation_scope(&result)
+                | self.apply_auto_focus(&result)
+                | self.follow_selection(&result)
+                | self.keyboard_inherited.take();
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout
             // below re-audits against the real one
@@ -7845,6 +7956,10 @@ impl Runtime {
             let heir = self.loans.borrow().heir(&dead, input_lives).map(str::to_owned);
             if let Some(heir) = heir {
                 self.hand_keyboard(&heir, None);
+            } else {
+                // a member of a group: the layout that comes next gives
+                // the keyboard to the group, when the group is still there
+                *self.group_orphan.borrow_mut() = self.group_root_of(&dead);
             }
         }
         self.loans.borrow_mut().settle(input_lives);
@@ -8224,11 +8339,33 @@ impl Runtime {
         self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
-        let lost_control = self.focused().is_some_and(|path| {
+        let held = self.focused();
+        let lost_control = held.as_deref().is_some_and(|path| {
             self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path)
                 && !result.focus_order.iter().any(|stop| stop.path.as_ref() == path)
         });
-        if lost_control { self.blur(); }
+        if lost_control {
+            // a group is ONE stop: when the member under the keyboard goes
+            // and the group stays, the keyboard stays in the group
+            let heir = held.as_deref().and_then(|path| self.group_root_of(path)).and_then(|root| group_heir(&root, &result));
+            match heir {
+                Some(path) => {
+                    self.focus(&path);
+                    self.keyboard_inherited.set(true);
+                }
+                None => { self.blur(); }
+            }
+        }
+        // the member that died in the render before this layout — a day
+        // that can no longer be chosen is no input at all — left the name
+        // of its group behind
+        let orphan = self.group_orphan.borrow_mut().take();
+        if self.focus.borrow().is_none()
+            && let Some(path) = orphan.and_then(|root| group_heir(&root, &result))
+        {
+            self.focus(&path);
+            self.keyboard_inherited.set(true);
+        }
         self.last_fields.borrow_mut().clone_from(&result.fields);
         self.last_focus_order.borrow_mut().clone_from(&result.focus_order);
         self.last_focus_groups.borrow_mut().clone_from(&result.focus_groups);
@@ -8773,6 +8910,38 @@ fn group_entry(order: &[crate::layout::FocusStop], group: crate::layout::FocusGr
     (group.start..end)
         .find(|&index| order[index].control.is_some_and(|state| state.checked == Some(true)))
         .unwrap_or(group.start)
+}
+
+/// What the members of `group` stand under: the path they share, cut at
+/// the end of a segment. It names the group from one layout to the next,
+/// while its members come and go. A group of one member is named by what
+/// that member stands under.
+fn group_root(order: &[crate::layout::FocusStop], group: crate::layout::FocusGroup) -> Option<&str> {
+    let end = group.end.min(order.len());
+    if group.start >= end {
+        return None;
+    }
+    let (first, last) = (order[group.start].path.as_ref(), order[end - 1].path.as_ref());
+    let shared = first.bytes().zip(last.bytes()).take_while(|(a, b)| a == b).count();
+    // the cut is at a `/`, which is one byte: it never falls inside a character
+    let cut = first.as_bytes()[..shared].iter().rposition(|byte| *byte == b'/')?;
+    Some(&first[..cut])
+}
+
+/// The member that takes the keyboard when the one that held it left and
+/// its group did not: the selected member of the group named `root`, or
+/// its first. `None` when the group left too.
+///
+/// A group is ONE stop. When its member under the keyboard goes — the
+/// 31st, in a month that has thirty days — the keyboard stays in the
+/// group.
+fn group_heir(root: &str, result: &crate::layout::LayoutResult) -> Option<Rc<str>> {
+    let order = &result.focus_order;
+    result.focus_groups.iter()
+        .filter(|group| group.start >= result.focus_floor)
+        .find(|group| group_root(order, **group) == Some(root))
+        .and_then(|group| order.get(group_entry(order, *group)))
+        .map(|stop| Rc::clone(&stop.path))
 }
 
 /// What each input has already answered, so that it takes the keyboard

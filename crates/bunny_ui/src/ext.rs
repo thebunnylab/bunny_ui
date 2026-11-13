@@ -329,7 +329,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::HugHeight)
     }
 
-    /// `.navigationTitle("…")`
+    /// The title of a page of a navigation stack: `.navigation_title("Countries")`.
+    ///
+    /// The stack shows it in the bar over the page, beside the button
+    /// that goes back. Write it on a view of the page; the page that is
+    /// on top is the one whose title shows. Outside a stack it does
+    /// nothing.
     #[track_caller]
     fn navigation_title(self, title: impl Into<String>) -> Modified<Self> {
         Modified::new(self, Modifier::NavigationTitle(title.into()))
@@ -1842,14 +1847,6 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     }
 
     // MARK: - Inert parity
-
-    /// `.navigationDestination(for:) { … }` — inert (the fake
-    /// NavigationPath carries only descriptions; the destination does not
-    /// mount).
-    #[track_caller]
-    fn navigation_destination(self) -> Modified<Self> {
-        Modified::new(self, Modifier::NavigationDestination)
-    }
 
     /// `.navigationViewStyle(.stack)`
     #[track_caller]

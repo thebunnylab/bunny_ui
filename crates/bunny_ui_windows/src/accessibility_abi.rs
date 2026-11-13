@@ -13,6 +13,8 @@ pub(super) const NO_MEMORY: Hresult = 0x8007000eu32 as i32;
 pub(super) const DENIED: Hresult = 0x80070005u32 as i32;
 pub(super) const UNAVAILABLE: Hresult = 0x80040201u32 as i32;
 pub(super) const UNSUPPORTED: Hresult = 0x80040204u32 as i32;
+/// UIA_E_INVALIDOPERATION: the element cannot do this in the state it is in.
+pub(super) const INVALID_OPERATION: Hresult = 0x80131509u32 as i32;
 
 const fn guid(value: u128) -> Guid {
     Guid {
@@ -30,6 +32,8 @@ pub(super) const INVOKE: Guid = guid(0x54fcb24b_e18e_47a2_b4d3_eccbe77599a2);
 pub(super) const VALUE: Guid = guid(0xc7935180_6fb3_4201_b174_7df73adbf64a);
 pub(super) const RANGE: Guid = guid(0x36dc7aef_33e6_4691_afe1_2be7274b3d33);
 pub(super) const TOGGLE: Guid = guid(0x56d00bd0_c4f4_433c_a836_1a52a57e0892);
+pub(super) const SELECTION_ITEM: Guid = guid(0x2acad808_b2d4_452d_a407_91ff1ad167b2);
+pub(super) const EXPAND_COLLAPSE: Guid = guid(0xd847d3a5_cab0_4a98_8c32_ecb45c59ad24);
 
 pub(super) const BOUNDS: i32 = 30001;
 pub(super) const CONTROL_TYPE: i32 = 30003;
@@ -56,8 +60,15 @@ pub(super) const RANGE_PATTERN: i32 = 10003;
 pub(super) const VALUE_PATTERN: i32 = 10002;
 pub(super) const TOGGLE_PATTERN: i32 = 10015;
 pub(super) const TOGGLE_STATE: i32 = 30086;
+pub(super) const EXPAND_COLLAPSE_PATTERN: i32 = 10005;
+/// ExpandCollapseState: 0 is collapsed, 1 is expanded.
+pub(super) const EXPAND_COLLAPSE_STATE: i32 = 30070;
+pub(super) const SELECTION_ITEM_PATTERN: i32 = 10010;
+pub(super) const SELECTION_ITEM_SELECTED: i32 = 30079;
 pub(super) const NOT_ENABLED: Hresult = 0x80040200u32 as i32;
 pub(super) const FOCUS_EVENT: i32 = 20005;
+/// UIA_SelectionItem_ElementSelectedEventId: this element is now the one selected.
+pub(super) const ELEMENT_SELECTED_EVENT: i32 = 20012;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -192,6 +203,24 @@ pub(super) struct InvokeVtbl {
 pub(super) struct ToggleVtbl {
     pub unknown: UnknownVtbl,
     pub toggle: unsafe extern "system" fn(Object) -> Hresult,
+    pub state: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+}
+/// ISelectionItemProvider, in the order of its methods.
+#[repr(C)]
+pub(super) struct SelectionItemVtbl {
+    pub unknown: UnknownVtbl,
+    pub select: unsafe extern "system" fn(Object) -> Hresult,
+    pub add: unsafe extern "system" fn(Object) -> Hresult,
+    pub remove: unsafe extern "system" fn(Object) -> Hresult,
+    pub selected: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+    pub container: unsafe extern "system" fn(Object, *mut Object) -> Hresult,
+}
+/// IExpandCollapseProvider, in the order of its methods.
+#[repr(C)]
+pub(super) struct ExpandCollapseVtbl {
+    pub unknown: UnknownVtbl,
+    pub expand: unsafe extern "system" fn(Object) -> Hresult,
+    pub collapse: unsafe extern "system" fn(Object) -> Hresult,
     pub state: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
 }
 #[repr(C)]

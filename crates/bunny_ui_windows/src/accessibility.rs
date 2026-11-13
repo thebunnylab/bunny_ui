@@ -33,6 +33,7 @@ struct Node {
     multiline: bool,
     enabled: bool,
     checked: Option<bool>,
+    expanded: Option<bool>,
     range: Option<RangeValue>,
 }
 #[derive(Clone, Default)]
@@ -156,6 +157,7 @@ impl Accessibility {
                         multiline: node.multiline,
                         enabled: node.enabled,
                         checked: node.checked,
+                        expanded: node.expanded,
                         range: node.range,
                     })
                     .collect(),
@@ -428,12 +430,33 @@ impl Surface {
                         );
                     }
                 }
-                if old.checked != node.checked {
+                if old.checked != node.checked && selects(node.role) {
+                    notify_property(
+                        &provider,
+                        SELECTION_ITEM_SELECTED,
+                        Ok(Variant::boolean(old.checked.unwrap_or(false))),
+                        Ok(Variant::boolean(node.checked.unwrap_or(false))),
+                    );
+                    if node.checked == Some(true) {
+                        // the sets hold one selection: this element is now it
+                        unsafe {
+                            UiaRaiseAutomationEvent(provider.simple(), ELEMENT_SELECTED_EVENT);
+                        }
+                    }
+                } else if old.checked != node.checked {
                     notify_property(
                         &provider,
                         TOGGLE_STATE,
                         Ok(Variant::integer(i32::from(old.checked.unwrap_or(false)))),
                         Ok(Variant::integer(i32::from(node.checked.unwrap_or(false)))),
+                    );
+                }
+                if old.expanded != node.expanded {
+                    notify_property(
+                        &provider,
+                        EXPAND_COLLAPSE_STATE,
+                        Ok(Variant::integer(i32::from(old.expanded.unwrap_or(false)))),
+                        Ok(Variant::integer(i32::from(node.expanded.unwrap_or(false)))),
                     );
                 }
                 if old.bounds != node.bounds
@@ -528,6 +551,8 @@ struct Provider {
     value: Port<ValueVtbl>,
     toggle: Port<ToggleVtbl>,
     range: Port<RangeVtbl>,
+    selection: Port<SelectionItemVtbl>,
+    expand: Port<ExpandCollapseVtbl>,
     refs: AtomicU32,
     surface: Weak<Surface>,
     key: Key,
@@ -570,6 +595,14 @@ impl Owned {
                 table: &RANGE_VTABLE,
                 owner: ptr::null_mut(),
             },
+            selection: Port {
+                table: &SELECTION_ITEM_VTABLE,
+                owner: ptr::null_mut(),
+            },
+            expand: Port {
+                table: &EXPAND_COLLAPSE_VTABLE,
+                owner: ptr::null_mut(),
+            },
             refs: AtomicU32::new(1),
             surface: Arc::downgrade(surface),
             key,
@@ -583,6 +616,8 @@ impl Owned {
         value.value.owner = owner;
         value.toggle.owner = owner;
         value.range.owner = owner;
+        value.selection.owner = owner;
+        value.expand.owner = owner;
         Self(Box::into_raw(value))
     }
     fn simple(&self) -> Object {
@@ -636,7 +671,11 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
         ptr::from_ref(&value.toggle).cast_mut().cast()
     } else if iid == RANGE && value.role.is_some_and(ranges) {
         ptr::from_ref(&value.range).cast_mut().cast()
-    } else if iid == VALUE && matches!(value.role, Some(Role::TextField | Role::PasswordField)) {
+    } else if iid == SELECTION_ITEM && value.role.is_some_and(selects) {
+        ptr::from_ref(&value.selection).cast_mut().cast()
+    } else if iid == EXPAND_COLLAPSE && value.role.is_some_and(expands) {
+        ptr::from_ref(&value.expand).cast_mut().cast()
+    } else if iid == VALUE && value.role.is_some_and(holds_value) {
         ptr::from_ref(&value.value).cast_mut().cast()
     } else {
         return NO_INTERFACE;
@@ -647,11 +686,24 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
     }
     OK
 }
-/// The roles a press runs: they answer the Invoke pattern. A radio
-/// button, a tab and a pop-up button are selected or opened by the same
-/// press a button takes.
+/// The role a press runs: it answers the Invoke pattern. UI Automation
+/// gives a radio button, a tab item and a combo box patterns of their
+/// own, and says they never answer Invoke.
 fn invokes(role: Role) -> bool {
-    matches!(role, Role::Button | Role::RadioButton | Role::Tab | Role::PopUpButton)
+    role == Role::Button
+}
+/// One of a set: it answers the SelectionItem pattern.
+fn selects(role: Role) -> bool {
+    matches!(role, Role::RadioButton | Role::Tab)
+}
+/// A button that opens a list: it answers the ExpandCollapse pattern.
+fn expands(role: Role) -> bool {
+    role == Role::PopUpButton
+}
+/// The roles with a text value: a field, and a pop-up button, whose
+/// value is the choice it shows and cannot be set.
+fn holds_value(role: Role) -> bool {
+    matches!(role, Role::TextField | Role::PasswordField | Role::PopUpButton)
 }
 /// The two-state roles: they answer the Toggle pattern. UI Automation
 /// has no switch of its own; a switch is a button that toggles.
@@ -719,8 +771,10 @@ unsafe extern "system" fn pattern(this: Object, pattern: i32, out: *mut Object) 
             RANGE_PATTERN if value.role.is_some_and(ranges) => &RANGE,
             INVOKE_PATTERN if value.role.is_some_and(invokes) => &INVOKE,
             TOGGLE_PATTERN if value.role.is_some_and(toggles) => &TOGGLE,
+            SELECTION_ITEM_PATTERN if value.role.is_some_and(selects) => &SELECTION_ITEM,
+            EXPAND_COLLAPSE_PATTERN if value.role.is_some_and(expands) => &EXPAND_COLLAPSE,
             VALUE_PATTERN
-                if matches!(value.role, Some(Role::TextField | Role::PasswordField))
+                if value.role.is_some_and(holds_value)
                     && node.is_some_and(|node| !node.multiline) =>
             {
                 &VALUE
@@ -773,6 +827,12 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                     TOGGLE_STATE if toggles(node.role) => {
                         Ok(Variant::integer(i32::from(node.checked.unwrap_or(false))))
                     }
+                    SELECTION_ITEM_SELECTED if selects(node.role) => {
+                        Ok(Variant::boolean(node.checked.unwrap_or(false)))
+                    }
+                    EXPAND_COLLAPSE_STATE if expands(node.role) => {
+                        Ok(Variant::integer(i32::from(node.expanded.unwrap_or(false))))
+                    }
                     RANGE_READ_ONLY if ranges(node.role) => {
                         Ok(Variant::boolean(!node.enabled))
                     }
@@ -784,14 +844,14 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                     }
                     PASSWORD => Ok(Variant::boolean(node.role == Role::PasswordField)),
                     VALUE_VALUE if node.role == Role::PasswordField => Err(DENIED),
-                    VALUE_VALUE if node.role == Role::TextField && !node.multiline => {
-                        Variant::string(node.value.as_deref().unwrap_or(""))
-                    }
-                    VALUE_READ_ONLY
-                        if matches!(node.role, Role::TextField | Role::PasswordField)
+                    VALUE_VALUE
+                        if matches!(node.role, Role::TextField | Role::PopUpButton)
                             && !node.multiline =>
                     {
-                        Ok(Variant::boolean(false))
+                        Variant::string(node.value.as_deref().unwrap_or(""))
+                    }
+                    VALUE_READ_ONLY if holds_value(node.role) && !node.multiline => {
+                        Ok(Variant::boolean(node.role == Role::PopUpButton))
                     }
                     _ => Ok(Variant::empty()),
                 }
@@ -1031,9 +1091,75 @@ unsafe extern "system" fn get_value(this: Object, out: *mut *mut u16) -> Hresult
 }
 unsafe extern "system" fn read_only(this: Object, out: *mut i32) -> Hresult {
     output(out, 0, || {
-        state(unsafe { provider(this) })?;
-        Ok(0)
+        let value = unsafe { provider(this) };
+        state(value)?;
+        // a pop-up button shows its choice; the choice is made in its list
+        Ok(i32::from(value.role == Some(Role::PopUpButton)))
     })
+}
+/// The element's node, for a pattern that reads one of its states.
+fn node_of(this: Object) -> Result<Node, Hresult> {
+    let (_, _, node) = state(unsafe { provider(this) })?;
+    node.ok_or(UNSUPPORTED)
+}
+/// ISelectionItemProvider::Select. The element becomes the one selected
+/// by the press that selects it on the screen. On the selected element
+/// it does nothing: a second press is not a selection, and in the list
+/// of a date picker it closes the list.
+unsafe extern "system" fn select(this: Object) -> Hresult {
+    match node_of(this) {
+        Ok(node) if node.checked == Some(true) => OK,
+        Ok(_) => enqueue(unsafe { provider(this) }, Action::Activate),
+        Err(error) => error,
+    }
+}
+/// ISelectionItemProvider::AddToSelection. The sets here hold one
+/// selection: a second element cannot join it.
+unsafe extern "system" fn add_to_selection(this: Object) -> Hresult {
+    match node_of(this) {
+        Ok(node) if node.checked == Some(true) => OK,
+        Ok(_) => INVALID_OPERATION,
+        Err(error) => error,
+    }
+}
+/// ISelectionItemProvider::RemoveFromSelection. The sets here always
+/// have their selection: the selected element cannot leave it.
+unsafe extern "system" fn remove_from_selection(this: Object) -> Hresult {
+    match node_of(this) {
+        Ok(node) if node.checked == Some(true) => INVALID_OPERATION,
+        Ok(_) => OK,
+        Err(error) => error,
+    }
+}
+unsafe extern "system" fn is_selected(this: Object, out: *mut i32) -> Hresult {
+    output(out, 0, || Ok(i32::from(node_of(this)?.checked.ok_or(UNSUPPORTED)?)))
+}
+/// ISelectionItemProvider::SelectionContainer. The tree is flat: a set
+/// has no element of its own to name.
+unsafe extern "system" fn selection_container(this: Object, out: *mut Object) -> Hresult {
+    output(out, ptr::null_mut(), || {
+        state(unsafe { provider(this) })?;
+        Ok(ptr::null_mut())
+    })
+}
+/// IExpandCollapseProvider::Expand and Collapse: the press that opens
+/// the list also closes it, so each runs it only from the other state.
+fn set_expanded(this: Object, wanted: bool) -> Hresult {
+    match node_of(this).map(|node| node.expanded) {
+        Ok(Some(now)) if now == wanted => OK,
+        Ok(Some(_)) => enqueue(unsafe { provider(this) }, Action::Activate),
+        Ok(None) => UNSUPPORTED,
+        Err(error) => error,
+    }
+}
+unsafe extern "system" fn expand(this: Object) -> Hresult {
+    set_expanded(this, true)
+}
+unsafe extern "system" fn collapse(this: Object) -> Hresult {
+    set_expanded(this, false)
+}
+unsafe extern "system" fn expand_state(this: Object, out: *mut i32) -> Hresult {
+    output(out, 0, || Ok(i32::from(node_of(this)?.expanded.ok_or(UNSUPPORTED)?)))
 }
 fn range_property(range: RangeValue, property: i32) -> Result<f64, Hresult> {
     match property {
@@ -1115,6 +1241,20 @@ static TOGGLE_VTABLE: ToggleVtbl = ToggleVtbl {
     toggle: invoke,
     state: toggle_state,
 };
+static SELECTION_ITEM_VTABLE: SelectionItemVtbl = SelectionItemVtbl {
+    unknown: unknown(),
+    select,
+    add: add_to_selection,
+    remove: remove_from_selection,
+    selected: is_selected,
+    container: selection_container,
+};
+static EXPAND_COLLAPSE_VTABLE: ExpandCollapseVtbl = ExpandCollapseVtbl {
+    unknown: unknown(),
+    expand,
+    collapse,
+    state: expand_state,
+};
 static VALUE_VTABLE: ValueVtbl = ValueVtbl {
     unknown: unknown(),
     set: set_value,
@@ -1136,7 +1276,7 @@ static RANGE_VTABLE: RangeVtbl = RangeVtbl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bunny_ui::prelude::{State, button, text, text_editor, text_field, vstack};
+    use bunny_ui::prelude::{State, button, picker, segmented, text, text_editor, text_field, vstack};
 
     fn fixture() -> (Arc<Surface>, Owned, Owned, Owned) {
         let runtime = Runtime::new();
@@ -1156,6 +1296,16 @@ mod tests {
                 height: 480.0,
             },
         );
+        let surface = published(&runtime);
+        let tree = runtime.accessibility_tree();
+        let button = surface.provider(Key::Node(tree.nodes()[0].id)).unwrap();
+        let field = surface.provider(Key::Node(tree.nodes()[1].id)).unwrap();
+        let text = surface.provider(Key::Node(tree.nodes()[2].id)).unwrap();
+        (surface, button, field, text)
+    }
+
+    /// A surface with no window that holds what the runtime shows.
+    fn published(runtime: &Runtime) -> Arc<Surface> {
         let tree = runtime.accessibility_tree();
         let nodes: Vec<_> = tree
             .nodes()
@@ -1170,10 +1320,11 @@ mod tests {
                 multiline: node.multiline,
                 enabled: node.enabled,
                 checked: node.checked,
+                expanded: node.expanded,
                 range: node.range,
             })
             .collect();
-        let surface = Arc::new(Surface {
+        Arc::new(Surface {
             window: 0,
             queue: Arc::new(Queue {
                 owner: 0,
@@ -1189,11 +1340,145 @@ mod tests {
                 factor: 1.0,
             })),
             providers: Mutex::new(HashMap::new()),
-        });
-        let button = surface.provider(Key::Node(tree.nodes()[0].id)).unwrap();
-        let field = surface.provider(Key::Node(tree.nodes()[1].id)).unwrap();
-        let text = surface.provider(Key::Node(tree.nodes()[2].id)).unwrap();
-        (surface, button, field, text)
+        })
+    }
+
+    /// Two segments with the first selected, and a pop-up button that
+    /// shows "Dark": the surface, then a provider for each of the three.
+    fn choices() -> (Arc<Surface>, Owned, Owned, Owned) {
+        let runtime = Runtime::new();
+        runtime.set_accessibility_enabled(true);
+        let (mode, look) = (State::new(0), State::new(1));
+        let root = vstack!(
+            segmented(mode.binding(), [(0, "List"), (1, "Grid")]),
+            picker(look.binding(), [(0, "System"), (1, "Dark")])
+        );
+        let _ = runtime.display_frame(
+            &root,
+            bunny_ui::layout::Size {
+                width: 480.0,
+                height: 480.0,
+            },
+        );
+        let surface = published(&runtime);
+        let (snapshot, _) = surface.read(Key::Root).unwrap();
+        let provider_of = |role: Role, label: &str| {
+            let node = snapshot
+                .nodes
+                .iter()
+                .find(|node| node.role == role && (label.is_empty() || &*node.label == label))
+                .unwrap();
+            surface.provider(Key::Node(node.id)).unwrap()
+        };
+        let list = provider_of(Role::RadioButton, "List");
+        let grid = provider_of(Role::RadioButton, "Grid");
+        let pop_up = provider_of(Role::PopUpButton, "");
+        (surface, list, grid, pop_up)
+    }
+
+    /// A press that a pattern asked for was queued, or the queue had no
+    /// window to wake and refused it. Both show the press was ASKED FOR;
+    /// a call that decides to do nothing answers `OK` and queues nothing.
+    fn asked_for_a_press(surface: &Surface, result: Hresult) -> bool {
+        let mut queued = surface.queue.requests.lock().unwrap();
+        let pressed = queued.len() == 1 && matches!(queued[0].action, Action::Activate);
+        let refused = result == UNAVAILABLE && queued.is_empty();
+        queued.clear();
+        (result == OK && pressed) || refused
+    }
+
+    #[test]
+    fn one_of_a_set_answers_selection_item_and_never_invoke() {
+        let (surface, list, grid, _) = choices();
+        unsafe {
+            let mut port = ptr::dangling_mut::<std::ffi::c_void>();
+            assert_eq!(query(grid.simple(), &INVOKE, &mut port), NO_INTERFACE);
+            assert_eq!(pattern(grid.simple(), INVOKE_PATTERN, &mut port), OK);
+            assert!(port.is_null());
+            assert_eq!(pattern(grid.simple(), TOGGLE_PATTERN, &mut port), OK);
+            assert!(port.is_null());
+            assert_eq!(pattern(grid.simple(), SELECTION_ITEM_PATTERN, &mut port), OK);
+            assert!(!port.is_null());
+            // the pattern's own port reaches the same element
+            let mut selected = -1;
+            assert_eq!(is_selected(port, &mut selected), OK);
+            assert_eq!(selected, 0);
+            release(port);
+            assert_eq!(is_selected(list.simple(), &mut selected), OK);
+            assert_eq!(selected, 1);
+
+            let mut value = Variant::empty();
+            assert_eq!(property(list.simple(), SELECTION_ITEM_SELECTED, &mut value), OK);
+            assert_eq!((value.kind, value.data.boolean), (11, -1));
+            assert_eq!(property(grid.simple(), SELECTION_ITEM_SELECTED, &mut value), OK);
+            assert_eq!((value.kind, value.data.boolean), (11, 0));
+            assert_eq!(property(list.simple(), TOGGLE_STATE, &mut value), OK);
+            assert_eq!(value.kind, 0, "a radio button is no toggle");
+            assert_eq!(property(list.simple(), CONTROL_TYPE, &mut value), OK);
+            assert_eq!((value.kind, value.data.integer), (3, 50013));
+
+            // a set with one selection that is always there
+            assert_eq!(add_to_selection(list.simple()), OK);
+            assert_eq!(add_to_selection(grid.simple()), INVALID_OPERATION);
+            assert_eq!(remove_from_selection(grid.simple()), OK);
+            assert_eq!(remove_from_selection(list.simple()), INVALID_OPERATION);
+            let mut container = ptr::dangling_mut::<std::ffi::c_void>();
+            assert_eq!(selection_container(list.simple(), &mut container), OK);
+            assert!(container.is_null());
+            assert!(surface.queue.requests.lock().unwrap().is_empty());
+
+            // Select runs the press on the element that is not selected, and only there
+            assert_eq!(select(list.simple()), OK);
+            assert!(surface.queue.requests.lock().unwrap().is_empty());
+            let result = select(grid.simple());
+            assert!(asked_for_a_press(&surface, result), "{result:#x}");
+        }
+    }
+
+    #[test]
+    fn a_pop_up_button_expands_and_shows_a_value_nobody_can_set() {
+        let (surface, _, _, pop_up) = choices();
+        unsafe {
+            let mut port = ptr::dangling_mut::<std::ffi::c_void>();
+            assert_eq!(query(pop_up.simple(), &INVOKE, &mut port), NO_INTERFACE);
+            assert_eq!(query(pop_up.simple(), &SELECTION_ITEM, &mut port), NO_INTERFACE);
+            assert_eq!(pattern(pop_up.simple(), EXPAND_COLLAPSE_PATTERN, &mut port), OK);
+            assert!(!port.is_null());
+            let mut open = -1;
+            assert_eq!(expand_state(port, &mut open), OK);
+            assert_eq!(open, 0, "collapsed");
+            release(port);
+
+            let mut value = Variant::empty();
+            assert_eq!(property(pop_up.simple(), EXPAND_COLLAPSE_STATE, &mut value), OK);
+            assert_eq!((value.kind, value.data.integer), (3, 0));
+            assert_eq!(property(pop_up.simple(), CONTROL_TYPE, &mut value), OK);
+            assert_eq!((value.kind, value.data.integer), (3, 50003));
+
+            // the value is the choice it shows
+            assert_eq!(pattern(pop_up.simple(), VALUE_PATTERN, &mut port), OK);
+            assert!(!port.is_null());
+            release(port);
+            assert_eq!(property(pop_up.simple(), VALUE_VALUE, &mut value), OK);
+            assert_eq!(value.kind, 8);
+            let words = std::slice::from_raw_parts(value.data.pointer.cast::<u16>(), 4);
+            assert_eq!(String::from_utf16_lossy(words), "Dark");
+            assert_eq!(VariantClear(&mut value), OK);
+            assert_eq!(property(pop_up.simple(), VALUE_READ_ONLY, &mut value), OK);
+            assert_eq!((value.kind, value.data.boolean), (11, -1));
+            let mut locked = -1;
+            assert_eq!(read_only(pop_up.simple(), &mut locked), OK);
+            assert_eq!(locked, 1);
+            let dark: Vec<u16> = "System\0".encode_utf16().collect();
+            assert_eq!(set_value(pop_up.simple(), dark.as_ptr()), UNSUPPORTED);
+            assert!(surface.queue.requests.lock().unwrap().is_empty());
+
+            // Collapse on a closed list does nothing; Expand runs the press that opens it
+            assert_eq!(collapse(pop_up.simple()), OK);
+            assert!(surface.queue.requests.lock().unwrap().is_empty());
+            let result = expand(pop_up.simple());
+            assert!(asked_for_a_press(&surface, result), "{result:#x}");
+        }
     }
 
     #[test]

@@ -73,9 +73,9 @@ Each desktop adapter maps them to the role of the native control:
 | Role | macOS | Windows UI Automation | Linux AT-SPI |
 |---|---|---|---|
 | `Switch` | `AXCheckBox`, subrole `AXSwitch` | Button, Toggle pattern | toggle button, CHECKABLE/CHECKED, action `toggle` |
-| `RadioButton` | `AXRadioButton` | RadioButton, Invoke pattern | radio button, CHECKABLE/CHECKED, action `click` |
-| `Tab` | `AXRadioButton`, subrole `AXTabButton` | TabItem, Invoke pattern | page tab, SELECTABLE/SELECTED, action `click` |
-| `PopUpButton` | `AXPopUpButton`, `isAccessibilityExpanded` | ComboBox, Invoke pattern | combo box, EXPANDABLE/EXPANDED, action `press` |
+| `RadioButton` | `AXRadioButton` | RadioButton, SelectionItem pattern | radio button, CHECKABLE/CHECKED, action `click` |
+| `Tab` | `AXRadioButton`, subrole `AXTabButton` | TabItem, SelectionItem pattern | page tab, SELECTABLE/SELECTED, action `click` |
+| `PopUpButton` | `AXPopUpButton`, `isAccessibilityExpanded` | ComboBox, ExpandCollapse pattern, read-only Value | combo box, EXPANDABLE/EXPANDED, action `press` |
 | `Stepper` | `AXIncrementor` | Spinner, RangeValue pattern | spin button, Value interface |
 
 Successful `Activate` follows the pointer's keyboard-ownership rule after the
@@ -150,6 +150,20 @@ Multiline editors expose focus but require the still-unimplemented Text pattern
 for text access; they do not claim Value pattern support.
 Password fields set IsPassword and refuse value reads.
 
+A radio button and a tab item expose SelectionItem, and no Invoke: UI
+Automation gives one of a set a pattern of its own. `Select` runs the press
+that selects the element, and does nothing on the element that is selected. The
+sets hold one selection that is always there, so `AddToSelection` on another
+element and `RemoveFromSelection` on the selected one answer
+`UIA_E_INVALIDOPERATION`. A change of the selection emits the IsSelected
+property notification and `ElementSelected` on the element that took it. The
+tree is flat, so `SelectionContainer` is empty.
+
+A pop-up button is a ComboBox that exposes ExpandCollapse. `Expand` and
+`Collapse` run the press that opens or closes its list, each only from the
+other state, and the state emits a property notification. Its Value is the
+choice it shows and is read-only: the choice is made in the list.
+
 COM providers hold immutable owned snapshots behind synchronization; they never
 borrow Runtime, views or application bindings. They support callbacks from an
 MTA as well as a normal STA host. Action methods validate and queue requests to
@@ -170,6 +184,7 @@ and adds no Rust dependency.
 IUIAutomation client on a separate MTA thread while the app pumps its window
 messages. Its fixture checks model edits, invocation, focus, dynamic names,
 runtime identity, password redaction, moved bounds, native child interoperability,
+selection of one of a set, the list of a pop-up button opened and closed,
 modal exclusion and first-query activation, events, and retired/closed objects.
 Subprocesses exercise an already-MTA host and first access to an open modal.
 This protocol test is distinct from a human NVDA workflow.

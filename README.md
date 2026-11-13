@@ -167,6 +167,15 @@ cargo run -p bunny-ui-core --example counter_mvvm
 cargo run -p bunny-ui-core --example profile_mvvm
 ```
 
+The built-in [controls](docs/controls.md) each bind to a value: checkbox and
+toggle, segmented control and tabs, picker, stepper, text field and search
+field, calendar and date picker, and `form!` to set them in rows. Each is
+reached by the keyboard and announced by its role. One page shows them all:
+
+```bash
+cargo run -p bunny-ui --example controls
+```
+
 The canvas-backed [slider](docs/slider.md) binds a scalar value to a validated
 range, with pointer capture, keyboard adjustment, disabled state and RTL input.
 [Line charts](docs/line-charts.md) plot validated live snapshots, with compact

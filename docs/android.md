@@ -93,10 +93,20 @@ field's `keyboard_type` goes unsaid here.
 
 Keys arrive as key codes, not text. A table of the latin layout says
 what each types, with shift and caps lock; a return is the break a
-field of many lines takes; the back key is the escape, closing what is
-open before it leaves the app. A composed character, a script the
+field of many lines takes. A composed character, a script the
 table does not know, an emoji need an `InputConnection`, which is
 Java, and do not arrive — the honest ceiling of a `NativeActivity`.
+
+The back key is "back" (`Runtime::navigate_back`), and one thing goes
+at a press: an open menu; else the overlay on top, which is a popover,
+an alert, a dialog or a sheet; else the page on top of a navigation
+stack. With nothing to go back from, a field that holds the keyboard
+lets it go. With nothing of that either, the key is the platform's and
+the app leaves. The key reaches the app as a key code while the
+manifest does not turn on `android:enableOnBackInvokedCallback`; the
+sample's manifest does not, and it targets API 35. An app that targets
+API 36 gets the callback by default and must turn it off in its
+manifest until the shell registers one.
 
 ## The secret store
 

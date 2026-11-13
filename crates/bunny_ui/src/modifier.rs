@@ -264,7 +264,6 @@ pub enum Modifier {
     Toolbar,
     AttachEnvironmentOverrides,
     AttachEnvironmentOverridesOnChange,
-    NavigationDestination,
 
     /// `.flipsForRightToLeftLayoutDirection(…)` — the pictures below
     /// mirror in a right-to-left scene (a chevron that points the way,
@@ -382,7 +381,6 @@ impl Modifier {
             Modifier::Toolbar => "toolbar",
             Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
             Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
-            Modifier::NavigationDestination => "navigation_destination",
             Modifier::FlipsForRightToLeftLayoutDirection { .. } => "flips_for_right_to_left_layout_direction",
         }
     }
@@ -578,7 +576,6 @@ impl Modifier {
             Modifier::FlipsForRightToLeftLayoutDirection(flips) => {
                 format!(" [.flipsForRightToLeftLayoutDirection({flips})]")
             }
-            Modifier::NavigationDestination => " [.navigationDestination(for: …)]".into(),
         }
     }
 }
@@ -1044,6 +1041,17 @@ pub(crate) fn apply(
             if let Some(node) = out.last_mut() {
                 node.children
                     .push(RenderNode::branch(crate::view::print_label("Sheet"), sheet_prints));
+            }
+            if let Some(path) = &path {
+                // "back" closes a sheet (`Runtime::navigate_back`). The
+                // name is not `#dismiss`: that is the road of an app
+                // switch and of a scrolled-away anchor, and neither of
+                // them closes a sheet
+                let is_presented = is_presented.clone();
+                crate::reconciler::attribute_action(
+                    Rc::from(format!("{path}/#back")),
+                    Rc::new(move |_, _| is_presented.set(false)),
+                );
             }
             // The sheet centres over the base and CAPTURES: what it
             // covers is out of reach while it is up, which is what
@@ -1739,6 +1747,14 @@ pub(crate) fn apply(
         Modifier::RestoreFocusOnClose => {
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, crate::reconciler::FOCUS_RETURN, false);
+        }
+        Modifier::NavigationTitle(title) => {
+            // the page says what it is called, and the stack it is a
+            // page of shows that in its bar. Outside a stack nobody
+            // hears it, and the title stays a word of the print
+            if let Some(stack) = ctx.environment::<Option<motor::state::Navigator>>() {
+                stack.set_title(title);
+            }
         }
         Modifier::KeyContextFocused(name) => {
             // the same declaration, with the view it hangs on: it counts

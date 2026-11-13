@@ -5,8 +5,14 @@
 //! crates/bunny_ui_android/android/run-emu.sh countries_window_android
 //! ```
 //!
-//! Limitations of this phase (noted, not hidden): `navigation_link` does
-//! not mount a destination yet (tapping a row does not navigate);
+//! The list is a navigation stack: tapping a row opens the details of its
+//! country as a page over the list, and a neighbour in the details opens
+//! another page over that one.
+//!
+//! The stack's bar shows the title of the page and the button that goes
+//! back.
+//!
+//! Limitations of this phase (noted, not hidden):
 //! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports, unused_variables))]

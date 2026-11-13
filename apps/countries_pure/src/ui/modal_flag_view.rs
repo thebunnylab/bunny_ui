@@ -39,7 +39,7 @@ impl Component for ModalFlagView {
                 .navigation_title(self.country.name.clone())
                 .toolbar(toolbar_item(self.clone().close_button()))
         });
-        navigation_stack_content((flag_item,))
+        navigation_stack_content(flag_item)
             .navigation_view_style()
             .attach_environment_overrides()
     }

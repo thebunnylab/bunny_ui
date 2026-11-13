@@ -296,6 +296,16 @@ pub enum NodeKind {
     Form,
     /// `labeled(…)`.
     Labeled,
+    /// `search_field(…)`.
+    SearchField,
+    /// `calendar(…)`.
+    Calendar,
+    /// `date_picker(…)`.
+    DatePicker,
+    /// `navigation_stack(…)`.
+    NavigationStack,
+    /// `nav_link_value(…)`.
+    NavLink,
 }
 
 impl NodeKind {
@@ -328,6 +338,11 @@ impl NodeKind {
             Self::Picker => "picker",
             Self::Form => "form",
             Self::Labeled => "labeled",
+            Self::SearchField => "search_field",
+            Self::Calendar => "calendar",
+            Self::DatePicker => "date_picker",
+            Self::NavigationStack => "navigation_stack",
+            Self::NavLink => "nav_link_value",
         }
     }
 }

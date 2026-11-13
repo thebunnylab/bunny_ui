@@ -150,8 +150,9 @@ pub fn lookup(keycode: i32) -> Option<(char, char)> {
 ///
 /// The modifier mapping is the platform's: Ctrl is the accelerator,
 /// so Ctrl carries `command`; Alt carries `option`; the `control` flag
-/// stays false (Meta belongs to the system). The phone's back key is
-/// the escape — it closes what is open before it leaves the app.
+/// stays false (Meta belongs to the system). The phone's back key reads
+/// as the escape here, for a caller that asks what key it is; the app's
+/// key gate does not ask, and takes it as "back" before any key.
 pub fn key_pattern(stroke: &KeyStroke) -> Option<KeyPattern> {
     let named = match stroke.keycode {
         KEYCODE_DPAD_DOWN => Some(Key::Down),

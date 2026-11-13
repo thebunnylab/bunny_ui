@@ -72,6 +72,53 @@ edges. In a segmented control the member the arrows reach is selected as they
 reach it, as in a set of radio buttons. A key that has nowhere to go is not
 handled, so the app's own bindings can take it.
 
+In a group that selects as the arrows move, the keyboard and the selection are
+one thing. When the app writes another value while the keyboard is on a member,
+the keyboard goes to the member that is now selected. A write never takes the
+keyboard from a control outside the group.
+
+A group stays one stop when its members change. When the member under the
+keyboard leaves the scene, or can no longer be chosen, and the group is still
+there, the keyboard goes to the selected member of the group, or to its first.
+
+### The days of a calendar
+
+`calendar(due.binding())` shows one month. Its two buttons are Tab stops, and
+its days are one more: a group of seven columns that selects as the arrows
+move. The days are a window on a longer line, so the group does not go round.
+
+| Key | On a day |
+| --- | --- |
+| Left, Right | One day back or forward. The two swap in a right-to-left scene. At the first or the last day of the month, into the month before or after. |
+| Up, Down | One week back or forward, into the month before or after where the week leaves the month. |
+| Page Up, Page Down | The same day of the month before or after, or its last day where that month is shorter. |
+| Home, End | The first or the last day of the month that can be chosen. |
+| Space, Enter | In the list of a date picker, on the chosen day: closes the list. |
+
+A key that would reach a day out of the calendar's range does nothing. Page Up
+and Page Down stop at the first and the last day of the range.
+
+`date_picker(due.binding())` is a button that opens the same calendar in a
+list. The list opens with the keyboard on the chosen day, also though the two
+buttons stand before the days. The arrows write the day as they move. Escape
+closes the list and leaves what they wrote.
+
+### The pages of a navigation stack
+
+`navigation_stack(path, root)` shows one page. A page under another one has no
+Tab stop: Tab goes round the bar and the page on top. On a page that was
+pushed, the first stop is the button that goes back.
+
+| Key | With a page to leave |
+| --- | --- |
+| ⌘[ on the Mac, Ctrl+[ elsewhere | The page on top leaves. |
+| Alt+Left | The same. A text field that has the keyboard keeps it: there it moves one word. |
+| Escape | Nothing. It closes a popover and answers an alert, and it never leaves a page. |
+
+At the root the two keys are not the stack's, and an app's own bindings take
+them. When a page leaves holding the keyboard, the keyboard goes back to the
+link that opened it.
+
 These contracts have runtime and native protocol regression tests. They do not
 establish human screen-reader or operating-system keyboard qualification.
 
