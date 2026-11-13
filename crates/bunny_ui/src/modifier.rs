@@ -1045,6 +1045,17 @@ pub(crate) fn apply(
                 node.children
                     .push(RenderNode::branch(crate::view::print_label("Sheet"), sheet_prints));
             }
+            if let Some(path) = &path {
+                // "back" closes a sheet (`Runtime::navigate_back`). The
+                // name is not `#dismiss`: that is the road of an app
+                // switch and of a scrolled-away anchor, and neither of
+                // them closes a sheet
+                let is_presented = is_presented.clone();
+                crate::reconciler::attribute_action(
+                    Rc::from(format!("{path}/#back")),
+                    Rc::new(move |_, _| is_presented.set(false)),
+                );
+            }
             // The sheet centres over the base and CAPTURES: what it
             // covers is out of reach while it is up, which is what
             // modal has always meant.

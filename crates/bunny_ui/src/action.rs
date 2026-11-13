@@ -90,6 +90,12 @@ pub const ALERT_CANCEL: ActionId = ActionId("bunny.alert.cancel");
 /// must not become a decision.
 pub const ALERT_DEFAULT: ActionId = ActionId("bunny.alert.default");
 
+/// "Back" for a navigation stack: the page on top leaves. A stack with a
+/// page to leave mounts a handler for it, and
+/// [`Runtime::navigate_back`](crate::runtime::Runtime::navigate_back)
+/// dispatches it after the menus and the overlays had their turn.
+pub const NAV_BACK: ActionId = ActionId("bunny.nav.back");
+
 /// The key context the days of a calendar declare while the keyboard is
 /// on one of them. The runtime pre-binds here the keys that leave the
 /// month: an arrow at the edge of the days, Page Up and Page Down. An

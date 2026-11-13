@@ -1346,6 +1346,42 @@ impl Runtime {
         self.device_scale.get()
     }
 
+    /// "Back", where the platform has a way to ask for it: the Android
+    /// button, a swipe from the leading edge, a mouse's side button, the
+    /// browser's own arrow.
+    ///
+    /// ONE thing goes back, the nearest to the reader: an open menu; else
+    /// the overlay on top — a popover, an alert (its cancel answer), a
+    /// dialog or a sheet; else the navigation stack with a page to leave.
+    /// `false` when there was nothing to go back from: the shell then
+    /// lets the platform do what it does by default, which on Android is
+    /// to leave the app.
+    ///
+    /// Escape is not this. Escape closes a popover and answers an alert,
+    /// and it never closes a sheet or leaves a page.
+    pub fn navigate_back(&self) -> bool {
+        self.enter_scene();
+        if self.close_menu() {
+            self.frame_asked.set(true);
+            return true;
+        }
+        // the overlays in the order they were placed: the last is on top
+        let top = self.last_overlays.borrow().last().map(|overlay| overlay.path.clone());
+        if let Some(path) = top {
+            // a sheet answers `#back`; the others close by the road their
+            // own close button and their outside press already take
+            let closed = reconciler::run_action(&format!("{path}/#back"), 1)
+                || reconciler::run_action(&format!("{path}/#dismiss"), 1);
+            if closed {
+                self.frame_asked.set(true);
+            }
+            // an overlay that cannot close still stands between the
+            // reader and the pages under it: "back" stops here
+            return closed;
+        }
+        self.dispatch_action(crate::action::NAV_BACK)
+    }
+
     /// Closes every open popover, outermost last — the app-switch
     /// behavior (the desktop shell calls it when the window resigns
     /// key). `true` = something closed and the shell repaints.
