@@ -30,6 +30,19 @@
 //! nav_link_value(CountryCell::new(country.clone()), Route::Country(country.clone()))
 //! ```
 //!
+//! A page the app never opens by itself needs no route. A link makes it:
+//!
+//! ```ignore
+//! nav_link("About", || About)
+//! ```
+//!
+//! Such a page is not in the path. It stands over the pages the stack
+//! shows when it opens; a route pushed later goes over it, and "back"
+//! returns to it. The button of the bar, the platform's "back" and its
+//! keys leave it. The app's `path.pop()` does not see it, and a write of
+//! the path that changes a route under it takes it away. A place the app
+//! must open by itself, restore or link to from outside takes a route.
+//!
 //! ## What a page keeps
 //!
 //! A page under another one is still mounted. Its state, its scroll
@@ -87,6 +100,7 @@ use motor::view::RenderNode;
 use motor::views::Edge;
 
 use crate::action::NAV_BACK;
+use crate::erased::Erased;
 use crate::ext::ViewExt;
 use crate::icon::house as symbol;
 use crate::layout::{ControlKind, LayoutNode, Truncation};
@@ -216,17 +230,115 @@ struct Kept<R> {
 }
 
 impl<R: Clone + PartialEq> Kept<R> {
-    /// The number of the page of each route. The routes the path still
-    /// starts with keep their pages; from the first route that changed,
-    /// every page is a new one.
-    fn numbers(&mut self, routes: &[R]) -> Vec<u64> {
+    /// The number of the page of each route, and how many routes the path
+    /// still starts with. Those keep their pages; from the first route
+    /// that changed, every page is a new one.
+    fn numbers(&mut self, routes: &[R]) -> (Vec<u64>, usize) {
         let same = self.pages.iter().zip(routes).take_while(|((was, _), now)| was == *now).count();
         self.pages.truncate(same);
         for route in &routes[same..] {
             self.made += 1;
             self.pages.push((route.clone(), self.made));
         }
-        self.pages.iter().map(|(_, number)| *number).collect()
+        (self.pages.iter().map(|(_, number)| *number).collect(), same)
+    }
+
+    /// A number for a page that has no route.
+    fn number(&mut self) -> u64 {
+        self.made += 1;
+        self.made
+    }
+}
+
+/// A page with no route: the view a link made ([`nav_link`]).
+///
+/// It is not in the path. It stands over the routes that were in the path
+/// when it was opened, and it stays for as long as the path still starts
+/// with them: a route pushed later goes over it, and a write that changes
+/// a route under it takes it away.
+#[derive(Clone)]
+struct Loose {
+    number: u64,
+    /// How many routes were under it.
+    over: usize,
+    make: Rc<dyn Fn() -> Erased>,
+}
+
+/// What a link to a view hands its stack, through `Navigator::push`.
+struct Opens(Rc<dyn Fn() -> Erased>);
+
+/// A page over the root, in the order the pages stand.
+#[derive(Clone)]
+enum Entry<R> {
+    Route(R, u64),
+    Loose(Loose),
+}
+
+impl<R> Entry<R> {
+    fn number(&self) -> u64 {
+        match self {
+            Entry::Route(_, number) => *number,
+            Entry::Loose(loose) => loose.number,
+        }
+    }
+}
+
+/// The pages over the root: each route's page, and after it the pages
+/// with no route that were opened over it.
+fn entries<R: Clone>(routes: &[R], numbers: &[u64], loose: &[Loose]) -> Vec<Entry<R>> {
+    let mut all = Vec::with_capacity(routes.len() + loose.len());
+    all.extend(loose.iter().filter(|page| page.over == 0).cloned().map(Entry::Loose));
+    for (place, (route, number)) in routes.iter().zip(numbers).enumerate() {
+        all.push(Entry::Route(route.clone(), *number));
+        all.extend(loose.iter().filter(|page| page.over == place + 1).cloned().map(Entry::Loose));
+    }
+    all
+}
+
+/// The doors of a stack that its bar, its keys and its pages all use.
+struct Doors<R: 'static> {
+    path: Binding<Vec<R>>,
+    kept: Rc<RefCell<Kept<R>>>,
+    loose: Rc<RefCell<Vec<Loose>>>,
+    /// Moved when a page with no route comes or goes: the stack reads it.
+    moved: State<u64>,
+}
+
+impl<R: 'static> Clone for Doors<R>
+where
+    Binding<Vec<R>>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self { path: self.path.clone(), kept: Rc::clone(&self.kept), loose: Rc::clone(&self.loose), moved: self.moved }
+    }
+}
+
+impl<R: Clone + PartialEq + 'static> Doors<R> {
+    /// The page on top leaves: a page with no route that stands over the
+    /// whole path, else the page of the last route. `false` on the root.
+    fn leave(&self) -> bool {
+        let routes = self.path.with(Vec::len);
+        let top = self.loose.borrow().iter().rposition(|page| page.over == routes);
+        match top {
+            Some(place) => {
+                self.loose.borrow_mut().remove(place);
+                self.moved.update(|times| *times += 1);
+                true
+            }
+            None => self.path.pop(),
+        }
+    }
+
+    /// A view opens as a page over everything the stack holds now.
+    fn open(&self, make: Rc<dyn Fn() -> Erased>) {
+        let number = self.kept.borrow_mut().number();
+        let over = self.path.with(Vec::len);
+        self.loose.borrow_mut().push(Loose { number, over, make });
+        self.moved.update(|times| *times += 1);
+    }
+
+    fn depth(&self) -> usize {
+        self.path.with(Vec::len) + self.loose.borrow().len()
     }
 }
 
@@ -234,6 +346,8 @@ impl<R: Clone + PartialEq> Kept<R> {
 /// makes the body run: it is written inside the body, and only there.
 struct Shelf<R> {
     kept: Rc<RefCell<Kept<R>>>,
+    /// The pages with no route, in the order they were opened.
+    loose: Rc<RefCell<Vec<Loose>>>,
     /// True while the stack makes its pages. A page that speaks then is
     /// read by the stack in the same run; one that speaks at another time
     /// has to make the stack run.
@@ -242,7 +356,7 @@ struct Shelf<R> {
 
 impl<R> Clone for Shelf<R> {
     fn clone(&self) -> Self {
-        Self { kept: Rc::clone(&self.kept), making: Rc::clone(&self.making) }
+        Self { kept: Rc::clone(&self.kept), loose: Rc::clone(&self.loose), making: Rc::clone(&self.making) }
     }
 }
 
@@ -431,33 +545,40 @@ where
     fn body(self) -> impl View {
         let shelf = State::new(Shelf {
             kept: Rc::new(RefCell::new(Kept { pages: Vec::new(), made: 0 })),
+            loose: Rc::new(RefCell::new(Vec::new())),
             making: Rc::new(Cell::new(false)),
         })
         .get();
+        // read, so that a page with no route that comes or goes runs this body
+        let moved = State::new(0u64);
+        moved.get();
         let routes = self.path.wrappedValue();
-        let numbers = shelf.kept.borrow_mut().numbers(&routes);
-        Laid { path: self.path, root: self.root, destination: self.destination, routes, numbers, making: shelf.making }
+        let (numbers, same) = shelf.kept.borrow_mut().numbers(&routes);
+        // a page with no route stays while the routes under it are the same
+        shelf.loose.borrow_mut().retain(|page| page.over <= same);
+        let pages = entries(&routes, &numbers, &shelf.loose.borrow());
+        let doors = Doors { path: self.path, kept: shelf.kept, loose: shelf.loose, moved };
+        Laid { doors, root: self.root, destination: self.destination, pages, making: shelf.making }
     }
 }
 
 /// The pages of one run: every page is made, and the one on top is laid.
 struct Laid<R: 'static, Root, V> {
-    path: Binding<Vec<R>>,
+    doors: Doors<R>,
     root: Root,
     destination: Rc<dyn Fn(R) -> V>,
-    routes: Vec<R>,
-    numbers: Vec<u64>,
+    /// The pages over the root, the one on top last.
+    pages: Vec<Entry<R>>,
     making: Rc<Cell<bool>>,
 }
 
 impl<R: Clone + 'static, Root: Clone, V> Clone for Laid<R, Root, V> {
     fn clone(&self) -> Self {
         Self {
-            path: self.path.clone(),
+            doors: self.doors.clone(),
             root: self.root.clone(),
             destination: Rc::clone(&self.destination),
-            routes: self.routes.clone(),
-            numbers: self.numbers.clone(),
+            pages: self.pages.clone(),
             making: Rc::clone(&self.making),
         }
     }
@@ -472,8 +593,8 @@ where
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let depth = self.routes.len();
-        let stack = navigator(&self.path);
+        let depth = self.pages.len();
+        let stack = navigator(&self.doors);
         let _making = Making::start(&self.making);
 
         let mut prints = Vec::with_capacity(depth + 2);
@@ -482,7 +603,7 @@ where
         for place in 0..=depth {
             let covered = place < depth;
             let key: Cow<'static, str> =
-                if place == 0 { Cow::Borrowed("root") } else { Cow::Owned(format!("p{}", self.numbers[place - 1])) };
+                if place == 0 { Cow::Borrowed("root") } else { Cow::Owned(format!("p{}", self.pages[place - 1].number())) };
             let mut page = NodeList::new();
             {
                 // a page is its own scope: its state lives under its key,
@@ -519,10 +640,10 @@ where
                         crate::reconciler::attribute_context(scope, crate::reconciler::FOCUS_RETURN, false);
                     }
                 }
-                if place == 0 {
-                    self.root.render_into(&inside, &mut page);
-                } else {
-                    (self.destination)(self.routes[place - 1].clone()).render_into(&inside, &mut page);
+                match place.checked_sub(1).map(|over_root| &self.pages[over_root]) {
+                    None => self.root.render_into(&inside, &mut page),
+                    Some(Entry::Route(route, _)) => (self.destination)(route.clone()).render_into(&inside, &mut page),
+                    Some(Entry::Loose(loose)) => (loose.make)().render_into(&inside, &mut page),
                 }
                 if !covered {
                     // read AFTER the page was made: a page that ran in
@@ -546,11 +667,11 @@ where
         {
             // only a stack with a page to leave answers "back": the one
             // around it answers when this one is at its root
-            let path = self.path.clone();
+            let doors = self.doors.clone();
             // the keys of "back" answer while this stands, and only then
             crate::reconciler::attribute_context(scope.clone(), crate::action::NAV_CONTEXT, false);
             crate::reconciler::attribute_handler(scope, NAV_BACK, Rc::new(move || {
-                path.pop();
+                doors.leave();
             }));
         }
         let page = wrap_layout(top);
@@ -588,13 +709,13 @@ where
     /// its title, and its other items at the trailing edge.
     fn under_a_bar(&self, ctx: &Context, said: Said, page: LayoutNode) -> impl View<Arity = Single> + use<R, Root, V> {
         let theme = crate::theme::current();
-        let back = (!self.routes.is_empty()).then(|| {
+        let back = (!self.pages.is_empty()).then(|| {
             let words = Words::for_locale(&ctx.environment::<Locale>());
             // the arrow points where the page under this one is
             let glyph = if ctx.environment::<LayoutDirection>().is_rtl() { symbol::CHEVRON_RIGHT } else { symbol::CHEVRON_LEFT };
-            let path = self.path.clone();
+            let doors = self.doors.clone();
             button(icon(glyph).frame(28.0, 28.0), move || {
-                path.pop();
+                doors.leave();
             })
             .plain()
             .accessibility_label(&*words.get(Word::Back))
@@ -635,19 +756,25 @@ impl View for Made {
 /// The stack's three doors, for the views inside its pages. They hold the
 /// path and no page, so a page that was kept from an earlier run pushes
 /// on the path as it is now.
-fn navigator<R: Clone + 'static>(path: &Binding<Vec<R>>) -> Navigator {
-    let (push, pop, depth) = (path.clone(), path.clone(), path.clone());
+fn navigator<R: Clone + PartialEq + 'static>(doors: &Doors<R>) -> Navigator {
+    let (push, pop, depth) = (doors.clone(), doors.clone(), doors.clone());
     Navigator::new(
-        move |route: Box<dyn Any>| match route.downcast::<R>() {
+        move |word: Box<dyn Any>| match word.downcast::<R>() {
             Ok(route) => {
-                push.push(*route);
+                push.path.push(*route);
                 true
             }
-            // a route of another stack's type: this stack has no page for it
-            Err(_) => false,
+            Err(word) => match word.downcast::<Opens>() {
+                Ok(opens) => {
+                    push.open(opens.0);
+                    true
+                }
+                // a route of another stack's type: this stack has no page for it
+                Err(_) => false,
+            },
         },
-        move || pop.pop(),
-        move || depth.with(Vec::len),
+        move || pop.leave(),
+        move || depth.depth(),
     )
 }
 
@@ -706,28 +833,66 @@ pub fn navigation_stack_content<Root: View>(root: Root) -> NavigationStackConten
     NavigationStackContent { root, site: crate::provenance::here() }
 }
 
-/// A view that pushes a route when it is pressed ([`nav_link_value`]).
+/// What a link shows: words, or any view.
+///
+/// `nav_link("About", …)` and `nav_link(CountryCell::new(country), …)`
+/// are both a label.
+pub trait IntoLabel {
+    /// The view the link shows.
+    type Label: View;
+    /// The label as a view.
+    fn into_label(self) -> Self::Label;
+}
+
+impl IntoLabel for &str {
+    type Label = crate::views::Text;
+
+    fn into_label(self) -> Self::Label {
+        text(self)
+    }
+}
+
+impl IntoLabel for String {
+    type Label = crate::views::Text;
+
+    fn into_label(self) -> Self::Label {
+        text(self)
+    }
+}
+
+impl<V: View> IntoLabel for V {
+    type Label = V;
+
+    fn into_label(self) -> V {
+        self
+    }
+}
+
+/// A view that opens a page when it is pressed ([`nav_link`],
+/// [`nav_link_value`]).
 #[derive(Clone)]
-pub struct NavLink<L, R> {
+pub struct NavLink<L> {
     label: L,
-    route: R,
+    /// What a press tells the stack the link stands in.
+    open: Rc<dyn Fn(&Navigator)>,
+    kind: NodeKind,
     site: Site,
 }
 
-impl<L: View + Clone + 'static, R: Clone + 'static> View for NavLink<L, R> {
+impl<L: View> View for NavLink<L> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         let stack = ctx.environment::<Option<Navigator>>();
         let outside = stack.is_none();
-        let route = self.route.clone();
+        let open = Rc::clone(&self.open);
         crate::provenance::quiet(|| {
             control(
                 self.label.clone(),
                 move || {
                     if let Some(stack) = &stack {
-                        stack.push(route.clone());
+                        open(stack);
                     }
                 },
                 ControlSpec {
@@ -742,20 +907,55 @@ impl<L: View + Clone + 'static, R: Clone + 'static> View for NavLink<L, R> {
             )
             .render_into(ctx, out);
         });
-        crate::provenance::seal(ctx, out, mark, self.site, NodeKind::NavLink, None);
+        crate::provenance::seal(ctx, out, mark, self.site, self.kind, None);
     }
 }
 
 /// A view that pushes `route` on the stack it stands in when it is
 /// pressed: `nav_link_value(CountryCell::new(country), Route::Country(country))`.
 ///
-/// The label is any view, and it draws everything: the link adds no
-/// padding and no colour. Space and Enter press it, and it is a button
-/// to assistive technology. Outside every stack it is disabled. On a
-/// stack whose routes are of another type it does nothing.
+/// The label is words or any view, and a view draws everything: the link
+/// adds no padding and no colour. Space and Enter press it, and it is a
+/// button to assistive technology. Outside every stack it is disabled.
+/// On a stack whose routes are of another type it does nothing.
 #[track_caller]
-pub fn nav_link_value<L: View + Clone + 'static, R: Clone + 'static>(label: L, route: R) -> NavLink<L, R> {
-    NavLink { label, route, site: crate::provenance::here() }
+pub fn nav_link_value<L: IntoLabel, R: Clone + 'static>(label: L, route: R) -> NavLink<L::Label> {
+    NavLink {
+        label: label.into_label(),
+        open: Rc::new(move |stack| {
+            stack.push(route.clone());
+        }),
+        kind: NodeKind::NavLinkValue,
+        site: crate::provenance::here(),
+    }
+}
+
+/// A view that opens the page `destination` makes when it is pressed:
+/// `nav_link("About", || About)`.
+///
+/// The page has no route and is not in the path. It stands over the
+/// pages the stack shows when it opens. The button of the bar, the
+/// platform's "back" and the keys of "back" leave it; the app's own
+/// `path.pop()` does not see it. A route that is pushed later goes over
+/// it, and a write of the path that changes a route under it takes it
+/// away. A place the app must be able to open by itself, or restore,
+/// takes a route and [`nav_link_value`].
+#[track_caller]
+pub fn nav_link<L, V, F>(label: L, destination: F) -> NavLink<L::Label>
+where
+    L: IntoLabel,
+    V: View<Arity = Single>,
+    F: Fn() -> V + 'static,
+{
+    let make: Rc<dyn Fn() -> Erased> = Rc::new(move || Erased::new(destination()));
+    NavLink {
+        label: label.into_label(),
+        open: Rc::new(move |stack| {
+            stack.push(Opens(Rc::clone(&make)));
+        }),
+        kind: NodeKind::NavLink,
+        site: crate::provenance::here(),
+    }
 }
 
 #[cfg(test)]
@@ -765,12 +965,26 @@ mod tests {
     #[test]
     fn a_page_keeps_its_number_while_the_path_still_starts_with_its_route() {
         let mut kept = Kept { pages: Vec::new(), made: 0 };
-        assert_eq!(kept.numbers(&["a", "b"]), [1, 2]);
-        assert_eq!(kept.numbers(&["a", "b", "c"]), [1, 2, 3], "a push keeps the pages under it");
-        assert_eq!(kept.numbers(&["a", "b"]), [1, 2], "a pop keeps them too");
-        assert_eq!(kept.numbers(&["a", "c"]), [1, 4], "another route at the same place is another page");
-        assert_eq!(kept.numbers(&["a", "c", "b"]), [1, 4, 5], "and the route that left comes back as a new page");
-        assert_eq!(kept.numbers(&[]), [0u64; 0]);
-        assert_eq!(kept.numbers(&["a"]), [6], "a number is never used twice");
+        assert_eq!(kept.numbers(&["a", "b"]), (vec![1, 2], 0));
+        assert_eq!(kept.numbers(&["a", "b", "c"]), (vec![1, 2, 3], 2), "a push keeps the pages under it");
+        assert_eq!(kept.numbers(&["a", "b"]), (vec![1, 2], 2), "a pop keeps them too");
+        assert_eq!(kept.numbers(&["a", "c"]), (vec![1, 4], 1), "another route at the same place is another page");
+        assert_eq!(kept.numbers(&["a", "c", "b"]), (vec![1, 4, 5], 2), "and the route that left comes back as a new page");
+        assert_eq!(kept.numbers(&[]), (vec![], 0));
+        assert_eq!(kept.number(), 6, "a page with no route takes a number of the same count");
+        assert_eq!(kept.numbers(&["a"]), (vec![7], 0), "a number is never used twice");
+    }
+
+    #[test]
+    fn a_page_with_no_route_stands_after_the_routes_it_was_opened_over() {
+        let page = |number: u64, over: usize| Loose { number, over, make: Rc::new(|| Erased::new(EmptyView)) };
+        let order = |routes: &[&str], numbers: &[u64], loose: &[Loose]| -> Vec<u64> {
+            entries(routes, numbers, loose).iter().map(Entry::number).collect()
+        };
+        assert_eq!(order(&[], &[], &[page(9, 0)]), [9], "over the root");
+        assert_eq!(order(&["a", "b"], &[1, 2], &[page(9, 2)]), [1, 2, 9], "over the whole path");
+        // a route pushed later goes over it
+        assert_eq!(order(&["a", "b", "c"], &[1, 2, 3], &[page(9, 2)]), [1, 2, 9, 3]);
+        assert_eq!(order(&["a"], &[1], &[page(8, 0), page(9, 1), page(10, 1)]), [8, 1, 9, 10]);
     }
 }

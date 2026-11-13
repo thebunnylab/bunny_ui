@@ -591,6 +591,113 @@ fn a_root_with_items_and_no_title_has_a_bar() {
     assert!(element(&runtime, &table, "Lock").origin.y >= 45.0);
 }
 
+/// A page that no route names: a link makes it.
+#[derive(Clone, Copy)]
+struct Notes;
+
+impl Component for Notes {
+    fn body(self) -> impl View {
+        let taps = State::new(0u32);
+        vstack!(
+            text!("Notes taps {}", taps),
+            button(text("Tap notes"), move || taps.add(1)),
+            nav_link_value("Open item 9", Route::Item(9)),
+        )
+        .navigation_title("Notes")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Shop {
+    path: State<Vec<Route>>,
+}
+
+impl Component for Shop {
+    fn body(self) -> impl View {
+        let root = vstack!(nav_link("About the shop", || Notes), nav_link_value("Open item 1", Route::Item(1)))
+            .navigation_title("Shop");
+        navigation_stack(self.path, root).destination(|route| match route {
+            Route::Item(number) => Either::First(
+                vstack!(text!("Item {}", number), nav_link(text("Notes on it"), || Notes)).navigation_title("An item"),
+            ),
+            Route::About => Either::Second(text("About this app")),
+        })
+    }
+}
+
+fn titles(runtime: &Runtime, view: &impl View) -> Vec<String> {
+    elements(runtime, view).into_iter().filter(|(role, _, _)| *role == Role::Text).map(|(_, label, _)| label).collect()
+}
+
+#[test]
+fn a_link_opens_a_page_that_has_no_route() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(Vec::new()) };
+    // the label is words: a button named by them
+    assert!(elements(&runtime, &shop).iter().any(|(role, label, _)| *role == Role::Button && label == "About the shop"));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+    assert!(shop.path.get().is_empty(), "the page is not in the path");
+
+    // the button of the bar leaves it, and so do "back" and its keys
+    press_on(&runtime, &shop, "Back");
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(runtime.navigate_back());
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    press_on(&runtime, &shop, "About the shop");
+    assert!(runtime.offer_key(KeyPattern::command(Key::Char('['))));
+    assert!(titles(&runtime, &shop).contains(&"Shop".to_string()));
+    assert!(!runtime.navigate_back(), "and then the root has nothing under it");
+    // the same link again makes a new page
+    press_on(&runtime, &shop, "About the shop");
+    press_on(&runtime, &shop, "Tap notes");
+    press_on(&runtime, &shop, "Back");
+    press_on(&runtime, &shop, "About the shop");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+}
+
+#[test]
+fn a_route_goes_over_a_page_with_no_route_and_back_returns_to_it() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(vec![Route::Item(1)]) };
+    press_on(&runtime, &shop, "Notes on it");
+    press_on(&runtime, &shop, "Tap notes");
+    press_on(&runtime, &shop, "Tap notes");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 2".to_string()));
+
+    // a route pushed from it stands over it
+    press_on(&runtime, &shop, "Open item 9");
+    assert_eq!(shop.path.get(), [Route::Item(1), Route::Item(9)]);
+    assert!(titles(&runtime, &shop).contains(&"Item 9".to_string()));
+    // back: the page with no route again, as it was left
+    assert!(runtime.navigate_back());
+    assert_eq!(shop.path.get(), [Route::Item(1)]);
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 2".to_string()));
+    assert!(runtime.navigate_back());
+    assert!(titles(&runtime, &shop).contains(&"Item 1".to_string()));
+    assert_eq!(shop.path.get(), [Route::Item(1)], "leaving it wrote nothing to the path");
+}
+
+#[test]
+fn a_write_that_changes_a_route_under_it_takes_a_page_with_no_route_away() {
+    let runtime = runtime();
+    let shop = Shop { path: State::new(vec![Route::Item(1)]) };
+    press_on(&runtime, &shop, "Notes on it");
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+    // the app's own pop does not see the page: it takes the route under it
+    assert!(shop.path.pop());
+    let shown = titles(&runtime, &shop);
+    assert!(shown.contains(&"Shop".to_string()) && !shown.iter().any(|title| title.starts_with("Notes taps")), "{shown:?}");
+
+    // over the root there is no route under it: a route that comes and goes leaves it there
+    press_on(&runtime, &shop, "About the shop");
+    shop.path.push(Route::Item(4));
+    assert!(titles(&runtime, &shop).contains(&"Item 4".to_string()));
+    shop.path.pop_to_root();
+    assert!(titles(&runtime, &shop).contains(&"Notes taps 0".to_string()));
+}
+
 #[test]
 fn a_root_with_no_title_has_no_bar() {
     #[derive(Clone, Copy)]
@@ -644,7 +751,7 @@ fn it_lowers_the_page_on_top_to_the_web_and_a_tool_sees_only_the_apps_lines() {
     let sites = runtime.sites();
     runtime.record_sites(false);
     assert!(sites.iter().any(|site| site.kind == NodeKind::NavigationStack));
-    assert!(sites.iter().any(|site| site.kind == NodeKind::NavLink));
+    assert!(sites.iter().any(|site| site.kind == NodeKind::NavLinkValue));
     for site in &sites {
         if let Site::Caller(location) = site.site {
             // a path reads with either separator, by the platform that built it
