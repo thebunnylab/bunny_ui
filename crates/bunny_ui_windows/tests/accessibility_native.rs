@@ -125,6 +125,35 @@ mod probe {
         unknown: Unknown,
         invoke: unsafe extern "system" fn(Object) -> Hresult,
     }
+    const SELECTION_ITEM_IID: Guid = Guid {
+        d1: 0xa8efa66a,
+        d2: 0x0fda,
+        d3: 0x421a,
+        d4: [0x91, 0x94, 0x38, 0x02, 0x1f, 0x35, 0x78, 0xea],
+    };
+    const EXPAND_COLLAPSE_IID: Guid = Guid {
+        d1: 0x619be086,
+        d2: 0x1f4e,
+        d3: 0x4ee4,
+        d4: [0xba, 0xfa, 0x21, 0x01, 0x28, 0x73, 0x87, 0x30],
+    };
+    // UIAutomationClient.h: the prefix through get_CurrentIsSelected.
+    #[repr(C)]
+    struct SelectionItemPattern {
+        unknown: Unknown,
+        select: unsafe extern "system" fn(Object) -> Hresult,
+        add: unsafe extern "system" fn(Object) -> Hresult,
+        remove: unsafe extern "system" fn(Object) -> Hresult,
+        selected: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+    }
+    // UIAutomationClient.h: the prefix through get_CurrentExpandCollapseState.
+    #[repr(C)]
+    struct ExpandCollapsePattern {
+        unknown: Unknown,
+        expand: unsafe extern "system" fn(Object) -> Hresult,
+        collapse: unsafe extern "system" fn(Object) -> Hresult,
+        state: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+    }
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Variant {
@@ -334,7 +363,9 @@ mod probe {
                 }))
                 .cast(),
             );
-            let properties = [30005, 30045, 30008, 30010, 30086, 30047, 30048];
+            // name, value, focus, enabled, toggle state, range value and
+            // read-only, expand/collapse state, is selected
+            let properties = [30005, 30045, 30008, 30010, 30086, 30047, 30048, 30070, 30079];
             unsafe {
                 succeeded((client.table::<Client>().add_properties)(
                     client.0,
@@ -591,6 +622,65 @@ mod probe {
         }
     }
 
+    /// One of a set and a button that opens a list, as UI Automation
+    /// itself reads them: which patterns it finds on each, and what the
+    /// patterns do. A pattern is found only when the provider answers the
+    /// interface id UI Automation asks for.
+    unsafe fn exercise_choices(client: &Owned, root: &Owned) {
+        unsafe {
+            let (compact, roomy) = (named(client, root, "Compact"), named(client, root, "Roomy"));
+            assert_eq!(read_integer(&roomy, 30003, 3), 50013, "RadioButton");
+            assert_ne!(read_integer(&roomy, 30036, 11), 0, "SelectionItem is found");
+            assert_eq!(read_integer(&roomy, 30031, 11), 0, "and Invoke is not");
+            assert_ne!(read_integer(&compact, 30079, 11), 0, "the first is selected");
+            assert_eq!(read_integer(&roomy, 30079, 11), 0);
+            let stable = identity(&roomy);
+            let events = Events::subscribe(client, &roomy);
+            let item = pattern(&roomy, 10010, &SELECTION_ITEM_IID);
+            let table = item.table::<SelectionItemPattern>();
+            let mut selected = -1;
+            succeeded((table.selected)(item.0, &mut selected));
+            assert_eq!(selected, 0);
+            // a set of one selection: a second element cannot join it
+            assert!((table.add)(item.0) < 0);
+            succeeded((table.select)(item.0));
+            until("selection follows Select", || read_integer(&roomy, 30079, 11) != 0);
+            until("the other leaves the selection", || read_integer(&compact, 30079, 11) == 0);
+            succeeded((table.selected)(item.0, &mut selected));
+            assert_ne!(selected, 0);
+            // the selection is always there: the selected element cannot leave it
+            assert!((table.remove)(item.0) < 0);
+            until("selection notification", || events.saw(30079, "true"));
+            assert_eq!(identity(&roomy), stable);
+            drop(events);
+
+            let theme = named(client, root, "Theme");
+            assert_eq!(read_integer(&theme, 30003, 3), 50003, "ComboBox");
+            assert_ne!(read_integer(&theme, 30028, 11), 0, "ExpandCollapse is found");
+            assert_eq!(read_integer(&theme, 30031, 11), 0, "and Invoke is not");
+            assert_eq!(read_integer(&theme, 30070, 3), 0, "collapsed");
+            assert_eq!(read_string(&theme, 30045), "Dark", "its value is the choice it shows");
+            assert_ne!(read_integer(&theme, 30046, 11), 0, "and nobody can set it");
+            let events = Events::subscribe(client, &theme);
+            let list = pattern(&theme, 10005, &EXPAND_COLLAPSE_IID);
+            let table = list.table::<ExpandCollapsePattern>();
+            let mut open = -1;
+            succeeded((table.state)(list.0, &mut open));
+            assert_eq!(open, 0);
+            succeeded((table.collapse)(list.0)); // closed already: nothing to do
+            succeeded((table.expand)(list.0));
+            until("the list opens", || read_integer(&theme, 30070, 3) == 1);
+            until("expanded notification", || events.saw(30070, "1"));
+            succeeded((table.collapse)(list.0));
+            until("the list closes", || read_integer(&theme, 30070, 3) == 0);
+            assert_eq!(read_string(&theme, 30045), "Dark", "opening the list chose nothing");
+            drop(events);
+            println!(
+                "UIA SelectionItem select, single-selection contract and event; ExpandCollapse state, expand, collapse and event; read-only value passed"
+            );
+        }
+    }
+
     fn until(label: &str, mut check: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -818,6 +908,7 @@ mod probe {
             println!(
                 "UIA checkbox Toggle, state, focus, enabled rejection and notifications passed"
             );
+            exercise_choices(&client, &root);
             println!("UIA phase: locate retiring row");
             let row = named(&client, &root, "Row 2");
             println!("UIA phase: retiring row located");
@@ -906,6 +997,8 @@ mod probe {
         rate: State<f64>,
         checked: State<bool>,
         disabled: State<bool>,
+        density: State<u8>,
+        theme: State<u8>,
     }
     impl Component for Form {
         fn body(self) -> impl View {
@@ -927,6 +1020,9 @@ mod probe {
                 .accessibility_label("Refresh rate"),
                 checkbox(text("Reimbursable"), self.checked.binding())
                     .disabled(self.disabled.get()),
+                segmented(self.density.binding(), [(0, "Compact"), (1, "Roomy")]),
+                picker(self.theme.binding(), [(0, "System"), (1, "Dark")])
+                    .accessibility_label("Theme"),
                 button(text("Toggle controls"), move || self
                     .disabled
                     .set(!self.disabled.get())),
@@ -973,6 +1069,8 @@ mod probe {
             rate: State::new(0.0),
             checked: State::new(false),
             disabled: State::new(false),
+            density: State::new(0),
+            theme: State::new(1),
             rows: State::new(vec![1, 2]),
             modal: State::new(first_modal),
         };
