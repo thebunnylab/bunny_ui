@@ -3872,23 +3872,6 @@ pub fn list_content<C: View>(children: C) -> Section<EmptyView, C> {
 
 // MARK: - Navigation
 
-/// `ToolbarItem { … }` — exists in the API; the fake runtime's `.toolbar` is
-/// inert and never mounts it (parity with the engine, which also drops the content).
-#[derive(Clone)]
-pub struct ToolbarItem;
-
-impl View for ToolbarItem {
-    type Arity = Single;
-
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(crate::view::print_label("ToolbarItem")));
-    }
-}
-
-pub fn toolbar_item<C: View>(_content: C) -> ToolbarItem {
-    ToolbarItem
-}
-
 /// `WindowGroup { … }` (Scene level)
 #[derive(Clone)]
 pub struct WindowGroup<C> {

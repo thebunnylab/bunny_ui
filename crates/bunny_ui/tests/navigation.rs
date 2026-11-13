@@ -457,6 +457,140 @@ fn the_back_button_is_named_in_the_readers_language_and_changes_sides_right_to_l
     assert!(right_to_left.origin.x > SIZE.width / 2.0, "the leading edge is on the right");
 }
 
+thread_local! {
+    static ROWS_RUNS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A page with items in its bar: one that is always there, at the
+/// leading side, and one that reads the page's state and can leave.
+#[derive(Clone, Copy)]
+struct Rows {
+    added: State<u32>,
+    edited: State<u32>,
+    locked: State<bool>,
+    titled: bool,
+}
+
+impl Component for Rows {
+    fn body(self) -> impl View {
+        count(&ROWS_RUNS);
+        let rows = self.added.get();
+        let page = vstack!(
+            text!("Rows {}", self.added),
+            button(text("Lock"), move || self.locked.set(!self.locked.get())),
+        )
+        .toolbar((
+            toolbar_item(button(text("Edit"), move || self.edited.add(1))).leading(),
+            toolbar_item((!self.locked.get()).then(|| button(text(format!("Add {rows}")), move || self.added.add(1)))),
+        ));
+        if self.titled { Either::First(page.navigation_title("All rows")) } else { Either::Second(page) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Table {
+    path: State<Vec<Route>>,
+    rows: Rows,
+}
+
+impl Table {
+    fn new(titled: bool) -> Self {
+        Self {
+            path: State::new(Vec::new()),
+            rows: Rows { added: State::new(0), edited: State::new(0), locked: State::new(false), titled },
+        }
+    }
+}
+
+impl Component for Table {
+    fn body(self) -> impl View {
+        let rows = self.rows;
+        navigation_stack(self.path, rows).destination(move |_| rows)
+    }
+}
+
+/// The elements of the frame, in the order assistive technology has them.
+fn elements(runtime: &Runtime, view: &impl View) -> Vec<(Role, String, Rect)> {
+    runtime.display_frame(view, SIZE);
+    runtime.accessibility_tree().nodes().iter().map(|node| (node.role, node.label.to_string(), node.bounds)).collect()
+}
+
+fn element(runtime: &Runtime, view: &impl View, label: &str) -> Rect {
+    elements(runtime, view)
+        .into_iter()
+        .find(|(_, name, _)| name == label)
+        .unwrap_or_else(|| panic!("nothing is named {label:?}"))
+        .2
+}
+
+fn press_on(runtime: &Runtime, view: &impl View, label: &str) {
+    let rect = element(runtime, view, label);
+    let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+    runtime.pointer_pressed(x, y);
+    runtime.pointer_released(x, y);
+    runtime.display_frame(view, SIZE);
+}
+
+#[test]
+fn a_page_puts_its_items_in_the_bar_on_the_side_it_names() {
+    let runtime = runtime();
+    let table = Table::new(true);
+    let (edit, title, add) = (element(&runtime, &table, "Edit"), element(&runtime, &table, "All rows"), element(&runtime, &table, "Add 0"));
+    assert!(edit.origin.x < title.origin.x, "a leading item stands before the title");
+    assert!(title.origin.x < add.origin.x, "and the other at the trailing edge");
+    assert!(add.origin.x + add.size.width > SIZE.width - 20.0);
+    for item in [edit, add] {
+        assert!(item.origin.y + item.size.height <= 44.0, "inside the bar");
+    }
+    assert!(element(&runtime, &table, "Lock").origin.y >= 45.0, "the page is under the bar");
+
+    // over a page that was pushed: the button that goes back, then the leading item
+    table.path.push(Route::About);
+    let (back, edit) = (element(&runtime, &table, "Back"), element(&runtime, &table, "Edit"));
+    assert!(back.origin.x < edit.origin.x);
+    // Tab: the bar from its leading edge, then the page
+    let mut stops = Vec::new();
+    for _ in 0..4 {
+        assert!(runtime.offer_key(KeyPattern::key(Key::Tab)));
+        runtime.display_frame(&table, SIZE);
+        let tree = runtime.accessibility_tree();
+        stops.push(tree.nodes().iter().find(|node| node.focused).map(|node| node.label.to_string()).unwrap_or_default());
+    }
+    assert_eq!(stops, ["Back", "Edit", "Add 0", "Lock"]);
+}
+
+#[test]
+fn the_items_are_the_pages_own_and_follow_its_state() {
+    let runtime = runtime();
+    let table = Table::new(true);
+    runtime.display_frame(&table, SIZE);
+    let made = runs(&ROWS_RUNS);
+
+    press_on(&runtime, &table, "Edit");
+    assert_eq!(table.rows.edited.get(), 1, "an item runs its action");
+    press_on(&runtime, &table, "Add 0");
+    assert_eq!(table.rows.added.get(), 1);
+    // the page ran because its state moved, and said its items again:
+    // the bar shows the new ones
+    let labels: Vec<_> = elements(&runtime, &table).into_iter().map(|(_, label, _)| label).collect();
+    assert!(labels.iter().any(|label| label == "Add 1") && !labels.iter().any(|label| label == "Add 0"), "{labels:?}");
+    assert_eq!(runs(&ROWS_RUNS), made + 1, "one run of the page for one change of its state");
+
+    // an item that the page stops making leaves the bar
+    press_on(&runtime, &table, "Lock");
+    let labels: Vec<_> = elements(&runtime, &table).into_iter().map(|(_, label, _)| label).collect();
+    assert!(labels.iter().any(|label| label == "Edit") && !labels.iter().any(|label| label.starts_with("Add")), "{labels:?}");
+}
+
+#[test]
+fn a_root_with_items_and_no_title_has_a_bar() {
+    let runtime = runtime();
+    let table = Table::new(false);
+    let add = element(&runtime, &table, "Add 0");
+    assert!(add.origin.y + add.size.height <= 44.0);
+    assert!(element(&runtime, &table, "Lock").origin.y >= 45.0);
+}
+
 #[test]
 fn a_root_with_no_title_has_no_bar() {
     #[derive(Clone, Copy)]

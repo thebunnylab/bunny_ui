@@ -52,9 +52,20 @@
 //! The stack draws a bar over the page on top: the button that goes
 //! back, where there is a page to leave, and the title the page gave
 //! itself with `.navigation_title(…)`. The title is the page's, so it
-//! may read the page's state and it changes with it. A root with no
-//! title has no bar. The button is named "Back" in the reader's
-//! language, and it is the first Tab stop of a page.
+//! may read the page's state and it changes with it. The button is named
+//! "Back" in the reader's language, and it is the first Tab stop of a
+//! page.
+//!
+//! ```ignore
+//! page.toolbar((toolbar_item(edit_button()).leading(), toolbar_item(add_button())))
+//! ```
+//!
+//! A page puts views of its own in the bar with `.toolbar(…)`. An item
+//! stands at the trailing edge, or after the button that goes back when
+//! it is `.leading()`. The items are the page's too: a page says them
+//! each time its body runs, and the bar shows the last ones it said.
+//!
+//! A root that says no title and no item has no bar.
 //!
 //! ## Back
 //!
@@ -67,7 +78,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -221,11 +232,176 @@ impl<R: Clone + PartialEq> Kept<R> {
 
 /// The stack's memory, shared by the runs of its body. Reading it never
 /// makes the body run: it is written inside the body, and only there.
-struct Shelf<R>(Rc<RefCell<Kept<R>>>);
+struct Shelf<R> {
+    kept: Rc<RefCell<Kept<R>>>,
+    /// True while the stack makes its pages. A page that speaks then is
+    /// read by the stack in the same run; one that speaks at another time
+    /// has to make the stack run.
+    making: Rc<Cell<bool>>,
+}
 
 impl<R> Clone for Shelf<R> {
     fn clone(&self) -> Self {
-        Self(Rc::clone(&self.0))
+        Self { kept: Rc::clone(&self.kept), making: Rc::clone(&self.making) }
+    }
+}
+
+/// What a view of a page tells the stack the page stands in. It travels
+/// through [`Navigator::tell`], which knows no type of this crate.
+pub(crate) enum PageWord {
+    /// `.navigation_title(…)`.
+    Title(Arc<str>),
+    /// `.toolbar(…)`.
+    Items(BarItems),
+}
+
+/// One view of a bar, made when the bar is.
+type BarItem = Rc<dyn Fn(&Context, &mut NodeList)>;
+
+/// The views a page puts in its bar, by the side they stand on.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct BarItems {
+    leading: Vec<BarItem>,
+    trailing: Vec<BarItem>,
+}
+
+impl BarItems {
+    fn is_empty(&self) -> bool {
+        self.leading.is_empty() && self.trailing.is_empty()
+    }
+
+    fn take(&mut self, more: BarItems) {
+        self.leading.extend(more.leading);
+        self.trailing.extend(more.trailing);
+    }
+}
+
+/// What a page told its stack, kept in the page's own scope.
+#[derive(Clone, Default)]
+struct Said {
+    title: Option<Arc<str>>,
+    items: BarItems,
+}
+
+#[derive(Clone, Default)]
+struct Told(Rc<RefCell<Said>>);
+
+impl Told {
+    /// Keeps the word. `true` when what the bar shows is different now.
+    fn hear(&self, word: &PageWord) -> bool {
+        let mut said = self.0.borrow_mut();
+        match word {
+            PageWord::Title(title) if said.title.as_ref() == Some(title) => false,
+            PageWord::Title(title) => {
+                said.title = Some(Arc::clone(title));
+                true
+            }
+            // two views are not compared: new items are different items
+            PageWord::Items(items) => {
+                said.items = items.clone();
+                true
+            }
+        }
+    }
+}
+
+/// One view of a page's bar ([`toolbar_item`]).
+#[derive(Clone)]
+pub struct ToolbarItem<C> {
+    content: C,
+    leading: bool,
+}
+
+impl<C> ToolbarItem<C> {
+    /// The item stands at the leading side of the bar, after the button
+    /// that goes back. An item stands at the trailing side when this is
+    /// not said.
+    #[must_use]
+    pub fn leading(mut self) -> Self {
+        self.leading = true;
+        self
+    }
+}
+
+/// One view of a page's bar: `toolbar_item(button(text("Add"), add))`.
+///
+/// The view is any view. `None` is no item, so
+/// `toolbar_item(self.can_edit.then(|| edit_button()))` is an item that
+/// is there only while the page allows it.
+pub fn toolbar_item<C: View>(content: C) -> ToolbarItem<C> {
+    ToolbarItem { content, leading: false }
+}
+
+/// What `.toolbar(…)` takes: one [`toolbar_item`], or a tuple of up to
+/// eight.
+pub trait ToolbarItems {
+    #[doc(hidden)]
+    fn into_bar(self) -> BarItems;
+}
+
+impl<C: View> ToolbarItems for ToolbarItem<C> {
+    fn into_bar(self) -> BarItems {
+        let content = self.content;
+        let item: BarItem = Rc::new(move |ctx, out| content.render_into(ctx, out));
+        if self.leading {
+            BarItems { leading: vec![item], trailing: Vec::new() }
+        } else {
+            BarItems { leading: Vec::new(), trailing: vec![item] }
+        }
+    }
+}
+
+macro_rules! toolbar_items {
+    ($($item:ident),+) => {
+        impl<$($item: ToolbarItems),+> ToolbarItems for ($($item,)+) {
+            fn into_bar(self) -> BarItems {
+                #[allow(non_snake_case)]
+                let ($($item,)+) = self;
+                let mut all = BarItems::default();
+                $(all.take($item.into_bar());)+
+                all
+            }
+        }
+    };
+}
+toolbar_items!(A);
+toolbar_items!(A, B);
+toolbar_items!(A, B, C);
+toolbar_items!(A, B, C, D);
+toolbar_items!(A, B, C, D, E);
+toolbar_items!(A, B, C, D, E, F);
+toolbar_items!(A, B, C, D, E, F, G);
+toolbar_items!(A, B, C, D, E, F, G, H);
+
+/// The items of one side of a bar, each under its own key.
+#[derive(Clone)]
+struct Items(Vec<BarItem>, &'static str);
+
+impl View for Items {
+    type Arity = crate::view::Many;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        for (place, item) in self.0.iter().enumerate() {
+            let _frame = motor::identity::enter_key(&format!("{}{place}", self.1));
+            item(ctx, out);
+        }
+    }
+}
+
+/// Says that the stack is making its pages, for as long as it lives.
+struct Making(Rc<Cell<bool>>);
+
+impl Making {
+    fn start(flag: &Rc<Cell<bool>>) -> Self {
+        flag.set(true);
+        Self(Rc::clone(flag))
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 
@@ -253,10 +429,14 @@ where
     const KEYED_LIST: bool = true;
 
     fn body(self) -> impl View {
-        let shelf = State::new(Shelf(Rc::new(RefCell::new(Kept { pages: Vec::new(), made: 0 }))));
+        let shelf = State::new(Shelf {
+            kept: Rc::new(RefCell::new(Kept { pages: Vec::new(), made: 0 })),
+            making: Rc::new(Cell::new(false)),
+        })
+        .get();
         let routes = self.path.wrappedValue();
-        let numbers = shelf.get().0.borrow_mut().numbers(&routes);
-        Laid { path: self.path, root: self.root, destination: self.destination, routes, numbers }
+        let numbers = shelf.kept.borrow_mut().numbers(&routes);
+        Laid { path: self.path, root: self.root, destination: self.destination, routes, numbers, making: shelf.making }
     }
 }
 
@@ -267,6 +447,7 @@ struct Laid<R: 'static, Root, V> {
     destination: Rc<dyn Fn(R) -> V>,
     routes: Vec<R>,
     numbers: Vec<u64>,
+    making: Rc<Cell<bool>>,
 }
 
 impl<R: Clone + 'static, Root: Clone, V> Clone for Laid<R, Root, V> {
@@ -277,6 +458,7 @@ impl<R: Clone + 'static, Root: Clone, V> Clone for Laid<R, Root, V> {
             destination: Rc::clone(&self.destination),
             routes: self.routes.clone(),
             numbers: self.numbers.clone(),
+            making: Rc::clone(&self.making),
         }
     }
 }
@@ -292,10 +474,11 @@ where
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let depth = self.routes.len();
         let stack = navigator(&self.path);
+        let _making = Making::start(&self.making);
 
         let mut prints = Vec::with_capacity(depth + 2);
         let mut top = Vec::new();
-        let mut title = None;
+        let mut bar = Said::default();
         for place in 0..=depth {
             let covered = place < depth;
             let key: Cow<'static, str> =
@@ -305,18 +488,27 @@ where
                 // a page is its own scope: its state lives under its key,
                 // and leaves with it when the route leaves the path
                 let _frame = motor::identity::enter_key(&key);
-                // what the page calls itself. It is state of the page's
-                // scope: a page whose body is kept from an earlier run
-                // says nothing in this one, and its title is still here
-                let called = State::new(None::<Arc<str>>);
+                // what the page told the stack, for the bar. It is kept
+                // in the page's scope: a page whose body is kept from an
+                // earlier run says nothing in this one, and what it said
+                // is still here
+                let told = State::new(Told::default()).get();
+                // moved when the page speaks while the stack is not making
+                // its pages: the stack reads it, and so runs after the page
+                let spoke = State::new(0u64);
+                let hear = {
+                    let (told, making) = (told.clone(), Rc::clone(&self.making));
+                    move |word: &dyn Any| {
+                        let heard = word.downcast_ref::<PageWord>().is_some_and(|word| told.hear(word));
+                        if heard && !making.get() {
+                            spoke.update(|times| *times += 1);
+                        }
+                    }
+                };
                 // the pages read their stack from the environment; the
                 // app's other values pass through as they are
                 let mut inside = ctx.clone();
-                Rc::make_mut(&mut inside.values).navigation = Some(stack.clone().for_page(move |words| {
-                    // a write that compares and records no read: the page
-                    // that says its title must not come to depend on it
-                    called.set_if_changed(Some(Arc::from(words)));
-                }));
+                Rc::make_mut(&mut inside.values).navigation = Some(stack.clone().for_page(hear));
                 if let Some(scope) = motor::identity::cursor_scope() {
                     if covered {
                         crate::reconciler::attribute_context(scope.clone(), crate::reconciler::NAV_COVERED, false);
@@ -334,8 +526,10 @@ where
                 }
                 if !covered {
                     // read AFTER the page was made: a page that ran in
-                    // this pass has just said its title
-                    title = called.get();
+                    // this pass has just spoken. The count is read so
+                    // that a page that speaks later runs the stack
+                    spoke.get();
+                    bar = told.0.borrow().clone();
                 }
             }
             // EVERY page is made, so a covered one stays mounted with its
@@ -360,13 +554,13 @@ where
             }));
         }
         let page = wrap_layout(top);
-        // a root that has no title has no bar: a stack that only holds
+        // a root that says nothing has no bar: a stack that only holds
         // one untitled view adds nothing to it
-        let laid = if depth > 0 || title.is_some() {
+        let laid = if depth > 0 || bar.title.is_some() || !bar.items.is_empty() {
             let mut whole = NodeList::new();
             // the bar is the stack's own: under its own key, beside the pages
             let _frame = motor::identity::enter_key("bar");
-            self.under_a_bar(ctx, title, page).render_into(ctx, &mut whole);
+            self.under_a_bar(ctx, bar, page).render_into(ctx, &mut whole);
             let (print, layout) = whole.into_parts();
             prints.push(RenderNode::branch(print_label("Bar"), print));
             wrap_layout(layout)
@@ -390,8 +584,9 @@ where
     V: View + 'static,
 {
     /// The page on top with the stack's bar over it: the button that goes
-    /// back, where there is a page to leave, and the page's title.
-    fn under_a_bar(&self, ctx: &Context, title: Option<Arc<str>>, page: LayoutNode) -> impl View<Arity = Single> + use<R, Root, V> {
+    /// back, where there is a page to leave, the page's leading items,
+    /// its title, and its other items at the trailing edge.
+    fn under_a_bar(&self, ctx: &Context, said: Said, page: LayoutNode) -> impl View<Arity = Single> + use<R, Root, V> {
         let theme = crate::theme::current();
         let back = (!self.routes.is_empty()).then(|| {
             let words = Words::for_locale(&ctx.environment::<Locale>());
@@ -408,7 +603,8 @@ where
             .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center)
             .frame_height(1.0)
             .background_color(theme.divider);
-        let bar = hstack((back, text(title.as_deref().unwrap_or("")).bold().truncation_mode(Truncation::End), spacer()))
+        let title = text(said.title.as_deref().unwrap_or("")).bold().truncation_mode(Truncation::End);
+        let bar = hstack((back, Items(said.items.leading, "l"), title, spacer(), Items(said.items.trailing, "t")))
             .spacing(4.0)
             .padding_edge(Edge::Leading, BAR_INSET)
             .padding_edge(Edge::Trailing, BAR_INSET)

@@ -231,8 +231,8 @@ pub mod prelude {
     pub use crate::choice::{Choice, IntoChoices, Segmented, segmented};
     pub use crate::date::{Date, DateNames, Weekday};
     pub use crate::nav::{
-        IntoRoutes, NavLink, NavPathExt, NavigationStack, NavigationStackContent, nav_link_value,
-        navigation_stack, navigation_stack_content,
+        IntoRoutes, NavLink, NavPathExt, NavigationStack, NavigationStackContent, ToolbarItem,
+        ToolbarItems, nav_link_value, navigation_stack, navigation_stack_content, toolbar_item,
     };
     pub use crate::picker::{Picker, picker};
     pub use crate::search_field::{SearchField, search_field};

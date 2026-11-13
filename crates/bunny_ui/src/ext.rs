@@ -1763,10 +1763,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Popover { is_presented, side, focus: crate::layout::PopoverFocus::Scope, on_dismiss: Some(Rc::new(on_dismiss)), content: Rc::new(content), })
     }
 
-    /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
+    /// The views a page puts in the bar of its navigation stack:
+    /// `.toolbar((toolbar_item(edit).leading(), toolbar_item(add)))`.
+    ///
+    /// An item stands at the trailing edge of the bar, or after the
+    /// button that goes back when it is `.leading()`. Write it on a view
+    /// of the page; the items are the page's, so they may read its state
+    /// and they change with it. A page says its items every time its body
+    /// runs, and the last ones it said are the ones in the bar. Outside a
+    /// stack it does nothing.
     #[track_caller]
-    fn toolbar(self, _items: impl View) -> Modified<Self> {
-        Modified::new(self, Modifier::Toolbar)
+    fn toolbar(self, items: impl crate::nav::ToolbarItems) -> Modified<Self> {
+        Modified::new(self, Modifier::Toolbar(items.into_bar()))
     }
 
     // MARK: - Data & environment

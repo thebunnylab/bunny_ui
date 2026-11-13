@@ -9,11 +9,11 @@
 //! country as a page over the list, and a neighbour in the details opens
 //! another page over that one.
 //!
-//! The stack's bar shows the title of the page and the button that goes
-//! back.
+//! The stack's bar shows the title of the page, the button that goes back
+//! and the items the page puts in it.
 //!
 //! Limitations of this phase (noted, not hidden):
-//! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
+//! `.searchable`/`.refreshable` are inert; images are 40×40 boxes.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 

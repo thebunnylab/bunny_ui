@@ -495,12 +495,12 @@ pub struct Navigator {
     push: Rc<dyn Fn(Box<dyn Any>) -> bool>,
     pop: Rc<dyn Fn() -> bool>,
     depth: Rc<dyn Fn() -> usize>,
-    /// Where the page this navigator was handed to says its title.
-    title: Option<TitleSink>,
+    /// Where the page this navigator was handed to speaks to its stack.
+    page: Option<PageSink>,
 }
 
-/// What hears a page say its title.
-type TitleSink = Rc<dyn Fn(&str)>;
+/// What hears a page speak. The word is of a type the stack defines.
+type PageSink = Rc<dyn Fn(&dyn Any)>;
 
 impl Navigator {
     /// A stack's own three doors. `push` answers `false` for a value that
@@ -510,21 +510,27 @@ impl Navigator {
         pop: impl Fn() -> bool + 'static,
         depth: impl Fn() -> usize + 'static,
     ) -> Self {
-        Self { push: Rc::new(push), pop: Rc::new(pop), depth: Rc::new(depth), title: None }
+        Self { push: Rc::new(push), pop: Rc::new(pop), depth: Rc::new(depth), page: None }
     }
 
-    /// The same navigator for ONE page: `title` hears what that page
-    /// calls itself, for the stack's bar.
+    /// The same navigator for ONE page: `hear` gets what the views of
+    /// that page tell the stack — its title, the items of its bar.
     #[must_use]
-    pub fn for_page(mut self, title: impl Fn(&str) + 'static) -> Self {
-        self.title = Some(Rc::new(title));
+    pub fn for_page(mut self, hear: impl Fn(&dyn Any) + 'static) -> Self {
+        self.page = Some(Rc::new(hear));
         self
     }
 
-    /// The page says its title. Outside a page of a stack nobody hears it.
-    pub fn set_title(&self, title: &str) {
-        if let Some(hear) = &self.title {
-            hear(title);
+    /// A view of a page tells the stack something about the page. The
+    /// word is of a type the stack defines, and the stack ignores a word
+    /// it does not know. `false` outside a page: nobody heard it.
+    pub fn tell(&self, word: &dyn Any) -> bool {
+        match &self.page {
+            Some(hear) => {
+                hear(word);
+                true
+            }
+            None => false,
         }
     }
 
