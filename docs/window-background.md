@@ -8,8 +8,11 @@ GPU tier; Metal, GL and Vulkan are compared against the raster on a
 solid canvas and on a clear ground, the last two on Mesa's software
 renderers in the container. On Linux a clear window ran on both doors
 and the three roads, and a blurred one ran only as the fall to opaque,
-because no compositor with a blur was at hand. The Windows shell is
-type-checked and has not run. The details are in
+because no compositor with a blur was at hand. The Windows shell ran in
+CI, on a headless runner with a software adapter: a composed window
+opened clear and opened blurred, and the D3D11 tier matched the raster
+on a solid canvas and on a clear ground. No person has seen it on a
+display. The details are in
 [What each platform serves](#what-each-platform-serves) and in
 [Honest edges](#honest-edges).*
 
@@ -158,8 +161,12 @@ An opaque window stays on the road it had, with no new cost.
 | `BackgroundBlend::Replace` | yes | yes | yes | yes | yes, over the canvas |
 | seen on a display | yes | no | no | no | — |
 
-¹ Type-checked for `x86_64-pc-windows-msvc` from macOS. Its tests run
-first in CI, on a headless runner.
+¹ Ran in CI on `windows-2025` (build 26100, the Microsoft Basic Render
+Driver), headless. The composition entry of `dcomp.dll` resolved, the
+adapter took a composition swap chain with premultiplied alpha, and a
+window that asked for `Blurred` opened `Blurred`, with a native bar and
+with a bar the scene draws. That is DWM answering success to each call;
+it is not a blur seen on a display.
 ² Ran in the container: on Weston by the CPU, GL and Vulkan roads, read
 back from the compositor as the canvas at 60 % over black; under Xvfb
 with a compositing manager on the three roads, and as `Opaque` without
@@ -221,6 +228,7 @@ BUNNY_PRESENT=cpu cargo run -p bunny-ui-macos --example blur_window
 crates/bunny_ui_linux/container/run.sh test                # GL and Vulkan against the raster, on llvmpipe and lavapipe
 crates/bunny_ui_linux/container/run.sh drive blur_window_linux   # and with --clear, --opaque
 cargo check -p bunny-ui-windows --target x86_64-pc-windows-msvc --tests --examples
+cargo test -p bunny-ui-windows --all-targets -- --nocapture   # on Windows; CI runs it as "correctness (windows-2025)"
 ```
 
 `blur_window` shows two stacks of three shades at one alpha. On the
@@ -244,23 +252,27 @@ same strength.
   `ext-background-effect-v1`, names the blur capability 0. Release 1.46
   corrected it to 1, which is what a compositor sends and what the shell
   reads.
-- On Windows the vtable slots of `IDCompositionDevice`,
-  `IDCompositionTarget`, `IDCompositionVisual` and
-  `CreateSwapChainForComposition` are the order of the headers, counted
-  by hand and never run. A wrong slot is an access violation in CI, not
-  a failed assertion.
+- On Windows the one machine that ran the shell is the CI runner:
+  headless, on the software adapter. The vtable slots of
+  `IDCompositionDevice`, `IDCompositionTarget`, `IDCompositionVisual`
+  and `CreateSwapChainForComposition` were counted by hand from the
+  order of the headers, and their first run was that job, where a
+  composed window was built through every one of them. No hardware
+  adapter was tried.
 - On Windows a bar the scene draws (`Chrome::Scene`) with `Blurred` is
   an open question: with the frame extended the compositor may show its
   caption tint or its buttons through the scene. The three switches
   that answer it are constants in `apply_backdrop`, all off, and
-  `blur_window --scene` is the probe.
+  `blur_window --scene` is the probe. In CI such a window opens and
+  reports `Blurred`; what it looks like is not known.
 - A pane of glass takes the place of what it covers over a clear ground
   on the raster and on the Metal, D3D11, GL and Vulkan tiers. Two roads
   still lay it over the ground, so the pane there is more solid than its
   tint says and the sharp scene shows faintly through it: the WebGL
   tier, which has no second source to blend with, and a Vulkan device
-  without `dualSrcBlend`. The D3D11 blend is type-checked and has not
-  run. A background that replaces is exact on every tier.
+  without `dualSrcBlend`. The D3D11 blend ran against the raster on the
+  software adapter of the CI runner. A background that replaces is exact
+  on every tier.
 - A window that is not opaque costs more to compose on macOS than an
   opaque one, because it gives up the native roads.
 - `Blurred` where the system has no blur is `Opaque`: Windows 10, a
