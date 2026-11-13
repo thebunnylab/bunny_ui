@@ -288,6 +288,12 @@ focus, and a selecting beat selects its text. And the engine hears where the
 browser's focus is, so "nobody holds the keyboard" is true when it is true on
 the page.
 
+A landmark is a tag, and a tag is what an element was created as. When two
+faces of an app put different elements in the same place — a door's `<main>`
+where an account's `<nav>` stands — the old element leaves and the new one
+mounts under its own tag; the diff keeps an element only for a node of the
+same kind **and** the same tag.
+
 What the element lowering still does not say: a name on anything but a field
 (`accessibility_label` on a button or on text reaches the native projection
 alone, so a control with no words in it has no name on a page),

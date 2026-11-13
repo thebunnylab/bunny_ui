@@ -3536,8 +3536,9 @@ fn diff_node(
     }
     let same_binding = same_binding(old, &new);
     if hints_changed(old, &new) {
-        // class and id re-attribute live; a TAG change would need a
-        // recreation and the walk never changes one on a kept identity
+        // class and id re-attribute live; a TAG never changes on a kept
+        // element — a node under another tag is not matched to this one
+        // at all (`same_element`), and mounts fresh
         patches.push(DomPatch::SetHints {
             id,
             class: new.hints.class.clone(),
@@ -3727,13 +3728,8 @@ fn diff_children(
             // mismatched retained goes BACK to its slot so the leftover
             // sweep emits its remove (taking and filtering would drop
             // it silently and leak the element on the browser's side)
-            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
-                Some(old)
-                    if std::mem::discriminant(&old.kind)
-                        == std::mem::discriminant(kind) =>
-                {
-                    Some(old)
-                }
+            _ => by_index.get_mut(index).and_then(|slot| match slot.take() {
+                Some(old) if same_element(&old, &child) => Some(old),
                 Some(old) => {
                     *slot = Some(old);
                     None
@@ -3801,7 +3797,7 @@ fn diff_children_ordered(
     let shortest = old_len.min(new_len);
     // the head: every child that takes the old one at its own place
     let head = (0..shortest)
-        .take_while(|&at| takes_place(&retained.children[at].kind, &new_children[at].kind))
+        .take_while(|&at| takes_place(&retained.children[at], &new_children[at]))
         .count();
     // the ALIGNED fast path: same length, every child matching its
     // old position (groups by path, the rest by kind) — the shape of
@@ -3814,9 +3810,7 @@ fn diff_children_ordered(
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
                 // a reuse promise aligns with the group it promised
                 (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
-                (old_kind, new_kind) => {
-                    std::mem::discriminant(old_kind) == std::mem::discriminant(new_kind)
-                }
+                _ => same_element(&retained.children[at], &new_children[at]),
             }
         });
     if aligned {
@@ -3831,9 +3825,9 @@ fn diff_children_ordered(
     let shifted = old_len != new_len;
     let tail = (0..shortest - head)
         .take_while(|&back| {
-            let was = &retained.children[old_len - 1 - back].kind;
-            let now = &new_children[new_len - 1 - back].kind;
-            (!shifted || matches!(now, DomKind::Group { .. } | DomKind::Reuse { .. }))
+            let was = &retained.children[old_len - 1 - back];
+            let now = &new_children[new_len - 1 - back];
+            (!shifted || matches!(now.kind, DomKind::Group { .. } | DomKind::Reuse { .. }))
                 && takes_place(was, now)
         })
         .count();
@@ -3932,10 +3926,8 @@ fn diff_children_ordered(
                         .remove(path)
                 }
             }
-            kind => (index < old_end
-                && std::mem::discriminant(&retained.children[index].kind)
-                    == std::mem::discriminant(kind))
-            .then_some(index),
+            _ => (index < old_end && same_element(&retained.children[index], &child))
+                .then_some(index),
         };
         match matched {
             Some(position) if !claimed[position - head] => {
@@ -4036,14 +4028,26 @@ fn diff_children_ordered(
 const FRESH: usize = usize::MAX;
 
 /// Does the new child take the old one at its own place? A group or a
-/// reuse promise by its path, anything else by its kind.
-fn takes_place(was: &DomKind, now: &DomKind) -> bool {
-    match now {
+/// reuse promise by its path, anything else by its element.
+fn takes_place(was: &DomNode, now: &DomNode) -> bool {
+    match &now.kind {
         DomKind::Group { path } | DomKind::Reuse { path } => {
-            matches!(was, DomKind::Group { path: there } if there == path)
+            matches!(&was.kind, DomKind::Group { path: there } if there == path)
         }
-        kind => std::mem::discriminant(was) == std::mem::discriminant(kind),
+        _ => same_element(was, now),
     }
+}
+
+/// Is the new node the old one's ELEMENT — the same kind, under the same
+/// tag? A tag is what an element was created as and nothing changes it
+/// afterwards, so a box a view called `<main>` and a later frame calls
+/// `<nav>` is another element: the old one leaves and the new one mounts,
+/// exactly as a kind swap goes. Keeping it would leave a page saying a
+/// landmark it no longer is — two faces of an app that put different
+/// elements in the same place are the ordinary way to meet this.
+fn same_element(was: &DomNode, now: &DomNode) -> bool {
+    std::mem::discriminant(&was.kind) == std::mem::discriminant(&now.kind)
+        && was.hints.tag == now.hints.tag
 }
 
 /// The old groups a new child of the middle may have come from, by
@@ -4068,7 +4072,7 @@ fn rows_that_may_move(
         };
         let waits = position > asking
             && position < new_end
-            && takes_place(&old[position].kind, &ahead[position - asking - 1].kind);
+            && takes_place(&old[position], &ahead[position - asking - 1]);
         if !claimed[position - head] && !waits {
             rows.insert(std::rc::Rc::clone(path), position);
         }
@@ -5864,6 +5868,71 @@ mod tests {
             })
             .collect();
         assert_eq!(checked, [2 | 8 | 2 << 4], "the checked value re-attributes in place: {moved:?}");
+    }
+
+    /// An element's tag is what it was created as. Two faces of an app
+    /// that put different elements in the same place — a door's `<main>`
+    /// where an account's `<nav>` stands — are two elements: the old one
+    /// leaves and the new one mounts under its own tag. Kept in place, the
+    /// page went on saying a landmark it no longer was.
+    #[test]
+    fn a_node_under_another_tag_is_another_element() {
+        #[derive(Clone)]
+        struct Faces {
+            signed_in: State<bool>,
+        }
+
+        impl Component for Faces {
+            fn body(self) -> impl View {
+                if self.signed_in.get() {
+                    erased(hstack!(vstack!(text("rail")).element("nav"), vstack!(text("page")).element("main")))
+                } else {
+                    erased(hstack!(vstack!(text("form")).element("main"), vstack!(text("art"))))
+                }
+            }
+        }
+
+        let tags = |patches: &[DomPatch]| -> Vec<(u32, String)> {
+            patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } => {
+                        hints.tag.as_deref().map(|tag| (*id, tag.to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let runtime = Runtime::new();
+        let view = Faces { signed_in: State::new(false) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let [(door, tag)] = tags(&mount).try_into().expect("one tagged element");
+        assert_eq!(tag, "main");
+
+        view.signed_in.set(true);
+        let swapped = runtime.dom_frame(&view, size);
+        // made back to front, as a fresh list is: the order is the
+        // walk's, the tags are the views'
+        let mut made: Vec<String> = tags(&swapped).into_iter().map(|(_, tag)| tag).collect();
+        made.sort();
+        assert_eq!(made, ["main", "nav"], "each mounts under its own tag: {swapped:?}");
+        assert!(
+            tags(&swapped).iter().all(|(id, _)| *id != door),
+            "the door's element is not handed to the rail: {swapped:?}"
+        );
+        assert!(
+            swapped.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Remove { id } if *id == door
+            ) || matches!(patch, DomPatch::RemoveChildren { .. })),
+            "the door's element leaves: {swapped:?}"
+        );
+
+        // the same face again changes nothing: a tag that did not move
+        // keeps its element
+        let still = runtime.dom_frame(&view, size);
+        assert!(tags(&still).is_empty(), "{still:?}");
     }
 
     /// The control byte crosses after the href, on a create and on the
