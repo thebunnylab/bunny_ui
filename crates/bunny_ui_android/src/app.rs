@@ -403,6 +403,17 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
         let root = Rc::clone(&root);
         let blit = blit.clone();
         move |stroke: &keys::KeyStroke| {
+            // the phone's back is "back", not a key: a menu, the overlay
+            // on top or the page on top goes. With nothing to go back
+            // from it falls to the handler, which releases the keyboard,
+            // and from there to the platform, which leaves the app
+            if stroke.keycode == keys::KEYCODE_BACK {
+                let went = runtime.navigate_back();
+                if went {
+                    blit(&runtime, &*root);
+                }
+                return went;
+            }
             let Some(pattern) = key_pattern(stroke) else {
                 return false;
             };
@@ -560,7 +571,8 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                     keys::KEYCODE_MOVE_HOME => Some(EditCommand::Home(shift)),
                     keys::KEYCODE_MOVE_END => Some(EditCommand::End(shift)),
                     keys::KEYCODE_ESCAPE | keys::KEYCODE_BACK => {
-                        // escape — and the phone's back key — release
+                        // escape — and the phone's back key, when the
+                        // gate found nothing to go back from — release
                         // the keyboard; a back key with nothing to
                         // release is the platform's, and leaves
                         if runtime.blur() {
