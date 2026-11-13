@@ -353,6 +353,8 @@ where
             // only a stack with a page to leave answers "back": the one
             // around it answers when this one is at its root
             let path = self.path.clone();
+            // the keys of "back" answer while this stands, and only then
+            crate::reconciler::attribute_context(scope.clone(), crate::action::NAV_CONTEXT, false);
             crate::reconciler::attribute_handler(scope, NAV_BACK, Rc::new(move || {
                 path.pop();
             }));

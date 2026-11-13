@@ -96,6 +96,14 @@ pub const ALERT_DEFAULT: ActionId = ActionId("bunny.alert.default");
 /// dispatches it after the menus and the overlays had their turn.
 pub const NAV_BACK: ActionId = ActionId("bunny.nav.back");
 
+/// The key context a navigation stack declares while it has a page to
+/// leave. The runtime pre-binds the two keys of "back" here: the
+/// accelerator with `[`, which is ⌘[ on the Mac, and Alt with the left
+/// arrow, which is the one a browser taught. A field keeps its own
+/// Alt+Left: a key reaches the keymap only after the field declined it.
+/// Escape is not bound: it never leaves a page.
+pub const NAV_CONTEXT: &str = "bunny.nav";
+
 /// The key context the days of a calendar declare while the keyboard is
 /// on one of them. The runtime pre-binds here the keys that leave the
 /// month: an arrow at the edge of the days, Page Up and Page Down. An

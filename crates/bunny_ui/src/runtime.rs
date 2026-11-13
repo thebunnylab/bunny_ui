@@ -2050,6 +2050,14 @@ impl Runtime {
             calendar.insert(KeyPattern::key(Key::Right), crate::action::CALENDAR_RIGHT);
             calendar.insert(KeyPattern::key(Key::PageUp), crate::action::CALENDAR_PREVIOUS_MONTH);
             calendar.insert(KeyPattern::key(Key::PageDown), crate::action::CALENDAR_NEXT_MONTH);
+            // "back" by the keyboard, while a navigation stack has a page
+            // to leave: the accelerator with `[`, and Alt with the left
+            // arrow. Never Escape
+            let nav = scoped.entry(crate::action::NAV_CONTEXT).or_default();
+            nav.insert(KeyPattern::command(Key::Char('[')), crate::action::NAV_BACK);
+            let mut alt_left = KeyPattern::key(Key::Left);
+            alt_left.option = true;
+            nav.insert(alt_left, crate::action::NAV_BACK);
         }
         runtime
     }

@@ -103,6 +103,22 @@ list. The list opens with the keyboard on the chosen day, also though the two
 buttons stand before the days. The arrows write the day as they move. Escape
 closes the list and leaves what they wrote.
 
+### The pages of a navigation stack
+
+`navigation_stack(path, root)` shows one page. A page under another one has no
+Tab stop: Tab goes round the bar and the page on top. On a page that was
+pushed, the first stop is the button that goes back.
+
+| Key | With a page to leave |
+| --- | --- |
+| ⌘[ on the Mac, Ctrl+[ elsewhere | The page on top leaves. |
+| Alt+Left | The same. A text field that has the keyboard keeps it: there it moves one word. |
+| Escape | Nothing. It closes a popover and answers an alert, and it never leaves a page. |
+
+At the root the two keys are not the stack's, and an app's own bindings take
+them. When a page leaves holding the keyboard, the keyboard goes back to the
+link that opened it.
+
 These contracts have runtime and native protocol regression tests. They do not
 establish human screen-reader or operating-system keyboard qualification.
 

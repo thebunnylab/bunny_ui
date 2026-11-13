@@ -348,6 +348,54 @@ fn back_takes_the_page_on_top_away_after_the_overlays() {
 }
 
 #[test]
+fn the_keys_of_back_leave_a_page_and_escape_does_not() {
+    let runtime = runtime();
+    let app = App::new();
+    runtime.display_frame(&app, SIZE);
+    let bracket = KeyPattern::command(Key::Char('['));
+    let mut alt_left = KeyPattern::key(Key::Left);
+    alt_left.option = true;
+    assert!(!runtime.offer_key(bracket), "at the root the key is not the stack's");
+    assert!(!runtime.offer_key(alt_left));
+
+    app.path.set(vec![Route::Item(1), Route::Item(2)]);
+    runtime.display_frame(&app, SIZE);
+    assert!(runtime.offer_key(bracket));
+    runtime.display_frame(&app, SIZE);
+    assert_eq!(app.path.get(), [Route::Item(1)]);
+    assert!(!runtime.offer_key(KeyPattern::key(Key::Escape)), "Escape leaves no page");
+    assert_eq!(app.path.get(), [Route::Item(1)]);
+    assert!(runtime.offer_key(alt_left));
+    runtime.display_frame(&app, SIZE);
+    assert!(app.path.get().is_empty());
+}
+
+#[test]
+fn a_field_keeps_its_own_alt_left() {
+    #[derive(Clone, Copy)]
+    struct Editor {
+        path: State<Vec<Route>>,
+        note: State<String>,
+    }
+    impl Component for Editor {
+        fn body(self) -> impl View {
+            let note = self.note;
+            navigation_stack(self.path, text("Root"))
+                .destination(move |_| text_field("Note", note.binding()).id("note"))
+        }
+    }
+    let runtime = runtime();
+    let editor = Editor { path: State::new(vec![Route::About]), note: State::new("two words".into()) };
+    runtime.display_frame(&editor, SIZE);
+    assert!(runtime.focus_named("note"));
+    let mut alt_left = KeyPattern::key(Key::Left);
+    alt_left.option = true;
+    assert!(runtime.offer_key(alt_left), "the field takes it: one word to the left");
+    runtime.display_frame(&editor, SIZE);
+    assert_eq!(editor.path.get(), [Route::About], "and the page stays");
+}
+
+#[test]
 fn the_keyboard_goes_back_to_the_link_when_its_page_leaves_holding_it() {
     let runtime = runtime();
     let app = App::new();
