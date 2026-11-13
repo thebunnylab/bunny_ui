@@ -33,6 +33,9 @@ sheet.sheet.insertRule("a[href][href]{cursor:pointer;pointer-events:auto}", 1);
 // browser's own margins, list marks, heading faces and link ink step
 // aside, at no specificity at all, so every look still wins
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}", 2);
+// a control the keyboard reached shows where the keyboard is. At no
+// specificity, so a page that draws its own ring only has to say so
+sheet.sheet.insertRule(":where(#app [role][tabindex]):focus-visible{outline:2px solid Highlight;outline-offset:2px}", 3);
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}", 3);
 sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
 sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
@@ -68,7 +71,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 24;
+const EXPECTED_ABI = 25;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -165,6 +168,54 @@ function actionPath(el) {
   return home ? home.getAttribute("data-base") + path.slice(1) : "";
 }
 window.__bunnyPath = actionPath;
+
+// What a control publishes, as the page says it (op 1 and op 15 carry
+// the byte: bits 0–2 the kind, bit 3 enabled, bits 4–5 the checked
+// value). The engine's accessibility tree does not exist on a page, so
+// the element itself says its role, its state and its tab stop — the
+// attributes a keyboard and a screen reader read. An element whose tag
+// is a control already (`.element("button")`, a link) keeps the role and
+// the tab stop the browser gave it. Zero takes every word back.
+const CONTROL_ROLES = ["", "button", "checkbox", "switch", "radio", "tab", "button"];
+const NATIVE_CONTROLS = new Set(["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
+const CONTROL_ATTRIBUTES = ["role", "tabindex", "aria-disabled", "aria-checked", "aria-selected", "aria-haspopup"];
+function applyControl(el, control) {
+  const kind = control & 7;
+  const enabled = (control & 8) !== 0;
+  const checked = (control >> 4) & 3;
+  const native = NATIVE_CONTROLS.has(el.tagName);
+  const states = checked ? (checked === 2 ? "true" : "false") : null;
+  const wanted = control
+    ? {
+        role: native ? null : CONTROL_ROLES[kind] || "button",
+        tabindex: native || !enabled ? null : "0",
+        "aria-disabled": enabled ? null : "true",
+        "aria-checked": kind === 5 ? null : states,
+        "aria-selected": kind === 5 ? states : null,
+        "aria-haspopup": kind === 6 ? "true" : null,
+      }
+    : {};
+  // each word written only where it moved: a tab stop taken off and put
+  // back would drop the focus of the very control a key just toggled
+  for (const name of CONTROL_ATTRIBUTES) {
+    const value = wanted[name] ?? null;
+    if (el.getAttribute(name) === value) continue;
+    if (value === null) el.removeAttribute(name);
+    else el.setAttribute(name, value);
+  }
+}
+
+// The keys that activate a focused control, by its role — the engine's
+// own rule (`ControlKind`): a button, a radio and a tab take Enter and
+// Space; a checkbox and a switch take Space and leave Enter to the form
+// around them.
+function activates(el, key) {
+  if (key !== "Enter" && key !== " ") return false;
+  if (!el.hasAttribute || !el.hasAttribute("tabindex") || !el.hasAttribute("data-path")) return false;
+  const role = el.getAttribute("role");
+  if (!role || el.getAttribute("aria-disabled") === "true") return false;
+  return key === " " || (role !== "checkbox" && role !== "switch");
+}
 
 // A click resolved by the BROWSER: the nearest [data-path] above the
 // event target IS the pressed thing — no coordinates cross the border.
@@ -1176,6 +1227,8 @@ function applyPatches(view, length) {
   // per parent — a thousand appended rows must not pay a thousand
   // live-tree insertions
   const staged = new Map();
+  // the field the engine gave the keyboard to in this batch (op 28)
+  let summoned = null;
   const stagedFor = (parentId, parentEl) => {
     let fragment = staged.get(parentId);
     if (!fragment) {
@@ -1225,6 +1278,7 @@ function applyPatches(view, length) {
       const cls = text(u8());
       const domId = text(u8());
       const href = text(u16());
+      const control = u8();
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1233,6 +1287,7 @@ function applyPatches(view, length) {
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
       if (href) el.setAttribute("href", href);
+      if (control) applyControl(el, control);
       if (kind === 4) {
         wireScroll(el, id);
       }
@@ -1668,10 +1723,12 @@ function applyPatches(view, length) {
       const target = lookup(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
-      // live hints: class, id and href re-attribute in place
+      // live hints: class, id, href and what a control publishes
+      // re-attribute in place
       const cls = text(u8());
       const domId = text(u8());
       const href = text(u16());
+      const control = u8();
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1687,7 +1744,17 @@ function applyPatches(view, length) {
         } else {
           el.removeAttribute("href");
         }
+        applyControl(el, control);
       }
+    } else if (op === 28) {
+      // the engine gave this field the keyboard — `.auto_focus()`, a
+      // beat — and the browser, which owns the box, moves its focus
+      // there; a beat that asked to replace the text selects it. Held
+      // until the batch lands: a field this batch mounted still sits in
+      // a staged fragment, and an element off the page takes no focus
+      const select = u8();
+      const el = lookup(id);
+      if (el) summoned = [el, select];
     } else if (op === 16) {
       // the iframe navigates: the diff only ships a CHANGED src, so
       // the write is the navigation (the same one would reload).
@@ -1759,6 +1826,13 @@ function applyPatches(view, length) {
   for (const { holder, parent } of staged.values()) {
     parent.appendChild(holder);
   }
+  if (summoned) {
+    const [el, select] = summoned;
+    if (el.isConnected && typeof el.focus === "function") {
+      el.focus();
+      if (select && typeof el.select === "function") el.select();
+    }
+  }
 }
 
 // The popover placement: the browser owns the boxes, so the browser
@@ -1807,6 +1881,48 @@ function placePopover(el) {
 function repositionPopovers() {
   for (const el of app.querySelectorAll("[data-popover]")) {
     placePopover(el);
+  }
+}
+
+// A string for the wasm: written into a buffer the receiving export
+// takes the ownership of.
+function lend(words) {
+  const bytes = new TextEncoder().encode(words);
+  const pointer = wasm.bunny_alloc(bytes.length);
+  new Uint8Array(memory.buffer, pointer, bytes.length).set(bytes);
+  return [pointer, bytes.length];
+}
+
+// Enter in a field (the chord, in a field of many lines): the field's
+// own word to the app. True when its `.on_submit` took the key; a wasm
+// older than the export keeps every Enter the browser's.
+function sendSubmit(path) {
+  if (!wasm.bunny_submit) return false;
+  const [pointer, length] = lend(path);
+  return wasm.bunny_submit(pointer, length) !== 0;
+}
+
+// Where the keyboard is, as the browser decided it. Said in the next
+// microtask and never at once: a focus the engine moved (op 28) fires
+// `focusin` from inside the patch pass, which the wasm is still in.
+let focusedField = null;
+function sendFocus(path, focused) {
+  if (!path) return;
+  queueMicrotask(() => {
+    if (!wasm || !wasm.bunny_field_focus) return;
+    const [pointer, length] = lend(path);
+    wasm.bunny_field_focus(pointer, length, focused);
+  });
+}
+
+// A field that left the page with the focus in it: a browser fires no
+// `focusout` for an element it removed, so the pass that removed it says
+// the keyboard is free.
+function settleFocus() {
+  if (focusedField && !focusedField.isConnected) {
+    const path = focusedField.dataset.path ?? "";
+    focusedField = null;
+    sendFocus(path, 0);
   }
 }
 
@@ -1957,11 +2073,13 @@ const imports = {
       const view = new DataView(batch.buffer, batch.byteOffset, batch.byteLength);
       if (!STATS) {
         applyPatches(view, length);
+        settleFocus();
         armIdle();
         return;
       }
       const opened = performance.now();
       applyPatches(view, length);
+      settleFocus();
       const box = (window.__bunnyApply ||= { ms: 0, batches: 0 });
       box.ms += performance.now() - opened;
       box.batches += 1;
@@ -2255,6 +2373,23 @@ const booted = booting.then(
         sendAction(path, event.detail || 1);
       }
     });
+    // the browser decides where the keyboard is in this mode — a
+    // click, a Tab, a password manager — and the engine hears it, so a
+    // field's `.auto_focus()` answers only when nobody holds the keys
+    app.addEventListener("focusin", (event) => {
+      const el = event.target;
+      if (el instanceof Element && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") && el.dataset.path) {
+        focusedField = el;
+        sendFocus(el.dataset.path, 1);
+      }
+    });
+    app.addEventListener("focusout", (event) => {
+      if (event.target === focusedField) {
+        const path = focusedField.dataset.path ?? "";
+        focusedField = null;
+        sendFocus(path, 0);
+      }
+    });
     window.addEventListener("resize", repositionPopovers);
     // the window's box: a page that sizes the mount to the viewport
     // hears it move, and the bodies that read the Viewport run again —
@@ -2288,6 +2423,24 @@ const booted = booting.then(
       const mods = modifiers(event);
       if (MODIFIER_KEYS.has(event.key)) {
         if (wasm.bunny_modifiers) wasm.bunny_modifiers(mods);
+        return;
+      }
+      // Enter in a one-line field is the field's own word to the app
+      // (`.on_submit`), and in a field of many lines the chord is: the
+      // bare key there is a break, and stays the browser's. An input
+      // method's Enter commits a composition and is neither.
+      if (typing && event.key === "Enter" && !event.isComposing && event.target.dataset.path) {
+        const many = event.target.tagName === "TEXTAREA";
+        const chord = event.metaKey || event.ctrlKey;
+        if ((many ? chord : mods === 0) && sendSubmit(event.target.dataset.path)) {
+          event.preventDefault();
+          return;
+        }
+      }
+      // a focused control answers the keys its role names, as a press
+      if (!typing && mods === 0 && !event.repeat && event.target instanceof Element && activates(event.target, event.key)) {
+        event.preventDefault();
+        sendAction(actionPath(event.target), 1);
         return;
       }
       // the function row is the browser's as much as the page's — F5

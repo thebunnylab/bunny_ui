@@ -1460,6 +1460,29 @@ pub(crate) struct ControlState {
     pub kind: ControlKind,
 }
 
+impl ControlState {
+    /// The state as one byte of the element wire (`dom::ABI_VERSION` 25),
+    /// never zero — zero is an element that is no control. Bits 0–2: the
+    /// kind, one past its place in [`ControlKind`]. Bit 3: enabled. Bits
+    /// 4–5: the checked value (0 publishes none, 1 unchecked, 2 checked).
+    pub(crate) const fn wire(self) -> u8 {
+        let kind = match self.kind {
+            ControlKind::Button => 1,
+            ControlKind::Checkbox => 2,
+            ControlKind::Switch => 3,
+            ControlKind::Radio => 4,
+            ControlKind::Tab => 5,
+            ControlKind::PopUp => 6,
+        };
+        let checked = match self.checked {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        kind | (self.enabled as u8) << 3 | checked << 4
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FocusStop {
     pub path: Rc<str>,
@@ -1566,6 +1589,16 @@ impl Address {
             address.href.clone_from(href);
         }
         Some(Address::shared(address))
+    }
+
+    /// `base` with what the control under it IS written over it. The
+    /// element lowering has no accessibility tree to ask, so the state a
+    /// control publishes rides its address to the element that answers
+    /// its press, and the page says it as attributes.
+    pub(crate) fn controlling(base: &Option<Rc<Address>>, control: ControlState) -> Rc<Address> {
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        address.control = Some(control);
+        Address::shared(address)
     }
 
     /// One shared copy of an address.

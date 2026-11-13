@@ -48,6 +48,11 @@ autocomplete="current-password" aria-label="Password">` — the pair a
 password manager recognizes. "Show password" flips the secret off and
 the input is retyped in place, value and caret kept.
 
+The page opens with the keyboard in the email box (`.auto_focus()`), Enter
+in either box signs in (`.on_submit`), and Tab reaches the checkbox and the
+button — a `role="checkbox"` and a `role="button"` with a tab stop — which
+Space and Enter activate.
+
 Build and run (trunk fetches the wasm-bindgen CLI `web/Trunk.toml`
 pins, which must match the crate in `Cargo.lock`):
 

@@ -610,6 +610,17 @@ impl Walk<'_> {
                 None => (None, None),
             };
             Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
+            // what a control IS rides to the element that answers its
+            // press: the page has no accessibility tree to ask, so the
+            // glue says the role, the state and the tab stop as attributes
+            if let Some(control) = hints.address.as_deref().and_then(|address| address.control) {
+                for lowered in &mut out[opened..] {
+                    if lowered.style.interactive.is_some() {
+                        lowered.hints.address =
+                            Some(crate::layout::Address::controlling(&lowered.hints.address, control));
+                    }
+                }
+            }
         }
     }
 

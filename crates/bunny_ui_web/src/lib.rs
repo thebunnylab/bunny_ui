@@ -558,6 +558,11 @@ enum Event {
     DomScroll { id: u32, x: f64, y: f64 },
     DomViewport { id: u32, width: f64, height: f64 },
     DomBox { id: u32, width: f64, height: f64 },
+    /// Dom mode: Enter in a one-line `<input>`, or the chord in a field
+    /// of many lines — the field's own word to the app.
+    FieldSubmit { path: String },
+    /// Dom mode: the browser's focus entered or left an `<input>`.
+    FieldFocus { path: String, focused: bool },
     IslandPointer { id: u32, kind: u32, x: f64, y: f64, mods: u32 },
     Action { path: String, clicks: u8 },
     /// Dom mode: the browser's input edited — value + selectionStart.
@@ -1022,7 +1027,9 @@ pub fn start_with(
             | Event::DomBox { .. }
             | Event::IslandPointer { .. }
             | Event::Action { .. }
-            | Event::Field { .. } => {}
+            | Event::Field { .. }
+            | Event::FieldSubmit { .. }
+            | Event::FieldFocus { .. } => {}
         }
         // A frame went up, whoever asked: the asks it carried are served.
         if drew.replace(false) {
@@ -1213,6 +1220,20 @@ fn start_dom_with(
             }
             Event::Field { path, value, caret } => {
                 if runtime.sync_field(&path, &value, caret) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::FieldSubmit { path } => {
+                // the browser owns the box; the stroke that is the
+                // field's word to the app crosses by the field's name
+                if runtime.dom_submit(&path) {
+                    KEY_TAKEN.with(|taken| taken.set(true));
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::FieldFocus { path, focused } => {
+                // where the keyboard is, as the browser decided it
+                if runtime.dom_field_focus(&path, focused) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
@@ -1833,6 +1854,28 @@ pub extern "C" fn bunny_field(
     let path = unsafe { String::from_raw_parts(path_pointer, path_len, path_len.max(1)) };
     let value = unsafe { String::from_raw_parts(value_pointer, value_len, value_len.max(1)) };
     dispatch(Event::Field { path, value, caret });
+}
+
+/// Dom mode: Enter in the `<input>` at this path (the chord, in a field
+/// of many lines). Answers 1 when the field's `.on_submit` took it — the
+/// glue prevents the key's default only then, so a field that names no
+/// handler keeps the browser's own Enter. The path arrives through a
+/// `bunny_alloc` buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_submit(pointer: *mut u8, len: usize) -> u32 {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    KEY_TAKEN.with(|taken| taken.set(false));
+    dispatch(Event::FieldSubmit { path });
+    KEY_TAKEN.with(|taken| taken.get()) as u32
+}
+
+/// Dom mode: the browser's focus entered (`focused` = 1) or left (0)
+/// the `<input>` at this path. The path arrives through a `bunny_alloc`
+/// buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_field_focus(pointer: *mut u8, len: usize, focused: u32) {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    dispatch(Event::FieldFocus { path, focused: focused != 0 });
 }
 
 /// The WebGL2 context died. The CPU takes the page this very turn.

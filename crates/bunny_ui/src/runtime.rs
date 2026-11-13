@@ -6287,8 +6287,10 @@ impl Runtime {
         drop(offsets);
         drop(carets);
         // a field that asks for the keyboard takes it by the one rule
+        let mut summoned = None;
         for (path, ask) in &output.fields {
             if self.claim_auto_focus(path, *ask) {
+                summoned = Some((path.clone(), matches!(ask, crate::layout::AutoFocus::Selecting(_))));
                 break;
             }
         }
@@ -6298,6 +6300,14 @@ impl Runtime {
         let mut patches = dom.lower(output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        // the browser owns every `<input>` here, so the keyboard the
+        // engine just gave a field is the browser's focus to move: said
+        // after the scene's own patches, when the element stands
+        if let Some((path, select)) = summoned
+            && let Some(id) = dom.field_id(&path)
+        {
+            patches.push(crate::dom::DomPatch::Focus { id, select });
         }
         // the mount's language and direction, after everything else: the
         // first frame always says them, a still frame never
@@ -6424,6 +6434,42 @@ impl Runtime {
         // so the first frame says nothing about it either
         let locale = self.locale();
         let _ = dom.note_language(locale.identifier(), self.layout_direction());
+    }
+
+    /// Dom mode: Enter in the `<input>` the engine knows by `path` — the
+    /// chord, in a field of many lines, where the bare key is a break.
+    /// The browser owns the box and its keys, so the one stroke that is
+    /// the field's own word to the app crosses by name: the field takes
+    /// the keyboard if it did not hold it, and its `.on_submit` runs.
+    /// `false` for a field that named no handler — the key stays the
+    /// browser's.
+    pub fn dom_submit(&self, path: &str) -> bool {
+        if !reconciler::has_editor(path) {
+            return false;
+        }
+        if self.focus.borrow().as_deref() != Some(path) {
+            self.focus(path);
+        }
+        self.submit(path).applied
+    }
+
+    /// Dom mode: the browser's focus entered or left the `<input>` the
+    /// engine knows by `path`. The browser decides where the keyboard is
+    /// there — a click, a Tab, a password manager — and the engine hears
+    /// it, so "nobody holds the keyboard" is true when it is true on the
+    /// page: a field that left with the focus does not keep the next
+    /// page's `.auto_focus()` from answering. Answers whether the
+    /// keyboard moved.
+    pub fn dom_field_focus(&self, path: &str, focused: bool) -> bool {
+        let holds = self.focus.borrow().as_deref() == Some(path);
+        match (focused, holds) {
+            (true, false) if reconciler::has_editor(path) => {
+                self.focus(path);
+                true
+            }
+            (false, true) => self.blur(),
+            _ => false,
+        }
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the

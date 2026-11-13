@@ -264,9 +264,35 @@ text_field("", password)
 A field that names no `autocomplete` carries no attribute and leaves the
 choice with the browser; the pixel shells own no native field for an autofill
 to fill and ignore it. The served page (`ssr`) writes the same three
-attributes. Only fields carry a name into the element lowering today: a label
-on a button or on text reaches the native projection alone, and a pressable
-box is a `<div>` with no `role`.
+attributes.
+
+A built-in control says what it is on the element that answers its press. The
+state a control publishes for the native projection — its kind, whether it is
+enabled, its checked value — rides to the page as attributes: `role`
+(`button`, `checkbox`, `switch`, `radio`, `tab`; a pop-up button is a `button`
+with `aria-haspopup`), `tabindex="0"` while it is enabled, `aria-disabled`
+when it is not, and `aria-checked` (`aria-selected` on a tab). A keyboard
+reaches it with Tab and activates it with the keys its kind names: Enter and
+Space for a button, a radio and a tab, Space alone for a checkbox and a
+switch. An element whose tag is a control already — `.element("button")`, a
+link — keeps the role and the tab stop the browser gave it. A bare
+`.on_click` is a target and no control: nothing said it is a button, so it
+gets no role and no tab stop. The served page writes the same attributes.
+
+The keyboard is the browser's in this mode, and the two meet in three places.
+Enter in a one-line field runs the field's `.on_submit` (in a field of many
+lines the bare key is a break and the chord, `⌘↵` or `Ctrl+↵`, submits); an
+input method's Enter commits its composition and is not that key. A field the
+engine gives the keyboard to — `.auto_focus()`, a beat — takes the browser's
+focus, and a selecting beat selects its text. And the engine hears where the
+browser's focus is, so "nobody holds the keyboard" is true when it is true on
+the page.
+
+What the element lowering still does not say: a name on anything but a field
+(`accessibility_label` on a button or on text reaches the native projection
+alone, so a control with no words in it has no name on a page),
+`accessibility_hidden`, a pop-up's expanded state and shown value, and a live
+region. Landmarks and headings are the page's own to say, with `.element(…)`.
 
 ## Remaining work
 
