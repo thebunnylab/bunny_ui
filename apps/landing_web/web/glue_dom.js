@@ -71,7 +71,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 25;
+const EXPECTED_ABI = 26;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -171,18 +171,39 @@ window.__bunnyPath = actionPath;
 
 // What a control publishes, as the page says it (op 1 and op 15 carry
 // the byte: bits 0–2 the kind, bit 3 enabled, bits 4–5 the checked
-// value). The engine's accessibility tree does not exist on a page, so
-// the element itself says its role, its state and its tab stop — the
-// attributes a keyboard and a screen reader read. An element whose tag
-// is a control already (`.element("button")`, a link) keeps the role and
-// the tab stop the browser gave it. Zero takes every word back.
+// value, bits 6–7 whether what it opens is open). The engine's
+// accessibility tree does not exist on a page, so the element itself
+// says its role, its state and its tab stop — the attributes a keyboard
+// and a screen reader read. An element whose tag is a control already
+// (`.element("button")`, a link) keeps the role and the tab stop the
+// browser gave it. Zero takes every word back.
+//
+// The byte after it is the element's voice (bit 0 decoration, bits 1–2
+// a live region: 1 polite, 2 assertive), and the string after that its
+// name. A live region is a `status` or an `alert` where the element is
+// no control — a control's role is the control's.
 const CONTROL_ROLES = ["", "button", "checkbox", "switch", "radio", "tab", "button"];
+const LIVE_ROLES = ["", "status", "alert"];
+const LIVE_WORDS = ["", "polite", "assertive"];
 const NATIVE_CONTROLS = new Set(["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
-const CONTROL_ATTRIBUTES = ["role", "tabindex", "aria-disabled", "aria-checked", "aria-selected", "aria-haspopup"];
-function applyControl(el, control) {
+const SAID_ATTRIBUTES = [
+  "role",
+  "tabindex",
+  "aria-disabled",
+  "aria-checked",
+  "aria-selected",
+  "aria-haspopup",
+  "aria-expanded",
+  "aria-hidden",
+  "aria-live",
+  "aria-label",
+];
+function applyControl(el, control, voice, label) {
   const kind = control & 7;
   const enabled = (control & 8) !== 0;
   const checked = (control >> 4) & 3;
+  const expanded = control >> 6;
+  const live = (voice >> 1) & 3;
   const native = NATIVE_CONTROLS.has(el.tagName);
   const states = checked ? (checked === 2 ? "true" : "false") : null;
   const wanted = control
@@ -193,11 +214,19 @@ function applyControl(el, control) {
         "aria-checked": kind === 5 ? null : states,
         "aria-selected": kind === 5 ? states : null,
         "aria-haspopup": kind === 6 ? "true" : null,
+        "aria-expanded": expanded ? (expanded === 2 ? "true" : "false") : null,
       }
-    : {};
+    : { role: live ? LIVE_ROLES[live] : null };
+  wanted["aria-hidden"] = voice & 1 ? "true" : null;
+  wanted["aria-live"] = live ? LIVE_WORDS[live] : null;
+  // a field's name is the field's own (op 16 writes it): a hint never
+  // names an input, and never takes its name away
+  const field = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+  if (!field) wanted["aria-label"] = label || null;
   // each word written only where it moved: a tab stop taken off and put
   // back would drop the focus of the very control a key just toggled
-  for (const name of CONTROL_ATTRIBUTES) {
+  for (const name of SAID_ATTRIBUTES) {
+    if (field && name === "aria-label") continue;
     const value = wanted[name] ?? null;
     if (el.getAttribute(name) === value) continue;
     if (value === null) el.removeAttribute(name);
@@ -1279,6 +1308,8 @@ function applyPatches(view, length) {
       const domId = text(u8());
       const href = text(u16());
       const control = u8();
+      const voice = u8();
+      const label = text(u16());
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1287,7 +1318,7 @@ function applyPatches(view, length) {
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
       if (href) el.setAttribute("href", href);
-      if (control) applyControl(el, control);
+      if (control || voice || label) applyControl(el, control, voice, label);
       if (kind === 4) {
         wireScroll(el, id);
       }
@@ -1723,12 +1754,14 @@ function applyPatches(view, length) {
       const target = lookup(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
-      // live hints: class, id, href and what a control publishes
-      // re-attribute in place
+      // live hints: class, id, href, what a control publishes, the
+      // element's voice and its name re-attribute in place
       const cls = text(u8());
       const domId = text(u8());
       const href = text(u16());
       const control = u8();
+      const voice = u8();
+      const label = text(u16());
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1744,7 +1777,7 @@ function applyPatches(view, length) {
         } else {
           el.removeAttribute("href");
         }
-        applyControl(el, control);
+        applyControl(el, control, voice, label);
       }
     } else if (op === 28) {
       // the engine gave this field the keyboard — `.auto_focus()`, a
@@ -1918,12 +1951,35 @@ function sendFocus(path, focused) {
 // A field that left the page with the focus in it: a browser fires no
 // `focusout` for an element it removed, so the pass that removed it says
 // the keyboard is free.
+//
+// And a control that left with the focus in it — the row of a list that
+// closed when it was chosen — leaves the focus on the page's body, where
+// the next Tab starts from the top. The focus goes back to the control
+// that had it before, when that one still stands: the button that opened
+// the list. Only to a control: a field would raise a phone's keyboard,
+// and the engine gives a field the keys itself (op 28) when it wants to.
 function settleFocus() {
   if (focusedField && !focusedField.isConnected) {
     const path = focusedField.dataset.path ?? "";
     focusedField = null;
     sendFocus(path, 0);
   }
+  const last = focusTrail[focusTrail.length - 1];
+  if (!last || last.isConnected) return;
+  const dropped = !document.activeElement || document.activeElement === document.body;
+  focusTrail = focusTrail.filter((el) => el.isConnected);
+  const before = focusTrail[focusTrail.length - 1];
+  if (dropped && before && before.hasAttribute("tabindex")) before.focus({ preventScroll: true });
+}
+
+// The controls the focus was in, oldest first — what `settleFocus` hands
+// the focus back along. A few are enough: an opener and what it opened.
+let focusTrail = [];
+function trailFocus(el) {
+  if (focusTrail[focusTrail.length - 1] === el) return;
+  focusTrail = focusTrail.filter((held) => held !== el && held.isConnected);
+  focusTrail.push(el);
+  if (focusTrail.length > 4) focusTrail.shift();
 }
 
 function sendField(path, value, caret) {
@@ -2378,10 +2434,12 @@ const booted = booting.then(
     // field's `.auto_focus()` answers only when nobody holds the keys
     app.addEventListener("focusin", (event) => {
       const el = event.target;
-      if (el instanceof Element && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") && el.dataset.path) {
+      if (!(el instanceof Element)) return;
+      if ((el.tagName === "INPUT" || el.tagName === "TEXTAREA") && el.dataset.path) {
         focusedField = el;
         sendFocus(el.dataset.path, 1);
       }
+      trailFocus(el);
     });
     app.addEventListener("focusout", (event) => {
       if (event.target === focusedField) {
