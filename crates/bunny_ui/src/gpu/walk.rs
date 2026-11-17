@@ -232,6 +232,12 @@ pub trait AtlasGround {
     }
     fn drop_live(&mut self, _id: u64) {}
 
+    /// Can this tier take feed bytes laid out as `format` and convert them
+    /// in its shader? `false` = the walk converts them to RGBA first.
+    fn converts(&self, format: PixelFormat) -> bool {
+        format == PixelFormat::Rgba8
+    }
+
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
     /// One tile of straight-RGBA rows into virgin shared space.
@@ -657,6 +663,23 @@ impl RunAtlas {
     ) -> Option<ResolvedImage<'_>> {
         if size.0 == 0 || size.1 == 0 || bytes.len() < format.bytes_for(size) {
             return None;
+        }
+        // a tier with no shader for the layout gets RGBA, converted here
+        // once per generation: an unchanged frame is the texture it was
+        if let PixelFormat::I420(yuv) = format
+            && !ground.converts(format)
+        {
+            let walk = self.walk;
+            if let Some(entry) = self.live.get_mut(&key)
+                && (entry.width, entry.height, entry.format) == (size.0, size.1, PixelFormat::Rgba8)
+                && entry.generation == generation
+                && !entry.stale
+            {
+                entry.walk = walk;
+                return Some(ResolvedImage::Live(entry.id, entry.width, entry.height));
+            }
+            let rgba = yuv.to_rgba(bytes, size);
+            return self.resolve_live(ground, key, generation, size, PixelFormat::Rgba8, &rgba);
         }
         let walk = self.walk;
         if let Some(entry) = self.live.get_mut(&key) {

@@ -260,7 +260,8 @@ pub mod prelude {
     pub use crate::shapes::{BorderStyle, Stripes};
     pub use crate::icon::{Cap, Dash, ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
-        FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages, file_icon,
+        FeedBytes, FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages,
+        Yuv, YuvMatrix, file_icon,
     };
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)

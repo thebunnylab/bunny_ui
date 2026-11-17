@@ -638,8 +638,12 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
         }
         },
         ImageSource::Rgba { size, rgba, .. } => ResourceKind::Rgba { size: *size, rgba: rgba.to_vec() },
-        ImageSource::Feed { generation, size, bytes, .. } => {
-            ResourceKind::Feed { generation: *generation, size: *size, rgba: bytes.to_vec() }
+        ImageSource::Feed { generation, size, format, bytes, .. } => {
+            let rgba = match format {
+                PixelFormat::I420(yuv) => yuv.to_rgba(bytes, *size),
+                _ => bytes.to_vec(),
+            };
+            ResourceKind::Feed { generation: *generation, size: *size, rgba }
         }
         // a world is drawn where it shows, like a platform surface: the
         // wire carries no picture of it
@@ -727,7 +731,7 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             generation: *generation,
             size: *size,
             format: PixelFormat::Rgba8,
-            bytes: Rc::from(rgba.as_slice()),
+            bytes: Rc::<[u8]>::from(rgba.as_slice()).into(),
         },
     })
 }
