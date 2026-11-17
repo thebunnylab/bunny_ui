@@ -7763,6 +7763,8 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
                         out.accessibility.push(crate::accessibility::Placed {
+                            level: None,
+                            inside: None,
                             enabled: true,
                             checked: None,
                             expanded: None,
@@ -8236,6 +8238,8 @@ impl LayoutNode {
                     && let Some(range) = element.element().accessibility_range()
                 {
                     out.accessibility.push(crate::accessibility::Placed {
+                        level: None,
+                        inside: None,
                         enabled: element.element().accepts_keys(),
                         checked: None,
                         expanded: None,
@@ -8248,6 +8252,22 @@ impl LayoutNode {
                         surface: out.accessibility_surface.clone(),
                         multiline: false,
                     });
+                }
+                if env.accessibility && !path.is_empty() {
+                    let nodes = element.element().accessibility_nodes(frame.size);
+                    if !nodes.is_empty() {
+                        let owner: Rc<str> = Rc::from(path.as_str());
+                        let mut placed = Vec::new();
+                        crate::accessibility::place(
+                            &nodes,
+                            &owner,
+                            frame.origin,
+                            &out.accessibility_surface,
+                            &|rect| out.accessible_bounds(rect),
+                            &mut placed,
+                        );
+                        out.accessibility.extend(placed);
+                    }
                 }
                 let focusable = !path.is_empty()
                     && out.can_reveal_focus(frame)

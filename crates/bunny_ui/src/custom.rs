@@ -171,6 +171,45 @@ pub trait CustomElement: 'static {
         Err(crate::accessibility::ActionError::Unsupported)
     }
 
+    /// What the box holds, for assistive technology: the links, headings,
+    /// texts and controls it paints, each with its bounds in LOCAL
+    /// coordinates and a key of the element's own. Read only while native
+    /// accessibility is enabled, once a frame; the default is nothing, and
+    /// the box is then heard only by its own semantics.
+    ///
+    /// ```ignore
+    /// fn accessibility_nodes(&self, _size: Size) -> Vec<AccessibleNode> {
+    ///     self.page.links().map(|link| {
+    ///         AccessibleNode::new(link.id, Role::Link, link.bounds).label(link.text)
+    ///     }).collect()
+    /// }
+    /// ```
+    ///
+    /// A node that the clip hides is left out, as a control would be. See
+    /// [`crate::accessibility::AccessibleNode`].
+    fn accessibility_nodes(&self, size: Size) -> Vec<crate::accessibility::AccessibleNode> {
+        let _ = size;
+        Vec::new()
+    }
+
+    /// Applies an assistive-technology request to the node `key` of
+    /// [`CustomElement::accessibility_nodes`]: `Activate` follows a link or
+    /// presses a button, `Focus` moves the element's own focus to it (the
+    /// box takes the keyboard first, when it can), `SetText` replaces a
+    /// field's value. The runtime checks that the node is still exposed,
+    /// enabled and of a role that supports the action.
+    ///
+    /// # Errors
+    /// Returns unsupported by default, or the element's own refusal.
+    fn accessibility_node_action(
+        &self,
+        key: u64,
+        action: &crate::accessibility::Action,
+    ) -> Result<(), crate::accessibility::ActionError> {
+        let _ = (key, action);
+        Err(crate::accessibility::ActionError::Unsupported)
+    }
+
     /// What the pointer should look like at `at`, in LOCAL coordinates.
     ///
     /// `None` — the default — leaves the shell's own rule standing: the hand

@@ -9180,6 +9180,17 @@ impl Runtime {
         let node = tree.node(id).ok_or(ActionError::Unavailable)?;
         if !node.supports(&action) { return Err(ActionError::Unsupported); }
         self.enter_scene();
+        if let Some((owner, key)) = crate::accessibility::inside_of(&node.path) {
+            let placement = self.custom_at(owner).ok_or(ActionError::Unavailable)?;
+            if action == Action::Focus {
+                let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
+                    .find(|stop| stop.path.as_ref() == owner).cloned();
+                if let Some(stop) = stop { self.focus_stop(&stop); }
+            }
+            placement.element.element().accessibility_node_action(key, &action)?;
+            self.frame_asked.set(true);
+            return Ok(());
+        }
         let applied = match action {
             Action::Activate => {
                 let applied = reconciler::run_action(&node.path, 1);
