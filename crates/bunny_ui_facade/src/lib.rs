@@ -99,3 +99,20 @@ pub use bunny_ui_web as platform;
     )
 ))]
 pub use platform::{run_window, run_window_with};
+
+/// Sound out of this target's speakers — see [`audio`]. CoreAudio on the
+/// Mac; every other target, and a build without the shell, plays nothing
+/// and keeps the clock running ([`audio::Silent`]).
+///
+/// ```no_run
+/// let format = bunny_ui::audio::AudioFormat::new(48_000, 2).unwrap();
+/// let mut output = bunny_ui::AudioOutput::open(format).unwrap();
+/// output.push(&[0.0; 960]);
+/// let heard = output.position();
+/// ```
+#[cfg(all(feature = "shell", target_os = "macos"))]
+pub type AudioOutput = audio::AudioOutput<platform::audio::CoreAudio>;
+/// Sound out of this target's speakers — see [`audio`]. This target plays
+/// nothing and keeps the clock running ([`audio::Silent`]).
+#[cfg(not(all(feature = "shell", target_os = "macos")))]
+pub type AudioOutput = audio::AudioOutput<audio::Silent>;

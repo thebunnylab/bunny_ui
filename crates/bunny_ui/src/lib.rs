@@ -44,6 +44,7 @@ pub mod provenance;
 pub mod preview;
 pub mod action;
 pub mod angle;
+pub mod audio;
 pub mod anim;
 pub mod beat;
 pub mod bind;

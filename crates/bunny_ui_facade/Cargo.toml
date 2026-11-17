@@ -94,6 +94,10 @@ name = "controls"
 required-features = ["shell", "canvas"]
 
 [[example]]
+name = "tone"
+required-features = ["shell"]
+
+[[example]]
 name = "preview"
 required-features = ["shell", "preview"]
 

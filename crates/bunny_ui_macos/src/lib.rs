@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 pub use bunny_ui_apple::credentials;
+pub mod audio;
 use bunny_ui_apple::trace;
 pub mod dialog;
 pub mod drive;
