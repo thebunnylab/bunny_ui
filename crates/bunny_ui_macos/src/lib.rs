@@ -1944,6 +1944,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if lifecycle.is_hidden() {
                 return;
             }
+            // the `B` line: the whole frame on the main thread, settle to
+            // driver sync — what a frame costs the hand
+            let begun = trace::active().then(std::time::Instant::now);
 
             // a sleeper due by now wakes before the settle polls
             runtime.advance_tasks_to_now();
@@ -2137,6 +2140,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         // wake or park the frame driver — the event may have started
         // (or finished) an animation
         sync_frame_driver(runtime, &pacer, window_id);
+        if let Some(begun) = begun {
+            trace::mark(
+                "B",
+                format_args!(
+                    "dur={:.2} via={}",
+                    begun.elapsed().as_secs_f64() * 1000.0,
+                    trace::Origin::names(1 << via.index())
+                ),
+            );
+        }
         }
     };
     // The door for an event that CAN wait for the display's next beat. From

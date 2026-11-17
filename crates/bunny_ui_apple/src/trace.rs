@@ -18,6 +18,7 @@
 //! M <ms> dur=<ms> sync=<0|1>
 //! S <ms> dur=<ms> n=<alive> raster=<n> px=<n>
 //! E <ms> dur=<ms>
+//! B <ms> dur=<ms> via=<origin>      the whole frame on the main thread, marked as it ends
 //! X <ms> what=<name>
 //! F <ms> settle=<ms> layout=<ms> pass=<ms> asm=<ms> measure=<ms> place=<ms> hover=<ms> passes=<n> layouts=<n> asm#=<n> hover#=<n> paints=<n> cmds=<n> mk=<n> mm=<n>
 //! V <ms> mount=<process-local number> stage=<load-request|load-return|commit|finish|post>
