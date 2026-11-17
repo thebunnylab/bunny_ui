@@ -59,6 +59,9 @@ mod modal;
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
+#[path = "fullscreen_ops.rs"]
+mod fullscreen_ops;
+pub use fullscreen_ops::{forget_fullscreen, set_window_fullscreen, window_fullscreen};
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
@@ -244,6 +247,8 @@ pub enum AppEvent {
     AppearanceChanged(Option<bunny_ui::theme::Appearance>),
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// One step of a trip into or out of native full screen.
+    Fullscreen(bunny_ui::window::FullscreenEvent),
     /// A native dialog fact scoped to its current presentation and subscription.
     DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// A native assistive-technology client first queried this window.
@@ -1378,6 +1383,9 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
         // steal. A stroke `performKeyEquivalent:` already offered — and the
         // gate and the menu bar both declined — is not offered twice.
         let composing = ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND);
+        if !composing && fullscreen_ops::escape_presentation(this, code) {
+            return;
+        }
         if !composing && first_offer(event) && gate_consumed(&stroke) {
             return; // the keymap dispatched — the event dies here
         }
@@ -2497,6 +2505,24 @@ unsafe fn register_classes() {
             sel("windowWillClose:"),
             bunny_window_will_close as *const c_void,
             types.as_ptr(),
+        );
+        // the trips into and out of full screen, whoever asked for them
+        for (selector, method) in [
+            ("windowWillEnterFullScreen:", fullscreen_ops::will_enter as extern "C" fn(Id, Sel, Id)),
+            ("windowDidEnterFullScreen:", fullscreen_ops::did_enter),
+            ("windowWillExitFullScreen:", fullscreen_ops::will_exit),
+            ("windowDidExitFullScreen:", fullscreen_ops::did_exit),
+            ("windowDidFailToEnterFullScreen:", fullscreen_ops::did_fail_enter),
+            ("windowDidFailToExitFullScreen:", fullscreen_ops::did_fail_exit),
+        ] {
+            class_addMethod(delegate, sel(selector), method as *const c_void, types.as_ptr());
+        }
+        let options_types = CString::new("Q@:@Q").expect("type encoding");
+        class_addMethod(
+            delegate,
+            sel("window:willUseFullScreenPresentationOptions:"),
+            fullscreen_ops::presentation_for as *const c_void,
+            options_types.as_ptr(),
         );
         let close_bool = objc_bool::OBJECT;
         class_addMethod(

@@ -494,9 +494,10 @@ pub fn window_background(asked: WindowBackground) -> WindowBackground {
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
+mod window_fullscreen;
 mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, DesktopPosition, DesktopSpace, WindowBackground, WindowError, WindowGeometry,
+    CloseAction, DesktopPosition, DesktopSpace, FullscreenEvent, FullscreenMode, WindowBackground, WindowError, WindowGeometry,
     WindowId, WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
@@ -709,7 +710,9 @@ impl App {
             slot.confirmation.owner_closed();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
+            slot.lifecycle.fullscreen_events().retire();
             ffi::forget_geometry(slot.window, id);
+            ffi::forget_fullscreen(slot.window);
             ffi::lend_hand(|| ffi::close_top_level(slot.window));
             self.inner.relationships.retire(id);
             self.inner
@@ -913,6 +916,13 @@ impl AppInner {
                 observation.deliver();
                 return;
             }
+            if let AppEvent::Fullscreen(change) = event {
+                let source = ffi::event_source();
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.window == source) {
+                    slot.lifecycle.fullscreen_events().observe(change);
+                }
+                return;
+            }
             if let AppEvent::GeometryChanged(observation) = event {
                 if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
                     slot.lifecycle.geometry_events().observe_captured(&observation);
@@ -1010,7 +1020,9 @@ impl AppInner {
             slot.presentation.borrow_mut().take();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
+            slot.lifecycle.fullscreen_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
+            ffi::forget_fullscreen(slot.window);
             self.relationships.retire(slot.lifecycle.id());
         }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
@@ -2357,7 +2369,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
+        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) | AppEvent::Fullscreen(_) => return,
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {
