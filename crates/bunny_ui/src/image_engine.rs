@@ -69,7 +69,7 @@ pub enum ImageSource {
     /// only resamples and uploads them, so every tier draws it the way
     /// it draws any other image. No engine sees this variant either —
     /// there is nothing to decode.
-    Rgba { key: u64, size: (u32, u32), rgba: Rc<[u8]> },
+    Rgba { key: u64, size: (u32, u32), rgba: FeedBytes },
     /// Immutable GPU frame. The platform imports its owned payload directly;
     /// CPU/headless renderers never download it implicitly. The producer must
     /// publish only completed frames and retain resources through this owner.
@@ -170,7 +170,18 @@ impl ImageSource {
             (size.0 as usize) * (size.1 as usize) * 4,
             "an RGBA buffer is width × height × 4 bytes"
         );
-        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba }
+        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba: FeedBytes::Local(rgba) }
+    }
+
+    /// [`ImageSource::rgba`] with pixels another thread made and keeps — a
+    /// decoder's output — shared instead of copied into the scene.
+    pub fn rgba_shared(key: u64, size: (u32, u32), rgba: std::sync::Arc<[u8]>) -> ImageSource {
+        debug_assert_eq!(
+            rgba.len(),
+            (size.0 as usize) * (size.1 as usize) * 4,
+            "an RGBA buffer is width × height × 4 bytes"
+        );
+        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba: FeedBytes::Shared(rgba) }
     }
 
     /// One frame of a feed, for an app that keeps its own slots and
@@ -984,8 +995,9 @@ impl Yuv {
     }
 }
 
-/// A feed frame's bytes: the app's own, or bytes another thread made and
-/// shares (a video decoder's frame), which reach the tier without a copy.
+/// The bytes of a feed frame or of RGBA pixels: the app's own, or bytes
+/// another thread made and shares (a video decoder's frame, a decoded
+/// image), which reach the tier without a copy.
 #[derive(Clone)]
 pub enum FeedBytes {
     Local(Rc<[u8]>),

@@ -603,7 +603,7 @@ fn a_host_box_rides_the_frame_and_a_door_fills_it() {
 
     let mut host = host.with_pictures(Box::new(|placement: &HostPlacement| {
         assert!(matches!(placement.spec, bunny_ui::host::HostSpec::Webview { .. }));
-        Some(ImageSource::Rgba { key: 77, size: (2, 2), rgba: Rc::from(vec![9u8; 16]) })
+        Some(ImageSource::Rgba { key: 77, size: (2, 2), rgba: Rc::<[u8]>::from(vec![9u8; 16]).into() })
     }));
     assert!(host.tick(), "the door's picture is a new frame");
     let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
@@ -779,7 +779,7 @@ impl Pictures for Door {
 
 /// A two-by-two red picture under `key`.
 fn red(key: u64) -> ImageSource {
-    ImageSource::Rgba { key, size: (2, 2), rgba: Rc::from([255u8, 0, 0, 255].repeat(4)) }
+    ImageSource::Rgba { key, size: (2, 2), rgba: Rc::<[u8]>::from([255u8, 0, 0, 255].repeat(4)).into() }
 }
 
 fn snapshots(seen: &Rc<RefCell<Vec<ToIde>>>) -> Vec<((u32, u32), Vec<u8>)> {

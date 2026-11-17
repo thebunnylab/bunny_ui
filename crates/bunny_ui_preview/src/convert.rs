@@ -699,7 +699,7 @@ fn verb_from_wire(verb: wire::Verb) -> icon::Verb {
 pub fn image_source(resource: &Resource) -> Option<ImageSource> {
     let key = resource.key;
     Some(match &resource.kind {
-        ResourceKind::Rgba { size, rgba } => ImageSource::Rgba { key, size: *size, rgba: Rc::from(rgba.as_slice()) },
+        ResourceKind::Rgba { size, rgba } => ImageSource::Rgba { key, size: *size, rgba: Rc::<[u8]>::from(rgba.as_slice()).into() },
         ResourceKind::Encoded { bytes } => ImageSource::Bytes { key, bytes: Rc::from(bytes.as_slice()) },
         ResourceKind::Vector { verbs, paint, ink, box_size } => ImageSource::Path {
             key,

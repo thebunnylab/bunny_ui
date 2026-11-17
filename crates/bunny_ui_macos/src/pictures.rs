@@ -303,7 +303,7 @@ impl Desk {
                         // the key names the page (its view) and the shot: a new
                         // picture is a new resource on the wire, an old one stays cached
                         ("bunny-ui-macos pictures", page.view as usize, page.kept).hash(&mut hasher);
-                        page.picture = Some(ImageSource::Rgba { key: hasher.finish(), size: (width as u32, height as u32), rgba: Rc::from(rgba) });
+                        page.picture = Some(ImageSource::Rgba { key: hasher.finish(), size: (width as u32, height as u32), rgba: Rc::<[u8]>::from(rgba).into() });
                         moved = true;
                     }
                     // the same bytes, or an engine that refused: the
@@ -378,7 +378,7 @@ impl Page {
     /// Whether the page already pictures these bytes.
     fn pictures(&self, rgba: &[u8]) -> bool {
         match &self.picture {
-            Some(ImageSource::Rgba { rgba: standing, .. }) => standing.as_ref() == rgba,
+            Some(ImageSource::Rgba { rgba: standing, .. }) => **standing == *rgba,
             _ => false,
         }
     }
