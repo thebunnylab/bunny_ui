@@ -186,6 +186,12 @@ unsafe extern "C" {
 }
 
 // AppKit comes in via the ObjC runtime; the link guarantees the classes.
+#[link(name = "QuartzCore", kind = "framework")]
+unsafe extern "C" {
+    /// The clock the display link stamps its refreshes with, in seconds.
+    fn CACurrentMediaTime() -> f64;
+}
+
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
     /// The pasteboard string type (`public.utf8-plain-text`).
@@ -1852,14 +1858,22 @@ extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
     // whatever re-laid the chrome since the last tick, the buttons go
     // back — the check is three reads and it usually does nothing
     keep_traffic_lights();
-    let dt = unsafe {
+    let (dt, beat) = unsafe {
         let last = msg_f64(link, sel("timestamp"));
         let next = msg_f64(link, sel("targetTimestamp"));
+        // the refresh an app drawing on its own clock aims at, on the
+        // clock `Instant` reads
+        let left = (next - CACurrentMediaTime()).clamp(0.0, 1.0);
+        let beat = bunny_ui::vsync::DisplayBeat {
+            target: std::time::Instant::now() + std::time::Duration::from_secs_f64(left),
+            interval: std::time::Duration::from_secs_f64((next - last).clamp(0.0, 1.0)),
+        };
         // the first tick after a resume reports the whole pause as the
         // gap — a clamped step keeps springs continuous instead of
         // teleporting them
-        (next - last).clamp(0.0, 1.0 / 30.0)
+        ((next - last).clamp(0.0, 1.0 / 30.0), beat)
     };
+    bunny_ui::vsync::deliver(beat);
     dispatch_all(AppEvent::Frame { dt });
 }
 

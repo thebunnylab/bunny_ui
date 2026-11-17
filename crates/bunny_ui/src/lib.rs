@@ -113,6 +113,7 @@ pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
+pub mod vsync;
 pub mod words;
 #[cfg(feature = "3d")]
 pub mod world;

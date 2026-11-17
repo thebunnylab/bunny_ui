@@ -6015,6 +6015,7 @@ impl Runtime {
         // clock is the frame tick — the shell's driver stays awake; so
         // does a finger whose meaning the clock decides, and a fling
         self.animator.borrow().wants_frame()
+            || crate::vsync::requested()
             || (self.task_driver.borrow().is_none() && motor::task::has_timers())
             || self.touch.borrow().alive()
     }
@@ -6041,7 +6042,8 @@ impl Runtime {
         // A live finger keeps the link whatever else is true: the clock
         // is what decides what the touch MEANS — a fling from a hold —
         // and a beat of its own would decide it late.
-        if pace == FramePace::Display || self.touch.borrow().alive() {
+        // so does an app waiting for the next refresh (`vsync::request`)
+        if pace == FramePace::Display || self.touch.borrow().alive() || crate::vsync::requested() {
             return FramePace::Display;
         }
         // a shell with an alarm of its own for the sleepers asks the
