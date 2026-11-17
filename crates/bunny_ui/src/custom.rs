@@ -660,10 +660,28 @@ impl<'a> Painter<'a> {
         self.fill_rounded(rect, color, 0.0);
     }
 
+    /// A painter that records into `display` at the origin, with this
+    /// painter's font and ink: a picture the element keeps and paints
+    /// again with [`Painter::draw_list`] while what it shows is the same.
+    pub fn recorder<'b>(&self, display: &'b mut DisplayList) -> Painter<'b> {
+        Painter { display, origin: Point { x: 0.0, y: 0.0 }, font: self.font, ink: self.ink }
+    }
+
     /// Paints a whole display list here, every command shifted to this
     /// painter's origin — what a tool that shows frames another process
     /// rendered calls, with the list it decoded off the wire.
     pub fn draw_list(&mut self, display: &DisplayList) {
+        self.draw_list_swapping(display, |_| None);
+    }
+
+    /// [`Painter::draw_list`], with each image `swap` answers for drawn
+    /// from the source it gives instead: a kept picture of a page whose
+    /// video moved on to its next frame, and nothing else changed.
+    pub fn draw_list_swapping(
+        &mut self,
+        display: &DisplayList,
+        swap: impl Fn(&ImageSource) -> Option<ImageSource>,
+    ) {
         for command in display.iter() {
             let shifted = match command.clone() {
                 DrawCommand::FillRect { rect, color, corner_radius } => {
@@ -701,6 +719,7 @@ impl<'a> Painter<'a> {
                     DrawCommand::TurnedText { pivot: self.at(pivot), content, range, color, font, turn }
                 }
                 DrawCommand::Image { rect, source, placement } => {
+                    let source = swap(&source).unwrap_or(source);
                     DrawCommand::Image { rect: self.shift(rect), source, placement }
                 }
                 DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
@@ -1650,6 +1669,42 @@ mod tests {
         }
         let result = layout_root(&node(Document), 300.0, 900.0);
         assert_eq!(result.size.height, crate::layout::LINE_H * 12.0);
+    }
+
+    #[test]
+    fn a_kept_picture_paints_again_with_the_newest_frame_of_its_feed() {
+        // an element records its picture once, then replays it at its
+        // box for every new frame of a video, the frame swapped in
+        let key = crate::image_engine::FeedKey::new(7);
+        let frame = |generation: u64| ImageSource::feed(key, generation, (1, 1), vec![0u8; 4]);
+        let generations = |display: &DisplayList| -> Vec<(Rect, u64)> {
+            display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::Image { rect, source: ImageSource::Feed { generation, .. }, .. } => {
+                        Some((*rect, *generation))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let size = Size { width: 40.0, height: 30.0 };
+        let bounds = Rect { origin: Point::ZERO, size };
+        let at = Rect { origin: Point { x: 10.0, y: 20.0 }, size };
+        let mut display = DisplayList::default();
+        let mut kept = DisplayList::default();
+        let mut painter = Painter::new(&mut display, at.origin, FontSpec::DEFAULT, Color::FILL);
+        {
+            let mut recorder = painter.recorder(&mut kept);
+            recorder.fill(bounds, Color::FILL);
+            recorder.image(bounds, frame(1));
+        }
+        painter.draw_list_swapping(&kept, |source| {
+            matches!(source, ImageSource::Feed { .. }).then(|| frame(5))
+        });
+        assert_eq!(generations(&kept), vec![(bounds, 1)], "the kept picture is recorded at the origin");
+        assert_eq!(generations(&display), vec![(at, 5)], "and painted at the box with the newest frame");
+        assert_eq!(fills(&display), vec![at]);
     }
 
     #[test]
