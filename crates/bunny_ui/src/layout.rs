@@ -8399,9 +8399,10 @@ impl LayoutNode {
                 // replayed at its place. Never a box that moves on its own:
                 // one under a loop, one that holds the keyboard, one on the
                 // element lowering.
-                let kept = element
-                    .cached_version()
-                    .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
+                let kept = element.cached_version().filter(|_| {
+                    let focus = !focused || element.cached_through_focus();
+                    env.live.is_none() && focus && out.dom.is_none() && !path.is_empty()
+                });
                 // a box NO PIXEL can show — its clip came out empty. One that
                 // keeps its picture promised that its paint is only a
                 // picture, so there is nothing to do. Any other box may read

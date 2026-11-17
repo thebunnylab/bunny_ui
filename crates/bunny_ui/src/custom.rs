@@ -399,16 +399,30 @@ pub struct Custom {
     /// The version of the picture the app vouches for, if any — see
     /// [`CustomView::cached`].
     cached: Option<u64>,
+    /// Does the kept picture hold while the box has the keyboard? See
+    /// [`CustomView::cached_while_focused`].
+    focus_blind: bool,
 }
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom { element: Rc::new(element), auto_focus: None, borrows: false, cached: None }
+        Custom {
+            element: Rc::new(element),
+            auto_focus: None,
+            borrows: false,
+            cached: None,
+            focus_blind: false,
+        }
     }
 
     /// The picture's version, when the app asked for it to be kept.
     pub(crate) fn cached_version(&self) -> Option<u64> {
         self.cached
+    }
+
+    /// Is the kept picture good while the box holds the keyboard?
+    pub(crate) fn cached_through_focus(&self) -> bool {
+        self.focus_blind
     }
 
     pub fn element(&self) -> &dyn CustomElement {
@@ -1470,6 +1484,19 @@ impl CustomView {
     #[must_use]
     pub fn cached(mut self, version: u64) -> Self {
         self.element.cached = Some(version);
+        self
+    }
+
+    /// [`CustomView::cached`], kept even while the box holds the keyboard.
+    ///
+    /// For a box that draws its own caret and selection from its own state
+    /// (a web page, a terminal grid) and never reads `focused`,
+    /// `caret_visible` or `phase`: having the keyboard changes nothing it
+    /// paints, so the frames it does not change replay its picture too.
+    #[must_use]
+    pub fn cached_while_focused(mut self, version: u64) -> Self {
+        self.element.cached = Some(version);
+        self.element.focus_blind = true;
         self
     }
 }
