@@ -2681,11 +2681,6 @@ impl Drawables {
         }
     }
 
-    /// Whether the last present has landed — or there is none.
-    unsafe fn landed(&mut self) -> bool {
-        self.shown.as_mut().is_none_or(|shown| unsafe { shown.settled() }.is_some())
-    }
-
     /// How many surfaces are offered back right now.
     fn offered(&self) -> usize {
         self.surfaces.iter().filter(|(_, offered)| *offered).count()
@@ -2956,6 +2951,16 @@ impl Easel {
     }
 }
 
+/// The patch a bridge keeps up, and the drawable of the FIRST whole
+/// frame it covered. It comes down once that one lands: a stream of
+/// whole frames (a video) replaces the newest drawable before it ever
+/// lands, and a bridge waiting for the newest stayed up for good —
+/// every frame of the stream paid a bridge and its wait.
+struct Bridged {
+    patch: usize,
+    under: ShownSurface,
+}
+
 /// A patch kept up over a whole frame, its box repainted from that
 /// frame, until the frame's drawable lands (see
 /// [`MetalPresenter::bridge`]).
@@ -3024,7 +3029,7 @@ pub struct MetalPresenter {
     /// for the bands, the list where it stood before it scrolled. Taken
     /// down by the first frame or rest that finds the drawable landed
     /// ([`MetalPresenter::retire_bridge`]).
-    bridge: Option<usize>,
+    bridge: Option<Bridged>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
     /// The window's own drawables, offered back while it rests.
@@ -3337,7 +3342,7 @@ impl MetalPresenter {
                 // undone, a hover gone): the patch over it steps aside
                 // and nothing encodes. A bridge shows this frame too, and
                 // stays until the frame lands under it
-                let bridge = self.bridge;
+                let bridge = self.bridge.as_ref().map(|bridged| bridged.patch);
                 if self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge) {
                     self.previous = self.patch_on_screen();
                     let transaction = class("CATransaction");
@@ -3564,7 +3569,17 @@ impl MetalPresenter {
                     patch.hide();
                 }
                 msg_void(transaction, sel("commit"));
-                self.bridge = bridged;
+                self.bridge = match (bridged, self.bridge.take()) {
+                    (Some(patch), Some(kept)) if kept.patch == patch => Some(kept),
+                    (Some(patch), _) => Some(Bridged {
+                        patch,
+                        under: ShownSurface::Presenting {
+                            drawable: msg_id(drawable, sel("retain")),
+                            at: std::time::Instant::now(),
+                        },
+                    }),
+                    (None, _) => None,
+                };
                 if let Some(at) = bridged
                     && let Some(rect) = self.patches[at].shown
                 {
@@ -3669,10 +3684,11 @@ impl MetalPresenter {
     /// from then on the window's own layer shows the same pixels.
     unsafe fn retire_bridge(&mut self) {
         unsafe {
-            let Some(at) = self.bridge else { return };
-            if !self.drawables.landed() {
+            let Some(bridged) = self.bridge.as_mut() else { return };
+            if bridged.under.settled().is_none() {
                 return;
             }
+            let at = bridged.patch;
             self.bridge = None;
             let transaction = class("CATransaction");
             msg_void(transaction, sel("begin"));
@@ -4902,6 +4918,21 @@ mod tests {
             .expect("a patch on screen")
     }
 
+    /// The patch a bridge keeps up, by its index.
+    #[cfg(target_os = "macos")]
+    fn bridged(presenter: &MetalPresenter) -> Option<usize> {
+        presenter.bridge.as_ref().map(|bridged| bridged.patch)
+    }
+
+    /// Makes the first frame under the bridge `age` old, never reported
+    /// on screen — a window that is covered.
+    #[cfg(target_os = "macos")]
+    fn age_bridge(presenter: &mut MetalPresenter, age: std::time::Duration) {
+        if let Some(Bridged { under: ShownSurface::Presenting { at, .. }, .. }) = &mut presenter.bridge {
+            *at = std::time::Instant::now() - age;
+        }
+    }
+
     /// The RGBA pixel at `(x, y)` of the IOSurface a layer holds as its
     /// contents — what the window server composites at the commit.
     #[cfg(target_os = "macos")]
@@ -4990,7 +5021,7 @@ mod tests {
             let (at, rect) = shown_patch(&presenter);
             // the ground changes: a whole frame
             present_boxes(&mut presenter, &boxes_scene(true, false, second));
-            assert_eq!(presenter.bridge, Some(at), "the patch bridges the whole frame");
+            assert_eq!(bridged(&presenter), Some(at), "the patch bridges the whole frame");
             assert_eq!(shown_patch(&presenter), (at, rect), "still up, where it was");
             let patch = presenter.patches[at].layer;
             let inside = |x: i64, y: i64| ((x - rect.0) as usize, (y - rect.1) as usize);
@@ -5002,18 +5033,48 @@ mod tests {
             );
             // presented just now, never on screen: not landed
             let fresh = |presenter: &mut MetalPresenter, age: std::time::Duration| {
-                if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
-                    *at = std::time::Instant::now() - age;
-                }
+                age_bridge(presenter, age);
             };
             fresh(&mut presenter, std::time::Duration::ZERO);
             presenter.rest();
-            assert_eq!(presenter.bridge, Some(at), "a rest before it lands keeps the bridge");
+            assert_eq!(bridged(&presenter), Some(at), "a rest before it lands keeps the bridge");
             assert!(presenter.patches[at].shown.is_some());
             fresh(&mut presenter, PRESENT_LANDS_IN);
             presenter.offer_drawables();
-            assert_eq!(presenter.bridge, None);
+            assert_eq!(bridged(&presenter), None);
             assert!(presenter.patches[at].shown.is_none(), "down once the frame landed under it");
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stream_of_whole_frames_takes_the_bridge_down_once_the_first_landed() {
+        // a video under a patch: every frame is whole and replaces the
+        // drawable before it lands. Waiting for the NEWEST to land kept
+        // the bridge up for good, and every frame painted it and waited
+        // for the GPU on the main thread
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let ground = |shade: u8| Color::rgb(18, 22, shade);
+            present_boxes(&mut presenter, &boxes_scene(false, false, ground(0)));
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground(0)));
+            let (at, _) = shown_patch(&presenter);
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground(1)));
+            assert_eq!(bridged(&presenter), Some(at), "the first whole frame is bridged");
+            age_bridge(&mut presenter, PRESENT_LANDS_IN);
+            for shade in 2..6 {
+                present_boxes(&mut presenter, &boxes_scene(true, false, ground(shade)));
+                assert_eq!(bridged(&presenter), None, "frame {shade} has no bridge to paint");
+                assert!(presenter.patches.iter().all(|patch| patch.shown.is_none()));
+            }
             drop(presenter);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
@@ -5071,17 +5132,15 @@ mod tests {
             // the ground changes: a whole frame the bands refuse
             present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
             assert!(!presenter.scroll_bands.active());
-            let at = presenter.bridge.expect("a bridge over the rows");
+            let at = bridged(&presenter).expect("a bridge over the rows");
             assert_eq!(shown_patch(&presenter), (at, rows), "it covers what the bands did");
             let patch = presenter.patches[at].layer;
             // physical row 60 lies in row 3, scrolled up by 48: 44..68
             let inside = |x: i64, y: i64| ((x - rows.0) as usize, (y - rows.1) as usize);
             assert_eq!(contents_pixel(patch, inside(90, 60)), [0x44, 0x66, 0xaa, 0xff], "the rows as they stand now");
-            if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
-                *at -= PRESENT_LANDS_IN;
-            }
+            age_bridge(&mut presenter, PRESENT_LANDS_IN);
             present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
-            assert_eq!(presenter.bridge, None, "down once the frame landed");
+            assert_eq!(bridged(&presenter), None, "down once the frame landed");
             drop(presenter);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
@@ -5107,7 +5166,7 @@ mod tests {
             let taller = Size { width: 512.0, height: 640.0 };
             let display = boxes_scene(true, false, ground);
             presenter.present(&display, taller, 1, Color::CANVAS, &PixelFont, &RawImages::default(), false);
-            assert_eq!(presenter.bridge, None, "no bridge across a resize");
+            assert_eq!(bridged(&presenter), None, "no bridge across a resize");
             assert!(presenter.patches[at].shown.is_none(), "the patch steps aside with the frame");
             drop(presenter);
             msg_void(layer, sel("release"));
