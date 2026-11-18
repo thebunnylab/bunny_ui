@@ -8088,6 +8088,7 @@ impl LayoutNode {
                             crate::dom::DomKind::Image(crate::dom::DomImage {
                                 key: source.key(),
                                 cover: false,
+                                contain: false,
                             }),
                             frame,
                         );
@@ -9233,6 +9234,7 @@ impl LayoutNode {
                             crate::dom::DomKind::Image(crate::dom::DomImage {
                                 key: source.key(),
                                 cover,
+                                contain: false,
                             }),
                             frame,
                         );

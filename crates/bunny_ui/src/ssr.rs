@@ -708,6 +708,8 @@ impl Tree {
                         .insert("data-img", format!("{}:{}", key >> 32, key as u32));
                     if image.cover {
                         element.style.insert("object-fit", "cover".into());
+                    } else if image.contain {
+                        element.style.insert("object-fit", "contain".into());
                     }
                 }
             }
@@ -1042,6 +1044,11 @@ fn rule_text(
         base.insert("flex", "1 1 auto".into());
         base.insert("min-width", "0".into());
         base.insert("min-height", "0".into());
+        // a resizable picture takes its frame across as well (the glue's
+        // `lookRules` says why)
+        if matches!(kind, CreateKind::Image) {
+            base.insert("align-self", "stretch".into());
+        }
     }
     if let Some(line_gap) = layout.wrap {
         if !matches!(kind, CreateKind::Grid) {
@@ -1866,6 +1873,9 @@ mod tests {
         );
         let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
         assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
+        // and it takes its frame on both axes, as the layout sizes it: a
+        // width left to the ratio would spill a contained picture
+        assert!(page.css.contains("flex:1 1 auto") && page.css.contains("align-self:stretch"), "{}", page.css);
     }
 
     /// A served control says what it is before any script runs: the

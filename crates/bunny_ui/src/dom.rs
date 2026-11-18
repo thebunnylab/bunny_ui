@@ -141,13 +141,17 @@ pub enum DomKind {
 }
 
 /// One image element. `key` is the source identity ([`crate::
-/// image_engine::ImageSource::key`]); `cover` picks `object-fit`
-/// (`false` = our frame IS the rect, the element just fills it;
-/// `true` = the browser covers-and-clips with the same centered math).
+/// image_engine::ImageSource::key`]); `cover` and `contain` pick
+/// `object-fit` — neither: our frame IS the rect, the element just
+/// fills it; `cover`: the browser covers-and-clips with the same
+/// centered math; `contain`: the element holds the whole box it is
+/// offered and the browser letterboxes the picture in its middle, where
+/// the layout places the contained rect.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DomImage {
     pub key: u64,
     pub cover: bool,
+    pub contain: bool,
 }
 
 /// One vector glyph element. `key` is the SYMBOL's identity — never
@@ -4411,7 +4415,8 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// 27 (2026-11-18): the harness's name. After the element's name, Create
 /// (op 1) and `SetHints` (op 15) carry the view's `.test_id(…)` as a
 /// u16-length string, empty for none; the glue writes it as
-/// `data-testid`.
+/// `data-testid`. The fit byte of `SetImage` (op 9) gains a value: 2 is
+/// `object-fit: contain`, for a flow picture that holds its whole box.
 pub const ABI_VERSION: u32 = 27;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
@@ -4689,7 +4694,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *id);
                 push_u32(&mut out, (image.key >> 32) as u32);
                 push_u32(&mut out, image.key as u32);
-                out.push(image.cover as u8);
+                out.push(u8::from(image.cover) | u8::from(image.contain) << 1);
             }
             DomPatch::SetIcon { id, icon } => {
                 out.push(10);
@@ -6152,6 +6157,22 @@ mod tests {
         };
         assert_eq!(size_of("pad"), (Some(84.0), Some(44.0), Some((12.0, 12.0, 12.0, 12.0))));
         assert_eq!(size_of("edge"), (Some(84.0), Some(20.0), Some((0.0, 0.0, 0.0, 24.0))));
+
+        // a frame a harness names keeps its own box inside the padding
+        let named = rectangle().frame(60.0, 20.0).test_id("inner").padding_length(12.0);
+        let mount = Runtime::new().dom_frame(&named, Size { width: 200.0, height: 200.0 });
+        let inner = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.test_id() == Some("inner") => Some(*id),
+                _ => None,
+            })
+            .expect("the named frame mounted");
+        let boxed = mount.iter().find_map(|patch| match patch {
+            DomPatch::SetBox { id, width, height, .. } if *id == inner => Some((*width, *height)),
+            _ => None,
+        });
+        assert_eq!(boxed, Some((Some(60.0), Some(20.0))), "{mount:?}");
     }
 
     /// The harness's name (ABI 27) crosses last among the hints, on a
@@ -7907,7 +7928,7 @@ mod tests {
     fn the_image_encoding_is_byte_stable() {
         let bytes = encode(&[DomPatch::SetImage {
             id: 7,
-            image: DomImage { key: 0x1122_3344_5566_7788, cover: true },
+            image: DomImage { key: 0x1122_3344_5566_7788, cover: true, contain: false },
         }]);
         let expected: Vec<u8> = [
             &1u32.to_le_bytes()[..],
@@ -7919,6 +7940,31 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    /// A resizable picture that fits holds the whole box it is offered
+    /// and the browser letterboxes it (fit byte 2); one that fills
+    /// covers (1); a picture at its own size is just its rect (0).
+    #[test]
+    fn a_picture_says_how_it_fits() {
+        let runtime = Runtime::new();
+        let view = vstack!(
+            image(tiny_image(21)).resizable().aspect_ratio(motor::views::ContentMode::Fit).frame(40.0, 40.0),
+            image(tiny_image(22)).resizable().aspect_ratio(motor::views::ContentMode::Fill).frame(40.0, 40.0),
+            image(tiny_image(23)),
+        );
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let fit_of = |seed| {
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::SetImage { image, .. } if image.key == tiny_image(seed).key() => Some(image),
+                    _ => None,
+                })
+                .map(|image| encode(&[DomPatch::SetImage { id: 1, image: *image }]).last().copied())
+                .unwrap_or_else(|| panic!("picture {seed} mounted: {mount:?}"))
+        };
+        assert_eq!([fit_of(21), fit_of(22), fit_of(23)], [Some(2), Some(1), Some(0)]);
     }
 
     /// The walk asks whether a style paints without building one: the

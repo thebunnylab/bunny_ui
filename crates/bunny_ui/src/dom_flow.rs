@@ -804,9 +804,12 @@ impl Walk<'_> {
                 // FOLD: a padding around one pure layout node becomes
                 // that node's own padding (nested edges sum). Styled
                 // boxes never fold — their background must stay tight
-                // to the child, and CSS padding would slide under it.
+                // to the child, and CSS padding would slide under it —
+                // and neither does a node a harness names: its box is
+                // the view's, not the padding's.
                 if let [only] = lowered.as_mut_slice()
                     && only.style.is_default()
+                    && only.hints.test_id().is_none()
                     && !only.layout.as_ref().is_some_and(|layout| layout.relative)
                     && matches!(
                         only.kind,
@@ -1161,9 +1164,13 @@ impl Walk<'_> {
                             fit,
                             Some(motor::views::ContentMode::Fill)
                         );
+                        // a contained picture holds its whole box below and
+                        // the browser letterboxes it there
+                        let contain = *resizable && matches!(fit, Some(motor::views::ContentMode::Fit));
                         let mut picture = node(DomKind::Image(crate::dom::DomImage {
                             key: source.key(),
                             cover,
+                            contain,
                         }));
                         // a resizable picture takes the length it is offered
                         // down its holder, as the pixel layout sizes it to

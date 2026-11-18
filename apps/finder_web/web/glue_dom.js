@@ -648,6 +648,10 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl.flex = "1 1 auto";
     decl["min-width"] = "0";
     decl["min-height"] = "0";
+    // a resizable picture takes its frame across as well: a width left
+    // to the ratio spills a contained picture past its frame and crops
+    // a covering one from one side
+    if (kind === 7) decl["align-self"] = "stretch";
   }
   if (layout.wrap !== null) {
     // a row that wraps: its lines break where its items' widths say
@@ -1602,16 +1606,18 @@ function applyPatches(view, length) {
     } else if (op === 9) {
       const hi = u32();
       const lo = u32();
-      const cover = u8();
+      const fit = u8();
       const el = lookup(id);
       const entry = images.get(imageKey(hi, lo));
-      if (el) el.dataset.img = imageKey(hi, lo);
-      if (el && entry) {
-        el.src = entry.url;
-        // false: our frame IS the rect (contain and stretch resolve in
-        // the engine's geometry) — the element just fills it
-        el.style.objectFit = cover ? "cover" : "fill";
+      if (el) {
+        el.dataset.img = imageKey(hi, lo);
+        // 0: our frame IS the rect (the engine's geometry resolved the
+        // fit) — the element just fills it; 1 covers and clips; 2 holds
+        // the whole box and letterboxes the picture in its middle. The
+        // fit holds whether the bytes are here yet or arrive later
+        el.style.objectFit = fit === 1 ? "cover" : fit === 2 ? "contain" : "fill";
       }
+      if (el && entry) el.src = entry.url;
     } else if (op === 10) {
       u32(); // the symbol identity rides for the debugger's eyes
       u32();
