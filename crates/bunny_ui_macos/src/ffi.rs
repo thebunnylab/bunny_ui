@@ -58,7 +58,7 @@ mod modal;
 
 #[path = "window_ops.rs"]
 mod window_ops;
-pub use window_ops::{focus_window, set_window_parent, set_window_title};
+pub use window_ops::{focus_window, set_application_icon, set_window_parent, set_window_title};
 #[path = "fullscreen_ops.rs"]
 mod fullscreen_ops;
 pub use fullscreen_ops::{forget_fullscreen, set_window_fullscreen, window_fullscreen};

@@ -63,6 +63,13 @@ impl App {
         ffi::set_window_title(slot.window, title)
     }
 
+    /// Shows `image`, PNG or TIFF bytes, as the application's icon in the Dock and the app
+    /// switcher while it runs — what an app started outside a bundle needs to look like
+    /// itself. `false` when the image cannot be read.
+    pub fn set_icon(&self, image: &[u8]) -> bool {
+        ffi::set_application_icon(image)
+    }
+
     /// Reads this scene's successfully requested native parent relationship.
     /// Placement and stacking remain subject to window-manager policy.
     ///

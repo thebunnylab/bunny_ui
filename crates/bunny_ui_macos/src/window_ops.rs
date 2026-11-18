@@ -1,8 +1,8 @@
 //! Native requests for registered, independently routed scenes.
 use super::ObjcBool;
 use super::{
-    Id, MODAL_WINDOWS, WINDOWS, class, lend_hand, msg_bool, msg_id, msg_id_cstr, msg_void_bool,
-    msg_void_id, msg_void_id_i64, sel,
+    Id, MODAL_WINDOWS, WINDOWS, class, lend_hand, msg_bool, msg_id, msg_id_arg, msg_id_cstr,
+    msg_id_u64_u64, msg_void_bool, msg_void_id, msg_void_id_i64, sel,
 };
 use bunny_ui::window::{WindowError, WindowParentKind};
 
@@ -27,6 +27,26 @@ pub fn set_window_title(window: usize, title: &str) -> Result<(), WindowError> {
         msg_void_id(window, sel("setTitle:"), name);
     });
     Ok(())
+}
+
+/// Shows the PNG or TIFF in `image` as the application's icon in the Dock and the app
+/// switcher; `false` when AppKit cannot read it.
+pub fn set_application_icon(image: &[u8]) -> bool {
+    lend_hand(|| unsafe {
+        let data = msg_id_u64_u64(
+            class("NSData"),
+            sel("dataWithBytes:length:"),
+            image.as_ptr() as u64,
+            image.len() as u64,
+        );
+        let picture = msg_id_arg(msg_id(class("NSImage"), sel("alloc")), sel("initWithData:"), data);
+        if picture.is_null() {
+            return false;
+        }
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_void_id(app, sel("setApplicationIconImage:"), picture);
+        true
+    })
 }
 
 /// Requests the native relationship after validating both live endpoints.
