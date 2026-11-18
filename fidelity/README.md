@@ -165,9 +165,10 @@ with itself.
   (`display: flex; flex-direction: column; align-items: flex-start`).
 - Name a size other than 400 × 300 with
   `<meta name="fidelity" content="width=400, height=340">`.
-- Name every box worth comparing with `data-fid`. A run of text is
-  compared by an inline element around it: its client rect is the union
-  of its lines.
+- Name every box worth comparing with `data-fid`. A paragraph is a
+  block (`<p>`): its box is as wide as its container, which is the box a
+  bunny text that wraps takes. A short label in a flex row or column is
+  any element around the words: a flex item fits its content.
 - Say the design, not bunny's model of it. bunny draws a border over the
   box's edge and lays nothing out around it; a field whose words stand
   12 px from the outer edge under a 1 px stroke is `padding-left: 11px`

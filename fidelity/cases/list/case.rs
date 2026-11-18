@@ -23,7 +23,7 @@ fn row(icon: Color, title: &str, subtitle: &str, id: &str) -> impl View<Arity = 
 }
 
 fn separator(id: &str) -> impl View<Arity = Single> + use<> {
-    rectangle().foreground_color(SEPARATOR).frame_height(1.0).padding_edge(Edge::Leading, 56.0).test_id(id)
+    rectangle().foreground_color(SEPARATOR).frame_height(1.0).test_id(id).padding_edge(Edge::Leading, 56.0)
 }
 
 #[must_use]
