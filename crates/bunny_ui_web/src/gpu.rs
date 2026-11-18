@@ -26,7 +26,7 @@ use std::cell::{Cell, RefCell};
 use bunny_ui::gpu::shaders::PRELUDE_300ES;
 use bunny_ui::gpu::walk::{
     build_frame, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
-    SpriteInstance, GLASS_MAX_LEVEL,
+    SpriteInstance, TurnedInstance, GLASS_MAX_LEVEL,
 };
 use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageEngine;
@@ -252,12 +252,15 @@ struct Pipelines {
     sprite: u32,
     /// The feeds' program: the sprite vertex over a LINEAR sampler.
     live: u32,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned: u32,
     glass: u32,
     blur: u32,
     blit: u32,
     vao_rect: u32,
     vao_sprite: u32,
     vao_glass: u32,
+    vao_turned: u32,
     /// A vertex array with no attributes at all: the full-screen
     /// triangle builds its own corners from the vertex id.
     vao_full: u32,
@@ -267,6 +270,8 @@ struct Pipelines {
     blur_mode: u32,
     rects: u32,
     sprites: u32,
+    turned_buffer: u32,
+    turned_cap: u32,
     frame_ubo: u32,
     round_ubo: u32,
     /// What each instance buffer currently holds, in bytes — a smaller
@@ -462,6 +467,16 @@ impl Pipelines {
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::LIVE_FRAG_BODY),
             &["a_dest", "a_tex", "a_clip"],
         )?;
+        let turned = program(
+            &format!("{}{}", PRELUDE_300ES, src::TURNED_VERT),
+            &format!(
+                "{}{}{}",
+                PRELUDE_300ES,
+                src::SHARED_FRAG,
+                src::TURNED_FRAG_BODY
+            ),
+            &["a_axes", "a_origin", "a_tex", "a_clip"],
+        )?;
         let glass = program(
             &format!("{}{}", PRELUDE_300ES, src::GLASS_VERT),
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::GLASS_FRAG_BODY),
@@ -506,6 +521,7 @@ impl Pipelines {
                 rect,
                 sprite,
                 live,
+                turned,
                 glass,
                 blur,
                 blit,
@@ -514,11 +530,14 @@ impl Pipelines {
                 vao_rect: gl_create_vertex_array(),
                 vao_sprite: gl_create_vertex_array(),
                 vao_glass: gl_create_vertex_array(),
+                vao_turned: gl_create_vertex_array(),
                 vao_full: gl_create_vertex_array(),
                 glass_buffer: gl_create_buffer(),
                 glass_cap: 0,
                 rects: gl_create_buffer(),
                 sprites: gl_create_buffer(),
+                turned_buffer: gl_create_buffer(),
+                turned_cap: 0,
                 frame_ubo: gl_create_buffer(),
                 round_ubo: gl_create_buffer(),
                 rect_cap: 0,
@@ -564,6 +583,17 @@ fn rect_attribs(base: usize) {
 fn sprite_attribs(base: usize) {
     let stride = std::mem::size_of::<SpriteInstance>() as i32;
     for (index, offset) in [(0u32, 0usize), (1, 16), (2, 32)] {
+        unsafe {
+            gl_enable_vertex_attrib_array(index);
+            gl_vertex_attrib_pointer(index, 4, GL_FLOAT, 0, stride, (base + offset) as i32);
+            gl_vertex_attrib_divisor(index, 1);
+        }
+    }
+}
+
+fn turned_attribs(base: usize) {
+    let stride = std::mem::size_of::<TurnedInstance>() as i32;
+    for (index, offset) in [(0u32, 0usize), (1, 16), (2, 32), (3, 48)] {
         unsafe {
             gl_enable_vertex_attrib_array(index);
             gl_vertex_attrib_pointer(index, 4, GL_FLOAT, 0, stride, (base + offset) as i32);
@@ -1189,6 +1219,11 @@ pub(crate) fn present_window(
             &mut tier.pipelines.glass_cap,
             instance_bytes(&tier.batches.glass),
         );
+        upload(
+            tier.pipelines.turned_buffer,
+            &mut tier.pipelines.turned_cap,
+            instance_bytes(&tier.batches.turned),
+        );
 
         // the runs, in paint order — the display list IS the order, and
         // nothing here sorts or batches across it
@@ -1260,6 +1295,36 @@ pub(crate) fn present_window(
                         gl_bind_texture(GL_TEXTURE_2D, texture);
                     }
                     sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
+                }
+                RunKind::Turned | RunKind::TurnedTexture(_) => {
+                    if program != tier.pipelines.turned {
+                        program = tier.pipelines.turned;
+                        unsafe {
+                            gl_use_program(program);
+                            gl_bind_vertex_array(tier.pipelines.vao_turned);
+                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.turned_buffer);
+                        }
+                    }
+                    let texture = match run.kind {
+                        RunKind::TurnedTexture(index) => tier
+                            .batches
+                            .textures
+                            .get(index as usize)
+                            .and_then(|handle| {
+                                tier.ground
+                                    .dedicated
+                                    .get(handle)
+                                    .or_else(|| tier.ground.live.get(handle))
+                                    .copied()
+                            })
+                            .unwrap_or(0),
+                        _ => tier.ground.shared.unwrap_or(0),
+                    };
+                    unsafe {
+                        gl_active_texture(GL_TEXTURE0);
+                        gl_bind_texture(GL_TEXTURE_2D, texture);
+                    }
+                    turned_attribs(run.base as usize * std::mem::size_of::<TurnedInstance>());
                 }
                 // a world's target, composited with the box's veil
                 #[cfg(feature = "3d")]

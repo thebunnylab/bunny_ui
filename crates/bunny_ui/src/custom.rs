@@ -644,6 +644,10 @@ impl<'a> Painter<'a> {
         Point { x: point.x + self.origin.x, y: point.y + self.origin.y }
     }
 
+    fn moved(&self, transform: crate::layout::Affine) -> crate::layout::Affine {
+        crate::layout::Affine::translation(self.origin.x, self.origin.y).then(&transform)
+    }
+
     /// The font the box inherited — the default of the text calls.
     pub fn font(&self) -> FontSpec {
         self.font
@@ -724,6 +728,20 @@ impl<'a> Painter<'a> {
                 }
                 DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform,
+                    opacity,
+                } => {
+                    let source = swap(&source).unwrap_or(source);
+                    DrawCommand::Sprite {
+                        rect,
+                        source,
+                        transform: self.moved(transform),
+                        opacity,
+                    }
+                }
             };
             self.display.push(shifted);
         }
@@ -889,6 +907,31 @@ impl<'a> Painter<'a> {
             rect: self.shift(rect),
             source: source.into(),
             placement: ImagePlacement::Pixel,
+        });
+    }
+
+    /// One picture under an affine map and a group opacity
+    /// ([`DrawCommand::Sprite`]): `rect` is the picture's box in its own
+    /// coordinates and `transform` lays them onto the box's. The GPU turns,
+    /// scales and fades the texture it already holds, so a picture that
+    /// spins draws no new pixels, frame after frame.
+    ///
+    /// ```ignore
+    /// let spin = Affine { a: cos, b: sin, c: -sin, d: cos, e: x, f: y };
+    /// painter.sprite(card_box, card_pixels.clone(), spin, 0.8);
+    /// ```
+    pub fn sprite(
+        &mut self,
+        rect: Rect,
+        source: impl Into<ImageSource>,
+        transform: crate::layout::Affine,
+        opacity: f64,
+    ) {
+        self.display.push(DrawCommand::Sprite {
+            rect,
+            source: source.into(),
+            transform: self.moved(transform),
+            opacity,
         });
     }
 

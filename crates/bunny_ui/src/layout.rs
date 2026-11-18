@@ -2896,6 +2896,128 @@ pub enum ImagePlacement {
     Subpixel,
 }
 
+/// A flat affine map: the point `(x, y)` lands at
+/// `(a·x + c·y + e, b·x + d·y + f)` — the six numbers CSS's `matrix()` and
+/// Core Graphics name the same way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+}
+
+impl Affine {
+    pub const IDENTITY: Affine = Affine {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub const fn translation(dx: Px, dy: Px) -> Affine {
+        Affine {
+            e: dx,
+            f: dy,
+            ..Affine::IDENTITY
+        }
+    }
+
+    pub const fn scale(factor: f64) -> Affine {
+        Affine {
+            a: factor,
+            d: factor,
+            ..Affine::IDENTITY
+        }
+    }
+
+    /// `inner` first, then `self`.
+    pub fn then(&self, inner: &Affine) -> Affine {
+        Affine {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    pub fn apply(&self, point: Point) -> Point {
+        Point {
+            x: self.a * point.x + self.c * point.y + self.e,
+            y: self.b * point.x + self.d * point.y + self.f,
+        }
+    }
+
+    pub fn determinant(&self) -> f64 {
+        self.a * self.d - self.b * self.c
+    }
+
+    /// The map back, unless the map flattens the plane onto a line.
+    pub fn inverse(&self) -> Option<Affine> {
+        let det = self.determinant();
+        if det.abs() < 1e-12 || !det.is_finite() {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+
+    /// Does it only move? Then a picture keeps every pixel it has.
+    pub fn is_translation(&self) -> bool {
+        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0
+    }
+
+    /// Where the four corners of `rect` land, clockwise from its top left.
+    pub fn corners(&self, rect: Rect) -> [Point; 4] {
+        let (x0, y0) = (rect.origin.x, rect.origin.y);
+        let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
+        [
+            self.apply(Point { x: x0, y: y0 }),
+            self.apply(Point { x: x1, y: y0 }),
+            self.apply(Point { x: x1, y: y1 }),
+            self.apply(Point { x: x0, y: y1 }),
+        ]
+    }
+
+    /// The upright box that holds `rect` once it is mapped.
+    pub fn bounds(&self, rect: Rect) -> Rect {
+        let corners = self.corners(rect);
+        let mut low = corners[0];
+        let mut high = corners[0];
+        for corner in &corners[1..] {
+            low.x = low.x.min(corner.x);
+            low.y = low.y.min(corner.y);
+            high.x = high.x.max(corner.x);
+            high.y = high.y.max(corner.y);
+        }
+        Rect {
+            origin: low,
+            size: Size {
+                width: high.x - low.x,
+                height: high.y - low.y,
+            },
+        }
+    }
+
+    pub fn is_finite(&self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .iter()
+            .all(|value| value.is_finite())
+    }
+}
+
 /// How a view's background meets what is already painted under it —
 /// `.background_blend(…)`.
 ///
@@ -3012,6 +3134,21 @@ pub enum DrawCommand {
     /// intersection, so the composition lives where the stacks live.
     PushClip { rect: Rect, corner_radius: Corners },
     PopClip,
+    /// One picture under an affine map and a group opacity: a layer a
+    /// compositor turns, scales and fades without painting it again.
+    /// `rect` is the picture's box in its OWN coordinates and `transform`
+    /// lays those coordinates onto the scene. The backend asks the frame's
+    /// [`ImageEngine`] for pixels at the rect's PHYSICAL size, as for an
+    /// image, and samples them where the map puts each device pixel's
+    /// centre: four texels, weighed in premultiplied colour, and nothing
+    /// past the picture's edge — so a turned edge fades over one texel
+    /// instead of stepping.
+    Sprite {
+        rect: Rect,
+        source: ImageSource,
+        transform: Affine,
+        opacity: f64,
+    },
 }
 
 /// Two commands are equal when they paint alike. Every kind compares
@@ -3057,6 +3194,14 @@ impl PartialEq for DrawCommand {
             PushClip { rect, corner_radius } => matches!(other,
                 PushClip { rect: r, corner_radius: k } if rect == r && corner_radius == k),
             PopClip => matches!(other, PopClip),
+            Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => matches!(other,
+                Sprite { rect: r, source: s, transform: t, opacity: o }
+                    if rect == r && source == s && transform == t && opacity == o),
         }
     }
 }
@@ -3260,6 +3405,9 @@ impl DrawCommand {
                     }
                 }
             }
+            DrawCommand::Sprite {
+                rect, transform, ..
+            } => around(&transform.bounds(*rect), 1.0),
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => true,
         }
     }
@@ -3324,6 +3472,17 @@ impl DrawCommand {
                 DrawCommand::PushClip { rect: moved(rect), corner_radius: *corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => DrawCommand::Sprite {
+                rect: *rect,
+                source: source.clone(),
+                transform: Affine::translation(by.x, by.y).then(transform),
+                opacity: *opacity,
+            },
             DrawCommand::Gradient { .. } | DrawCommand::Backdrop { .. } => return None,
         })
     }
@@ -3564,6 +3723,9 @@ impl DisplayList {
                     }
                 },
                 DrawCommand::Image { source, .. } => *source = source.faded(opacity),
+                DrawCommand::Sprite {
+                    opacity: strength, ..
+                } => *strength *= opacity,
                 DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
             }
         }
@@ -3711,6 +3873,30 @@ impl DisplayList {
                     DrawCommand::PushClip { rect: rect(r), corner_radius: corners(corner_radius) }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect: r,
+                    source,
+                    transform,
+                    opacity,
+                } => {
+                    let zero = point(Point::ZERO);
+                    let across = point(Point { x: 1.0, y: 0.0 });
+                    let down = point(Point { x: 0.0, y: 1.0 });
+                    let turned = Affine {
+                        a: across.x - zero.x,
+                        b: across.y - zero.y,
+                        c: down.x - zero.x,
+                        d: down.y - zero.y,
+                        e: zero.x,
+                        f: zero.y,
+                    };
+                    DrawCommand::Sprite {
+                        rect: r,
+                        source,
+                        transform: turned.then(&transform),
+                        opacity,
+                    }
+                }
             };
         }
     }
@@ -3779,6 +3965,17 @@ impl DisplayList {
                     DrawCommand::PushClip { rect: shift_rect(rect), corner_radius }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform,
+                    opacity,
+                } => DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform: Affine::translation(dx, dy).then(&transform),
+                    opacity,
+                },
             })
             .collect();
         DisplayList { commands }
@@ -5803,6 +6000,7 @@ fn painted_reach(command: &DrawCommand, env: &LayoutEnv<'_>) -> Option<Rect> {
         // of anti-aliasing is the floor of both, as the damage diff keeps it
         DrawCommand::StrokeRect { rect, width, .. } => Some(around(rect, (width / 2.0).max(1.0))),
         DrawCommand::Shadow { rect, radius, .. } => Some(around(rect, radius.max(1.0))),
+        DrawCommand::Sprite { rect, transform, .. } => Some(around(&transform.bounds(*rect), 1.0)),
         DrawCommand::TextLine { origin, content, range, font, .. } => {
             let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
             Some(Rect {

@@ -2618,6 +2618,17 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                 DrawCommand::PushClip { rect: shift(rect), corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => DrawCommand::Sprite {
+                rect,
+                source,
+                transform: crate::layout::Affine::translation(dx, dy).then(&transform),
+                opacity,
+            },
         })
         .collect()
 }

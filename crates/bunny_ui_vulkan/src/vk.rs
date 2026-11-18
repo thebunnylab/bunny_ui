@@ -43,7 +43,7 @@ use bunny_ui::text_engine::TextEngine;
 
 use bunny_ui::gpu::walk::{
     build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL, ATLAS_KEEP_WALKS,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, TurnedInstance, GLASS_MAX_LEVEL, ATLAS_KEEP_WALKS,
 };
 
 #[cfg(feature = "3d")]
@@ -78,6 +78,8 @@ const SPRITE_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite.frag.spv");
 // a feed's sprite: the picture's own size, scaled into the box by the
 // linear sampler
 const LIVE_FRAG_SPV: &[u8] = include_bytes!("shaders/live.frag.spv");
+const TURNED_VERT_SPV: &[u8] = include_bytes!("shaders/turned.vert.spv");
+const TURNED_FRAG_SPV: &[u8] = include_bytes!("shaders/turned.frag.spv");
 const MASK_VERT_SPV: &[u8] = include_bytes!("shaders/mask.vert.spv");
 const MASK_FRAG_SPV: &[u8] = include_bytes!("shaders/mask.frag.spv");
 // liquid glass: the pane, one separable blur pass, and the copy of the
@@ -1581,6 +1583,8 @@ struct VkStack {
     sprite_pipeline: Pipeline,
     /// The feeds' pipeline: the sprite vertex over the LINEAR sampler.
     live_pipeline: Pipeline,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned_pipeline: Pipeline,
     mask_pipeline: Pipeline,
     /// The rect shaders under the erase blend — [`RunKind::Knockout`].
     /// Built only for a target the system composites by its own alpha,
@@ -2087,6 +2091,7 @@ impl VkStack {
                 rect_pipeline: 0,
                 sprite_pipeline: 0,
                 live_pipeline: 0,
+                turned_pipeline: 0,
                 mask_pipeline: 0,
                 erase_pipeline: 0,
                 command_pool,
@@ -2318,6 +2323,8 @@ impl VkStack {
         let sprite_vert = self.shader(SPRITE_VERT_SPV)?;
         let sprite_frag = self.shader(SPRITE_FRAG_SPV)?;
         let live_frag = self.shader(LIVE_FRAG_SPV)?;
+        let turned_vert = self.shader(TURNED_VERT_SPV)?;
+        let turned_frag = self.shader(TURNED_FRAG_SPV)?;
         let mask_vert = self.shader(MASK_VERT_SPV)?;
         let mask_frag = self.shader(MASK_FRAG_SPV)?;
         // the RectInstance bytes as instance-rate attributes — the
@@ -2349,6 +2356,18 @@ impl VkStack {
         ];
         // the feeds ride the sprite's lattice, through another fragment
         let live_binding = VertexInputBinding { ..sprite_binding };
+        // a turned picture: four vec4, the 64-byte lattice every tier shares
+        let turned_binding = VertexInputBinding {
+            binding: 0,
+            stride: std::mem::size_of::<TurnedInstance>() as u32,
+            input_rate: VERTEX_INPUT_RATE_INSTANCE,
+        };
+        let turned_attributes = [0u32, 1, 2, 3].map(|location| VertexInputAttribute {
+            location,
+            binding: 0,
+            format: FORMAT_R32G32B32A32_SFLOAT,
+            offset: location * 16,
+        });
         // and a knockout rides the rect's, under another blend
         let erase_binding = VertexInputBinding { ..rect_binding };
         // a pane's instance: six vec4 and two normalized ubyte4, the
@@ -2423,6 +2442,14 @@ impl VkStack {
             source_over,
             self.render_pass,
         )?;
+        self.turned_pipeline = self.pipeline(
+            turned_vert,
+            turned_frag,
+            &[turned_binding],
+            &turned_attributes,
+            source_over,
+            self.render_pass,
+        )?;
         self.mask_pipeline =
             self.pipeline(mask_vert, mask_frag, &[], &[], multiply, self.render_pass)?;
         // the same shaders and the same lattice as the rects: only the
@@ -2460,6 +2487,8 @@ impl VkStack {
                 sprite_vert,
                 sprite_frag,
                 live_frag,
+                turned_vert,
+                turned_frag,
                 mask_vert,
                 mask_frag,
                 glass_vert,
@@ -2659,6 +2688,7 @@ impl Drop for VkStack {
                 self.rect_pipeline,
                 self.sprite_pipeline,
                 self.live_pipeline,
+                self.turned_pipeline,
                 self.mask_pipeline,
                 // 0 where it was never built, which the destroy ignores
                 self.erase_pipeline,
@@ -3204,6 +3234,10 @@ struct VkSlot {
     glass_memory: DeviceMemory,
     glass_map: *mut u8,
     glass_capacity: usize,
+    turned: BufferHandle,
+    turned_memory: DeviceMemory,
+    turned_map: *mut u8,
+    turned_capacity: usize,
     in_flight: bool,
 }
 
@@ -3275,6 +3309,10 @@ impl VkSlot {
                 glass_memory: 0,
                 glass_map: std::ptr::null_mut(),
                 glass_capacity: 0,
+                turned: 0,
+                turned_memory: 0,
+                turned_map: std::ptr::null_mut(),
+                turned_capacity: 0,
                 in_flight: false,
             })
         }
@@ -3422,6 +3460,10 @@ fn draw_runs(
                 (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
                 | RunKind::Texture(_)) => false,
                 (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
+                (
+                    Some(RunKind::Turned | RunKind::TurnedTexture(_)),
+                    RunKind::Turned | RunKind::TurnedTexture(_),
+                ) => false,
                 (was, now) => was != Some(now),
             };
             if swap {
@@ -3430,6 +3472,7 @@ fn draw_runs(
                     // the rects again, taken away instead of painted
                     RunKind::Knockout => stack.erase_pipeline,
                     RunKind::Live(_) => stack.live_pipeline,
+                    RunKind::Turned | RunKind::TurnedTexture(_) => stack.turned_pipeline,
                     // the sprite's road, through the composite's fragment
                     RunKind::World(_) => worlds.0,
                     _ => stack.sprite_pipeline,
@@ -3446,12 +3489,24 @@ fn draw_runs(
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
                 }
-                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => {
-                    let offset =
-                        run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
-                    (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
+                RunKind::Sprites
+                | RunKind::Texture(_)
+                | RunKind::Live(_)
+                | RunKind::World(_)
+                | RunKind::Turned
+                | RunKind::TurnedTexture(_) => {
+                    let turned = matches!(run.kind, RunKind::Turned | RunKind::TurnedTexture(_));
+                    if turned {
+                        let offset = run.base as u64 * std::mem::size_of::<TurnedInstance>() as u64;
+                        (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.turned, &offset);
+                    } else {
+                        let offset = run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
+                        (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
+                    }
                     let set = match run.kind {
-                        RunKind::Texture(index) | RunKind::Live(index) => batches
+                        RunKind::Texture(index)
+                        | RunKind::Live(index)
+                        | RunKind::TurnedTexture(index) => batches
                             .textures
                             .get(index as usize)
                             .and_then(|id| ground.textures.get(id))
@@ -3932,7 +3987,15 @@ fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) 
     let rects_len = std::mem::size_of_val(batches.rects.as_slice());
     let sprites_len = std::mem::size_of_val(batches.sprites.as_slice());
     let glass_len = std::mem::size_of_val(batches.glass.as_slice());
+    let turned_len = std::mem::size_of_val(batches.turned.as_slice());
     if !VkSlot::ensure_side(
+        stack,
+        &mut slot.turned,
+        &mut slot.turned_memory,
+        &mut slot.turned_map,
+        &mut slot.turned_capacity,
+        turned_len,
+    ) || !VkSlot::ensure_side(
         stack,
         &mut slot.rects,
         &mut slot.rects_memory,
@@ -3976,6 +4039,13 @@ fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) 
                 batches.glass.as_ptr() as *const u8,
                 slot.glass_map,
                 glass_len,
+            );
+        }
+        if turned_len > 0 {
+            std::ptr::copy_nonoverlapping(
+                batches.turned.as_ptr() as *const u8,
+                slot.turned_map,
+                turned_len,
             );
         }
     }
@@ -6007,6 +6077,8 @@ mod tests {
             "sprite.vert",
             "sprite.frag",
             "live.frag",
+            "turned.vert",
+            "turned.frag",
             "mask.vert",
             "mask.frag",
             "glass.vert",

@@ -918,6 +918,25 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
                 Draw::PushClip { rect: (*rect).into(), corners: (*corner_radius).into() }
             }
             DrawCommand::PopClip => Draw::PopClip,
+            // the frozen wire has no turned picture: it shows upright,
+            // faded, in the box the map turns it into
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => {
+                let faded = source.faded(*opacity);
+                let (image, inner) = image_ref(&faded);
+                if seen.insert(image.key, ()).is_none() {
+                    images.push(inner.into_owned());
+                }
+                Draw::Image {
+                    rect: transform.bounds(*rect).into(),
+                    image,
+                    subpixel: true,
+                }
+            }
         })
         .collect();
     (commands, images)

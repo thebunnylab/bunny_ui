@@ -266,6 +266,81 @@ void main() {
 }
 "#;
 
+/// A picture under an affine map: the texel box one texel wider all
+/// round, mapped — the fade past the picture's edge lands inside the quad.
+pub const TURNED_VERT: &str = r#"
+layout(std140) uniform Frame {
+    vec2 viewport;
+};
+
+in vec4 a_axes;
+in vec4 a_origin;
+in vec4 a_tex;
+in vec4 a_clip;
+
+flat out vec4 v_axes;
+flat out vec4 v_origin;
+flat out vec4 v_tex;
+flat out vec4 v_clip;
+
+const vec2 unit_corners[6] = vec2[6](
+    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+    vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
+);
+
+void main() {
+    vec2 texel = mix(a_tex.xy - 1.0, a_tex.zw + 1.0, unit_corners[gl_VertexID]) - a_tex.xy;
+    vec2 p = a_origin.xy + a_axes.xy * texel.x + a_axes.zw * texel.y;
+    vec2 unit = p / viewport;
+    gl_Position = vec4(unit.x * 2.0 - 1.0, 1.0 - unit.y * 2.0, 0.0, 1.0);
+    v_axes = a_axes;
+    v_origin = a_origin;
+    v_tex = a_tex;
+    v_clip = a_clip;
+}
+"#;
+
+/// The pixel's centre mapped back onto the picture, and the four texels
+/// around it summed premultiplied — a texel past the picture's edge is
+/// clear, so the turned edge fades over one texel, as the raster's
+/// `composite_affine` does it.
+pub const TURNED_FRAG_BODY: &str = r#"
+flat in vec4 v_axes;
+flat in vec4 v_origin;
+flat in vec4 v_tex;
+flat in vec4 v_clip;
+out vec4 out_color;
+uniform sampler2D atlas;
+
+void main() {
+    vec2 p = raster_p();
+    if (any(lessThan(p, v_clip.xy)) || any(greaterThanEqual(p, v_clip.zw))) {
+        discard;
+    }
+    vec4 m = v_axes;
+    vec2 d = p - v_origin.xy;
+    vec2 local = vec2(m.w * d.x - m.z * d.y, m.x * d.y - m.y * d.x) / (m.x * m.w - m.z * m.y);
+    vec2 at = v_tex.xy + local - 0.5;
+    vec2 low = floor(at);
+    vec2 f = at - low;
+    vec4 sum = vec4(0.0);
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            vec2 texel = low + vec2(float(dx), float(dy));
+            float share = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+            if (share > 0.0 && all(greaterThanEqual(texel, v_tex.xy)) && all(lessThan(texel, v_tex.zw))) {
+                vec4 ink = texelFetch(atlas, ivec2(texel), 0);
+                sum += share * vec4(ink.rgb * ink.a, ink.a);
+            }
+        }
+    }
+    if (sum.a <= 0.0) {
+        discard;
+    }
+    out_color = vec4(sum.rgb / sum.a, sum.a * v_origin.z * clip_cov(p));
+}
+"#;
+
 // the scene's corner pass: the CPU road multiplies the corner squares
 // of its ARGB backing by the rounded-window coverage (premultiplied);
 // the GPU twin draws the same four squares with dst *= coverage —
@@ -575,13 +650,15 @@ mod tests {
 
     /// Every source a tier concatenates, by name, so a new one cannot
     /// join the set without joining the guards below.
-    const BODIES: [(&str, &str); 13] = [
+    const BODIES: [(&str, &str); 15] = [
         ("SHARED_FRAG", SHARED_FRAG),
         ("RECT_VERT", RECT_VERT),
         ("RECT_FRAG_BODY", RECT_FRAG_BODY),
         ("SPRITE_VERT", SPRITE_VERT),
         ("SPRITE_FRAG_BODY", SPRITE_FRAG_BODY),
         ("LIVE_FRAG_BODY", LIVE_FRAG_BODY),
+        ("TURNED_VERT", TURNED_VERT),
+        ("TURNED_FRAG_BODY", TURNED_FRAG_BODY),
         ("MASK_VERT", MASK_VERT),
         ("MASK_FRAG_BODY", MASK_FRAG_BODY),
         ("FULL_VERT", FULL_VERT),

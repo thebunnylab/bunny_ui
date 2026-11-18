@@ -40,7 +40,7 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame, ATLAS_KEEP_WALKS,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, TurnedInstance, build_frame, ATLAS_KEEP_WALKS,
 };
 use bunny_ui::glass;
 use bunny_ui::image_engine::ImageEngine;
@@ -668,6 +668,69 @@ fragment float4 live_fragment(SpriteVary in [[stage_in]],
     return float4(ink.rgb, ink.a * clip_cov(p, round));
 }
 
+// a picture under an affine map: the texel box one texel wider all
+// round, mapped — the fade past the picture's edge lands inside the quad
+struct TurnedInstance {
+    float4 axes;    // device px per texel: the x axis, then the y axis
+    float4 origin;  // the corner of texel tex.xy, the opacity
+    float4 tex;
+    float4 clip;
+};
+
+struct TurnedVary {
+    float4 position [[position]];
+    uint id [[flat]];
+};
+
+vertex TurnedVary turned_vertex(uint vid [[vertex_id]],
+                                uint iid [[instance_id]],
+                                device const TurnedInstance* turned [[buffer(0)]],
+                                constant Uniforms& uniforms [[buffer(1)]]) {
+    TurnedInstance sprite = turned[iid];
+    float2 texel = mix(sprite.tex.xy - 1.0, sprite.tex.zw + 1.0, unit_corners[vid]) - sprite.tex.xy;
+    float2 p = sprite.origin.xy + sprite.axes.xy * texel.x + sprite.axes.zw * texel.y;
+    TurnedVary out;
+    out.position = to_ndc(p - uniforms.origin, uniforms.viewport);
+    out.id = iid;
+    return out;
+}
+
+// the pixel's centre mapped back onto the picture, and the four texels
+// around it summed premultiplied — a texel past the picture's edge is
+// clear, so the turned edge fades over one texel (`composite_affine`)
+fragment float4 turned_fragment(TurnedVary in [[stage_in]],
+                                device const TurnedInstance* turned [[buffer(0)]],
+                                constant ClipRound& round [[buffer(1)]],
+                                constant Uniforms& uniforms [[buffer(2)]],
+                                texture2d<float, access::read> picture [[texture(0)]]) {
+    TurnedInstance sprite = turned[in.id];
+    float2 p = in.position.xy + uniforms.origin;
+    if (any(p < sprite.clip.xy) || any(p >= sprite.clip.zw)) {
+        discard_fragment();
+    }
+    float4 m = sprite.axes;
+    float2 d = p - sprite.origin.xy;
+    float2 local = float2(m.w * d.x - m.z * d.y, m.x * d.y - m.y * d.x) / (m.x * m.w - m.z * m.y);
+    float2 at = sprite.tex.xy + local - 0.5;
+    float2 low = floor(at);
+    float2 f = at - low;
+    float4 sum = float4(0.0);
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            float2 texel = low + float2(dx, dy);
+            float share = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+            if (share > 0.0 && all(texel >= sprite.tex.xy) && all(texel < sprite.tex.zw)) {
+                float4 ink = picture.read(uint2(texel));
+                sum += share * float4(ink.rgb * ink.a, ink.a);
+            }
+        }
+    }
+    if (sum.a <= 0.0) {
+        discard_fragment();
+    }
+    return float4(sum.rgb / sum.a, sum.a * sprite.origin.z * clip_cov(p, round));
+}
+
 // MARK: - Liquid glass
 //
 // The material of `glass.rs`, textually. Every constant below is that
@@ -1049,6 +1112,8 @@ struct MetalStack {
     /// The feeds' pipeline: the sprite vertex over a LINEAR sampler, so
     /// a picture of one size lands in a box of another.
     live_pipeline: Id,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned_pipeline: Id,
     /// The three pipelines liquid glass adds: the pane itself, one
     /// separable blur pass, and the copy of the offscreen scene onto
     /// the target a frame with glass cannot render into directly.
@@ -1153,6 +1218,14 @@ impl MetalStack {
             let live_pipeline = build_pipeline(
                 device, library, "sprite_vertex", "live_fragment", format, PassBlend::Over,
             )?;
+            let turned_pipeline = build_pipeline(
+                device,
+                library,
+                "turned_vertex",
+                "turned_fragment",
+                format,
+                PassBlend::Over,
+            )?;
             // a pane blends over the scene like any other paint; the
             // blur and the blit REPLACE what they write (a pass that
             // covers its whole destination has nothing to keep)
@@ -1178,6 +1251,7 @@ impl MetalStack {
                 knockout_pipeline,
                 sprite_pipeline,
                 live_pipeline,
+                turned_pipeline,
                 glass_pipeline,
                 blur_pipeline,
                 blit_pipeline,
@@ -1504,6 +1578,33 @@ impl MetalStack {
                                 );
                                 msg_void_id_u64(encoder, self.sels.set_fragment_texture, texture, 0);
                             }
+                            RunKind::Turned | RunKind::TurnedTexture(_) => {
+                                msg_void_id(encoder, self.sels.set_pipeline, self.turned_pipeline);
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_vertex_buffer,
+                                    frame.instances,
+                                    frame.turned_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_fragment_buffer,
+                                    frame.instances,
+                                    frame.turned_offset as u64,
+                                    0,
+                                );
+                                let texture = match run.kind {
+                                    RunKind::TurnedTexture(index) => frame.textures[index as usize],
+                                    _ => frame.atlas_texture,
+                                };
+                                msg_void_id_u64(
+                                    encoder,
+                                    self.sels.set_fragment_texture,
+                                    texture,
+                                    0,
+                                );
+                            }
                             // glass never reaches this pass
                             RunKind::Glass => continue,
                         }
@@ -1724,6 +1825,7 @@ struct EncodeFrame<'a> {
     instances: Id,
     sprite_offset: usize,
     glass_offset: usize,
+    turned_offset: usize,
     runs: &'a [DrawRun],
     rounds: &'a [RoundClip],
     atlas_texture: Id,
@@ -2438,9 +2540,15 @@ unsafe fn upload_frame(
         let rect_bytes = as_bytes(&batches.rects);
         let sprite_bytes = as_bytes(&batches.sprites);
         let glass_bytes = as_bytes(&batches.glass);
+        let turned_bytes = as_bytes(&batches.turned);
         let sprite_offset = rect_bytes.len().next_multiple_of(256);
         let glass_offset = (sprite_offset + sprite_bytes.len()).next_multiple_of(256);
-        let total = glass_offset + glass_bytes.len();
+        let turned_at = turned_offset(glass_offset, batches);
+        let total = if turned_bytes.is_empty() {
+            glass_offset + glass_bytes.len()
+        } else {
+            turned_at + turned_bytes.len()
+        };
         if total == 0 {
             return (0, 0);
         }
@@ -2474,9 +2582,24 @@ unsafe fn upload_frame(
                 glass_bytes.len(),
             );
         }
+        if !turned_bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                turned_bytes.as_ptr(),
+                contents.add(turned_at),
+                turned_bytes.len(),
+            );
+        }
         (sprite_offset, glass_offset)
     }
 }
+
+/// Where the turned pictures start in the frame's buffer: 256-aligned
+/// after the panes.
+fn turned_offset(glass_offset: usize, batches: &FrameBatches) -> usize {
+    (glass_offset + std::mem::size_of_val(batches.glass.as_slice())).next_multiple_of(256)
+}
+
+const _: () = assert!(std::mem::size_of::<TurnedInstance>() == 64);
 
 // MARK: - The window presenter
 
@@ -3499,6 +3622,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -3656,6 +3780,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -3857,6 +3982,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -4223,6 +4349,7 @@ impl OffscreenGpu {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -4342,6 +4469,7 @@ impl OffscreenGpu {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -5742,6 +5870,75 @@ mod tests {
                 let (gpu, cpu) =
                     scene_bytes(&subpixel_scene(shift), Size { width: 320.0, height: 400.0 }, scale, Color::CANVAS);
                 assert_close(&gpu, &cpu, 2, &format!("subpixel pictures at {scale}x, {shift} pt past the grid"));
+            }
+        }
+    }
+
+    /// Pictures under affine maps: turned on a shelf tile, scaled on a
+    /// dedicated texture, faded and skewed under a rounded clip.
+    fn sprite_scene(angle: f64) -> impl View {
+        use bunny_ui::custom::canvas;
+        use bunny_ui::layout::{Affine, Corners, Point, Rect};
+        canvas(move |_, p| {
+            let at = |x: f64, y: f64, width: f64, height: f64| Rect {
+                origin: Point { x, y },
+                size: Size { width, height },
+            };
+            p.fill(at(0.0, 0.0, 320.0, 400.0), Color::rgba(40, 60, 120, 255));
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let turn = |x: f64, y: f64, scale: f64| Affine {
+                a: cos * scale,
+                b: sin * scale,
+                c: -sin * scale,
+                d: cos * scale,
+                e: x,
+                f: y,
+            };
+            p.sprite(
+                at(-12.0, -12.0, 24.0, 24.0),
+                gradient_source(21),
+                turn(40.0, 40.0, 1.0),
+                1.0,
+            );
+            p.sprite(
+                at(-60.0, -60.0, 120.0, 300.0),
+                gradient_source(22),
+                turn(160.0, 200.0, 0.7),
+                1.0,
+            );
+            p.clipped_rounded(at(20.0, 260.0, 200.0, 120.0), Corners::all(18.0), |p| {
+                let skew = Affine {
+                    c: 0.4,
+                    ..turn(60.0, 300.0, 1.3)
+                };
+                p.sprite(at(-24.0, -12.0, 48.0, 24.0), cloud_source(23), skew, 0.6);
+            });
+        })
+        .frame(320.0, 400.0)
+    }
+
+    #[test]
+    fn sprites_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        for scale in [1, 2] {
+            for angle in [0.0, 17.0, 45.0, 90.0, 203.5] {
+                let (gpu, cpu) = scene_bytes(
+                    &sprite_scene(angle),
+                    Size {
+                        width: 320.0,
+                        height: 400.0,
+                    },
+                    scale,
+                    Color::CANVAS,
+                );
+                assert_close(
+                    &gpu,
+                    &cpu,
+                    3,
+                    &format!("sprites at {scale}x turned {angle} degrees"),
+                );
             }
         }
     }
