@@ -1863,7 +1863,19 @@ extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
         let next = msg_f64(link, sel("targetTimestamp"));
         // the refresh an app drawing on its own clock aims at, on the
         // clock `Instant` reads
-        let left = (next - CACurrentMediaTime()).clamp(0.0, 1.0);
+        let now = CACurrentMediaTime();
+        let left = (next - now).clamp(0.0, 1.0);
+        if bunny_ui_apple::trace::active() {
+            let tape = bunny_ui_apple::trace::clock_ms();
+            bunny_ui_apple::trace::mark(
+                "Y",
+                format_args!(
+                    "vsync={:.2} target={:.2}",
+                    tape + (last - now) * 1000.0,
+                    tape + (next - now) * 1000.0
+                ),
+            );
+        }
         let beat = bunny_ui::vsync::DisplayBeat {
             target: std::time::Instant::now() + std::time::Duration::from_secs_f64(left),
             interval: std::time::Duration::from_secs_f64((next - last).clamp(0.0, 1.0)),

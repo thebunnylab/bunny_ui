@@ -35,6 +35,7 @@ type Listener = Box<dyn FnMut(DisplayBeat) -> bool>;
 
 thread_local! {
     static REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static LAST: Cell<Option<DisplayBeat>> = const { Cell::new(None) };
     static LISTENERS: RefCell<Vec<Listener>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -56,9 +57,15 @@ pub fn listen(listener: impl FnMut(DisplayBeat) -> bool + 'static) {
     LISTENERS.with(|listeners| listeners.borrow_mut().push(Box::new(listener)));
 }
 
+/// The last refresh the shell on this thread delivered.
+pub fn last() -> Option<DisplayBeat> {
+    LAST.with(Cell::get)
+}
+
 /// The shell's half: a refresh came. The request is answered, and every
 /// listener hears it; one may ask for the next refresh from inside.
 pub fn deliver(beat: DisplayBeat) {
+    LAST.with(|last| last.set(Some(beat)));
     REQUESTED.with(|requested| requested.set(false));
     let mut running = LISTENERS.with(|listeners| std::mem::take(&mut *listeners.borrow_mut()));
     running.retain_mut(|listener| listener(beat));

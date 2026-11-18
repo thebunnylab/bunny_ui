@@ -2458,14 +2458,11 @@ impl Drop for MetalGround {
 /// A completed frame's time on the GPU, on the tape: `G gpu=<ms>`. Read
 /// when its slot is taken for a later frame — the command buffer is done
 /// by then, and the two timestamps are the GPU's own clock.
-unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
-    if !crate::trace::enabled() {
-        return;
-    }
+unsafe fn mark_gpu_time(command: Id, sels: &Sels) -> Option<f64> {
     let (start, end) = unsafe { (msg_f64(command, sels.gpu_start), msg_f64(command, sels.gpu_end)) };
-    if end > start {
-        crate::trace::mark("G", format_args!("gpu={:.2}", (end - start) * 1000.0));
-    }
+    let gpu = (end > start).then(|| (end - start) * 1000.0)?;
+    crate::trace::mark("G", format_args!("gpu={gpu:.2}"));
+    Some(gpu)
 }
 
 /// A free slot from a ring: polled by `status`, oldest-first. When all
@@ -2474,6 +2471,8 @@ unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
 struct AcquiredSlot {
     index: usize,
     retry: bool,
+    /// The GPU time of the frame the slot held, in milliseconds.
+    gpu_ms: Option<f64>,
 }
 
 fn acquire_slot(
@@ -2493,26 +2492,35 @@ fn acquire_slot(
             let free = status >= STATUS_COMPLETED;
             if free {
                 let retry = slots[index].settle_uploads(status, atlas);
+                let mut gpu_ms = None;
                 if !slots[index].command.is_null() {
-                    mark_gpu_time(slots[index].command, sels);
+                    gpu_ms = mark_gpu_time(slots[index].command, sels);
                     msg_void(slots[index].command, sels.release);
                     slots[index].command = null_mut();
                     slots[index].native.clear();
                 }
                 *cursor = (index + 1) % slots.len();
-                return AcquiredSlot { index, retry };
+                return AcquiredSlot {
+                    index,
+                    retry,
+                    gpu_ms,
+                };
             }
         }
         let index = *cursor;
         msg_void(slots[index].command, sels.wait_completed);
         let status = msg_u64(slots[index].command, sels.status);
         let retry = slots[index].settle_uploads(status, atlas);
-        mark_gpu_time(slots[index].command, sels);
+        let gpu_ms = mark_gpu_time(slots[index].command, sels);
         msg_void(slots[index].command, sels.release);
         slots[index].command = null_mut();
         slots[index].native.clear();
         *cursor = (index + 1) % slots.len();
-        AcquiredSlot { index, retry }
+        AcquiredSlot {
+            index,
+            retry,
+            gpu_ms,
+        }
     }
 }
 
@@ -3170,6 +3178,11 @@ pub struct MetalPresenter {
     glass: Option<GlassTextures>,
     /// How long the last present waited for a drawable, in milliseconds.
     drawable_wait_ms: f64,
+    /// Whether the last present changed what the window shows.
+    changed: bool,
+    /// The GPU time of the last frame known to have completed, in
+    /// milliseconds.
+    gpu_ms: f64,
 }
 
 impl MetalPresenter {
@@ -3417,12 +3430,14 @@ impl MetalPresenter {
                 (size.height.round().max(0.0) as usize) * scale,
             );
             self.drawable_wait_ms = 0.0;
+            self.changed = true;
             self.retire_bridge();
             if poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels) {
                 self.forget_failed_frame();
             }
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
+                self.changed = false;
                 if let Some(attempt) = observation {
                     attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
                 }
@@ -3432,6 +3447,7 @@ impl MetalPresenter {
             if frame_repeats(&self.retained, display, physical, scale, canvas) {
                 // the caret blink and friends land here every half
                 // second — nothing changed, nothing encodes
+                self.changed = false;
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -3466,7 +3482,9 @@ impl MetalPresenter {
                 // and nothing encodes. A bridge shows this frame too, and
                 // stays until the frame lands under it
                 let bridge = self.bridge.as_ref().map(|bridged| bridged.patch);
-                if self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge) {
+                self.changed =
+                    self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge);
+                if self.changed {
                     self.previous = self.patch_on_screen();
                     let transaction = class("CATransaction");
                     msg_void(transaction, sel("begin"));
@@ -3550,6 +3568,9 @@ impl MetalPresenter {
                 &mut self.atlas,
             );
             let index = acquired.index;
+            if let Some(gpu_ms) = acquired.gpu_ms {
+                self.gpu_ms = gpu_ms;
+            }
             if acquired.retry {
                 self.forget_failed_frame();
                 plan = Plan::Whole;
@@ -3591,6 +3612,7 @@ impl MetalPresenter {
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
+                self.changed = false;
                 if let Some(attempt) = observation {
                     attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
                 }
@@ -3902,6 +3924,7 @@ impl MetalPresenter {
             }) {
                 // Logical geometry changed, but no physical pixel did. Keep
                 // the visible surface untouched and advance the frame witness.
+                self.changed = false;
                 self.previous = self.patch_on_screen();
                 let held = Rc::new(display.clone());
                 self.patches[same].held = Some((held.clone(), rect));
@@ -4113,6 +4136,8 @@ impl MetalPresenter {
             drawables: Drawables::default(),
             resting: false,
             transactional: false,
+            changed: false,
+            gpu_ms: 0.0,
             glass: None,
             drawable_wait_ms: 0.0,
         })
@@ -4141,6 +4166,16 @@ impl MetalPresenter {
             live: self.atlas.live.len(),
             size: self.atlas.size,
         }
+    }
+
+    pub fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// The GPU time of the last frame known to have completed, in
+    /// milliseconds.
+    pub fn gpu_ms(&self) -> f64 {
+        self.gpu_ms
     }
 
     pub fn drawable_wait_ms(&self) -> f64 {
