@@ -6074,6 +6074,86 @@ mod tests {
         assert_eq!(tail[12..], [0, 0], "and no test id");
     }
 
+    /// A filled shape under a plain ink wears that ink: the box that
+    /// carried it declares no CSS `color` (only a state needs one), so a
+    /// `currentColor` fill would fall to the page's own colour. Under a
+    /// hover ink the shape inherits, and the browser flips it.
+    #[test]
+    fn a_shape_wears_the_ink_it_was_given() {
+        let blue = Color::rgba(52, 120, 246, 255);
+        let red = Color::rgba(255, 59, 48, 255);
+        let runtime = Runtime::new();
+        let view = vstack!(
+            rectangle().foreground_color(blue).frame(40.0, 20.0).test_id("plain"),
+            rectangle().frame(40.0, 20.0).test_id("hover").foreground_color(blue).foreground_hovered(red),
+        )
+        .foreground_color(Color::rgba(0, 0, 0, 255));
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let shape_under = |name: &str| {
+            let named = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } if hints.test_id() == Some(name) => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} mounted: {mount:?}"));
+            let mut parents = vec![named];
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, parent, kind: CreateKind::Rectangle, .. } => {
+                        if parents.contains(parent) {
+                            return Some(*id);
+                        }
+                        parents.push(*id);
+                        None
+                    }
+                    DomPatch::Create { id, parent, .. } if parents.contains(parent) => {
+                        parents.push(*id);
+                        None
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a rectangle under {name}: {mount:?}"))
+        };
+        let color_of = |id| look_of(&mount, id).and_then(|(look, _)| look.color);
+        assert_eq!(color_of(shape_under("plain")), Some(blue), "{mount:?}");
+        assert_eq!(color_of(shape_under("hover")), None, "the hovered ink is inherited: {mount:?}");
+    }
+
+    /// A padding around a frame of a fixed size goes AROUND it: the
+    /// frame's size is its content's, and the element that carries both
+    /// sizes its border edge.
+    #[test]
+    fn a_padded_frame_keeps_its_size_inside_the_padding() {
+        let runtime = Runtime::new();
+        let view = vstack!(
+            rectangle().frame(60.0, 20.0).padding_length(12.0).test_id("pad"),
+            rectangle().frame(60.0, 20.0).padding_edge(motor::views::Edge::Leading, 24.0).test_id("edge"),
+        );
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let size_of = |name: &str| {
+            let id = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } if hints.test_id() == Some(name) => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} mounted: {mount:?}"));
+            let (_, layout) = look_of(&mount, id).expect("a look");
+            let (width, height) = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::SetBox { id: at, width, height, .. } if *at == id => Some((*width, *height)),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (width, height, layout.padding)
+        };
+        assert_eq!(size_of("pad"), (Some(84.0), Some(44.0), Some((12.0, 12.0, 12.0, 12.0))));
+        assert_eq!(size_of("edge"), (Some(84.0), Some(20.0), Some((0.0, 0.0, 0.0, 24.0))));
+    }
+
     /// The harness's name (ABI 27) crosses last among the hints, on a
     /// create and on the live hints alike, and lands on the element the
     /// view lowered to — a stack, a text, a padded box — whatever the

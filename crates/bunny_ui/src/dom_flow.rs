@@ -478,15 +478,15 @@ fn align_code(align: CrossAlign) -> u8 {
 }
 
 /// [`align_code`] with the vertical edge a node names in the high nibble
-/// ([`crate::dom::DomLayout::align`]): only the top and bottom rows of an
-/// `Alignment` hold a child against an edge. The middle row centres
-/// natively and keeps the flow's own placement here, which is what it
-/// lowered to before it had a name — so its byte is the one it was.
+/// ([`crate::dom::DomLayout::align`]). The middle row centres: a frame
+/// taller than its child holds the child in its middle, as the pixel
+/// pipelines place it, and a flex column's own placement would put it on
+/// top.
 fn align_both(align: CrossAlign, vertical: CrossAlign) -> u8 {
     let edge = match vertical {
         CrossAlign::Start | CrossAlign::Baseline => 1,
+        CrossAlign::Center => 2,
         CrossAlign::End => 3,
-        CrossAlign::Center => 0,
     };
     align_code(align) | edge << 4
 }
@@ -823,6 +823,12 @@ impl Walk<'_> {
                         sum(was_bottom, bottom),
                         sum(was_leading, leading),
                     ));
+                    // the box sizes its border edge: a frame's own size is
+                    // its content's, and the padding goes around it
+                    layout.width = layout.width.map(|width| sum(width, leading + trailing));
+                    layout.height = layout.height.map(|height| sum(height, top + bottom));
+                    layout.max_width = layout.max_width.map(|width| sum(width, leading + trailing));
+                    layout.max_height = layout.max_height.map(|height| sum(height, top + bottom));
                     out.append(&mut lowered);
                     return;
                 }
@@ -927,8 +933,13 @@ impl Walk<'_> {
                 shape.layout.as_mut().expect("flow node").grow = true;
                 // currentColor follows inherited hover/press ink in CSS too.
                 // An unstyled shape retains the original rectangle's fill.
+                // A plain ink is no element's CSS `color` — the box that
+                // carried it declares one only for a state — so outside a
+                // hover scope the shape names the ink itself.
                 if self.ink.is_empty() {
                     shape.style.look_mut().color = Some(Color::FILL);
+                } else if self.ink_scopes.is_empty() {
+                    shape.style.look_mut().color = Some(self.current_ink());
                 }
             }
             LayoutNode::Leaf { size } => {
@@ -1869,8 +1880,11 @@ impl Walk<'_> {
         if !lone_table {
             return;
         }
+        // a block cannot centre: only the leading edge folds, and the
+        // middle row keeps the block's top, as it always did
+        let leading = [align_code(CrossAlign::Start), align_both(CrossAlign::Start, CrossAlign::Center)];
         if let Some(layout) = container.layout.as_mut()
-            && layout.align == Some(align_code(CrossAlign::Start))
+            && layout.align.is_some_and(|align| leading.contains(&align))
             && layout.wrap.is_none()
         {
             layout.plain = true;
@@ -2537,9 +2551,11 @@ mod tests {
             scene.children[0].layout.as_ref().expect("flow").align
         };
 
-        assert_eq!(code(CrossAlign::Start), Some(align_code(CrossAlign::Start)));
-        assert_eq!(code(CrossAlign::Center), Some(align_code(CrossAlign::Center)));
-        assert_eq!(code(CrossAlign::End), Some(align_code(CrossAlign::End)));
+        // and the middle row on the vertical one: the lane's child sits
+        // in the lane's middle
+        for align in [CrossAlign::Start, CrossAlign::Center, CrossAlign::End] {
+            assert_eq!(code(align), Some(align_code(align) | 2 << 4));
+        }
     }
 
     /// The native host lowers to the browser's own island: an iframe
