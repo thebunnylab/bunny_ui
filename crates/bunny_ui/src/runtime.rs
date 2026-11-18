@@ -7103,6 +7103,7 @@ impl Runtime {
                     touch: self.touch_modality.get(),
                     overlay_layered: true,
                     direction: placement.direction,
+                    anchor: owner.anchor,
                 };
                 let origin = crate::layout::Point {
                     x: owner.frame.origin.x - placement.frame.origin.x,
@@ -7133,6 +7134,7 @@ impl Runtime {
                     touch: self.touch_modality.get(),
                     overlay_layered: false,
                     direction: placement.direction,
+                    anchor: placement.anchor,
                 };
                 let origin = crate::layout::Point {
                     x: -placement.visible.origin.x,

@@ -13169,6 +13169,7 @@ mod tests {
             scale: 2.0,
             touch: false,
             direction: LayoutDirection::LeftToRight,
+            anchor: None,
         };
 
         // the product's own line, `(v * scale).round() / scale`

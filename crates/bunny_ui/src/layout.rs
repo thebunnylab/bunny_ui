@@ -4779,6 +4779,9 @@ pub struct CustomPlacement {
     /// Such a box records no hit, and the pointer's roads pass it by even
     /// when it shares its path with the control around it.
     pub pointer: bool,
+    /// The rect the popover holding the box hangs from, when it sits in
+    /// one ([`crate::custom::PaintCtx::anchor`]).
+    pub anchor: Option<Rect>,
 }
 
 impl CustomPlacement {
@@ -4861,6 +4864,9 @@ pub struct Placement {
     pub(crate) focus_scope: Option<Rc<str>>,
     accessibility_viewport: Option<Rect>,
     accessibility_surface: Option<Rc<str>>,
+    /// The anchor of the popover being placed, told to the custom boxes
+    /// inside it.
+    popover_anchor: Option<Rect>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
     pub display: DisplayList,
@@ -6673,7 +6679,10 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
         out.focus_scope = Some(Rc::from(queued.path.as_str()));
         let accessibility_surface = out.accessibility_surface.replace(Rc::from(queued.path.as_str()));
         let accessibility_viewport = out.accessibility_viewport.replace(frame);
+        let popover_anchor =
+            std::mem::replace(&mut out.popover_anchor, queued.side.map(|_| queued.anchor));
         queued.node.place(frame, &fit, env, out);
+        out.popover_anchor = popover_anchor;
         out.accessibility_viewport = accessibility_viewport;
         out.accessibility_surface = accessibility_surface;
         // a popover that placed no control is a picture beside the
@@ -8542,6 +8551,7 @@ impl LayoutNode {
                             slice: (0, 0),
                             direction: env.direction,
                             pointer,
+                            anchor: out.popover_anchor,
                         });
                         Some(out.customs.len() - 1)
                     } else { None }
@@ -8590,6 +8600,7 @@ impl LayoutNode {
                     touch: env.touch,
                     overlay_layered: layered,
                     direction: env.direction,
+                    anchor: out.popover_anchor,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 // a box that asked to keep its picture is painted once for
@@ -8642,6 +8653,13 @@ impl LayoutNode {
                                 touch: env.touch,
                                 overlay_layered: layered,
                                 direction: env.direction,
+                                anchor: out.popover_anchor.map(|anchor| Rect {
+                                    origin: Point {
+                                        x: anchor.origin.x - frame.origin.x,
+                                        y: anchor.origin.y - frame.origin.y,
+                                    },
+                                    size: anchor.size,
+                                }),
                             };
                             let mut recorded = DisplayList::default();
                             let mut painter = crate::custom::Painter::new(
@@ -8770,6 +8788,7 @@ impl LayoutNode {
                             slice: (overlay_from, overlay_end),
                             direction: env.direction,
                             pointer,
+                            anchor: out.popover_anchor,
                         });
                     }
                 }

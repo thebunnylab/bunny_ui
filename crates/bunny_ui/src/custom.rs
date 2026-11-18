@@ -556,12 +556,23 @@ pub struct PaintCtx<'a> {
     /// gutter, a disclosure, a scrollbar of its own) puts it on the
     /// leading edge with [`Self::leading_x`].
     pub direction: LayoutDirection,
+    /// The rect the popover holding the box hangs from, in the same
+    /// coordinates as `frame` — what a bubble's arrow points at. `None`
+    /// outside a popover.
+    pub anchor: Option<Rect>,
 }
 
 impl PaintCtx<'_> {
     /// The box's size — the usual start of a paint.
     pub fn size(&self) -> Size {
         self.frame.size
+    }
+
+    /// Where the middle of the popover's anchor falls on the box's own
+    /// horizontal axis, or `None` outside a popover. It may lie past
+    /// either edge when the popover was pushed aside to stay on screen.
+    pub fn anchor_x(&self) -> Option<Px> {
+        self.anchor.map(|anchor| anchor.origin.x + anchor.size.width / 2.0 - self.frame.origin.x)
     }
 
     /// Does the scene around the box read right to left?
