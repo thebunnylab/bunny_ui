@@ -3,6 +3,7 @@
 pub mod build;
 pub mod devices;
 pub mod doctor;
+pub mod fidelity;
 pub mod new;
 pub mod preview;
 pub mod run;

@@ -76,6 +76,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::setup::run,
     },
     Command {
+        name: "fidelity",
+        summary: commands::fidelity::SUMMARY,
+        usage: commands::fidelity::USAGE,
+        about: commands::fidelity::ABOUT,
+        options: commands::fidelity::OPTIONS,
+        run: commands::fidelity::run,
+    },
+    Command {
         name: "devices",
         summary: commands::devices::DEVICES_SUMMARY,
         usage: commands::devices::DEVICES_USAGE,

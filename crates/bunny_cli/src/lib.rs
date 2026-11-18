@@ -15,6 +15,7 @@ pub mod cli;
 pub mod commands;
 pub mod devices;
 pub mod error;
+pub mod fidelity;
 pub mod formats;
 pub mod hot;
 pub mod ids;
