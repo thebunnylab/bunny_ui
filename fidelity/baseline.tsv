@@ -1,0 +1,47 @@
+# The fidelity ratchet: `bunny fidelity sweep` fails when a number grows,
+# and `bunny fidelity sweep --bless` writes the numbers that shrank.
+# chrome	Chrome/150.0.7871.24
+# flags	--headless=new --disable-gpu --disable-gpu-rasterization --disable-gpu-compositing --force-color-profile=srgb --disable-lcd-text --font-render-hinting=none --hide-scrollbars --enable-unsafe-swiftshader
+case	pair	geometry	pixels_outside_text	pixels_in_text
+align	AxB	14	77440	0
+align	AxC	0	0	0
+align	BxC	14	77440	0
+card	AxB	6	199186	3261
+card	AxC	7	250993	15047
+card	BxC	7	269361	13929
+form	AxB	9	17314	15453
+form	AxC	0	535	3314
+form	BxC	9	17348	15448
+grid	AxB	0	122400	0
+grid	AxC	0	720	0
+grid	BxC	0	122800	0
+grow_shrink	AxB	0	75520	0
+grow_shrink	AxC	3	0	8475
+grow_shrink	BxC	3	75520	8475
+image_scale	AxB	0	43832	0
+image_scale	AxC	0	118225	0
+image_scale	BxC	0	142719	0
+list	AxB	2	2496	0
+list	AxC	2	731	177
+list	BxC	0	3227	177
+padding_margin	AxB	9	44096	0
+padding_margin	AxC	0	0	0
+padding_margin	BxC	9	44096	0
+paragraph	AxB	2	0	0
+paragraph	AxC	2	0	6713
+paragraph	BxC	0	0	6713
+rounded_border	AxB	6	29366	0
+rounded_border	AxC	0	1792	0
+rounded_border	BxC	6	29359	0
+shadow	AxB	0	0	0
+shadow	AxC	0	35736	0
+shadow	BxC	0	35736	0
+stack_gap	AxB	0	40224	0
+stack_gap	AxC	0	0	0
+stack_gap	BxC	0	40224	0
+word	AxB	0	0	0
+word	AxC	1	0	672
+word	BxC	1	0	672
+wrap	AxB	0	0	0
+wrap	AxC	0	1401	0
+wrap	BxC	0	1401	0

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=340" />
+    <title>Main and cross alignment</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 340px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+      .track { width: 300px; height: 36px; display: flex; align-items: center; background: #f2f2f7; }
+      .track.leading { justify-content: flex-start; }
+      .track.center { justify-content: center; }
+      .track.trailing { justify-content: flex-end; }
+      .track.between { justify-content: space-between; }
+      .track.tall { height: 44px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row.top { align-items: flex-start; }
+      .row.bottom { align-items: flex-end; }
+      .vrow { display: flex; gap: 24px; align-items: flex-start; }
+      .vcol { display: flex; flex-direction: column; gap: 4px; }
+      .vcol.leading { align-items: flex-start; }
+      .vcol.trailing { align-items: flex-end; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="track leading" data-fid="leading">
+          <div class="row"><div class="blue" style="width: 40px; height: 20px" data-fid="leading-a"></div><div class="green" style="width: 60px; height: 20px" data-fid="leading-b"></div></div>
+        </div>
+        <div class="track center" data-fid="center">
+          <div class="row"><div class="blue" style="width: 40px; height: 20px" data-fid="center-a"></div><div class="green" style="width: 60px; height: 20px" data-fid="center-b"></div></div>
+        </div>
+        <div class="track trailing" data-fid="trailing">
+          <div class="row"><div class="blue" style="width: 40px; height: 20px" data-fid="trailing-a"></div><div class="green" style="width: 60px; height: 20px" data-fid="trailing-b"></div></div>
+        </div>
+        <div class="track between" data-fid="between">
+          <div class="blue" style="width: 40px; height: 20px" data-fid="between-a"></div><div class="green" style="width: 60px; height: 20px" data-fid="between-b"></div>
+        </div>
+        <div class="track tall" data-fid="top">
+          <div class="row top"><div class="blue" style="width: 20px; height: 12px" data-fid="top-a"></div><div class="green" style="width: 20px; height: 24px" data-fid="top-b"></div><div class="orange" style="width: 20px; height: 36px" data-fid="top-c"></div></div>
+        </div>
+        <div class="track tall" data-fid="bottom">
+          <div class="row bottom"><div class="blue" style="width: 20px; height: 12px" data-fid="bottom-a"></div><div class="green" style="width: 20px; height: 24px" data-fid="bottom-b"></div><div class="orange" style="width: 20px; height: 36px" data-fid="bottom-c"></div></div>
+        </div>
+        <div class="vrow">
+          <div class="vcol leading" data-fid="v-leading"><div class="blue" style="width: 80px; height: 10px" data-fid="vl-a"></div><div class="green" style="width: 40px; height: 10px" data-fid="vl-b"></div><div class="orange" style="width: 120px; height: 10px" data-fid="vl-c"></div></div>
+          <div class="vcol trailing" data-fid="v-trailing"><div class="blue" style="width: 80px; height: 10px" data-fid="vt-a"></div><div class="green" style="width: 40px; height: 10px" data-fid="vt-b"></div><div class="orange" style="width: 120px; height: 10px" data-fid="vt-c"></div></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

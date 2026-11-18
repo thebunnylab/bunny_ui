@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Shadows</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 32px; padding: 24px; }
+      .card { width: 160px; height: 80px; background: #fff; border-radius: 12px; box-shadow: 0 0 12px rgba(0, 0, 0, 0.25); }
+      .square { width: 80px; height: 80px; background: #3478f6; box-shadow: 0 0 6px rgba(52, 120, 246, 0.5); }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="card" data-fid="card"></div>
+        <div class="square" data-fid="square"></div>
+      </div>
+    </div>
+  </body>
+</html>

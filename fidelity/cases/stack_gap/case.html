@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Stacks with a gap</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; }
+
+      .column { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .row.tight { gap: 4px; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+      .purple { background: #af52de; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column" data-fid="column">
+        <div class="row" data-fid="row">
+          <div class="blue" style="width: 48px; height: 24px" data-fid="row-a"></div>
+          <div class="green" style="width: 32px; height: 24px" data-fid="row-b"></div>
+          <div class="orange" style="width: 64px; height: 24px" data-fid="row-c"></div>
+        </div>
+        <div class="purple" style="width: 120px; height: 40px" data-fid="wide"></div>
+        <div class="row tight" data-fid="tight">
+          <div class="blue" style="width: 20px; height: 20px" data-fid="tight-a"></div>
+          <div class="green" style="width: 20px; height: 40px" data-fid="tight-b"></div>
+          <div class="orange" style="width: 20px; height: 30px" data-fid="tight-c"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

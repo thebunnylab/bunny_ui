@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Grow and shrink</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+      .row { display: flex; width: 300px; }
+      .row.gap { gap: 10px; }
+      .row.narrow { width: 200px; gap: 8px; align-items: flex-start; }
+      .grow { flex: 1 1 0; height: 32px; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+      .purple { background: #af52de; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="row" data-fid="row1">
+          <div class="blue" style="width: 60px; height: 32px" data-fid="fixed-a"></div>
+          <div class="grow green" data-fid="grow"></div>
+          <div class="orange" style="width: 40px; height: 32px" data-fid="fixed-b"></div>
+        </div>
+        <div class="row gap" data-fid="row2">
+          <div class="grow green" data-fid="half-a"></div>
+          <div class="grow purple" data-fid="half-b"></div>
+        </div>
+        <div class="row narrow" data-fid="row3">
+          <span data-fid="shrink-a">Shrinking labels wrap</span>
+          <span data-fid="shrink-b">when the row is narrow</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

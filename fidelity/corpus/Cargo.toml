@@ -1,0 +1,13 @@
+[package]
+name = "fidelity-corpus"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "The bunny half of the fidelity corpus: one view per case of fidelity/cases"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bunny-ui = { workspace = true, features = ["canvas"] }
+bunny-ui-web = { path = "../../crates/bunny_ui_web", features = ["probe"] }

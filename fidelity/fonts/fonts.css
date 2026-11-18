@@ -1,0 +1,9 @@
+/* The corpus's one face, declared once for every page: the hand-written
+   cases and the shells that boot bunny alike. One file stands for every
+   weight, so no page ever sees a synthesized bold. */
+@font-face {
+  font-family: "Fid Sans";
+  src: url("/fonts/Lato-Medium.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+}

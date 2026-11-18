@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Paragraphs that wrap</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 20px; }
+      .box { width: 240px; }
+      .loose { font-size: 15px; line-height: 24px; }
+      .centered { text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="box" data-fid="box1"><span data-fid="text1">Layout is the quiet part of an interface: when it works, nobody notices the twelve pixels between a title and its body.</span></div>
+        <div class="box loose" data-fid="box2">Line height sets the rhythm of a paragraph, and one pixel of drift a line adds up fast.</div>
+        <div class="box centered" data-fid="box3"><span data-fid="text3">Centered lines break the same way and sit in the middle.</span></div>
+      </div>
+    </div>
+  </body>
+</html>
