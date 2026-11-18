@@ -492,8 +492,14 @@ const DEDICATED_HEIGHT: u32 = 256;
 const DEDICATED_AREA: u32 = 512 * 512;
 /// Dedicated textures retained before a stale one asks the collector.
 /// A frame that reads more keeps them all: the collector can only take
-/// a texture no walk needs.
-const DEDICATED_KEEP: usize = 8;
+/// a texture no walk needs. A web page shows a dozen big pictures at a
+/// time (a landing page's screenshots, the layers a browser flattened),
+/// and a frame that needs one more than the cap drains and re-uploads
+/// every picture, frame after frame — so the cap leaves room for a few
+/// screens of them…
+const DEDICATED_KEEP: usize = 32;
+/// …while the stale ones go first once the kept ones hold these bytes.
+const DEDICATED_BYTES: u64 = 256 << 20;
 /// Feeds kept warm between frames: a camera or a video is a handful on a
 /// screen, never a crowd. A frame that reads more keeps them all.
 pub const LIVE_KEEP: usize = 16;
@@ -1017,7 +1023,12 @@ impl RunAtlas {
         // this walk read is not garbage; after the drain+reset the map
         // holds nothing else, and the walk that re-runs keeps what it
         // needs instead of running into the same wall
-        if self.dedicated.len() >= DEDICATED_KEEP {
+        let held: u64 = self
+            .dedicated
+            .values()
+            .map(|entry| u64::from(entry.width) * u64::from(entry.height) * 4)
+            .sum();
+        if self.dedicated.len() >= DEDICATED_KEEP || held > DEDICATED_BYTES {
             // the cheap road first, as for the shelves: a texture no walk
             // read for a while is one no frame in flight samples
             let stale: Vec<_> = self

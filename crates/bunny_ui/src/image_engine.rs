@@ -664,18 +664,32 @@ pub trait ImageEngine {
 /// GPU tiers assert byte equality.
 fn resample_rgba(source: &[u8], (src_w, src_h): (u32, u32), width: usize, height: usize) -> Vec<u8> {
     let (src_w, src_h) = (src_w as usize, src_h as usize);
+    // the same size is the same bytes: the pictures an app draws at its
+    // own pixels (a layer it flattened, a feed) never walk pixel by pixel
+    if src_w == width && src_h == height && source.len() >= width * height * 4 {
+        return source[..width * height * 4].to_vec();
+    }
     let mut rgba = vec![0u8; width * height * 4];
     if src_w == 0 || src_h == 0 {
         return rgba;
     }
+    let columns: Vec<usize> = (0..width).map(|x| (x * src_w) / width * 4).collect();
+    let row = width * 4;
+    // a row that reads the same source row as the one above is that row
+    let mut above: Option<usize> = None;
     for y in 0..height {
         let sy = (y * src_h) / height;
-        for x in 0..width {
-            let sx = (x * src_w) / width;
-            let from = (sy * src_w + sx) * 4;
-            let to = (y * width + x) * 4;
-            rgba[to..to + 4].copy_from_slice(&source[from..from + 4]);
+        let (done, rest) = rgba.split_at_mut(y * row);
+        let out = &mut rest[..row];
+        if above == Some(sy) {
+            out.copy_from_slice(&done[(y - 1) * row..]);
+            continue;
         }
+        let line = &source[sy * src_w * 4..];
+        for (pixel, &from) in out.chunks_exact_mut(4).zip(&columns) {
+            pixel.copy_from_slice(&line[from..from + 4]);
+        }
+        above = Some(sy);
     }
     rgba
 }
