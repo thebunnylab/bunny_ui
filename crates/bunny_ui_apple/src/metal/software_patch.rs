@@ -208,7 +208,8 @@ impl Scene {
                 DrawCommand::Gradient { .. }
                 | DrawCommand::Backdrop { .. }
                 | DrawCommand::Shadow { .. }
-                | DrawCommand::Image { .. } => return None,
+                | DrawCommand::Image { .. }
+                | DrawCommand::Sprite { .. } => return None,
             }
         }
         let display = patch_coordinates(&lifted, rect, scale, text, cache)?;
@@ -534,7 +535,8 @@ pub(super) fn patch_coordinates(
                 DrawCommand::Gradient { .. }
                 | DrawCommand::Backdrop { .. }
                 | DrawCommand::Shadow { .. }
-                | DrawCommand::Image { .. } => return None,
+                | DrawCommand::Image { .. }
+                | DrawCommand::Sprite { .. } => return None,
             }
             Some(command)
         })

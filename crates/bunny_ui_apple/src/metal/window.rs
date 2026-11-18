@@ -733,6 +733,8 @@ pub struct WindowPresenter {
     /// leaves the software base, not opaque, holding premultiplied pixels.
     translucent: bool,
     strategy: Strategy,
+    /// Whether the last native present changed what the window shows.
+    changed: bool,
 }
 
 impl WindowPresenter {
@@ -801,6 +803,7 @@ impl WindowPresenter {
                 boxes: MeasureCache::default(),
                 state: NativeState::Choosing,
             })),
+            changed: false,
         })
     }
 
@@ -858,6 +861,7 @@ impl WindowPresenter {
         images: &dyn ImageEngine,
         live: bool,
     ) {
+        self.changed = true;
         if let Strategy::Metal(metal) = &mut self.strategy {
             metal.presenter.observation = self
                 .observation_visible
@@ -871,6 +875,7 @@ impl WindowPresenter {
             (size.height.round().max(0.0) as usize).saturating_mul(scale),
         );
         if scale == 0 || physical.0 == 0 || physical.1 == 0 {
+            self.changed = false;
             return;
         }
         let translucent = self.translucent;
@@ -894,6 +899,7 @@ impl WindowPresenter {
             NativeState::Software(prior) => frame_repeats(prior, display, physical, scale, canvas),
         };
         if repeats {
+            self.changed = false;
             return;
         }
         native.boxes.begin_frame();
@@ -1078,6 +1084,21 @@ impl WindowPresenter {
     pub fn set_transactional(&mut self, live: bool) {
         if let Strategy::Metal(m) = &mut self.strategy {
             m.presenter.set_transactional(live);
+        }
+    }
+    /// Whether the last present changed what the window shows.
+    pub fn changed(&self) -> bool {
+        match &self.strategy {
+            Strategy::Native(_) => self.changed,
+            Strategy::Metal(m) => m.presenter.changed(),
+        }
+    }
+    /// The GPU time of the last frame known to have completed, in
+    /// milliseconds; none for a native composition.
+    pub fn gpu_ms(&self) -> f64 {
+        match &self.strategy {
+            Strategy::Native(_) => 0.0,
+            Strategy::Metal(m) => m.presenter.gpu_ms(),
         }
     }
     /// Reports no drawable wait for a native composition.

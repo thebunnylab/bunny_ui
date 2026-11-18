@@ -461,10 +461,11 @@ pub struct Runtime {
     overlay_layers: Cell<bool>,
     /// Can the shell show a scrollbar's thumb on a layer of its own?
     thumb_layers: Cell<bool>,
-    /// The size last HANDED to each measurement probe. A probe fires on
-    /// change and only on change: a view at rest costs nothing, and a
-    /// handler that writes state cannot spin against its own report.
-    measures: RefCell<HashMap<String, crate::layout::Size>>,
+    /// What was last HANDED to each measurement probe: the size, at a
+    /// zero origin, for `.on_measure`; the frame for `.on_frame`. A probe
+    /// fires on change and only on change: a view at rest costs nothing,
+    /// and a handler that writes state cannot spin against its own report.
+    measures: RefCell<HashMap<String, Rect>>,
     /// The offset last PUBLISHED to each region's binding. It is what
     /// tells a value the app WROTE apart from the value the region
     /// itself landed on and reported: only one of the two can differ
@@ -1481,7 +1482,7 @@ impl Runtime {
         self.note_pointer_source();
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
-        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let over = self.hover_target(x, y).and_then(|path| self.pointer_custom_at(&path));
         if let Some(placement) = over {
             let at = Self::local(&placement, x, y);
             let event = crate::custom::ElementEvent::ButtonDown { at, button, modifiers };
@@ -1515,7 +1516,7 @@ impl Runtime {
             return false;
         }
         self.interaction.borrow_mut().button_grab = None;
-        let Some(placement) = self.custom_at(&path) else { return false };
+        let Some(placement) = self.pointer_custom_at(&path) else { return false };
         let at = Self::local(&placement, x, y);
         self.deliver(&placement, crate::custom::ElementEvent::ButtonUp { at, button }).handled
     }
@@ -2340,7 +2341,7 @@ impl Runtime {
         let held = self.interaction.borrow().button_grab.clone();
         if let Some((path, button)) = held {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
-            if let Some(placement) = self.custom_at(&path) {
+            if let Some(placement) = self.pointer_custom_at(&path) {
                 let at = Self::local(&placement, x, y);
                 let event = crate::custom::ElementEvent::ButtonMoved { at, button, modifiers };
                 return self.deliver(&placement, event).handled;
@@ -2379,7 +2380,7 @@ impl Runtime {
         let grabbed = self.interaction.borrow().element_grab.clone();
         if let Some(path) = grabbed {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
-            if let Some(placement) = self.custom_at(&path) {
+            if let Some(placement) = self.pointer_custom_at(&path) {
                 let at = Self::local(&placement, x, y);
                 let event =
                     crate::custom::ElementEvent::PointerMoved { at, pressed: true, modifiers };
@@ -2412,12 +2413,12 @@ impl Runtime {
         // another target, bare glass — exactly as it does when the pointer
         // leaves the window: a hover a box keeps for itself (a lifted row, a
         // column of chevrons) otherwise outlives the hand that made it
-        if changed && let Some(placement) = left.as_deref().and_then(|path| self.custom_at(path)) {
+        if changed && let Some(placement) = left.as_deref().and_then(|path| self.pointer_custom_at(path)) {
             self.deliver(&placement, crate::custom::ElementEvent::PointerExited);
         }
         // a free move over a box still reaches it: a cursor over code
         // wants the column under it
-        let over = hovered.as_deref().and_then(|path| self.custom_at(path));
+        let over = hovered.as_deref().and_then(|path| self.pointer_custom_at(path));
         let used = match over {
             Some(placement) => {
                 let at = Self::local(&placement, x, y);
@@ -2609,16 +2610,36 @@ impl Runtime {
     /// frames; keys and text carry no point, and the box's own world
     /// is exactly what the ctx should say).
     fn custom_at(&self, path: &str) -> Option<crate::layout::CustomPlacement> {
+        self.custom_where(path, |_| true)
+    }
+
+    /// [`Self::custom_at`] for the pointer's roads: only a box that takes
+    /// the pointer. A box that declines it — its own
+    /// [`crate::custom::CustomElement::takes_pointer`], or a subtree's
+    /// `.allows_hit_testing(false)` — often has the path of the control
+    /// around it (a glyph inside a button), and the press it does not
+    /// want is that control's.
+    fn pointer_custom_at(&self, path: &str) -> Option<crate::layout::CustomPlacement> {
+        self.custom_where(path, |placement| placement.pointer)
+    }
+
+    /// The first box at `path` that `wanted` keeps, in the order
+    /// [`Self::custom_at`] reads the two ledgers.
+    fn custom_where(
+        &self,
+        path: &str,
+        wanted: fn(&crate::layout::CustomPlacement) -> bool,
+    ) -> Option<crate::layout::CustomPlacement> {
         self.last_customs
             .borrow()
             .iter()
-            .find(|placement| placement.path == path)
+            .find(|placement| placement.path == path && wanted(placement))
             .cloned()
             .or_else(|| {
                 self.dom_customs
                     .borrow()
                     .iter()
-                    .find(|(_, placement)| placement.path == path)
+                    .find(|(_, placement)| placement.path == path && wanted(placement))
                     .map(|(_, placement)| placement.clone())
             })
     }
@@ -2718,7 +2739,7 @@ impl Runtime {
         // to the hand's owner before the previously focused box or keymap.
         if *pattern == KeyPattern::key(crate::action::Key::Escape) {
             let grabbed = self.interaction.borrow().element_grab.clone();
-            if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+            if let Some(placement) = grabbed.as_deref().and_then(|path| self.pointer_custom_at(path)) {
                 let response = self.deliver(
                     &placement,
                     crate::custom::ElementEvent::Key(stroke),
@@ -2996,7 +3017,7 @@ impl Runtime {
         // answers that the gesture RISES, and then the nearest
         // interactive ancestor arms too, exactly as if the box were
         // glass for that one purpose
-        if let Some(placement) = target.as_deref().and_then(|path| self.custom_at(path)) {
+        if let Some(placement) = target.as_deref().and_then(|path| self.pointer_custom_at(path)) {
             {
                 let mut interaction = self.interaction.borrow_mut();
                 interaction.pointer = Some(Point { x, y });
@@ -3103,7 +3124,7 @@ impl Runtime {
                 interaction.pointer = Some(Point { x, y });
                 interaction.pressed.take()
             };
-            if let Some(placement) = self.custom_at(&path) {
+            if let Some(placement) = self.pointer_custom_at(&path) {
                 let at = Self::local(&placement, x, y);
                 self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
                 // a box that takes the keyboard takes it on the click,
@@ -3233,7 +3254,7 @@ impl Runtime {
             .as_deref()
             .is_some_and(reconciler::has_editor);
         drop(interaction);
-        let held = holding.and_then(|path| self.custom_at(&path)).and_then(|placement| {
+        let held = holding.and_then(|path| self.pointer_custom_at(&path)).and_then(|placement| {
             let local = Self::local(&placement, at.x, at.y);
             placement.element.element().cursor(local, placement.visible)
         });
@@ -3251,7 +3272,7 @@ impl Runtime {
         // grab or a sweep stops the hover from following the hand, and the
         // question is the box under the hand NOW
         let under = self.hover_target(at.x, at.y)?;
-        let placement = self.custom_at(&under)?;
+        let placement = self.pointer_custom_at(&under)?;
         let local = Self::local(&placement, at.x, at.y);
         placement.element.element().cursor(local, placement.visible)
     }
@@ -3303,7 +3324,7 @@ impl Runtime {
         };
         // the box under the pointer hears it leave (a hovered column,
         // a hovered row of the app's own drawing, goes quiet)
-        if let Some(placement) = hovered.as_deref().and_then(|path| self.custom_at(path)) {
+        if let Some(placement) = hovered.as_deref().and_then(|path| self.pointer_custom_at(path)) {
             self.deliver(&placement, crate::custom::ElementEvent::PointerExited);
         }
         hovered.is_some()
@@ -3490,7 +3511,7 @@ impl Runtime {
             let at = interaction.pointer.take().unwrap_or(Point::ZERO);
             (interaction.element_grab.take(), at, changed)
         };
-        if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+        if let Some(placement) = grabbed.as_deref().and_then(|path| self.pointer_custom_at(path)) {
             let at = Self::local(&placement, at.x, at.y);
             // the box hears its press taken back; one with no word for that
             // hears the release it always heard, so its drag still ends
@@ -3505,7 +3526,7 @@ impl Runtime {
         // never see comes now
         let held = self.interaction.borrow_mut().button_grab.take();
         if let Some((path, button)) = &held
-            && let Some(placement) = self.custom_at(path)
+            && let Some(placement) = self.pointer_custom_at(path)
         {
             let at = Self::local(&placement, at.x, at.y);
             self.deliver(&placement, crate::custom::ElementEvent::ButtonUp { at, button: *button });
@@ -3519,7 +3540,7 @@ impl Runtime {
     /// step. Nothing else zooms; `true` = the box took it.
     pub fn magnify(&self, x: Px, y: Px, scale: f64) -> bool {
         self.enter_scene();
-        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let over = self.hover_target(x, y).and_then(|path| self.pointer_custom_at(&path));
         let Some(placement) = over else {
             return false;
         };
@@ -3533,7 +3554,7 @@ impl Runtime {
     /// the box took it.
     pub fn two_finger_pan(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         self.enter_scene();
-        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let over = self.hover_target(x, y).and_then(|path| self.pointer_custom_at(&path));
         let Some(placement) = over else {
             return false;
         };
@@ -3547,7 +3568,7 @@ impl Runtime {
     /// else turns; `true` = the box took it.
     pub fn rotate(&self, x: Px, y: Px, radians: f64) -> bool {
         self.enter_scene();
-        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let over = self.hover_target(x, y).and_then(|path| self.pointer_custom_at(&path));
         let Some(placement) = over else {
             return false;
         };
@@ -3631,7 +3652,7 @@ impl Runtime {
             }
             None => self.hover_target(x, y),
         };
-        let over = over.and_then(|path| Some((self.custom_at(&path)?, path)));
+        let over = over.and_then(|path| Some((self.pointer_custom_at(&path)?, path)));
         let mut offered = None;
         if let Some((placement, path)) = over {
             offered = Some(path);
@@ -5994,6 +6015,7 @@ impl Runtime {
         // clock is the frame tick — the shell's driver stays awake; so
         // does a finger whose meaning the clock decides, and a fling
         self.animator.borrow().wants_frame()
+            || crate::vsync::requested()
             || (self.task_driver.borrow().is_none() && motor::task::has_timers())
             || self.touch.borrow().alive()
     }
@@ -6020,7 +6042,8 @@ impl Runtime {
         // A live finger keeps the link whatever else is true: the clock
         // is what decides what the touch MEANS — a fling from a hold —
         // and a beat of its own would decide it late.
-        if pace == FramePace::Display || self.touch.borrow().alive() {
+        // so does an app waiting for the next refresh (`vsync::request`)
+        if pace == FramePace::Display || self.touch.borrow().alive() || crate::vsync::requested() {
             return FramePace::Display;
         }
         // a shell with an alarm of its own for the sleepers asks the
@@ -7348,7 +7371,7 @@ impl Runtime {
         // its subtree at its own origin, so the canvas point IS the
         // frame's point
         if !self.dom_customs.borrow().iter().any(|(home, custom)| {
-            home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+            home.as_ref() == island.as_ref() && custom.pointer && custom.frame.contains(x, y)
         }) {
             let under = self.island_hits.borrow().get(&island).and_then(|hits| {
                 hits.iter().rev().find_map(|(path, rect)| rect.contains(x, y).then(|| path.clone()))
@@ -7386,15 +7409,17 @@ impl Runtime {
                 .dom_customs
                 .borrow()
                 .iter()
-                .find(|(_, custom)| custom.path == path)
+                .find(|(_, custom)| custom.path == path && custom.pointer)
                 .map(|(_, custom)| custom.clone()),
+            // a box that declines the pointer is glass here too: the
+            // point reaches the targets and the boxes under it
             _ => self
                 .dom_customs
                 .borrow()
                 .iter()
                 .rev()
                 .find(|(home, custom)| {
-                    home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+                    home.as_ref() == island.as_ref() && custom.pointer && custom.frame.contains(x, y)
                 })
                 .map(|(_, custom)| custom.clone()),
         };
@@ -7719,8 +7744,8 @@ impl Runtime {
         moved
     }
 
-    /// Hands every probe the size its view resolved to, when that size
-    /// CHANGED since the last time it heard.
+    /// Hands every probe what its view resolved to — the size, or the
+    /// frame — when that CHANGED since the last time it heard.
     ///
     /// `true` = a probe fired, so the caller relayouts — which is what
     /// puts the report and the reaction to it in the SAME frame. A body
@@ -7742,14 +7767,21 @@ impl Runtime {
         let mut seen: Vec<String> = Vec::new();
         for (path, rect) in result.frames.measured() {
             seen.push(path.to_string());
+            // a size probe hears the size alone: a view that moved and
+            // kept its size has nothing new to tell it
+            let heard = if path.ends_with(crate::layout::FRAME_SEGMENT) {
+                *rect
+            } else {
+                Rect { origin: Point::ZERO, size: rect.size }
+            };
             let last = self.measures.borrow().get(path).copied();
-            if last == Some(rect.size) {
+            if last == Some(heard) {
                 continue;
             }
-            self.measures.borrow_mut().insert(path.to_string(), rect.size);
+            self.measures.borrow_mut().insert(path.to_string(), heard);
             // outside the borrow: the handler writes state, and the
             // write is the whole point
-            fired |= reconciler::run_measure(path, rect.size);
+            fired |= reconciler::run_measure(path, heard);
         }
         self.measures.borrow_mut().retain(|path, _| seen.iter().any(|kept| kept == path));
         fired
@@ -9107,7 +9139,7 @@ impl crate::touch::TouchScene for Runtime {
         let (horizontal, vertical) = self.scroll_travel_at(at.x, at.y);
         horizontal
             || vertical
-            || self.hover_target(at.x, at.y).and_then(|path| self.custom_at(&path)).is_some()
+            || self.hover_target(at.x, at.y).and_then(|path| self.pointer_custom_at(&path)).is_some()
     }
 
     fn grabs_at(&self, at: Point) -> bool {
@@ -9118,7 +9150,7 @@ impl crate::touch::TouchScene for Runtime {
             return true;
         }
         // the box's OWN point: a handle's square is where the box drew it
-        self.custom_at(&target).is_some_and(|placement| {
+        self.pointer_custom_at(&target).is_some_and(|placement| {
             let local = Point {
                 x: at.x - placement.frame.origin.x,
                 y: at.y - placement.frame.origin.y,
@@ -9199,6 +9231,17 @@ impl Runtime {
         let node = tree.node(id).ok_or(ActionError::Unavailable)?;
         if !node.supports(&action) { return Err(ActionError::Unsupported); }
         self.enter_scene();
+        if let Some((owner, key)) = crate::accessibility::inside_of(&node.path) {
+            let placement = self.custom_at(owner).ok_or(ActionError::Unavailable)?;
+            if action == Action::Focus {
+                let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
+                    .find(|stop| stop.path.as_ref() == owner).cloned();
+                if let Some(stop) = stop { self.focus_stop(&stop); }
+            }
+            placement.element.element().accessibility_node_action(key, &action)?;
+            self.frame_asked.set(true);
+            return Ok(());
+        }
         let applied = match action {
             Action::Activate => {
                 let applied = reconciler::run_action(&node.path, 1);

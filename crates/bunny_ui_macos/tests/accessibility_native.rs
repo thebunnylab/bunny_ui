@@ -205,6 +205,60 @@ mod probe {
         }
     }
 
+    /// A page painted in one box, heard through the nodes it answers for.
+    struct Page {
+        followed: Rc<std::cell::RefCell<Vec<u64>>>,
+    }
+    impl bunny_ui::custom::CustomElement for Page {
+        fn paint(&self, _: &bunny_ui::custom::PaintCtx, _: &mut bunny_ui::custom::Painter) {}
+        fn accessibility_nodes(&self, _: Size) -> Vec<bunny_ui::accessibility::AccessibleNode> {
+            use bunny_ui::accessibility::{AccessibleNode, Role};
+            let area = |y: f64| Rect { origin: Point { x: 10.0, y }, size: Size { width: 200.0, height: 20.0 } };
+            vec![
+                AccessibleNode::new(1, Role::Heading, area(10.0)).label("Page title").level(2),
+                AccessibleNode::new(2, Role::Link, area(40.0)).label("Next page"),
+            ]
+        }
+        fn accessibility_node_action(
+            &self,
+            key: u64,
+            _: &bunny_ui::accessibility::Action,
+        ) -> Result<(), bunny_ui::accessibility::ActionError> {
+            self.followed.borrow_mut().push(key);
+            Ok(())
+        }
+    }
+
+    fn custom_page_is_heard_through_its_nodes(app: &App) {
+        let followed = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let id = app.open(
+            WindowSpec::titled("Custom page witness").size(320.0, 200.0),
+            Rc::new(app.runtime()),
+            custom(Page { followed: Rc::clone(&followed) }).id("page"),
+        );
+        unsafe {
+            let ns_app = object(class("NSApplication"), sel("sharedApplication"));
+            let windows = object(ns_app, sel("windows"));
+            let window = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|window| property(*window, "title").as_deref() == Some("Custom page witness"))
+                .unwrap();
+            let view = object(window, sel("contentView"));
+            let heading = named(view, "Page title");
+            assert_eq!(property(heading, "accessibilityRole").as_deref(), Some("AXHeading"));
+            assert_eq!(double(object(heading, sel("accessibilityValue")), sel("doubleValue")), 2.0);
+            let link = named(view, "Next page");
+            assert_eq!(property(link, "accessibilityRole").as_deref(), Some("AXLink"));
+            let frame = rectangle(link, sel("accessibilityFrame"));
+            assert!((frame.size.width - 200.0).abs() < 0.5 && (frame.size.height - 20.0).abs() < 0.5);
+            assert_eq!(boolean(link, sel("accessibilityPerformPress")), 1);
+            assert_eq!(*followed.borrow(), [2]);
+            assert_eq!(boolean(heading, sel("accessibilityPerformPress")), 0);
+        }
+        app.close(id);
+        println!("A custom element's heading and link are native AXHeading and AXLink, and a press reaches the element");
+    }
+
     fn routed_modal_uses_its_native_child_surface(app: &App) {
         let model = RoutedModal {
             modal: State::new(None),
@@ -822,6 +876,7 @@ mod probe {
             );
         }
         routed_modal_uses_its_native_child_surface(&app);
+        custom_page_is_heard_through_its_nodes(&app);
         println!("Native AppKit protocol witness passed; no human assistive-technology claim.");
         app.close(keeper);
     }

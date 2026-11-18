@@ -1148,7 +1148,10 @@ impl DomCapture {
     /// Opens a canvas island at `frame`; `start` is where the island's
     /// draw commands begin in the pass's display list. An island inside
     /// an island dissolves — the outer one already owns the pixels.
-    pub(crate) fn open_canvas(&mut self, frame: Rect, start: usize) {
+    /// An island that does not take the pointer (`takes_pointer` false: a
+    /// box that declines it) lets the browser's hit test through to what
+    /// it covers.
+    pub(crate) fn open_canvas(&mut self, frame: Rect, start: usize, takes_pointer: bool) {
         if self.island > 0 {
             self.island += 1;
             return;
@@ -1162,6 +1165,10 @@ impl DomCapture {
             frame,
             frame.origin,
         );
+        if !takes_pointer {
+            let (_, node) = self.stack.last_mut().expect("just opened");
+            node.style.look_mut().pass_through = true;
+        }
         self.island = 1;
     }
 
@@ -2678,6 +2685,17 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                 DrawCommand::PushClip { rect: shift(rect), corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => DrawCommand::Sprite {
+                rect,
+                source,
+                transform: crate::layout::Affine::translation(dx, dy).then(&transform),
+                opacity,
+            },
         })
         .collect()
 }

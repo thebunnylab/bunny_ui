@@ -73,7 +73,7 @@ fn a_frame_goes_to_the_wire_and_back_unchanged() {
 
 #[test]
 fn images_travel_by_key_with_their_wraps_folded_in() {
-    let rgba = ImageSource::Rgba { key: 7, size: (1, 1), rgba: std::rc::Rc::from([1u8, 2, 3, 4].as_slice()) };
+    let rgba = ImageSource::Rgba { key: 7, size: (1, 1), rgba: std::rc::Rc::<[u8]>::from([1u8, 2, 3, 4].as_slice()).into() };
     let wrapped = ImageSource::Faded { key: 8, inner: std::rc::Rc::new(ImageSource::Mirrored { key: 9, inner: std::rc::Rc::new(rgba.clone()) }), alpha: 128 };
     let (image, inner) = image_ref(&wrapped);
     assert_eq!(image, wire::ImageRef { key: 7, alpha: 128, mirrored: true });

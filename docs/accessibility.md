@@ -85,6 +85,46 @@ current owner. This also gives forms an invoking control to restore when they
 close; it does not install a global edit-command fallback or change a focused
 text field's own history. Rejected actions leave focus unchanged.
 
+## Custom elements
+
+A box the app paints itself is pixels to the projection, unless it says what it
+holds. `CustomElement::accessibility_nodes(size)` answers a list of
+`AccessibleNode`s — role, label, value, bounds in the box's own coordinates,
+enabled, checked, expanded, heading level, children — and each one with a role
+becomes a node of the tree, moved into the scene and clipped like any control.
+A page drawn by a web engine answers with its links, headings and texts:
+
+```rust,ignore
+fn accessibility_nodes(&self, _size: Size) -> Vec<AccessibleNode> {
+    self.page.leaves().map(|leaf| {
+        AccessibleNode::new(leaf.id, leaf.role, leaf.bounds).label(leaf.name)
+    }).collect()
+}
+
+fn accessibility_node_action(&self, key: u64, action: &Action) -> Result<(), ActionError> {
+    match action {
+        Action::Activate => self.page.follow(key),
+        Action::Focus => self.page.focus(key),
+        _ => Err(ActionError::Unsupported),
+    }
+}
+```
+
+`key` is the element's own name for the node and must stay the same from one
+frame to the next: the node's `NodeId` is kept by it, and an action comes back
+with it. The runtime checks exposure, enabled state and the role's actions
+before it calls `accessibility_node_action`; `Focus` first gives the box the
+keyboard when it takes keys. A node is reported focused when the element says so
+and the box holds the keyboard. `Role::Link` (activate, focus) and
+`Role::Heading` (read as text, `Node::level`) exist for these pages: macOS says
+`AXLink` and `AXHeading` with the level as its value, UI Automation Hyperlink
+with Invoke and Text, AT-SPI link and heading.
+
+The projection stays flat. A group (`AccessibleNode::group`) is heard only
+through its children, in depth-first reading order; containers, landmarks,
+tables, lists and text ranges inside a box are not native elements yet, and a
+node scrolled out of the window is left out until it shows.
+
 ## macOS adapter
 
 The AppKit shell exposes these controls through `NSAccessibilityElement` proxies
@@ -342,7 +382,8 @@ to say, with `.element(…)`.
 ## Remaining work
 
 The core projection is a flat sequence of exposed leaves, not a complete document model.
-Custom elements can opt into bounded range semantics; arbitrary custom control
-roles, general read-only states, rich-text ranges, selection APIs, validation
+Custom elements can opt into bounded range semantics and answer flat nodes of
+the existing roles plus links and headings; native containers for them, other
+control roles, general read-only states, rich-text ranges, selection APIs, validation
 messages and virtualized offscreen navigation remain unsupported. Its snapshots are not evidence of screen-reader usability.
 Native AX/UIA/AT-SPI dumps and separate human workflows remain necessary.

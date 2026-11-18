@@ -44,6 +44,7 @@ pub mod provenance;
 pub mod preview;
 pub mod action;
 pub mod angle;
+pub mod audio;
 pub mod anim;
 pub mod beat;
 pub mod bind;
@@ -112,6 +113,7 @@ pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
+pub mod vsync;
 pub mod words;
 #[cfg(feature = "3d")]
 pub mod world;
@@ -259,7 +261,8 @@ pub mod prelude {
     pub use crate::shapes::{BorderStyle, Stripes};
     pub use crate::icon::{Cap, Dash, ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
-        FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages, file_icon,
+        FeedBytes, FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages,
+        Yuv, YuvMatrix, file_icon,
     };
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
@@ -4141,6 +4144,60 @@ mod tests {
         for (index, (plain, kept)) in plain.iter().zip(&kept).enumerate() {
             assert_eq!(plain.as_slice(), kept.as_slice(), "frame {index}: the replay is the same picture");
         }
+    }
+
+    #[test]
+    fn a_focused_box_keeps_its_picture_only_when_it_says_focus_changes_nothing() {
+        use crate::custom::{custom, CustomElement, PaintCtx, Painter};
+        use crate::layout::{Color, Point, Rect, Size};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // a web page draws its own caret from its own state: holding the
+        // keyboard changes nothing it paints, so its picture can be kept
+        struct Grid(Rc<Cell<u32>>);
+
+        impl CustomElement for Grid {
+            fn paint(&self, _ctx: &PaintCtx<'_>, painter: &mut Painter<'_>) {
+                self.0.set(self.0.get() + 1);
+                let area = Rect { origin: Point { x: 2.0, y: 2.0 }, size: Size { width: 40.0, height: 10.0 } };
+                painter.fill(area, Color::rgba(20, 20, 200, 255));
+            }
+
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            painted: Rc<Cell<u32>>,
+            blind: bool,
+        }
+
+        impl Component for Page {
+            fn body(self) -> impl View {
+                let grid = custom(Grid(Rc::clone(&self.painted)));
+                let grid = if self.blind { grid.cached_while_focused(1) } else { grid.cached(1) };
+                vstack!(grid.frame(120.0, 40.0).id("grid"), text("chrome"))
+            }
+        }
+
+        let painted = |blind: bool| {
+            let page = Page { painted: Rc::new(Cell::new(0)), blind };
+            let runtime = Runtime::scene(if blind { "blind" } else { "focus" });
+            let size = crate::layout::Size { width: 200.0, height: 120.0 };
+            runtime.display_frame(&page, size);
+            assert!(runtime.focus_named("grid"), "the grid takes the keyboard");
+            runtime.display_frame(&page, size);
+            let before = page.painted.get();
+            for _ in 0..3 {
+                runtime.display_frame(&page, size);
+            }
+            page.painted.get() - before
+        };
+        assert!(painted(false) >= 3, "a focused box is painted on every frame");
+        assert_eq!(painted(true), 0, "focus changes nothing it paints: the picture is replayed");
     }
 
     #[test]

@@ -38,6 +38,7 @@ unsafe extern "C" {
 struct Presenter {
     renderer: MetalPresenter,
     congested: bool,
+    changed: bool,
 }
 
 thread_local! {
@@ -79,6 +80,7 @@ pub(crate) fn try_install(
                     Presenter {
                         renderer,
                         congested: false,
+                        changed: false,
                     },
                 );
             });
@@ -288,6 +290,7 @@ pub(crate) fn present_view(
         presenter
             .renderer
             .present(display, size, scale, canvas, text, images, live);
+        presenter.changed |= presenter.renderer.changed();
         let waited = presenter.renderer.drawable_wait_ms();
         if !live && waited > CONGESTED_MS {
             presenter.congested = true;
@@ -305,6 +308,24 @@ pub(crate) fn arm_transaction_view(view: Id, live: bool) {
             presenter.renderer.set_transactional(live);
         }
     });
+}
+
+/// The GPU time of this view's last frame known to have completed.
+pub fn gpu_time(view: Id) -> std::time::Duration {
+    VIEW_PRESENTERS.with(|slot| {
+        slot.borrow().get(&(view as usize)).map_or(std::time::Duration::ZERO, |presenter| {
+            std::time::Duration::from_secs_f64(presenter.renderer.gpu_ms().max(0.0) / 1000.0)
+        })
+    })
+}
+
+/// Did a present change what this view shows since its pacer last asked?
+pub fn take_changed(view: Id) -> bool {
+    VIEW_PRESENTERS.with(|slot| {
+        slot.borrow_mut()
+            .get_mut(&(view as usize))
+            .is_some_and(|presenter| std::mem::take(&mut presenter.changed))
+    })
 }
 
 /// Did this view wait for a drawable since its pacer last asked? A sibling's

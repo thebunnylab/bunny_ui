@@ -69,7 +69,7 @@ pub enum ImageSource {
     /// only resamples and uploads them, so every tier draws it the way
     /// it draws any other image. No engine sees this variant either —
     /// there is nothing to decode.
-    Rgba { key: u64, size: (u32, u32), rgba: Rc<[u8]> },
+    Rgba { key: u64, size: (u32, u32), rgba: FeedBytes },
     /// Immutable GPU frame. The platform imports its owned payload directly;
     /// CPU/headless renderers never download it implicitly. The producer must
     /// publish only completed frames and retain resources through this owner.
@@ -82,7 +82,7 @@ pub enum ImageSource {
     /// to its box with a linear sampler; nothing is resampled on the
     /// CPU, nothing is minted per frame, and the shared atlas never
     /// hears of it. [`ImageFeed`] is the handle that mints these.
-    Feed { key: u64, generation: u64, size: (u32, u32), format: PixelFormat, bytes: Rc<[u8]> },
+    Feed { key: u64, generation: u64, size: (u32, u32), format: PixelFormat, bytes: FeedBytes },
     /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
     /// the pixel pipelines, where there is no offscreen layer to fade.
     /// The fade rides the identity, so the compositor, the GPU atlas
@@ -170,7 +170,18 @@ impl ImageSource {
             (size.0 as usize) * (size.1 as usize) * 4,
             "an RGBA buffer is width × height × 4 bytes"
         );
-        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba }
+        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba: FeedBytes::Local(rgba) }
+    }
+
+    /// [`ImageSource::rgba`] with pixels another thread made and keeps — a
+    /// decoder's output — shared instead of copied into the scene.
+    pub fn rgba_shared(key: u64, size: (u32, u32), rgba: std::sync::Arc<[u8]>) -> ImageSource {
+        debug_assert_eq!(
+            rgba.len(),
+            (size.0 as usize) * (size.1 as usize) * 4,
+            "an RGBA buffer is width × height × 4 bytes"
+        );
+        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba: FeedBytes::Shared(rgba) }
     }
 
     /// One frame of a feed, for an app that keeps its own slots and
@@ -189,7 +200,31 @@ impl ImageSource {
             PixelFormat::Rgba8.bytes_for(size),
             "an RGBA feed frame is width × height × 4 bytes"
         );
-        ImageSource::Feed { key: key.0, generation, size, format: PixelFormat::Rgba8, bytes }
+        ImageSource::Feed {
+            key: key.0,
+            generation,
+            size,
+            format: PixelFormat::Rgba8,
+            bytes: FeedBytes::Local(bytes),
+        }
+    }
+
+    /// One frame of a feed whose bytes another thread made and shares — a
+    /// video decoder's frame, in any [`PixelFormat`]: it reaches the tier
+    /// without a copy on the UI thread, and a planar frame is converted
+    /// where the tier can (in the shader) or on the CPU where it cannot.
+    pub fn feed_shared(
+        key: FeedKey,
+        generation: u64,
+        size: (u32, u32),
+        format: PixelFormat,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> ImageSource {
+        debug_assert!(
+            bytes.len() >= format.bytes_for(size),
+            "a feed frame holds its whole picture"
+        );
+        ImageSource::Feed { key: key.0, generation, size, format, bytes: FeedBytes::Shared(bytes) }
     }
 
     /// A tinted glyph — built at PLACEMENT, where the ink is known.
@@ -629,18 +664,32 @@ pub trait ImageEngine {
 /// GPU tiers assert byte equality.
 fn resample_rgba(source: &[u8], (src_w, src_h): (u32, u32), width: usize, height: usize) -> Vec<u8> {
     let (src_w, src_h) = (src_w as usize, src_h as usize);
+    // the same size is the same bytes: the pictures an app draws at its
+    // own pixels (a layer it flattened, a feed) never walk pixel by pixel
+    if src_w == width && src_h == height && source.len() >= width * height * 4 {
+        return source[..width * height * 4].to_vec();
+    }
     let mut rgba = vec![0u8; width * height * 4];
     if src_w == 0 || src_h == 0 {
         return rgba;
     }
+    let columns: Vec<usize> = (0..width).map(|x| (x * src_w) / width * 4).collect();
+    let row = width * 4;
+    // a row that reads the same source row as the one above is that row
+    let mut above: Option<usize> = None;
     for y in 0..height {
         let sy = (y * src_h) / height;
-        for x in 0..width {
-            let sx = (x * src_w) / width;
-            let from = (sy * src_w + sx) * 4;
-            let to = (y * width + x) * 4;
-            rgba[to..to + 4].copy_from_slice(&source[from..from + 4]);
+        let (done, rest) = rgba.split_at_mut(y * row);
+        let out = &mut rest[..row];
+        if above == Some(sy) {
+            out.copy_from_slice(&done[(y - 1) * row..]);
+            continue;
         }
+        let line = &source[sy * src_w * 4..];
+        for (pixel, &from) in out.chunks_exact_mut(4).zip(&columns) {
+            pixel.copy_from_slice(&line[from..from + 4]);
+        }
+        above = Some(sy);
     }
     rgba
 }
@@ -813,22 +862,182 @@ fn mirror_raster(
 
 // MARK: - Feeds: a picture whose bytes change and whose identity stays
 
-/// The pixel layout of a feed's bytes. RGBA8 today; a planar layout
-/// (NV12, I420) would be named here, with an upload arm per ground and
-/// a conversion in the shader — the enum is open for it.
+/// The pixel layout of a feed's bytes. A planar layout is uploaded as
+/// it is and converted in the tier's shader where the tier can, on the
+/// CPU where it cannot — the enum is open for more.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
     /// Straight RGBA, 8 bits a channel, row major: `width × height × 4`.
     Rgba8,
+    /// Planar YUV 4:2:0, the layout video decoders hand out: the luma
+    /// plane, then Cb, then Cr, each row major with no padding between
+    /// rows; the chroma planes are `⌈width/2⌉ × ⌈height/2⌉`. Opaque.
+    I420(Yuv),
 }
 
 impl PixelFormat {
     /// How many bytes `size` pixels take in this layout.
     pub fn bytes_for(self, size: (u32, u32)) -> usize {
+        let (width, height) = (size.0 as usize, size.1 as usize);
         match self {
-            PixelFormat::Rgba8 => size.0 as usize * size.1 as usize * 4,
+            PixelFormat::Rgba8 => width * height * 4,
+            PixelFormat::I420(yuv) => {
+                let chroma = width.div_ceil(2) * height.div_ceil(2);
+                (width * height + 2 * chroma) * yuv.sample_bytes()
+            }
         }
+    }
+}
+
+/// How a YUV picture's samples read as colour: their depth, the matrix
+/// that mixes them and their range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Yuv {
+    /// Bits a sample: 8 lays one byte per sample; 9 to 16 lay two,
+    /// little endian, holding the value in their low bits.
+    pub bits: u8,
+    pub matrix: YuvMatrix,
+    /// Full range (0 to 2^bits − 1) rather than video range (16 to 235
+    /// for luma, 16 to 240 for chroma, scaled for deeper samples).
+    pub full_range: bool,
+}
+
+/// The matrix a YUV picture was mixed with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum YuvMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+impl YuvMatrix {
+    /// The luma weights of red and blue.
+    fn weights(self) -> (f32, f32) {
+        match self {
+            YuvMatrix::Bt601 => (0.299, 0.114),
+            YuvMatrix::Bt709 => (0.2126, 0.0722),
+            YuvMatrix::Bt2020 => (0.2627, 0.0593),
+        }
+    }
+}
+
+/// What a tier's shader multiplies a sample triple by to get RGB: the
+/// range lifted out and the matrix inverted, in one affine map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct YuvToRgb {
+    /// Rows of red, green and blue: `[y, cb, cr, offset]`, applied to
+    /// samples normalised to 0..1 (the sample over `2^bits − 1`).
+    pub rows: [[f32; 4]; 3],
+}
+
+impl Yuv {
+    /// Bytes one sample takes.
+    pub fn sample_bytes(self) -> usize {
+        if self.bits > 8 { 2 } else { 1 }
+    }
+
+    /// The affine map from normalised samples to RGB in 0..1.
+    pub fn to_rgb(self) -> YuvToRgb {
+        let bits = self.bits.clamp(8, 16);
+        let (kr, kb) = self.matrix.weights();
+        let kg = 1.0 - kr - kb;
+        let top = ((1u32 << bits) - 1) as f32;
+        let unit = (1u32 << (bits - 8)) as f32;
+        let (luma_scale, luma_offset, chroma_scale) = if self.full_range {
+            (1.0, 0.0, 1.0)
+        } else {
+            (top / (219.0 * unit), 16.0 * unit / top, top / (224.0 * unit))
+        };
+        let half = (1u32 << (bits - 1)) as f32 / top;
+        // R = Y' + 2(1 − kr)·Cr; B = Y' + 2(1 − kb)·Cb; G from both
+        let cr_r = 2.0 * (1.0 - kr) * chroma_scale;
+        let cb_b = 2.0 * (1.0 - kb) * chroma_scale;
+        let cb_g = -cb_b * kb / kg;
+        let cr_g = -cr_r * kr / kg;
+        let lift = -luma_offset * luma_scale;
+        YuvToRgb {
+            rows: [
+                [luma_scale, 0.0, cr_r, lift - half * cr_r],
+                [luma_scale, cb_g, cr_g, lift - half * (cb_g + cr_g)],
+                [luma_scale, cb_b, 0.0, lift - half * cb_b],
+            ],
+        }
+    }
+
+    /// The picture as straight RGBA, on the CPU — for the tiers that
+    /// cannot convert in a shader and for the CPU raster.
+    pub fn to_rgba(self, bytes: &[u8], size: (u32, u32)) -> Vec<u8> {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let mut rgba = vec![255u8; width * height * 4];
+        if bytes.len() < PixelFormat::I420(self).bytes_for(size) {
+            return rgba;
+        }
+        let deep = self.sample_bytes() == 2;
+        let top = ((1u32 << self.bits.clamp(8, 16)) - 1) as f32;
+        let sample = |index: usize| -> f32 {
+            let value = if deep {
+                u16::from_le_bytes([bytes[2 * index], bytes[2 * index + 1]])
+            } else {
+                u16::from(bytes[index])
+            };
+            f32::from(value) / top
+        };
+        let rows = self.to_rgb().rows;
+        let cb_start = width * height;
+        let cr_start = cb_start + chroma_width * chroma_height;
+        for row in 0..height {
+            for column in 0..width {
+                let chroma = (row / 2) * chroma_width + column / 2;
+                let yuv = [
+                    sample(row * width + column),
+                    sample(cb_start + chroma),
+                    sample(cr_start + chroma),
+                ];
+                let at = (row * width + column) * 4;
+                for (channel, coefficients) in rows.iter().enumerate() {
+                    let value = coefficients[0] * yuv[0]
+                        + coefficients[1] * yuv[1]
+                        + coefficients[2] * yuv[2]
+                        + coefficients[3];
+                    rgba[at + channel] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+        }
+        rgba
+    }
+}
+
+/// The bytes of a feed frame or of RGBA pixels: the app's own, or bytes
+/// another thread made and shares (a video decoder's frame, a decoded
+/// image), which reach the tier without a copy.
+#[derive(Clone)]
+pub enum FeedBytes {
+    Local(Rc<[u8]>),
+    Shared(std::sync::Arc<[u8]>),
+}
+
+impl std::ops::Deref for FeedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FeedBytes::Local(bytes) => bytes,
+            FeedBytes::Shared(bytes) => bytes,
+        }
+    }
+}
+
+impl From<Rc<[u8]>> for FeedBytes {
+    fn from(bytes: Rc<[u8]>) -> FeedBytes {
+        FeedBytes::Local(bytes)
+    }
+}
+
+impl From<std::sync::Arc<[u8]>> for FeedBytes {
+    fn from(bytes: std::sync::Arc<[u8]>) -> FeedBytes {
+        FeedBytes::Shared(bytes)
     }
 }
 
@@ -958,7 +1167,7 @@ impl ImageFeed {
             generation: latest.generation,
             size: latest.size,
             format: PixelFormat::Rgba8,
-            bytes: Rc::clone(&latest.bytes),
+            bytes: FeedBytes::Local(Rc::clone(&latest.bytes)),
         }
     }
 }
@@ -1013,6 +1222,9 @@ fn feed_raster(
     }
     let rgba = match format {
         PixelFormat::Rgba8 => resample_rgba_bilinear(bytes, size, width, height),
+        PixelFormat::I420(yuv) => {
+            resample_rgba_bilinear(&yuv.to_rgba(bytes, size), size, width, height)
+        }
     };
     let raster = Rc::new(ImageRaster { width, height, rgba });
     FEEDS.with(|cache| {
@@ -1232,6 +1444,22 @@ impl ImageEngine for RawImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planar_yuv_reads_its_range_and_depth_on_the_cpu() {
+        let limited = Yuv { bits: 8, matrix: YuvMatrix::Bt709, full_range: false };
+        assert_eq!(limited.to_rgba(&[235, 128, 128], (1, 1)), [255, 255, 255, 255]);
+        assert_eq!(limited.to_rgba(&[16, 128, 128], (1, 1)), [0, 0, 0, 255]);
+        let deep = Yuv { bits: 10, matrix: YuvMatrix::Bt2020, full_range: false };
+        let samples: Vec<u8> = [940u16, 512, 512].iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(deep.to_rgba(&samples, (1, 1)), [255, 255, 255, 255]);
+        // 3×3: chroma planes 2×2, the last column and row share the last sample
+        let format = PixelFormat::I420(limited);
+        assert_eq!(format.bytes_for((3, 3)), 9 + 2 * 4);
+        assert_eq!(PixelFormat::I420(deep).bytes_for((3, 3)), 2 * (9 + 2 * 4));
+        let red = limited.to_rgba(&[[63u8; 9].as_slice(), &[102; 4], &[240; 4]].concat(), (3, 3));
+        assert!(red.chunks(4).all(|p| p[0] > 250 && p[1] < 5 && p[2] < 5), "{red:?}");
+    }
 
     fn two_by_one() -> ImageSource {
         // red then blue, 2×1

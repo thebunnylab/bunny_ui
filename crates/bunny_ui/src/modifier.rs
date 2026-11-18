@@ -136,6 +136,9 @@ pub enum Modifier {
     /// `.on_measure(|size| …)` — the size the view resolved to, handed
     /// back to the app.
     OnMeasure(Rc<dyn Fn(crate::layout::Size)>),
+    /// `.on_frame(|frame| …)` — the frame the view was placed at, in the
+    /// window's coordinates, handed back to the app.
+    OnFrame(Rc<dyn Fn(crate::layout::Rect)>),
     /// The field asks for focus on its first appearance.
     AutoFocus,
     /// Return focus to the invoker when this transient subtree closes.
@@ -344,6 +347,7 @@ impl Modifier {
             Modifier::TruncationMode { .. } => "truncation_mode",
             Modifier::ScrollTarget { .. } => "scroll_target",
             Modifier::OnMeasure { .. } => "on_measure",
+            Modifier::OnFrame { .. } => "on_frame",
             Modifier::AutoFocus => "auto_focus",
             Modifier::RestoreFocusOnClose => "restore_focus_on_close",
             Modifier::AutoFocusBeat { .. } => "auto_focus_beat",
@@ -517,6 +521,7 @@ impl Modifier {
             Modifier::ScrollTarget(id, None) => format!(" [.scrollTarget({id:?})]"),
             Modifier::ScrollTarget(id, Some(anchor)) => format!(" [.scrollTarget({id:?}, anchor: {anchor})]"),
             Modifier::OnMeasure(_) => " [.onMeasure]".into(),
+            Modifier::OnFrame(_) => " [.onFrame]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::RestoreFocusOnClose => " [.restoreFocusOnClose()]".into(),
             Modifier::AutoFocusBeat(beat) => format!(" [.autoFocusBeat({beat})]"),
@@ -684,6 +689,19 @@ fn arm_target(out: &mut NodeList, mark: usize, path: Rc<str>) {
         return;
     }
     wrap_in_place(base, |node| LayoutNode::Interactive { path, child: Box::new(node) });
+}
+
+/// Wraps what the base left in a measurement probe (`.on_measure`,
+/// `.on_frame`). The probe is addressed by WHERE it sits, with a segment
+/// of its own so it can never collide with the identity the subtree uses
+/// for its state, nor with the other kind of probe on the same view.
+fn wrap_probe(out: &mut NodeList, mark: usize, segment: &str, probe: crate::reconciler::MeasureFn) {
+    let Some(scope) = motor::identity::cursor_scope() else {
+        return;
+    };
+    let path = format!("{scope}{segment}");
+    crate::reconciler::attribute_measure(path.clone(), probe);
+    out.wrap_layout_from(mark, |node| LayoutNode::Measured { path, child: Box::new(node) });
 }
 
 /// A hint's words written over the ones a node holds: the outer word
@@ -1670,18 +1688,12 @@ pub(crate) fn apply(
             });
         }
         Modifier::OnMeasure(report) => {
-            // the probe is addressed by WHERE it sits, with a segment of
-            // its own so it can never collide with the identity the
-            // subtree uses for its state
-            let Some(scope) = motor::identity::cursor_scope() else {
-                return;
-            };
-            let path = format!("{scope}/#measure");
-            crate::reconciler::attribute_measure(path.clone(), report.clone());
-            out.wrap_layout_from(mark, |node| LayoutNode::Measured {
-                path: path.clone(),
-                child: Box::new(node),
-            });
+            let probe = crate::reconciler::MeasureFn::Size(report.clone());
+            wrap_probe(out, mark, crate::layout::MEASURE_SEGMENT, probe);
+        }
+        Modifier::OnFrame(report) => {
+            let probe = crate::reconciler::MeasureFn::Frame(report.clone());
+            wrap_probe(out, mark, crate::layout::FRAME_SEGMENT, probe);
         }
         Modifier::ScrollTarget(id, anchor) => {
             rewrite_leaf(out.base_from(mark), &mut |node| match node {

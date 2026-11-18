@@ -281,3 +281,38 @@ fn a_failed_upload_bypasses_the_identical_display_shortcut() {
         objc_autoreleasePoolPop(pool);
     }
 }
+
+#[test]
+fn planar_yuv_feeds_are_converted_by_the_kernel_with_their_matrix_and_range() {
+    use bunny_ui::image_engine::{FeedKey, ImageSource, PixelFormat, Yuv, YuvMatrix};
+    let mut gpu = OffscreenGpu::new(8, 8).expect("this test requires actual Metal");
+    assert!(gpu.ground.yuv, "the YUV kernel compiles");
+    let images = RawImages::default();
+    // video-range BT.709 red, then 10-bit full-range BT.601 green
+    let red = Yuv { bits: 8, matrix: YuvMatrix::Bt709, full_range: false };
+    let mut bytes = vec![63u8; 64];
+    bytes.extend([102u8; 16]);
+    bytes.extend([240u8; 16]);
+    let frame = |source: ImageSource| {
+        Runtime::new().display_frame(
+            &image(source).resizable().frame(8.0, 8.0),
+            Size { width: 8.0, height: 8.0 },
+        )
+    };
+    let key = FeedKey::new(7);
+    let source = ImageSource::feed_shared(key, 1, (8, 8), PixelFormat::I420(red), bytes.into());
+    gpu.present_wait(&frame(source), 1, Color::BLACK, &PixelFont, &images);
+    let pixel = gpu.read_rgba()[..4].to_vec();
+    let cpu = red.to_rgba(&[63, 102, 240], (1, 1));
+    for channel in 0..3 {
+        assert!(pixel[channel].abs_diff(cpu[channel]) <= 1, "{pixel:?} {cpu:?}");
+    }
+    assert!(pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40, "{pixel:?}");
+    let green = Yuv { bits: 10, matrix: YuvMatrix::Bt601, full_range: true };
+    let samples: Vec<u16> = [[600u16; 64].as_slice(), &[200; 16], &[200; 16]].concat();
+    let bytes: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+    let source = ImageSource::feed_shared(key, 2, (8, 8), PixelFormat::I420(green), bytes.into());
+    gpu.present_wait(&frame(source), 1, Color::BLACK, &PixelFont, &images);
+    let pixel = &gpu.read_rgba()[..4];
+    assert!(pixel[1] > 200 && pixel[0] < 120 && pixel[2] < 120, "{pixel:?}");
+}

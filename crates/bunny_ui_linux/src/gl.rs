@@ -56,7 +56,7 @@ use bunny_ui::text_engine::TextEngine;
 
 use bunny_ui::gpu::walk::{
     build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, TurnedInstance, GLASS_MAX_LEVEL,
 };
 
 // MARK: - FFI border (dlopen the door, eglGetProcAddress the hallway)
@@ -513,7 +513,7 @@ use bunny_ui::gpu::shaders::PRELUDE_330 as SHADER_PRELUDE;
 use bunny_ui::gpu::shaders::{
     BLIT_FRAG, BLUR_FRAG, FULL_VERT, GLASS_FRAG_BODY, GLASS_VERT, LIVE_FRAG_BODY,
     MASK_FRAG_BODY, MASK_VERT, RECT_FRAG_BODY, RECT_VERT, SHARED_FRAG, SPRITE_FRAG_BODY,
-    SPRITE_VERT,
+    SPRITE_VERT, TURNED_FRAG_BODY, TURNED_VERT,
 };
 use bunny_ui::image_engine::PixelFormat;
 
@@ -577,6 +577,8 @@ struct GlStack {
     /// The feeds' program: the sprite vertex over a LINEAR sampler, so a
     /// picture of one size lands in a box of another.
     live_program: u32,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned_program: u32,
     mask_program: u32,
     mask_quad: i32,
     /// The three programs liquid glass adds: the pane itself, one
@@ -590,6 +592,7 @@ struct GlStack {
     vao_rect: u32,
     vao_sprite: u32,
     vao_glass: u32,
+    vao_turned: u32,
     /// A vertex array with no attributes at all — the fullscreen
     /// triangle needs one bound, and it must not be a rect's.
     vao_full: u32,
@@ -836,6 +839,7 @@ impl GlStack {
                 rect_program: 0,
                 sprite_program: 0,
                 live_program: 0,
+                turned_program: 0,
                 mask_program: 0,
                 mask_quad: -1,
                 glass_program: 0,
@@ -846,6 +850,7 @@ impl GlStack {
                 vao_rect: 0,
                 vao_sprite: 0,
                 vao_glass: 0,
+                vao_turned: 0,
                 vao_full: 0,
                 frame_ubo: 0,
                 round_ubo: 0,
@@ -894,6 +899,13 @@ impl GlStack {
                 &[c"a_dest", c"a_tex", c"a_clip"],
             )
             .map_err(|log| format!("live pipeline refused: {}", log.trim()))?;
+            self.turned_program = build_program(
+                gl,
+                &[SHADER_PRELUDE, TURNED_VERT],
+                &[SHADER_PRELUDE, SHARED_FRAG, TURNED_FRAG_BODY],
+                &[c"a_axes", c"a_origin", c"a_tex", c"a_clip"],
+            )
+            .map_err(|log| format!("turned pipeline refused: {}", log.trim()))?;
             self.mask_program = build_program(
                 gl,
                 &[SHADER_PRELUDE, MASK_VERT],
@@ -953,12 +965,13 @@ impl GlStack {
             if source >= 0 {
                 (gl.uniform1i)(source, 0);
             }
-            let mut vaos = [0u32; 4];
-            (gl.gen_vertex_arrays)(4, vaos.as_mut_ptr());
+            let mut vaos = [0u32; 5];
+            (gl.gen_vertex_arrays)(5, vaos.as_mut_ptr());
             self.vao_rect = vaos[0];
             self.vao_sprite = vaos[1];
             self.vao_glass = vaos[2];
             self.vao_full = vaos[3];
+            self.vao_turned = vaos[4];
             let mut ubos = [0u32; 2];
             (gl.gen_buffers)(2, ubos.as_mut_ptr());
             self.frame_ubo = ubos[0];
@@ -1092,6 +1105,10 @@ impl GlStack {
                     (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
                     | RunKind::Texture(_)) => false,
                     (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
+                    (
+                        Some(RunKind::Turned | RunKind::TurnedTexture(_)),
+                        RunKind::Turned | RunKind::TurnedTexture(_),
+                    ) => false,
                     (was, now) => was != Some(now),
                 };
                 if swap_kind {
@@ -1111,6 +1128,10 @@ impl GlStack {
                         RunKind::Live(_) => {
                             (gl.use_program)(self.live_program);
                             (gl.bind_vertex_array)(self.vao_sprite);
+                        }
+                        RunKind::Turned | RunKind::TurnedTexture(_) => {
+                            (gl.use_program)(self.turned_program);
+                            (gl.bind_vertex_array)(self.vao_turned);
                         }
                         // handled above, in a pass of its own
                         RunKind::Glass => continue,
@@ -1151,6 +1172,20 @@ impl GlStack {
                         (gl.bind_buffer)(GL_ARRAY_BUFFER, slot.sprites.buffer);
                         let base = run.base as usize * std::mem::size_of::<SpriteInstance>();
                         sprite_attribs(gl, base);
+                        if bound_texture != Some(texture) {
+                            (gl.active_texture)(GL_TEXTURE0);
+                            (gl.bind_texture)(GL_TEXTURE_2D, texture);
+                            bound_texture = Some(texture);
+                        }
+                    }
+                    RunKind::Turned | RunKind::TurnedTexture(_) => {
+                        let texture = match run.kind {
+                            RunKind::TurnedTexture(index) => textures[index as usize] as u32,
+                            _ => atlas_texture,
+                        };
+                        (gl.bind_buffer)(GL_ARRAY_BUFFER, slot.turned.buffer);
+                        let base = run.base as usize * std::mem::size_of::<TurnedInstance>();
+                        turned_attribs(gl, base);
                         if bound_texture != Some(texture) {
                             (gl.active_texture)(GL_TEXTURE0);
                             (gl.bind_texture)(GL_TEXTURE_2D, texture);
@@ -1471,6 +1506,25 @@ unsafe fn sprite_attribs(gl: &GlFns, base: usize) {
     let stride = std::mem::size_of::<SpriteInstance>() as i32;
     unsafe {
         for (index, offset) in [(0u32, 0usize), (1, 16), (2, 32)] {
+            (gl.enable_vertex_attrib_array)(index);
+            (gl.vertex_attrib_pointer)(
+                index,
+                4,
+                GL_FLOAT,
+                0,
+                stride,
+                (base + offset) as *const c_void,
+            );
+            (gl.vertex_attrib_divisor)(index, 1);
+        }
+    }
+}
+
+/// The turned picture's layout at `base` bytes: 4×vec4, stride 64, divisor 1.
+unsafe fn turned_attribs(gl: &GlFns, base: usize) {
+    let stride = std::mem::size_of::<TurnedInstance>() as i32;
+    unsafe {
+        for (index, offset) in [(0u32, 0usize), (1, 16), (2, 32), (3, 48)] {
             (gl.enable_vertex_attrib_array)(index);
             (gl.vertex_attrib_pointer)(
                 index,
@@ -2118,6 +2172,7 @@ struct FrameSlot {
     rects: SlotBuffer,
     sprites: SlotBuffer,
     glass: SlotBuffer,
+    turned: SlotBuffer,
     fence: GlSync,
     in_flight: bool,
 }
@@ -2128,6 +2183,7 @@ impl FrameSlot {
             rects: SlotBuffer::empty(),
             sprites: SlotBuffer::empty(),
             glass: SlotBuffer::empty(),
+            turned: SlotBuffer::empty(),
             fence: std::ptr::null_mut(),
             in_flight: false,
         }
@@ -2200,9 +2256,11 @@ fn upload_frame(slot: &mut FrameSlot, gl: &GlFns, batches: &FrameBatches) -> boo
     slot.rects.ensure(gl, batches.rects.len(), std::mem::size_of::<RectInstance>())
         && slot.sprites.ensure(gl, batches.sprites.len(), std::mem::size_of::<SpriteInstance>())
         && slot.glass.ensure(gl, batches.glass.len(), std::mem::size_of::<GlassInstance>())
+        && slot.turned.ensure(gl, batches.turned.len(), std::mem::size_of::<TurnedInstance>())
         && slot.rects.upload(gl, &batches.rects)
         && slot.sprites.upload(gl, &batches.sprites)
         && slot.glass.upload(gl, &batches.glass)
+        && slot.turned.upload(gl, &batches.turned)
 }
 
 // MARK: - The window presenter

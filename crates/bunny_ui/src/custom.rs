@@ -171,6 +171,45 @@ pub trait CustomElement: 'static {
         Err(crate::accessibility::ActionError::Unsupported)
     }
 
+    /// What the box holds, for assistive technology: the links, headings,
+    /// texts and controls it paints, each with its bounds in LOCAL
+    /// coordinates and a key of the element's own. Read only while native
+    /// accessibility is enabled, once a frame; the default is nothing, and
+    /// the box is then heard only by its own semantics.
+    ///
+    /// ```ignore
+    /// fn accessibility_nodes(&self, _size: Size) -> Vec<AccessibleNode> {
+    ///     self.page.links().map(|link| {
+    ///         AccessibleNode::new(link.id, Role::Link, link.bounds).label(link.text)
+    ///     }).collect()
+    /// }
+    /// ```
+    ///
+    /// A node that the clip hides is left out, as a control would be. See
+    /// [`crate::accessibility::AccessibleNode`].
+    fn accessibility_nodes(&self, size: Size) -> Vec<crate::accessibility::AccessibleNode> {
+        let _ = size;
+        Vec::new()
+    }
+
+    /// Applies an assistive-technology request to the node `key` of
+    /// [`CustomElement::accessibility_nodes`]: `Activate` follows a link or
+    /// presses a button, `Focus` moves the element's own focus to it (the
+    /// box takes the keyboard first, when it can), `SetText` replaces a
+    /// field's value. The runtime checks that the node is still exposed,
+    /// enabled and of a role that supports the action.
+    ///
+    /// # Errors
+    /// Returns unsupported by default, or the element's own refusal.
+    fn accessibility_node_action(
+        &self,
+        key: u64,
+        action: &crate::accessibility::Action,
+    ) -> Result<(), crate::accessibility::ActionError> {
+        let _ = (key, action);
+        Err(crate::accessibility::ActionError::Unsupported)
+    }
+
     /// What the pointer should look like at `at`, in LOCAL coordinates.
     ///
     /// `None` — the default — leaves the shell's own rule standing: the hand
@@ -274,6 +313,30 @@ pub trait CustomElement: 'static {
         true
     }
 
+    /// Does the box take the POINTER? The default is yes: a press on the
+    /// box is the box's, and so are the moves, the wheel, the hover and
+    /// the cursor over it.
+    ///
+    /// A box that only DECORATES answers `false` — a glyph drawn inside a
+    /// button, marks painted over a chart. It still measures and paints,
+    /// and it can still take the keyboard. But the hit test skips it:
+    /// presses, hover, the wheel and the cursor reach what lies under it,
+    /// as if the box were glass. A button around the glyph hears its own
+    /// click.
+    ///
+    /// ```ignore
+    /// fn takes_pointer(&self) -> bool {
+    ///     false
+    /// }
+    /// ```
+    ///
+    /// It is the box's own `.allows_hit_testing(false)`, which a
+    /// `canvas(…)` wears from outside. The answer is read when the box is
+    /// placed, so a change shows on the next layout.
+    fn takes_pointer(&self) -> bool {
+        true
+    }
+
     /// What the platform's input system sees while the box is focused —
     /// the text around the caret, the selection, the live composition
     /// and the caret rect in LOCAL coordinates. `None` = no composition
@@ -336,16 +399,30 @@ pub struct Custom {
     /// The version of the picture the app vouches for, if any — see
     /// [`CustomView::cached`].
     cached: Option<u64>,
+    /// Does the kept picture hold while the box has the keyboard? See
+    /// [`CustomView::cached_while_focused`].
+    focus_blind: bool,
 }
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom { element: Rc::new(element), auto_focus: None, borrows: false, cached: None }
+        Custom {
+            element: Rc::new(element),
+            auto_focus: None,
+            borrows: false,
+            cached: None,
+            focus_blind: false,
+        }
     }
 
     /// The picture's version, when the app asked for it to be kept.
     pub(crate) fn cached_version(&self) -> Option<u64> {
         self.cached
+    }
+
+    /// Is the kept picture good while the box holds the keyboard?
+    pub(crate) fn cached_through_focus(&self) -> bool {
+        self.focus_blind
     }
 
     pub fn element(&self) -> &dyn CustomElement {
@@ -567,6 +644,10 @@ impl<'a> Painter<'a> {
         Point { x: point.x + self.origin.x, y: point.y + self.origin.y }
     }
 
+    fn moved(&self, transform: crate::layout::Affine) -> crate::layout::Affine {
+        crate::layout::Affine::translation(self.origin.x, self.origin.y).then(&transform)
+    }
+
     /// The font the box inherited — the default of the text calls.
     pub fn font(&self) -> FontSpec {
         self.font
@@ -583,10 +664,28 @@ impl<'a> Painter<'a> {
         self.fill_rounded(rect, color, 0.0);
     }
 
+    /// A painter that records into `display` at the origin, with this
+    /// painter's font and ink: a picture the element keeps and paints
+    /// again with [`Painter::draw_list`] while what it shows is the same.
+    pub fn recorder<'b>(&self, display: &'b mut DisplayList) -> Painter<'b> {
+        Painter { display, origin: Point { x: 0.0, y: 0.0 }, font: self.font, ink: self.ink }
+    }
+
     /// Paints a whole display list here, every command shifted to this
     /// painter's origin — what a tool that shows frames another process
     /// rendered calls, with the list it decoded off the wire.
     pub fn draw_list(&mut self, display: &DisplayList) {
+        self.draw_list_swapping(display, |_| None);
+    }
+
+    /// [`Painter::draw_list`], with each image `swap` answers for drawn
+    /// from the source it gives instead: a kept picture of a page whose
+    /// video moved on to its next frame, and nothing else changed.
+    pub fn draw_list_swapping(
+        &mut self,
+        display: &DisplayList,
+        swap: impl Fn(&ImageSource) -> Option<ImageSource>,
+    ) {
         for command in display.iter() {
             let shifted = match command.clone() {
                 DrawCommand::FillRect { rect, color, corner_radius } => {
@@ -624,10 +723,25 @@ impl<'a> Painter<'a> {
                     DrawCommand::TurnedText { pivot: self.at(pivot), content, range, color, font, turn }
                 }
                 DrawCommand::Image { rect, source, placement } => {
+                    let source = swap(&source).unwrap_or(source);
                     DrawCommand::Image { rect: self.shift(rect), source, placement }
                 }
                 DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform,
+                    opacity,
+                } => {
+                    let source = swap(&source).unwrap_or(source);
+                    DrawCommand::Sprite {
+                        rect,
+                        source,
+                        transform: self.moved(transform),
+                        opacity,
+                    }
+                }
             };
             self.display.push(shifted);
         }
@@ -793,6 +907,31 @@ impl<'a> Painter<'a> {
             rect: self.shift(rect),
             source: source.into(),
             placement: ImagePlacement::Pixel,
+        });
+    }
+
+    /// One picture under an affine map and a group opacity
+    /// ([`DrawCommand::Sprite`]): `rect` is the picture's box in its own
+    /// coordinates and `transform` lays them onto the box's. The GPU turns,
+    /// scales and fades the texture it already holds, so a picture that
+    /// spins draws no new pixels, frame after frame.
+    ///
+    /// ```ignore
+    /// let spin = Affine { a: cos, b: sin, c: -sin, d: cos, e: x, f: y };
+    /// painter.sprite(card_box, card_pixels.clone(), spin, 0.8);
+    /// ```
+    pub fn sprite(
+        &mut self,
+        rect: Rect,
+        source: impl Into<ImageSource>,
+        transform: crate::layout::Affine,
+        opacity: f64,
+    ) {
+        self.display.push(DrawCommand::Sprite {
+            rect,
+            source: source.into(),
+            transform: self.moved(transform),
+            opacity,
         });
     }
 
@@ -1409,6 +1548,19 @@ impl CustomView {
         self.element.cached = Some(version);
         self
     }
+
+    /// [`CustomView::cached`], kept even while the box holds the keyboard.
+    ///
+    /// For a box that draws its own caret and selection from its own state
+    /// (a web page, a terminal grid) and never reads `focused`,
+    /// `caret_visible` or `phase`: having the keyboard changes nothing it
+    /// paints, so the frames it does not change replay its picture too.
+    #[must_use]
+    pub fn cached_while_focused(mut self, version: u64) -> Self {
+        self.element.cached = Some(version);
+        self.element.focus_blind = true;
+        self
+    }
 }
 
 impl View for CustomView {
@@ -1560,6 +1712,42 @@ mod tests {
         }
         let result = layout_root(&node(Document), 300.0, 900.0);
         assert_eq!(result.size.height, crate::layout::LINE_H * 12.0);
+    }
+
+    #[test]
+    fn a_kept_picture_paints_again_with_the_newest_frame_of_its_feed() {
+        // an element records its picture once, then replays it at its
+        // box for every new frame of a video, the frame swapped in
+        let key = crate::image_engine::FeedKey::new(7);
+        let frame = |generation: u64| ImageSource::feed(key, generation, (1, 1), vec![0u8; 4]);
+        let generations = |display: &DisplayList| -> Vec<(Rect, u64)> {
+            display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::Image { rect, source: ImageSource::Feed { generation, .. }, .. } => {
+                        Some((*rect, *generation))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let size = Size { width: 40.0, height: 30.0 };
+        let bounds = Rect { origin: Point::ZERO, size };
+        let at = Rect { origin: Point { x: 10.0, y: 20.0 }, size };
+        let mut display = DisplayList::default();
+        let mut kept = DisplayList::default();
+        let mut painter = Painter::new(&mut display, at.origin, FontSpec::DEFAULT, Color::FILL);
+        {
+            let mut recorder = painter.recorder(&mut kept);
+            recorder.fill(bounds, Color::FILL);
+            recorder.image(bounds, frame(1));
+        }
+        painter.draw_list_swapping(&kept, |source| {
+            matches!(source, ImageSource::Feed { .. }).then(|| frame(5))
+        });
+        assert_eq!(generations(&kept), vec![(bounds, 1)], "the kept picture is recorded at the origin");
+        assert_eq!(generations(&display), vec![(at, 5)], "and painted at the box with the newest frame");
+        assert_eq!(fills(&display), vec![at]);
     }
 
     #[test]

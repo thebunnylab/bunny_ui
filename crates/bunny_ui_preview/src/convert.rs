@@ -638,8 +638,12 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
         }
         },
         ImageSource::Rgba { size, rgba, .. } => ResourceKind::Rgba { size: *size, rgba: rgba.to_vec() },
-        ImageSource::Feed { generation, size, bytes, .. } => {
-            ResourceKind::Feed { generation: *generation, size: *size, rgba: bytes.to_vec() }
+        ImageSource::Feed { generation, size, format, bytes, .. } => {
+            let rgba = match format {
+                PixelFormat::I420(yuv) => yuv.to_rgba(bytes, *size),
+                _ => bytes.to_vec(),
+            };
+            ResourceKind::Feed { generation: *generation, size: *size, rgba }
         }
         // a world is drawn where it shows, like a platform surface: the
         // wire carries no picture of it
@@ -695,7 +699,7 @@ fn verb_from_wire(verb: wire::Verb) -> icon::Verb {
 pub fn image_source(resource: &Resource) -> Option<ImageSource> {
     let key = resource.key;
     Some(match &resource.kind {
-        ResourceKind::Rgba { size, rgba } => ImageSource::Rgba { key, size: *size, rgba: Rc::from(rgba.as_slice()) },
+        ResourceKind::Rgba { size, rgba } => ImageSource::Rgba { key, size: *size, rgba: Rc::<[u8]>::from(rgba.as_slice()).into() },
         ResourceKind::Encoded { bytes } => ImageSource::Bytes { key, bytes: Rc::from(bytes.as_slice()) },
         ResourceKind::Vector { verbs, paint, ink, box_size } => ImageSource::Path {
             key,
@@ -727,7 +731,7 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             generation: *generation,
             size: *size,
             format: PixelFormat::Rgba8,
-            bytes: Rc::from(rgba.as_slice()),
+            bytes: Rc::<[u8]>::from(rgba.as_slice()).into(),
         },
     })
 }
@@ -914,6 +918,25 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
                 Draw::PushClip { rect: (*rect).into(), corners: (*corner_radius).into() }
             }
             DrawCommand::PopClip => Draw::PopClip,
+            // the frozen wire has no turned picture: it shows upright,
+            // faded, in the box the map turns it into
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => {
+                let faded = source.faded(*opacity);
+                let (image, inner) = image_ref(&faded);
+                if seen.insert(image.key, ()).is_none() {
+                    images.push(inner.into_owned());
+                }
+                Draw::Image {
+                    rect: transform.bounds(*rect).into(),
+                    image,
+                    subpixel: true,
+                }
+            }
         })
         .collect();
     (commands, images)

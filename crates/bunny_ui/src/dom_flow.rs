@@ -2044,6 +2044,14 @@ impl Walk<'_> {
             layout.height = (!hungry.1).then_some(size.height as f32);
             layout.stretch = hungry.0 || hungry.1;
         }
+        // the island of a box that declines the pointer is glass to the
+        // browser too: its press reaches the element under it, and the
+        // canvas never captures the pointer for a box that wants none
+        if let LayoutNode::Custom { element, .. } = subtree
+            && !element.element().takes_pointer()
+        {
+            island.style.look_mut().pass_through = true;
+        }
         // the node's own box feeds the raster — the flow diff never
         // reads it, but the island ledger sizes the pixels by it
         island.width = size.width;

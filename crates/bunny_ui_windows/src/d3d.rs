@@ -61,7 +61,7 @@ use std::ptr::{null, null_mut};
 
 use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance, RoundClip, RunAtlas, RunKind,
-    SpriteInstance, build_frame,
+    SpriteInstance, TurnedInstance, build_frame,
 };
 use bunny_ui::image_engine::{ImageEngine, PixelFormat};
 use bunny_ui::layout::{Color, DisplayList, Size};
@@ -1080,8 +1080,18 @@ struct SpriteInstance {
     float4 clip;
 };
 
+// a picture under an affine map: the texel box one texel wider all
+// round, mapped — the fade past the picture's edge lands inside the quad
+struct TurnedInstance {
+    float4 axes;    // device px per texel: the x axis, then the y axis
+    float4 origin;  // the corner of texel tex.xy, the opacity
+    float4 tex;
+    float4 clip;
+};
+
 StructuredBuffer<RectInstance> rects : register(t0);
 StructuredBuffer<SpriteInstance> sprites : register(t0);
+StructuredBuffer<TurnedInstance> turned : register(t0);
 Texture2D<float4> atlas : register(t1);
 Texture2D<float4> source : register(t0);
 SamplerState source_sampler : register(s0);
@@ -1250,6 +1260,49 @@ float4 live_fragment(SpriteVary vary) : SV_Target {
     atlas.GetDimensions(width, height);
     float4 ink = atlas.Sample(source_sampler, texel / float2(width, height));
     return float4(ink.rgb, ink.a * clip_cov(vary.position.xy));
+}
+
+SpriteVary turned_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+    uint index = iid + base_instance;
+    TurnedInstance sprite = turned[index];
+    float2 texel = lerp(sprite.tex.xy - 1.0, sprite.tex.zw + 1.0, unit_corners[vid]) - sprite.tex.xy;
+    float2 p = sprite.origin.xy + sprite.axes.xy * texel.x + sprite.axes.zw * texel.y;
+    SpriteVary vary;
+    vary.position = to_ndc(p, viewport);
+    vary.id = index;
+    return vary;
+}
+
+// the pixel's centre mapped back onto the picture, and the four texels
+// around it summed premultiplied — a texel past the picture's edge is
+// clear, so the turned edge fades over one texel (`composite_affine`)
+float4 turned_fragment(SpriteVary vary) : SV_Target {
+    TurnedInstance sprite = turned[vary.id];
+    float2 p = vary.position.xy;
+    if (any(p < sprite.clip.xy) || any(p >= sprite.clip.zw)) {
+        discard;
+    }
+    float4 m = sprite.axes;
+    float2 d = p - sprite.origin.xy;
+    float2 local = float2(m.w * d.x - m.z * d.y, m.x * d.y - m.y * d.x) / (m.x * m.w - m.z * m.y);
+    float2 at = sprite.tex.xy + local - 0.5;
+    float2 low = floor(at);
+    float2 f = at - low;
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll] for (int dy = 0; dy < 2; dy++) {
+        [unroll] for (int dx = 0; dx < 2; dx++) {
+            float2 texel = low + float2(dx, dy);
+            float share = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+            if (share > 0.0 && all(texel >= sprite.tex.xy) && all(texel < sprite.tex.zw)) {
+                float4 ink = atlas.Load(int3(int2(texel), 0));
+                sum += share * float4(ink.rgb * ink.a, ink.a);
+            }
+        }
+    }
+    if (sum.a <= 0.0) {
+        discard;
+    }
+    return float4(sum.rgb / sum.a, sum.a * sprite.origin.z * clip_cov(p));
 }
 
 // the fractional-DPI pass: the frame renders at the integer raster
@@ -1532,6 +1585,9 @@ struct D3dStack {
     sprite_ps: Com<PixelShader>,
     /// The feeds' pixel shader, over the sprite vertex shader.
     live_ps: Com<PixelShader>,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned_vs: Com<VertexShader>,
+    turned_ps: Com<PixelShader>,
     blit_vs: Com<VertexShader>,
     blit_ps: Com<PixelShader>,
     /// Liquid glass: the pane, and one separable blur pass. Both ride
@@ -1758,6 +1814,8 @@ impl D3dStack {
             let sprite_vs = make_vs(&shader("sprite_vertex", "vs_5_0")?, "sprite_vertex")?;
             let sprite_ps = make_ps(&shader("sprite_fragment", "ps_5_0")?, "sprite_fragment")?;
             let live_ps = make_ps(&shader("live_fragment", "ps_5_0")?, "live_fragment")?;
+            let turned_vs = make_vs(&shader("turned_vertex", "vs_5_0")?, "turned_vertex")?;
+            let turned_ps = make_ps(&shader("turned_fragment", "ps_5_0")?, "turned_fragment")?;
             let blit_vs = make_vs(&shader("blit_vertex", "vs_5_0")?, "blit_vertex")?;
             let blit_ps = make_ps(&shader("blit_fragment", "ps_5_0")?, "blit_fragment")?;
             let glass_vs = make_vs(&shader("glass_vertex", "vs_5_0")?, "glass_vertex")?;
@@ -1874,6 +1932,8 @@ impl D3dStack {
                 sprite_vs,
                 sprite_ps,
                 live_ps,
+                turned_vs,
+                turned_ps,
                 blit_vs,
                 blit_ps,
                 glass_vs,
@@ -1924,6 +1984,7 @@ impl D3dStack {
         rect_srv: *mut Srv,
         sprite_srv: *mut Srv,
         glass_srv: *mut Srv,
+        turned_srv: *mut Srv,
         runs: &[DrawRun],
         rounds: &[RoundClip],
         atlas_srv: *mut Srv,
@@ -2051,6 +2112,17 @@ impl D3dStack {
                                 RunKind::Texture(index) | RunKind::Live(index) => {
                                     textures[index as usize]
                                 }
+                                _ => atlas_srv,
+                            };
+                            (vtbl.ps_set_shader_resources)(context, 1, 1, &texture);
+                        }
+                        RunKind::Turned | RunKind::TurnedTexture(_) => {
+                            (vtbl.vs_set_shader)(context, self.turned_vs.as_ptr(), null(), 0);
+                            (vtbl.ps_set_shader)(context, self.turned_ps.as_ptr(), null(), 0);
+                            (vtbl.vs_set_shader_resources)(context, 0, 1, &turned_srv);
+                            (vtbl.ps_set_shader_resources)(context, 0, 1, &turned_srv);
+                            let texture = match run.kind {
+                                RunKind::TurnedTexture(index) => textures[index as usize],
                                 _ => atlas_srv,
                             };
                             (vtbl.ps_set_shader_resources)(context, 1, 1, &texture);
@@ -2730,6 +2802,7 @@ struct FrameSlot {
     rects: SlotBuffer,
     sprites: SlotBuffer,
     glass: SlotBuffer,
+    turned: SlotBuffer,
     query: Option<Com<Query>>,
     in_flight: bool,
 }
@@ -2740,6 +2813,7 @@ impl FrameSlot {
             rects: SlotBuffer::empty(),
             sprites: SlotBuffer::empty(),
             glass: SlotBuffer::empty(),
+            turned: SlotBuffer::empty(),
             query: None,
             in_flight: false,
         }
@@ -2825,9 +2899,11 @@ fn upload_frame(slot: &mut FrameSlot, device: *mut Device, context: *mut Context
     slot.rects.ensure(device, batches.rects.len(), std::mem::size_of::<RectInstance>())
         && slot.sprites.ensure(device, batches.sprites.len(), std::mem::size_of::<SpriteInstance>())
         && slot.glass.ensure(device, batches.glass.len(), std::mem::size_of::<GlassInstance>())
+        && slot.turned.ensure(device, batches.turned.len(), std::mem::size_of::<TurnedInstance>())
         && slot.rects.upload(context, &batches.rects)
         && slot.sprites.upload(context, &batches.sprites)
         && slot.glass.upload(context, &batches.glass)
+        && slot.turned.upload(context, &batches.turned)
 }
 
 // MARK: - The window presenter
@@ -3144,6 +3220,7 @@ impl D3dPresenter {
                 self.slots[index].rects.srv_ptr(),
                 self.slots[index].sprites.srv_ptr(),
                 self.slots[index].glass.srv_ptr(),
+                self.slots[index].turned.srv_ptr(),
                 &self.batches.runs,
                 &self.batches.rounds,
                 self.ground.shared_srv(),
@@ -3861,6 +3938,7 @@ impl OffscreenD3d {
                 self.slots[index].rects.srv_ptr(),
                 self.slots[index].sprites.srv_ptr(),
                 self.slots[index].glass.srv_ptr(),
+                self.slots[index].turned.srv_ptr(),
                 &self.batches.runs,
                 &self.batches.rounds,
                 self.ground.shared_srv(),

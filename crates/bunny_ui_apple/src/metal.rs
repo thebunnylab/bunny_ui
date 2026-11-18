@@ -40,11 +40,11 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame, ATLAS_KEEP_WALKS,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, TurnedInstance, build_frame, ATLAS_KEEP_WALKS,
 };
 use bunny_ui::glass;
 use bunny_ui::image_engine::ImageEngine;
-use bunny_ui::image_engine::PixelFormat;
+use bunny_ui::image_engine::{PixelFormat, Yuv};
 use bunny_ui::image_engine::ImageSource;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::raster::{DamageRect, ListDamage, list_damage};
@@ -183,6 +183,10 @@ unsafe extern "C" {
     // sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:`
     // — `MTLSize` and `MTLOrigin` are 3×u64 aggregates, passed INDIRECTLY
     // like the region above.
+    // `dispatchThreadgroups:threadsPerThreadgroup:` — two `MTLSize`s, each
+    // passed INDIRECTLY like the region above.
+    #[link_name = "objc_msgSend"]
+    fn msg_void_dispatch(obj: Id, sel: Sel, groups: MTLSize, per_group: MTLSize);
     #[link_name = "objc_msgSend"]
     fn msg_void_blit(
         obj: Id,
@@ -221,6 +225,7 @@ const BLEND_SOURCE1_ALPHA: u64 = 17;
 const STORAGE_MODE_SHARED: u64 = 0;
 const STORAGE_MODE_PRIVATE: u64 = 2;
 const TEXTURE_USAGE_SHADER_READ: u64 = 1;
+const TEXTURE_USAGE_SHADER_WRITE: u64 = 2;
 const TEXTURE_USAGE_RENDER_TARGET: u64 = 4;
 // CPUCacheModeWriteCombined | StorageModeShared — the CPU only writes
 // instance bytes, the GPU only reads them.
@@ -331,6 +336,88 @@ const _: () = {
 // terms) reproduces the straight spans exactly — every interior pixel
 // center sits at least 0.5 inside an integer edge, so coverage saturates
 // to 1.0 with no `radius < 0.5` branch.
+/// Planar YUV 4:2:0 in the staging buffer to straight RGBA in a feed's
+/// texture: one thread a pixel, the affine map the core derives from the
+/// matrix and range (`Yuv::to_rgb`).
+const YUV_KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct YuvParams {
+    uint width;
+    uint height;
+    uint deep;
+    float scale;
+    float4 red;
+    float4 green;
+    float4 blue;
+};
+
+kernel void yuv_to_rgba(
+    device const uchar* planes [[buffer(0)]],
+    constant YuvParams& p [[buffer(1)]],
+    texture2d<float, access::write> out [[texture(0)]],
+    uint2 at [[thread_position_in_grid]]
+) {
+    if (at.x >= p.width || at.y >= p.height) {
+        return;
+    }
+    uint chroma_width = (p.width + 1) / 2;
+    uint chroma_height = (p.height + 1) / 2;
+    uint luma = at.y * p.width + at.x;
+    uint chroma = (at.y / 2) * chroma_width + at.x / 2;
+    uint cb = p.width * p.height + chroma;
+    uint cr = cb + chroma_width * chroma_height;
+    float3 yuv;
+    if (p.deep != 0) {
+        device const ushort* samples = (device const ushort*)planes;
+        yuv = float3(samples[luma], samples[cb], samples[cr]);
+    } else {
+        yuv = float3(planes[luma], planes[cb], planes[cr]);
+    }
+    float4 s = float4(yuv * p.scale, 1.0);
+    float3 rgb = clamp(float3(dot(p.red, s), dot(p.green, s), dot(p.blue, s)), 0.0, 1.0);
+    out.write(float4(rgb, 1.0), at);
+}
+"#;
+
+/// What the YUV kernel reads besides the planes: `YuvParams` above.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct YuvParams {
+    width: u32,
+    height: u32,
+    deep: u32,
+    scale: f32,
+    red: [f32; 4],
+    green: [f32; 4],
+    blue: [f32; 4],
+}
+
+/// The YUV kernel's pipeline, compiled on its own so a failure costs the
+/// shader conversion only; null when it fails.
+unsafe fn build_yuv(device: Id) -> Id {
+    unsafe {
+        let mut error: Id = null_mut();
+        let library = msg_id_id_id_ptr(
+            device,
+            sel("newLibraryWithSource:options:error:"),
+            ns_string(YUV_KERNEL),
+            null_mut(),
+            &mut error,
+        );
+        if library.is_null() {
+            crate::trace::mark("X", format_args!("what=yuv-kernel {}", error_message(error)));
+            return null_mut();
+        }
+        let function = msg_id_arg(library, sel("newFunctionWithName:"), ns_string("yuv_to_rgba"));
+        if function.is_null() {
+            return null_mut();
+        }
+        msg_id_id_ptr(device, sel("newComputePipelineStateWithFunction:error:"), function, &mut error)
+    }
+}
+
 const SHADER_PRELUDE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -579,6 +666,69 @@ fragment float4 live_fragment(SpriteVary in [[stage_in]],
     float2 texel = sprite.tex.xy + (p - sprite.dest.xy) * ratio;
     float4 ink = live.sample(live_sampler, texel);
     return float4(ink.rgb, ink.a * clip_cov(p, round));
+}
+
+// a picture under an affine map: the texel box one texel wider all
+// round, mapped — the fade past the picture's edge lands inside the quad
+struct TurnedInstance {
+    float4 axes;    // device px per texel: the x axis, then the y axis
+    float4 origin;  // the corner of texel tex.xy, the opacity
+    float4 tex;
+    float4 clip;
+};
+
+struct TurnedVary {
+    float4 position [[position]];
+    uint id [[flat]];
+};
+
+vertex TurnedVary turned_vertex(uint vid [[vertex_id]],
+                                uint iid [[instance_id]],
+                                device const TurnedInstance* turned [[buffer(0)]],
+                                constant Uniforms& uniforms [[buffer(1)]]) {
+    TurnedInstance sprite = turned[iid];
+    float2 texel = mix(sprite.tex.xy - 1.0, sprite.tex.zw + 1.0, unit_corners[vid]) - sprite.tex.xy;
+    float2 p = sprite.origin.xy + sprite.axes.xy * texel.x + sprite.axes.zw * texel.y;
+    TurnedVary out;
+    out.position = to_ndc(p - uniforms.origin, uniforms.viewport);
+    out.id = iid;
+    return out;
+}
+
+// the pixel's centre mapped back onto the picture, and the four texels
+// around it summed premultiplied — a texel past the picture's edge is
+// clear, so the turned edge fades over one texel (`composite_affine`)
+fragment float4 turned_fragment(TurnedVary in [[stage_in]],
+                                device const TurnedInstance* turned [[buffer(0)]],
+                                constant ClipRound& round [[buffer(1)]],
+                                constant Uniforms& uniforms [[buffer(2)]],
+                                texture2d<float, access::read> picture [[texture(0)]]) {
+    TurnedInstance sprite = turned[in.id];
+    float2 p = in.position.xy + uniforms.origin;
+    if (any(p < sprite.clip.xy) || any(p >= sprite.clip.zw)) {
+        discard_fragment();
+    }
+    float4 m = sprite.axes;
+    float2 d = p - sprite.origin.xy;
+    float2 local = float2(m.w * d.x - m.z * d.y, m.x * d.y - m.y * d.x) / (m.x * m.w - m.z * m.y);
+    float2 at = sprite.tex.xy + local - 0.5;
+    float2 low = floor(at);
+    float2 f = at - low;
+    float4 sum = float4(0.0);
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            float2 texel = low + float2(dx, dy);
+            float share = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+            if (share > 0.0 && all(texel >= sprite.tex.xy) && all(texel < sprite.tex.zw)) {
+                float4 ink = picture.read(uint2(texel));
+                sum += share * float4(ink.rgb * ink.a, ink.a);
+            }
+        }
+    }
+    if (sum.a <= 0.0) {
+        discard_fragment();
+    }
+    return float4(sum.rgb / sum.a, sum.a * sprite.origin.z * clip_cov(p, round));
 }
 
 // MARK: - Liquid glass
@@ -962,12 +1112,17 @@ struct MetalStack {
     /// The feeds' pipeline: the sprite vertex over a LINEAR sampler, so
     /// a picture of one size lands in a box of another.
     live_pipeline: Id,
+    /// Pictures under an affine map — [`RunKind::Turned`].
+    turned_pipeline: Id,
     /// The three pipelines liquid glass adds: the pane itself, one
     /// separable blur pass, and the copy of the offscreen scene onto
     /// the target a frame with glass cannot render into directly.
     glass_pipeline: Id,
     blur_pipeline: Id,
     blit_pipeline: Id,
+    /// The kernel that turns a planar YUV feed into its RGBA texture, or
+    /// null when it did not compile (the walk then converts on the CPU).
+    yuv_pipeline: Id,
     /// The render-target format the pipelines bound to — the scene
     /// texture a glass frame renders into must match it.
     format: u64,
@@ -1063,6 +1218,14 @@ impl MetalStack {
             let live_pipeline = build_pipeline(
                 device, library, "sprite_vertex", "live_fragment", format, PassBlend::Over,
             )?;
+            let turned_pipeline = build_pipeline(
+                device,
+                library,
+                "turned_vertex",
+                "turned_fragment",
+                format,
+                PassBlend::Over,
+            )?;
             // a pane blends over the scene like any other paint; the
             // blur and the blit REPLACE what they write (a pass that
             // covers its whole destination has nothing to keep)
@@ -1088,9 +1251,11 @@ impl MetalStack {
                 knockout_pipeline,
                 sprite_pipeline,
                 live_pipeline,
+                turned_pipeline,
                 glass_pipeline,
                 blur_pipeline,
                 blit_pipeline,
+                yuv_pipeline: build_yuv(device),
                 format,
                 pass_class: class("MTLRenderPassDescriptor"),
                 sels: Sels::new(),
@@ -1117,6 +1282,52 @@ impl MetalStack {
     ///
     /// Returns the autoreleased command plus receipt eligibility. The caller
     /// owns the pool and decides how to present; eligibility alone is not a receipt.
+    /// The planar feeds' new frames, turned into their RGBA textures by the
+    /// YUV kernel straight from the staging buffer — after the blits, before
+    /// the pass that samples them.
+    unsafe fn encode_conversions(&self, command: Id, staging: Id, copies: &[LiveCopy]) {
+        if self.yuv_pipeline.is_null() || !copies.iter().any(|copy| copy.yuv.is_some()) {
+            return;
+        }
+        unsafe {
+            let encoder = msg_id(command, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                return;
+            }
+            msg_void_id(encoder, sel("setComputePipelineState:"), self.yuv_pipeline);
+            for copy in copies {
+                let Some(yuv) = copy.yuv else { continue };
+                let [red, green, blue] = yuv.to_rgb().rows;
+                let params = YuvParams {
+                    width: copy.width as u32,
+                    height: copy.height as u32,
+                    deep: u32::from(yuv.sample_bytes() == 2),
+                    scale: 1.0 / ((1u32 << yuv.bits.clamp(8, 16)) - 1) as f32,
+                    red,
+                    green,
+                    blue,
+                };
+                msg_void_id_u64_u64(encoder, sel("setBuffer:offset:atIndex:"), staging, copy.offset, 0);
+                msg_void_ptr_u64_u64(
+                    encoder,
+                    sel("setBytes:length:atIndex:"),
+                    (&raw const params).cast(),
+                    std::mem::size_of::<YuvParams>() as u64,
+                    1,
+                );
+                msg_void_id_u64(encoder, sel("setTexture:atIndex:"), copy.texture, 0);
+                let side = 16;
+                msg_void_dispatch(
+                    encoder,
+                    sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                    MTLSize { width: copy.width.div_ceil(side), height: copy.height.div_ceil(side), depth: 1 },
+                    MTLSize { width: side, height: side, depth: 1 },
+                );
+            }
+            msg_void(encoder, self.sels.end_encoding);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame(&self, frame: EncodeFrame) -> EncodedFrame {
         unsafe {
@@ -1133,7 +1344,8 @@ impl MetalStack {
             // the feeds' new bytes land first, from the slot's staging
             // buffer, on the queue — after every earlier frame that still
             // samples the textures, before this one does
-            if !frame.live_copies.is_empty() {
+            let blits = frame.live_copies.iter().filter(|copy| copy.yuv.is_none());
+            if blits.clone().next().is_some() {
                 let blit = msg_id(command, self.sels.blit_encoder);
                 if blit.is_null() {
                     return EncodedFrame {
@@ -1141,7 +1353,7 @@ impl MetalStack {
                         feed_uploads_encoded: false,
                     };
                 }
-                for copy in frame.live_copies {
+                for copy in blits {
                     msg_void_blit(
                         blit,
                         self.sels.copy_to_texture,
@@ -1158,6 +1370,7 @@ impl MetalStack {
                 }
                 msg_void(blit, self.sels.end_encoding);
             }
+            self.encode_conversions(command, frame.staging, frame.live_copies);
             // the worlds next, each into its own target: the 2D pass
             // below samples them
             frame.worlds.encode(command, self.queue, &self.sels, self.pass_class, frame.staging);
@@ -1364,6 +1577,33 @@ impl MetalStack {
                                     0,
                                 );
                                 msg_void_id_u64(encoder, self.sels.set_fragment_texture, texture, 0);
+                            }
+                            RunKind::Turned | RunKind::TurnedTexture(_) => {
+                                msg_void_id(encoder, self.sels.set_pipeline, self.turned_pipeline);
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_vertex_buffer,
+                                    frame.instances,
+                                    frame.turned_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_fragment_buffer,
+                                    frame.instances,
+                                    frame.turned_offset as u64,
+                                    0,
+                                );
+                                let texture = match run.kind {
+                                    RunKind::TurnedTexture(index) => frame.textures[index as usize],
+                                    _ => frame.atlas_texture,
+                                };
+                                msg_void_id_u64(
+                                    encoder,
+                                    self.sels.set_fragment_texture,
+                                    texture,
+                                    0,
+                                );
                             }
                             // glass never reaches this pass
                             RunKind::Glass => continue,
@@ -1585,6 +1825,7 @@ struct EncodeFrame<'a> {
     instances: Id,
     sprite_offset: usize,
     glass_offset: usize,
+    turned_offset: usize,
     runs: &'a [DrawRun],
     rounds: &'a [RoundClip],
     atlas_texture: Id,
@@ -1789,6 +2030,11 @@ struct MetalGround {
     slot: usize,
     /// The copies the frame's blit pass makes, in order.
     pending: Vec<LiveCopy>,
+    /// The live textures fed planar YUV, by handle: their bytes go through
+    /// the stack's kernel instead of a blit.
+    planar: HashMap<u64, Yuv>,
+    /// Whether the stack has the YUV kernel.
+    yuv: bool,
     /// The atlas was offered back to the system while the window rested.
     volatile: bool,
     /// The world door: targets, meshes and textures of the world pass.
@@ -1818,6 +2064,8 @@ struct LiveCopy {
     per_row: u64,
     width: u64,
     height: u64,
+    /// The layout of planar bytes the kernel converts; `None` = a blit.
+    yuv: Option<Yuv>,
 }
 
 /// A blit's source offset rides a 256-byte boundary — the alignment
@@ -1867,6 +2115,8 @@ impl MetalGround {
             }),
             slot: 0,
             pending: Vec::new(),
+            planar: HashMap::new(),
+            yuv: false,
         }
     }
 
@@ -2044,8 +2294,22 @@ impl AtlasGround for MetalGround {
         }
     }
 
+    fn converts(&self, format: PixelFormat) -> bool {
+        match format {
+            PixelFormat::Rgba8 => true,
+            PixelFormat::I420(_) => self.yuv,
+            _ => false,
+        }
+    }
+
     fn make_live(&mut self, w: u32, h: u32, format: PixelFormat) -> Option<u64> {
-        let PixelFormat::Rgba8 = format else { return None };
+        if !self.converts(format) {
+            return None;
+        }
+        let usage = match format {
+            PixelFormat::I420(_) => TEXTURE_USAGE_SHADER_READ | TEXTURE_USAGE_SHADER_WRITE,
+            _ => TEXTURE_USAGE_SHADER_READ,
+        };
         let texture = unsafe {
             let descriptor = msg_id_u64_u64_u64_bool(
                 class("MTLTextureDescriptor"),
@@ -2055,7 +2319,7 @@ impl AtlasGround for MetalGround {
                 h as u64,
                 0,
             );
-            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+            msg_void_u64(descriptor, sel("setUsage:"), usage);
             // the GPU alone writes it, from the staging buffer, in order
             msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_PRIVATE);
             msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor)
@@ -2066,11 +2330,32 @@ impl AtlasGround for MetalGround {
         let id = self.next;
         self.next += 1;
         self.textures.insert(id, texture);
+        if let PixelFormat::I420(yuv) = format {
+            self.planar.insert(id, yuv);
+        }
         Some(id)
     }
 
     fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
         let Some(&texture) = self.textures.get(&id) else { return false };
+        if let Some(&yuv) = self.planar.get(&id) {
+            let needed = PixelFormat::I420(yuv).bytes_for((w, h));
+            if bytes.len() < needed {
+                return false;
+            }
+            let offset = unsafe { self.stage(&bytes[..needed]) };
+            self.pending.retain(|copy| copy.texture != texture);
+            self.pending.push(LiveCopy {
+                id,
+                texture,
+                offset,
+                per_row: u64::from(w),
+                width: u64::from(w),
+                height: u64::from(h),
+                yuv: Some(yuv),
+            });
+            return true;
+        }
         let per_row = pitch_px as usize * 4;
         let needed = (h as usize - 1) * per_row + w as usize * 4;
         if bytes.len() < needed {
@@ -2086,11 +2371,13 @@ impl AtlasGround for MetalGround {
             per_row: per_row as u64,
             width: w as u64,
             height: h as u64,
+            yuv: None,
         });
         true
     }
 
     fn drop_live(&mut self, id: u64) {
+        self.planar.remove(&id);
         if let Some(texture) = self.textures.remove(&id) {
             self.pending.retain(|copy| copy.texture != texture);
             unsafe { msg_void(texture, sel("release")) };
@@ -2171,14 +2458,11 @@ impl Drop for MetalGround {
 /// A completed frame's time on the GPU, on the tape: `G gpu=<ms>`. Read
 /// when its slot is taken for a later frame — the command buffer is done
 /// by then, and the two timestamps are the GPU's own clock.
-unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
-    if !crate::trace::enabled() {
-        return;
-    }
+unsafe fn mark_gpu_time(command: Id, sels: &Sels) -> Option<f64> {
     let (start, end) = unsafe { (msg_f64(command, sels.gpu_start), msg_f64(command, sels.gpu_end)) };
-    if end > start {
-        crate::trace::mark("G", format_args!("gpu={:.2}", (end - start) * 1000.0));
-    }
+    let gpu = (end > start).then(|| (end - start) * 1000.0)?;
+    crate::trace::mark("G", format_args!("gpu={gpu:.2}"));
+    Some(gpu)
 }
 
 /// A free slot from a ring: polled by `status`, oldest-first. When all
@@ -2187,6 +2471,8 @@ unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
 struct AcquiredSlot {
     index: usize,
     retry: bool,
+    /// The GPU time of the frame the slot held, in milliseconds.
+    gpu_ms: Option<f64>,
 }
 
 fn acquire_slot(
@@ -2206,26 +2492,35 @@ fn acquire_slot(
             let free = status >= STATUS_COMPLETED;
             if free {
                 let retry = slots[index].settle_uploads(status, atlas);
+                let mut gpu_ms = None;
                 if !slots[index].command.is_null() {
-                    mark_gpu_time(slots[index].command, sels);
+                    gpu_ms = mark_gpu_time(slots[index].command, sels);
                     msg_void(slots[index].command, sels.release);
                     slots[index].command = null_mut();
                     slots[index].native.clear();
                 }
                 *cursor = (index + 1) % slots.len();
-                return AcquiredSlot { index, retry };
+                return AcquiredSlot {
+                    index,
+                    retry,
+                    gpu_ms,
+                };
             }
         }
         let index = *cursor;
         msg_void(slots[index].command, sels.wait_completed);
         let status = msg_u64(slots[index].command, sels.status);
         let retry = slots[index].settle_uploads(status, atlas);
-        mark_gpu_time(slots[index].command, sels);
+        let gpu_ms = mark_gpu_time(slots[index].command, sels);
         msg_void(slots[index].command, sels.release);
         slots[index].command = null_mut();
         slots[index].native.clear();
         *cursor = (index + 1) % slots.len();
-        AcquiredSlot { index, retry }
+        AcquiredSlot {
+            index,
+            retry,
+            gpu_ms,
+        }
     }
 }
 
@@ -2253,9 +2548,15 @@ unsafe fn upload_frame(
         let rect_bytes = as_bytes(&batches.rects);
         let sprite_bytes = as_bytes(&batches.sprites);
         let glass_bytes = as_bytes(&batches.glass);
+        let turned_bytes = as_bytes(&batches.turned);
         let sprite_offset = rect_bytes.len().next_multiple_of(256);
         let glass_offset = (sprite_offset + sprite_bytes.len()).next_multiple_of(256);
-        let total = glass_offset + glass_bytes.len();
+        let turned_at = turned_offset(glass_offset, batches);
+        let total = if turned_bytes.is_empty() {
+            glass_offset + glass_bytes.len()
+        } else {
+            turned_at + turned_bytes.len()
+        };
         if total == 0 {
             return (0, 0);
         }
@@ -2289,9 +2590,24 @@ unsafe fn upload_frame(
                 glass_bytes.len(),
             );
         }
+        if !turned_bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                turned_bytes.as_ptr(),
+                contents.add(turned_at),
+                turned_bytes.len(),
+            );
+        }
         (sprite_offset, glass_offset)
     }
 }
+
+/// Where the turned pictures start in the frame's buffer: 256-aligned
+/// after the panes.
+fn turned_offset(glass_offset: usize, batches: &FrameBatches) -> usize {
+    (glass_offset + std::mem::size_of_val(batches.glass.as_slice())).next_multiple_of(256)
+}
+
+const _: () = assert!(std::mem::size_of::<TurnedInstance>() == 64);
 
 // MARK: - The window presenter
 
@@ -2494,11 +2810,6 @@ impl Drawables {
             }
             self.shown = None;
         }
-    }
-
-    /// Whether the last present has landed — or there is none.
-    unsafe fn landed(&mut self) -> bool {
-        self.shown.as_mut().is_none_or(|shown| unsafe { shown.settled() }.is_some())
     }
 
     /// How many surfaces are offered back right now.
@@ -2771,6 +3082,16 @@ impl Easel {
     }
 }
 
+/// The patch a bridge keeps up, and the drawable of the FIRST whole
+/// frame it covered. It comes down once that one lands: a stream of
+/// whole frames (a video) replaces the newest drawable before it ever
+/// lands, and a bridge waiting for the newest stayed up for good —
+/// every frame of the stream paid a bridge and its wait.
+struct Bridged {
+    patch: usize,
+    under: ShownSurface,
+}
+
 /// A patch kept up over a whole frame, its box repainted from that
 /// frame, until the frame's drawable lands (see
 /// [`MetalPresenter::bridge`]).
@@ -2839,7 +3160,7 @@ pub struct MetalPresenter {
     /// for the bands, the list where it stood before it scrolled. Taken
     /// down by the first frame or rest that finds the drawable landed
     /// ([`MetalPresenter::retire_bridge`]).
-    bridge: Option<usize>,
+    bridge: Option<Bridged>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
     /// The window's own drawables, offered back while it rests.
@@ -2857,6 +3178,11 @@ pub struct MetalPresenter {
     glass: Option<GlassTextures>,
     /// How long the last present waited for a drawable, in milliseconds.
     drawable_wait_ms: f64,
+    /// Whether the last present changed what the window shows.
+    changed: bool,
+    /// The GPU time of the last frame known to have completed, in
+    /// milliseconds.
+    gpu_ms: f64,
 }
 
 impl MetalPresenter {
@@ -3104,12 +3430,14 @@ impl MetalPresenter {
                 (size.height.round().max(0.0) as usize) * scale,
             );
             self.drawable_wait_ms = 0.0;
+            self.changed = true;
             self.retire_bridge();
             if poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels) {
                 self.forget_failed_frame();
             }
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
+                self.changed = false;
                 if let Some(attempt) = observation {
                     attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
                 }
@@ -3119,6 +3447,7 @@ impl MetalPresenter {
             if frame_repeats(&self.retained, display, physical, scale, canvas) {
                 // the caret blink and friends land here every half
                 // second — nothing changed, nothing encodes
+                self.changed = false;
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -3152,8 +3481,10 @@ impl MetalPresenter {
                 // undone, a hover gone): the patch over it steps aside
                 // and nothing encodes. A bridge shows this frame too, and
                 // stays until the frame lands under it
-                let bridge = self.bridge;
-                if self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge) {
+                let bridge = self.bridge.as_ref().map(|bridged| bridged.patch);
+                self.changed =
+                    self.patches.iter().enumerate().any(|(at, patch)| patch.shown.is_some() && Some(at) != bridge);
+                if self.changed {
                     self.previous = self.patch_on_screen();
                     let transaction = class("CATransaction");
                     msg_void(transaction, sel("begin"));
@@ -3237,6 +3568,9 @@ impl MetalPresenter {
                 &mut self.atlas,
             );
             let index = acquired.index;
+            if let Some(gpu_ms) = acquired.gpu_ms {
+                self.gpu_ms = gpu_ms;
+            }
             if acquired.retry {
                 self.forget_failed_frame();
                 plan = Plan::Whole;
@@ -3278,6 +3612,7 @@ impl MetalPresenter {
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
+                self.changed = false;
                 if let Some(attempt) = observation {
                     attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
                 }
@@ -3309,6 +3644,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -3379,7 +3715,17 @@ impl MetalPresenter {
                     patch.hide();
                 }
                 msg_void(transaction, sel("commit"));
-                self.bridge = bridged;
+                self.bridge = match (bridged, self.bridge.take()) {
+                    (Some(patch), Some(kept)) if kept.patch == patch => Some(kept),
+                    (Some(patch), _) => Some(Bridged {
+                        patch,
+                        under: ShownSurface::Presenting {
+                            drawable: msg_id(drawable, sel("retain")),
+                            at: std::time::Instant::now(),
+                        },
+                    }),
+                    (None, _) => None,
+                };
                 if let Some(at) = bridged
                     && let Some(rect) = self.patches[at].shown
                 {
@@ -3456,6 +3802,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -3484,10 +3831,11 @@ impl MetalPresenter {
     /// from then on the window's own layer shows the same pixels.
     unsafe fn retire_bridge(&mut self) {
         unsafe {
-            let Some(at) = self.bridge else { return };
-            if !self.drawables.landed() {
+            let Some(bridged) = self.bridge.as_mut() else { return };
+            if bridged.under.settled().is_none() {
                 return;
             }
+            let at = bridged.patch;
             self.bridge = None;
             let transaction = class("CATransaction");
             msg_void(transaction, sel("begin"));
@@ -3576,6 +3924,7 @@ impl MetalPresenter {
             }) {
                 // Logical geometry changed, but no physical pixel did. Keep
                 // the visible surface untouched and advance the frame witness.
+                self.changed = false;
                 self.previous = self.patch_on_screen();
                 let held = Rc::new(display.clone());
                 self.patches[same].held = Some((held.clone(), rect));
@@ -3656,6 +4005,7 @@ impl MetalPresenter {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -3761,6 +4111,8 @@ impl MetalPresenter {
             kill_layer_actions(layer);
         }
         let (device, format) = (stack.device, stack.format);
+        let mut ground = MetalGround::new(device, format);
+        ground.yuv = !stack.yuv_pipeline.is_null();
         Some(MetalPresenter {
             observation: None,
             stack,
@@ -3770,7 +4122,7 @@ impl MetalPresenter {
             scale: 0,
             slots: std::array::from_fn(|_| FrameSlot::empty()),
             cursor: 0,
-            ground: MetalGround::new(device, format),
+            ground,
             atlas: RunAtlas::new(),
             batches: FrameBatches::default(),
             retained: None,
@@ -3784,6 +4136,8 @@ impl MetalPresenter {
             drawables: Drawables::default(),
             resting: false,
             transactional: false,
+            changed: false,
+            gpu_ms: 0.0,
             glass: None,
             drawable_wait_ms: 0.0,
         })
@@ -3812,6 +4166,16 @@ impl MetalPresenter {
             live: self.atlas.live.len(),
             size: self.atlas.size,
         }
+    }
+
+    pub fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// The GPU time of the last frame known to have completed, in
+    /// milliseconds.
+    pub fn gpu_ms(&self) -> f64 {
+        self.gpu_ms
     }
 
     pub fn drawable_wait_ms(&self) -> f64 {
@@ -3880,8 +4244,8 @@ impl OffscreenGpu {
         unsafe {
             let target = readable_target(stack.device, width, height)?;
             let (device, format) = (stack.device, stack.format);
-            #[allow(unused_mut)]
             let mut ground = MetalGround::new(device, format);
+            ground.yuv = !stack.yuv_pipeline.is_null();
             // the harness reads its worlds back
             #[cfg(feature = "3d")]
             {
@@ -4020,6 +4384,7 @@ impl OffscreenGpu {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -4139,6 +4504,7 @@ impl OffscreenGpu {
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
+                turned_offset: turned_offset(glass_offset, &self.batches),
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
                 atlas_texture: self.ground.shared,
@@ -4715,6 +5081,21 @@ mod tests {
             .expect("a patch on screen")
     }
 
+    /// The patch a bridge keeps up, by its index.
+    #[cfg(target_os = "macos")]
+    fn bridged(presenter: &MetalPresenter) -> Option<usize> {
+        presenter.bridge.as_ref().map(|bridged| bridged.patch)
+    }
+
+    /// Makes the first frame under the bridge `age` old, never reported
+    /// on screen — a window that is covered.
+    #[cfg(target_os = "macos")]
+    fn age_bridge(presenter: &mut MetalPresenter, age: std::time::Duration) {
+        if let Some(Bridged { under: ShownSurface::Presenting { at, .. }, .. }) = &mut presenter.bridge {
+            *at = std::time::Instant::now() - age;
+        }
+    }
+
     /// The RGBA pixel at `(x, y)` of the IOSurface a layer holds as its
     /// contents — what the window server composites at the commit.
     #[cfg(target_os = "macos")]
@@ -4803,7 +5184,7 @@ mod tests {
             let (at, rect) = shown_patch(&presenter);
             // the ground changes: a whole frame
             present_boxes(&mut presenter, &boxes_scene(true, false, second));
-            assert_eq!(presenter.bridge, Some(at), "the patch bridges the whole frame");
+            assert_eq!(bridged(&presenter), Some(at), "the patch bridges the whole frame");
             assert_eq!(shown_patch(&presenter), (at, rect), "still up, where it was");
             let patch = presenter.patches[at].layer;
             let inside = |x: i64, y: i64| ((x - rect.0) as usize, (y - rect.1) as usize);
@@ -4815,18 +5196,48 @@ mod tests {
             );
             // presented just now, never on screen: not landed
             let fresh = |presenter: &mut MetalPresenter, age: std::time::Duration| {
-                if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
-                    *at = std::time::Instant::now() - age;
-                }
+                age_bridge(presenter, age);
             };
             fresh(&mut presenter, std::time::Duration::ZERO);
             presenter.rest();
-            assert_eq!(presenter.bridge, Some(at), "a rest before it lands keeps the bridge");
+            assert_eq!(bridged(&presenter), Some(at), "a rest before it lands keeps the bridge");
             assert!(presenter.patches[at].shown.is_some());
             fresh(&mut presenter, PRESENT_LANDS_IN);
             presenter.offer_drawables();
-            assert_eq!(presenter.bridge, None);
+            assert_eq!(bridged(&presenter), None);
             assert!(presenter.patches[at].shown.is_none(), "down once the frame landed under it");
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stream_of_whole_frames_takes_the_bridge_down_once_the_first_landed() {
+        // a video under a patch: every frame is whole and replaces the
+        // drawable before it lands. Waiting for the NEWEST to land kept
+        // the bridge up for good, and every frame painted it and waited
+        // for the GPU on the main thread
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = MetalPresenter::attach(layer, 1.0).expect("a Metal presenter");
+            let ground = |shade: u8| Color::rgb(18, 22, shade);
+            present_boxes(&mut presenter, &boxes_scene(false, false, ground(0)));
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground(0)));
+            let (at, _) = shown_patch(&presenter);
+            present_boxes(&mut presenter, &boxes_scene(true, false, ground(1)));
+            assert_eq!(bridged(&presenter), Some(at), "the first whole frame is bridged");
+            age_bridge(&mut presenter, PRESENT_LANDS_IN);
+            for shade in 2..6 {
+                present_boxes(&mut presenter, &boxes_scene(true, false, ground(shade)));
+                assert_eq!(bridged(&presenter), None, "frame {shade} has no bridge to paint");
+                assert!(presenter.patches.iter().all(|patch| patch.shown.is_none()));
+            }
             drop(presenter);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
@@ -4884,17 +5295,15 @@ mod tests {
             // the ground changes: a whole frame the bands refuse
             present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
             assert!(!presenter.scroll_bands.active());
-            let at = presenter.bridge.expect("a bridge over the rows");
+            let at = bridged(&presenter).expect("a bridge over the rows");
             assert_eq!(shown_patch(&presenter), (at, rows), "it covers what the bands did");
             let patch = presenter.patches[at].layer;
             // physical row 60 lies in row 3, scrolled up by 48: 44..68
             let inside = |x: i64, y: i64| ((x - rows.0) as usize, (y - rows.1) as usize);
             assert_eq!(contents_pixel(patch, inside(90, 60)), [0x44, 0x66, 0xaa, 0xff], "the rows as they stand now");
-            if let Some(ShownSurface::Presenting { at, .. }) = &mut presenter.drawables.shown {
-                *at -= PRESENT_LANDS_IN;
-            }
+            age_bridge(&mut presenter, PRESENT_LANDS_IN);
             present(&mut presenter, &rows_scene(48.0, Color::hex(0xf4f0e8)));
-            assert_eq!(presenter.bridge, None, "down once the frame landed");
+            assert_eq!(bridged(&presenter), None, "down once the frame landed");
             drop(presenter);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
@@ -4920,7 +5329,7 @@ mod tests {
             let taller = Size { width: 512.0, height: 640.0 };
             let display = boxes_scene(true, false, ground);
             presenter.present(&display, taller, 1, Color::CANVAS, &PixelFont, &RawImages::default(), false);
-            assert_eq!(presenter.bridge, None, "no bridge across a resize");
+            assert_eq!(bridged(&presenter), None, "no bridge across a resize");
             assert!(presenter.patches[at].shown.is_none(), "the patch steps aside with the frame");
             drop(presenter);
             msg_void(layer, sel("release"));
@@ -5496,6 +5905,75 @@ mod tests {
                 let (gpu, cpu) =
                     scene_bytes(&subpixel_scene(shift), Size { width: 320.0, height: 400.0 }, scale, Color::CANVAS);
                 assert_close(&gpu, &cpu, 2, &format!("subpixel pictures at {scale}x, {shift} pt past the grid"));
+            }
+        }
+    }
+
+    /// Pictures under affine maps: turned on a shelf tile, scaled on a
+    /// dedicated texture, faded and skewed under a rounded clip.
+    fn sprite_scene(angle: f64) -> impl View {
+        use bunny_ui::custom::canvas;
+        use bunny_ui::layout::{Affine, Corners, Point, Rect};
+        canvas(move |_, p| {
+            let at = |x: f64, y: f64, width: f64, height: f64| Rect {
+                origin: Point { x, y },
+                size: Size { width, height },
+            };
+            p.fill(at(0.0, 0.0, 320.0, 400.0), Color::rgba(40, 60, 120, 255));
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let turn = |x: f64, y: f64, scale: f64| Affine {
+                a: cos * scale,
+                b: sin * scale,
+                c: -sin * scale,
+                d: cos * scale,
+                e: x,
+                f: y,
+            };
+            p.sprite(
+                at(-12.0, -12.0, 24.0, 24.0),
+                gradient_source(21),
+                turn(40.0, 40.0, 1.0),
+                1.0,
+            );
+            p.sprite(
+                at(-60.0, -60.0, 120.0, 300.0),
+                gradient_source(22),
+                turn(160.0, 200.0, 0.7),
+                1.0,
+            );
+            p.clipped_rounded(at(20.0, 260.0, 200.0, 120.0), Corners::all(18.0), |p| {
+                let skew = Affine {
+                    c: 0.4,
+                    ..turn(60.0, 300.0, 1.3)
+                };
+                p.sprite(at(-24.0, -12.0, 48.0, 24.0), cloud_source(23), skew, 0.6);
+            });
+        })
+        .frame(320.0, 400.0)
+    }
+
+    #[test]
+    fn sprites_match_the_raster() {
+        if !device_present() {
+            return;
+        }
+        for scale in [1, 2] {
+            for angle in [0.0, 17.0, 45.0, 90.0, 203.5] {
+                let (gpu, cpu) = scene_bytes(
+                    &sprite_scene(angle),
+                    Size {
+                        width: 320.0,
+                        height: 400.0,
+                    },
+                    scale,
+                    Color::CANVAS,
+                );
+                assert_close(
+                    &gpu,
+                    &cpu,
+                    3,
+                    &format!("sprites at {scale}x turned {angle} degrees"),
+                );
             }
         }
     }

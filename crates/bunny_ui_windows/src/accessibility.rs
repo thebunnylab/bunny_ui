@@ -690,7 +690,7 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
 /// gives a radio button, a tab item and a combo box patterns of their
 /// own, and says they never answer Invoke.
 fn invokes(role: Role) -> bool {
-    role == Role::Button
+    matches!(role, Role::Button | Role::Link)
 }
 /// One of a set: it answers the SelectionItem pattern.
 fn selects(role: Role) -> bool {
@@ -818,12 +818,16 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                         Role::Stepper => 50016, // Spinner
                         Role::Tab => 50019,     // TabItem
                         Role::TextField | Role::PasswordField => 50004,
+                        Role::Link => 50005, // Hyperlink
+                        Role::Heading => 50020,
                     })),
                     AUTOMATION_ID => Variant::string(&format!("bunny:{}", node.id.get())),
                     FOCUSED => Ok(Variant::boolean(
                         node.focused && window_has_focus(surface.window),
                     )),
-                    FOCUSABLE => Ok(Variant::boolean(node.enabled && node.role != Role::Text)),
+                    FOCUSABLE => Ok(Variant::boolean(
+                        node.enabled && !matches!(node.role, Role::Text | Role::Heading),
+                    )),
                     TOGGLE_STATE if toggles(node.role) => {
                         Ok(Variant::integer(i32::from(node.checked.unwrap_or(false))))
                     }
@@ -964,6 +968,7 @@ fn enqueue(value: &Provider, action: Action) -> Hresult {
                     | Role::RadioButton
                     | Role::Tab
                     | Role::PopUpButton
+                    | Role::Link
             ),
             Action::Activate | Action::Focus
         ) | (

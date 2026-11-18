@@ -238,6 +238,12 @@ strokes reach it before the key bindings, text arrives as text
 (typing, a paste, the commit of a composition), and on the desktop the
 input system asks it directly where the caret is.
 
+A box that only decorates — a glyph inside a button, marks drawn over a
+chart — answers `false` to `takes_pointer`. It still paints, but the hit
+test skips it: the press, the hover, the wheel and the cursor go to what
+is under it, so the button hears its own click. A `canvas(…)` does the
+same with `.allows_hit_testing(false)`.
+
 Use it for content that has no views. A rounded corner, a hover state
 or a gradient belongs in the framework. Content that arrives with its
 own renderer — a web page, a camera's video — takes the native host

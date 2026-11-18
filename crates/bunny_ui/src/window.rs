@@ -12,6 +12,7 @@ mod background;
 mod confirmation;
 mod confirmation_alert;
 mod dialog_geometry;
+mod fullscreen;
 mod geometry;
 mod relationships;
 pub use background::WindowBackground;
@@ -25,6 +26,9 @@ pub use confirmation_alert::FrameworkConfirmation;
 pub use dialog_geometry::DialogGeometry;
 #[doc(hidden)]
 pub use dialog_geometry::{DialogGeometryObservation, DialogGeometrySession};
+pub use fullscreen::{FullscreenEvent, FullscreenMode};
+#[doc(hidden)]
+pub use fullscreen::FullscreenEvents;
 pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
 #[doc(hidden)]
 pub use geometry::{GeometryEvents, GeometryObservation};
@@ -164,6 +168,7 @@ pub struct Lifecycle {
     hidden: Cell<bool>,
     owner_hidden: Cell<bool>,
     geometry_events: Rc<GeometryEvents>,
+    fullscreen_events: Rc<FullscreenEvents>,
 }
 
 impl Default for Lifecycle {
@@ -178,6 +183,7 @@ impl Default for Lifecycle {
         Self {
             id: WindowId(id),
             geometry_events: Rc::new(GeometryEvents::new(WindowId(id))),
+            fullscreen_events: Rc::new(FullscreenEvents::new(WindowId(id))),
             handler: RefCell::new(None),
             deciding: Cell::new(false),
             hidden: Cell::new(false),
@@ -204,6 +210,12 @@ impl Lifecycle {
     #[must_use]
     pub const fn geometry_events(&self) -> &Rc<GeometryEvents> {
         &self.geometry_events
+    }
+
+    /// Native full-screen trips belonging to this window lifetime.
+    #[must_use]
+    pub const fn fullscreen_events(&self) -> &Rc<FullscreenEvents> {
+        &self.fullscreen_events
     }
 
     /// The immutable identity belonging to this backend slot.

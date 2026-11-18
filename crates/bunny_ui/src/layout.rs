@@ -861,13 +861,14 @@ pub enum LayoutNode {
     /// `turn` is radians clockwise about the glyph's centre — zero for
     /// the upright glyph, which paints the bytes it always did.
     Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool, turn: f32 },
-    /// A view whose resolved size goes back to the app (`.on_measure`).
+    /// A view whose resolved size (`.on_measure`) or frame (`.on_frame`)
+    /// goes back to the app.
     ///
     /// Transparent to the layout in both directions: it measures as its
     /// child and places at the frame it is given. All it adds is the
     /// RECORD — the frame lands in [`LayoutResult::frames`] under
     /// `path`, which is the only thing the runtime needs to hand the
-    /// size over.
+    /// size or the frame over. The last segment of the path says which.
     Measured { path: String, child: Box<LayoutNode> },
     /// Semantic information with no effect on geometry or paint.
     Accessible { semantics: crate::accessibility::Semantics, child: Box<LayoutNode> },
@@ -2983,6 +2984,128 @@ pub enum ImagePlacement {
     Subpixel,
 }
 
+/// A flat affine map: the point `(x, y)` lands at
+/// `(a·x + c·y + e, b·x + d·y + f)` — the six numbers CSS's `matrix()` and
+/// Core Graphics name the same way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+}
+
+impl Affine {
+    pub const IDENTITY: Affine = Affine {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub const fn translation(dx: Px, dy: Px) -> Affine {
+        Affine {
+            e: dx,
+            f: dy,
+            ..Affine::IDENTITY
+        }
+    }
+
+    pub const fn scale(factor: f64) -> Affine {
+        Affine {
+            a: factor,
+            d: factor,
+            ..Affine::IDENTITY
+        }
+    }
+
+    /// `inner` first, then `self`.
+    pub fn then(&self, inner: &Affine) -> Affine {
+        Affine {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    pub fn apply(&self, point: Point) -> Point {
+        Point {
+            x: self.a * point.x + self.c * point.y + self.e,
+            y: self.b * point.x + self.d * point.y + self.f,
+        }
+    }
+
+    pub fn determinant(&self) -> f64 {
+        self.a * self.d - self.b * self.c
+    }
+
+    /// The map back, unless the map flattens the plane onto a line.
+    pub fn inverse(&self) -> Option<Affine> {
+        let det = self.determinant();
+        if det.abs() < 1e-12 || !det.is_finite() {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+
+    /// Does it only move? Then a picture keeps every pixel it has.
+    pub fn is_translation(&self) -> bool {
+        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0
+    }
+
+    /// Where the four corners of `rect` land, clockwise from its top left.
+    pub fn corners(&self, rect: Rect) -> [Point; 4] {
+        let (x0, y0) = (rect.origin.x, rect.origin.y);
+        let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
+        [
+            self.apply(Point { x: x0, y: y0 }),
+            self.apply(Point { x: x1, y: y0 }),
+            self.apply(Point { x: x1, y: y1 }),
+            self.apply(Point { x: x0, y: y1 }),
+        ]
+    }
+
+    /// The upright box that holds `rect` once it is mapped.
+    pub fn bounds(&self, rect: Rect) -> Rect {
+        let corners = self.corners(rect);
+        let mut low = corners[0];
+        let mut high = corners[0];
+        for corner in &corners[1..] {
+            low.x = low.x.min(corner.x);
+            low.y = low.y.min(corner.y);
+            high.x = high.x.max(corner.x);
+            high.y = high.y.max(corner.y);
+        }
+        Rect {
+            origin: low,
+            size: Size {
+                width: high.x - low.x,
+                height: high.y - low.y,
+            },
+        }
+    }
+
+    pub fn is_finite(&self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .iter()
+            .all(|value| value.is_finite())
+    }
+}
+
 /// How a view's background meets what is already painted under it —
 /// `.background_blend(…)`.
 ///
@@ -3099,6 +3222,21 @@ pub enum DrawCommand {
     /// intersection, so the composition lives where the stacks live.
     PushClip { rect: Rect, corner_radius: Corners },
     PopClip,
+    /// One picture under an affine map and a group opacity: a layer a
+    /// compositor turns, scales and fades without painting it again.
+    /// `rect` is the picture's box in its OWN coordinates and `transform`
+    /// lays those coordinates onto the scene. The backend asks the frame's
+    /// [`ImageEngine`] for pixels at the rect's PHYSICAL size, as for an
+    /// image, and samples them where the map puts each device pixel's
+    /// centre: four texels, weighed in premultiplied colour, and nothing
+    /// past the picture's edge — so a turned edge fades over one texel
+    /// instead of stepping.
+    Sprite {
+        rect: Rect,
+        source: ImageSource,
+        transform: Affine,
+        opacity: f64,
+    },
 }
 
 /// Two commands are equal when they paint alike. Every kind compares
@@ -3144,6 +3282,14 @@ impl PartialEq for DrawCommand {
             PushClip { rect, corner_radius } => matches!(other,
                 PushClip { rect: r, corner_radius: k } if rect == r && corner_radius == k),
             PopClip => matches!(other, PopClip),
+            Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => matches!(other,
+                Sprite { rect: r, source: s, transform: t, opacity: o }
+                    if rect == r && source == s && transform == t && opacity == o),
         }
     }
 }
@@ -3347,6 +3493,9 @@ impl DrawCommand {
                     }
                 }
             }
+            DrawCommand::Sprite {
+                rect, transform, ..
+            } => around(&transform.bounds(*rect), 1.0),
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => true,
         }
     }
@@ -3411,6 +3560,17 @@ impl DrawCommand {
                 DrawCommand::PushClip { rect: moved(rect), corner_radius: *corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => DrawCommand::Sprite {
+                rect: *rect,
+                source: source.clone(),
+                transform: Affine::translation(by.x, by.y).then(transform),
+                opacity: *opacity,
+            },
             DrawCommand::Gradient { .. } | DrawCommand::Backdrop { .. } => return None,
         })
     }
@@ -3651,6 +3811,9 @@ impl DisplayList {
                     }
                 },
                 DrawCommand::Image { source, .. } => *source = source.faded(opacity),
+                DrawCommand::Sprite {
+                    opacity: strength, ..
+                } => *strength *= opacity,
                 DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
             }
         }
@@ -3798,6 +3961,30 @@ impl DisplayList {
                     DrawCommand::PushClip { rect: rect(r), corner_radius: corners(corner_radius) }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect: r,
+                    source,
+                    transform,
+                    opacity,
+                } => {
+                    let zero = point(Point::ZERO);
+                    let across = point(Point { x: 1.0, y: 0.0 });
+                    let down = point(Point { x: 0.0, y: 1.0 });
+                    let turned = Affine {
+                        a: across.x - zero.x,
+                        b: across.y - zero.y,
+                        c: down.x - zero.x,
+                        d: down.y - zero.y,
+                        e: zero.x,
+                        f: zero.y,
+                    };
+                    DrawCommand::Sprite {
+                        rect: r,
+                        source,
+                        transform: turned.then(&transform),
+                        opacity,
+                    }
+                }
             };
         }
     }
@@ -3866,6 +4053,17 @@ impl DisplayList {
                     DrawCommand::PushClip { rect: shift_rect(rect), corner_radius }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
+                DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform,
+                    opacity,
+                } => DrawCommand::Sprite {
+                    rect,
+                    source,
+                    transform: Affine::translation(dx, dy).then(&transform),
+                    opacity,
+                },
             })
             .collect();
         DisplayList { commands }
@@ -4663,6 +4861,12 @@ pub struct CustomPlacement {
     /// Which way the box's scene reads — what its paint and its events
     /// are told, and the direction a menu it opens hangs in.
     pub direction: LayoutDirection,
+    /// Does the box take the pointer? `false` for a box that declines it
+    /// ([`crate::custom::CustomElement::takes_pointer`]) and for one in a
+    /// subtree that declines hit testing (`.allows_hit_testing(false)`).
+    /// Such a box records no hit, and the pointer's roads pass it by even
+    /// when it shares its path with the control around it.
+    pub pointer: bool,
 }
 
 impl CustomPlacement {
@@ -5217,6 +5421,11 @@ pub fn hit_test(hits: &[(String, Rect)], x: Px, y: Px) -> Option<&str> {
 /// probe's record can never be confused with a boundary's.
 pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 
+/// [`MEASURE_SEGMENT`] for a probe that hears the whole frame
+/// (`.on_frame`). A segment of its own: one view may carry both probes,
+/// and each keeps its own address.
+pub(crate) const FRAME_SEGMENT: &str = "/#frame";
+
 /// The absolute frames the placement pass produces, addressable by the
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
@@ -5237,11 +5446,11 @@ impl Frames {
     }
 
     /// The probes' own frames — the entries a `Measured` node recorded,
-    /// told apart by the segment only that node writes.
+    /// told apart by the segments only that node writes.
     pub(crate) fn measured(&self) -> impl Iterator<Item = (&str, &Rect)> {
         self.entries
             .iter()
-            .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT))
+            .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT) || path.ends_with(FRAME_SEGMENT))
             .map(|(path, frame)| (&**path, frame))
     }
 
@@ -5879,6 +6088,7 @@ fn painted_reach(command: &DrawCommand, env: &LayoutEnv<'_>) -> Option<Rect> {
         // of anti-aliasing is the floor of both, as the damage diff keeps it
         DrawCommand::StrokeRect { rect, width, .. } => Some(around(rect, (width / 2.0).max(1.0))),
         DrawCommand::Shadow { rect, radius, .. } => Some(around(rect, radius.max(1.0))),
+        DrawCommand::Sprite { rect, transform, .. } => Some(around(&transform.bounds(*rect), 1.0)),
         DrawCommand::TextLine { origin, content, range, font, .. } => {
             let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
             Some(Rect {
@@ -7839,6 +8049,8 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
                         out.accessibility.push(crate::accessibility::Placed {
+                            level: None,
+                            inside: None,
                             enabled: true,
                             checked: None,
                             expanded: None,
@@ -8312,6 +8524,8 @@ impl LayoutNode {
                     && let Some(range) = element.element().accessibility_range()
                 {
                     out.accessibility.push(crate::accessibility::Placed {
+                        level: None,
+                        inside: None,
                         enabled: element.element().accepts_keys(),
                         checked: None,
                         expanded: None,
@@ -8324,6 +8538,22 @@ impl LayoutNode {
                         surface: out.accessibility_surface.clone(),
                         multiline: false,
                     });
+                }
+                if env.accessibility && !path.is_empty() {
+                    let nodes = element.element().accessibility_nodes(frame.size);
+                    if !nodes.is_empty() {
+                        let owner: Rc<str> = Rc::from(path.as_str());
+                        let mut placed = Vec::new();
+                        crate::accessibility::place(
+                            &nodes,
+                            &owner,
+                            frame.origin,
+                            &out.accessibility_surface,
+                            &|rect| out.accessible_bounds(rect),
+                            &mut placed,
+                        );
+                        out.accessibility.extend(placed);
+                    }
                 }
                 let focusable = !path.is_empty()
                     && out.can_reveal_focus(frame)
@@ -8372,14 +8602,16 @@ impl LayoutNode {
                 };
                 // the box answers for the whole frame: a hit here never
                 // falls through to what is painted underneath, and the
-                // event finds the element by this path
+                // event finds the element by this path — unless the box,
+                // or a subtree around it, declines the pointer
+                let pointer = out.passive == 0 && element.element().takes_pointer();
                 let placed = if path.is_empty() {
                     None
                 } else {
                     let visible = out.current_clip().map_or(Some(frame), |clip| {
                         frame.intersection(clip)
                     });
-                    if let Some(visible) = visible.filter(|_| out.passive == 0) {
+                    if let Some(visible) = visible.filter(|_| pointer) {
                         out.hits.push((path.to_string(), visible));
                     }
                     if visible.is_some() || focusable {
@@ -8397,6 +8629,7 @@ impl LayoutNode {
                             covered: false,
                             slice: (0, 0),
                             direction: env.direction,
+                            pointer,
                         });
                         Some(out.customs.len() - 1)
                     } else { None }
@@ -8419,6 +8652,7 @@ impl LayoutNode {
                             size: window.size,
                         },
                         start,
+                        pointer,
                     );
                 }
                 // the box cannot paint outside itself — the clip is the
@@ -8451,9 +8685,10 @@ impl LayoutNode {
                 // replayed at its place. Never a box that moves on its own:
                 // one under a loop, one that holds the keyboard, one on the
                 // element lowering.
-                let kept = element
-                    .cached_version()
-                    .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
+                let kept = element.cached_version().filter(|_| {
+                    let focus = !focused || element.cached_through_focus();
+                    env.live.is_none() && focus && out.dom.is_none() && !path.is_empty()
+                });
                 // a box NO PIXEL can show — its clip came out empty. One that
                 // keeps its picture promised that its paint is only a
                 // picture, so there is nothing to do. Any other box may read
@@ -8622,6 +8857,7 @@ impl LayoutNode {
                             covered: false,
                             slice: (overlay_from, overlay_end),
                             direction: env.direction,
+                            pointer,
                         });
                     }
                 }
@@ -9722,7 +9958,7 @@ impl LayoutNode {
                 if out.dom.is_some() {
                         let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
-                        dom.open_canvas(frame, start);
+                        dom.open_canvas(frame, start, true);
                     }
                     child.place(frame, fit, env, out);
                     let end = out.display.len();

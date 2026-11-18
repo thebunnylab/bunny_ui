@@ -18,6 +18,7 @@
 //! M <ms> dur=<ms> sync=<0|1>
 //! S <ms> dur=<ms> n=<alive> raster=<n> px=<n>
 //! E <ms> dur=<ms>
+//! B <ms> dur=<ms> via=<origin> new=<0|1>   the whole frame on the main thread, marked as it ends; `new` = it changed the picture
 //! X <ms> what=<name>
 //! F <ms> settle=<ms> layout=<ms> pass=<ms> asm=<ms> measure=<ms> place=<ms> hover=<ms> passes=<n> layouts=<n> asm#=<n> hover#=<n> paints=<n> cmds=<n> mk=<n> mm=<n>
 //! V <ms> mount=<process-local number> stage=<load-request|load-return|commit|finish|post>
@@ -29,6 +30,7 @@
 //! D <ms> pace=<full|slow:<ms>|off>
 //! L <ms> blits=<n>   (live layers repainted alone: an overlay, a loop)
 //! Q <ms> box=<x0>,<y0>,<x1>,<y1>[ moved] | hide   (a change presented through the patch layer, or the patch stepping aside)
+//! Y <ms> vsync=<ms> target=<ms>   (a display beat: the refresh just shown, and the one a frame drawn now aims at)
 //! ```
 //!
 //! `V` records only document lifecycle milestones and an opaque process-local
@@ -105,11 +107,14 @@ fn out() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             value.replace("{pid}", &pid.to_string())
         };
         let mut file = std::fs::File::create(path).ok()?;
-        let t0 = std::time::SystemTime::now()
+        // the zero of the tape's clock, to the microsecond: a reader lines
+        // the tape up with its own clock by it
+        let t0 = start()
+            .1
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |t| t.as_millis());
+            .map_or(0.0, |t| t.as_secs_f64() * 1000.0);
         let tag = std::env::var("BUNNY_TRACE_TAG").unwrap_or_default();
-        let _ = writeln!(file, "# bunny-trace v2 pid={pid} t0={t0} tag={tag}");
+        let _ = writeln!(file, "# bunny-trace v2 pid={pid} t0={t0:.3} tag={tag}");
         Some(std::sync::Mutex::new(file))
     })
     .as_ref()
@@ -121,9 +126,14 @@ pub fn active() -> bool {
     out().is_some()
 }
 
+/// The tape's zero, on both clocks.
+fn start() -> (std::time::Instant, std::time::SystemTime) {
+    static START: std::sync::OnceLock<(std::time::Instant, std::time::SystemTime)> = std::sync::OnceLock::new();
+    *START.get_or_init(|| (std::time::Instant::now(), std::time::SystemTime::now()))
+}
+
 fn ms() -> f64 {
-    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    start().0.elapsed().as_secs_f64() * 1000.0
 }
 
 /// The tape's own clock, in milliseconds — the one a shell installs for

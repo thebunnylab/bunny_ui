@@ -89,7 +89,7 @@ impl FrameObservation {
             return None;
         }
         let drawn = batches.runs.iter().any(|run| {
-            matches!(run.kind, RunKind::Live(index)
+            matches!(run.kind, RunKind::Live(index) | RunKind::TurnedTexture(index)
                 if batches.textures.get(usize::from(index)) == Some(&entry.id))
                 && run.count > 0
                 && run.bounds.0 < run.bounds.2

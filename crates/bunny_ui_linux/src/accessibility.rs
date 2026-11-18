@@ -98,6 +98,8 @@ impl Entry {
                 Role::Stepper => (52, "spin button"),
                 Role::TextField => (79, "entry"),
                 Role::PasswordField => (40, "password text"),
+                Role::Link => (88, "link"),
+                Role::Heading => (83, "heading"),
             },
         }
     }
@@ -110,8 +112,9 @@ impl Entry {
                 | Role::Switch
                 | Role::RadioButton
                 | Role::Tab
-                | Role::PopUpButton => result.push(ACTION),
-                Role::Text => result.push(TEXT),
+                | Role::PopUpButton
+                | Role::Link => result.push(ACTION),
+                Role::Text | Role::Heading => result.push(TEXT),
                 Role::Slider | Role::Stepper => result.extend([VALUE, ACTION]),
                 Role::TextField | Role::PasswordField => result.extend([TEXT, EDITABLE]),
             }
@@ -120,7 +123,7 @@ impl Entry {
     }
     fn text(&self) -> &str {
         match &self.kind {
-            Kind::Control(node) if node.role == Role::Text => &node.label,
+            Kind::Control(node) if matches!(node.role, Role::Text | Role::Heading) => &node.label,
             Kind::Control(node) => node.value.as_deref().unwrap_or(""),
             _ => "",
         }
@@ -184,9 +187,11 @@ impl Entry {
                     ("decrement", Action::Decrement),
                 ],
                 Role::Checkbox | Role::Switch => &[("toggle", Action::Activate)],
-                Role::Button | Role::RadioButton | Role::Tab => &[("click", Action::Activate)],
+                Role::Button | Role::RadioButton | Role::Tab | Role::Link => {
+                    &[("click", Action::Activate)]
+                }
                 Role::PopUpButton => &[("press", Action::Activate)],
-                Role::Text | Role::TextField | Role::PasswordField => &[],
+                Role::Text | Role::Heading | Role::TextField | Role::PasswordField => &[],
             },
             _ => &[],
         }

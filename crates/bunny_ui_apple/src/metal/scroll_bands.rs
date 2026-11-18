@@ -285,6 +285,7 @@ impl Scene {
                 c,
                 DrawCommand::Backdrop { .. }
                     | DrawCommand::Image { .. }
+                    | DrawCommand::Sprite { .. }
                     | DrawCommand::Gradient { .. }
                     | DrawCommand::Shadow { .. }
             )

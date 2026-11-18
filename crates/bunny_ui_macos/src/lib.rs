@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 pub use bunny_ui_apple::credentials;
+pub mod audio;
 use bunny_ui_apple::trace;
 pub mod dialog;
 pub mod drive;
@@ -92,6 +93,9 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
     }
     pacer.set_beating(ffi::want_beat(window, wanted));
 }
+
+/// How long after an input a worker's frame still answers it.
+const ANSWERED_WITHIN: Duration = Duration::from_millis(250);
 
 /// The half-second recovery clock may rescue a stopped display link, but
 /// must not split a healthy beat into two presents. The clock is supplied
@@ -493,9 +497,10 @@ pub fn window_background(asked: WindowBackground) -> WindowBackground {
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
+mod window_fullscreen;
 mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, DesktopPosition, DesktopSpace, WindowBackground, WindowError, WindowGeometry,
+    CloseAction, DesktopPosition, DesktopSpace, FullscreenEvent, FullscreenMode, WindowBackground, WindowError, WindowGeometry,
     WindowId, WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
@@ -708,7 +713,9 @@ impl App {
             slot.confirmation.owner_closed();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
+            slot.lifecycle.fullscreen_events().retire();
             ffi::forget_geometry(slot.window, id);
+            ffi::forget_fullscreen(slot.window);
             ffi::lend_hand(|| ffi::close_top_level(slot.window));
             self.inner.relationships.retire(id);
             self.inner
@@ -912,6 +919,13 @@ impl AppInner {
                 observation.deliver();
                 return;
             }
+            if let AppEvent::Fullscreen(change) = event {
+                let source = ffi::event_source();
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.window == source) {
+                    slot.lifecycle.fullscreen_events().observe(change);
+                }
+                return;
+            }
             if let AppEvent::GeometryChanged(observation) = event {
                 if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
                     slot.lifecycle.geometry_events().observe_captured(&observation);
@@ -1009,7 +1023,9 @@ impl AppInner {
             slot.presentation.borrow_mut().take();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
+            slot.lifecycle.fullscreen_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
+            ffi::forget_fullscreen(slot.window);
             self.relationships.retire(slot.lifecycle.id());
         }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
@@ -1916,6 +1932,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // seconds, whichever comes first — a count that only grows across an
     // idle hour names a leak. (frames drawn, the clock of the last line)
     let kept_line: Rc<Cell<(u32, f64)>> = Rc::new(Cell::new((0, f64::NEG_INFINITY)));
+    let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
     let blit = {
         let lifecycle = Rc::clone(&lifecycle);
         let present = Rc::clone(&present);
@@ -1931,6 +1948,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if lifecycle.is_hidden() {
                 return;
             }
+            // the `B` line: the whole frame on the main thread, settle to
+            // driver sync — what a frame costs the hand
+            let begun = std::time::Instant::now();
+            // whatever an earlier present left unclaimed is not this frame's
+            let _ = metal::take_changed(window.view());
 
             // a sleeper due by now wakes before the settle polls
             runtime.advance_tasks_to_now();
@@ -2098,6 +2120,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
+            // a frame that changed the picture takes its refresh; the pacer
+            // learns how long a frame takes from the decision to the glass
+            let presented = Instant::now();
+            pacer.spent(presented - begun);
+            pacer.gpu(metal::gpu_time(window.view()));
+            // a present that waited for a drawable found the line in front of
+            // the display full: what comes next waits for it to drain, not
+            // only the next beat
+            if metal::take_congested(window.view()) && !unpaced {
+                pacer.congested();
+            }
+            let changed = !metal::active(window.view()) || metal::take_changed(window.view());
+            if changed {
+                pacer.claim(presented);
+                if asked.all & (1 << trace::Origin::Input.index()) != 0 {
+                    pacer.led(presented);
+                }
+            }
             // Prepare only after the window has presented its frame.
             webview::prepare_pending_html();
         point_cursor(runtime, !resizing());
@@ -2124,6 +2164,17 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         // wake or park the frame driver — the event may have started
         // (or finished) an animation
         sync_frame_driver(runtime, &pacer, window_id);
+        if trace::active() {
+            trace::mark(
+                "B",
+                format_args!(
+                    "dur={:.2} via={} new={}",
+                    begun.elapsed().as_secs_f64() * 1000.0,
+                    trace::Origin::names(1 << via.index()),
+                    u8::from(changed)
+                ),
+            );
+        }
         }
     };
     // The door for an event that CAN wait for the display's next beat. From
@@ -2131,19 +2182,37 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // beat draws one frame for all of them; mid-resize it draws nothing, and
     // the resize step shows what it changed.
     // `BUNNY_PACING=off` draws for every event, as the shell did before it
-    // had a pacer: the control of an A/B on the tape. The resize law still
-    // holds — it is the same door.
-    let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
+    // had a pacer, and `BUNNY_PACING=beat` folds every warm event into the
+    // next beat, as it did before it knew the refresh grid: the controls of
+    // an A/B on the tape. The resize law still holds — it is the same door.
+    let beat_paced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "beat");
+    // When the hand last spoke: a worker's frame within a moment of it is an
+    // answer someone waits for, and draws as soon as its refresh is open; a
+    // stream of them with nobody at the controls (an animation) keeps the
+    // beat's cadence.
+    let handled: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
     let soon = {
         let blit = blit.clone();
         let pacer = Rc::clone(&pacer);
         let resizing = Rc::clone(&resizing);
+        let handled = Rc::clone(&handled);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
             if unpaced && !resizing() {
                 blit(runtime, root, via);
                 return;
             }
-            if pacer.ask(via.index(), Urgency::Soon, resizing()) == Verdict::Draw {
+            // a worker's frame with nobody at the controls, or one that only
+            // follows a hand still drawing, waits for the beat
+            let now = Instant::now();
+            let follows = via.index() == trace::Origin::Wake.index()
+                && (handled.get().is_none_or(|at| now - at >= ANSWERED_WITHIN)
+                    || pacer.hand_drawing(now));
+            let asked = if beat_paced || follows {
+                pacer.ask(via.index(), Urgency::Soon, resizing())
+            } else {
+                pacer.ask_at(via.index(), Urgency::Soon, resizing(), now)
+            };
+            if asked == Verdict::Draw {
                 blit(runtime, root, via);
             } else {
                 sync_frame_driver(runtime, &pacer, window_id);
@@ -2292,6 +2361,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_dialogs = Rc::clone(&dialogs);
     let handler_pacer = Rc::clone(&pacer);
     let handler_resizing = Rc::clone(&resizing);
+    let handler_handled = Rc::clone(&handled);
     let soon = soon.clone();
     let file_drag = Box::new({
         let runtime = Rc::clone(&runtime);
@@ -2325,6 +2395,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 .values()
                 .any(|dialog| dialog.is_visible() && dialog.in_live_resize())
         };
+        if matches!(
+            event,
+            AppEvent::Key { .. }
+                | AppEvent::ImeInsert { .. }
+                | AppEvent::ImeMark { .. }
+                | AppEvent::ImeUnmark
+                | AppEvent::Wheel { .. }
+                | AppEvent::MouseDown { .. }
+                | AppEvent::RightMouseDown { .. }
+                | AppEvent::MiddleMouseDown { .. }
+                | AppEvent::MouseUp { .. }
+                | AppEvent::ButtonUp { .. }
+                | AppEvent::MouseMoved { .. }
+                | AppEvent::Magnify { .. }
+                | AppEvent::Rotate { .. }
+        ) {
+            handler_handled.set(Some(Instant::now()));
+        }
         // the `I` line: an input's arrival, for a tape that measures the
         // road from the hand to the glass (the `E` that follows closes it)
         if trace::active() {
@@ -2356,7 +2444,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
+        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) | AppEvent::Fullscreen(_) => return,
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {
@@ -2728,15 +2816,28 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if metal::take_congested(window.view()) && !unpaced {
                 handler_pacer.congested();
             }
-            let beat = handler_pacer.beat(handler_resizing());
+            if let Some(display) = bunny_ui::vsync::last() {
+                handler_pacer.refresh(display.target, display.interval);
+            }
+            let beat = if beat_paced {
+                handler_pacer.beat(handler_resizing())
+            } else {
+                // a worker's frame after a wheel turn follows the hand
+                let followers = handler_pacer.pending().all & !(1 << trace::Origin::Wake.index()) == 0;
+                handler_pacer.beat_at(handler_resizing(), Instant::now(), followers)
+            };
             if beat == Beat::Hold {
             } else if beat == Beat::Draw {
                 blit(runtime, root, trace::Origin::Frame);
             } else if moved.scene {
                 let (width, height) = window.content_size();
                 runtime.set_thumb_layers(metal::active(window.view()) && !window.in_live_resize());
+                let _ = metal::take_changed(window.view());
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display, trace::Origin::Frame);
+                if metal::take_changed(window.view()) {
+                    handler_pacer.claim(Instant::now());
+                }
                 // a spring or a fling moved content under a still hand
                 point_cursor(runtime, !handler_resizing());
             } else if moved.islands {

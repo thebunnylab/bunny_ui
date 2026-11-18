@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, ImagePlacement, Rect};
 use crate::angle::QuarterTurn;
-use crate::raster::{baseline_row, physical_extent, turn_raster, turned_corner};
+use crate::raster::{baseline_row, physical_extent, sprite_texels, turn_raster, turned_corner};
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
 
 /// The run atlas: text tiles append into one shared texture. Runs wider
@@ -97,6 +97,36 @@ pub struct SpriteInstance {
     pub tex: [f32; 4],  // atlas texel origin + the same extent
     pub clip: [f32; 4],
 }
+
+/// One picture under an affine map ([`DrawCommand::Sprite`]): the texels
+/// of `tex` laid onto device pixels by `axes` from `origin`. The fragment
+/// maps its pixel's centre back to a texel and takes the bilinear sample
+/// there, the four texels summed premultiplied and those outside `tex`
+/// clear — so the turned edge fades over one texel — and scales the sum
+/// by the opacity. The quad is the texel box one texel wider all round,
+/// mapped; the clip cuts per pixel, since a turned quad has no upright
+/// edges to clamp.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // written whole, read by the GPU — never field by field
+pub struct TurnedInstance {
+    /// Device px per texel: the texel x axis `(a, b)`, then the y axis `(c, d)`.
+    pub axes: [f32; 4],
+    /// Device px of the corner of texel `(tex.x, tex.y)`, the opacity, and
+    /// nothing.
+    pub origin: [f32; 4],
+    /// The picture's texel box in its texture: x0, y0, x1, y1.
+    pub tex: [f32; 4],
+    pub clip: [f32; 4],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<TurnedInstance>() == 64);
+    assert!(std::mem::offset_of!(TurnedInstance, axes) == 0);
+    assert!(std::mem::offset_of!(TurnedInstance, origin) == 16);
+    assert!(std::mem::offset_of!(TurnedInstance, tex) == 32);
+    assert!(std::mem::offset_of!(TurnedInstance, clip) == 48);
+};
 
 const _: () = {
     assert!(std::mem::size_of::<RectInstance>() == 80);
@@ -231,6 +261,12 @@ pub trait AtlasGround {
         false
     }
     fn drop_live(&mut self, _id: u64) {}
+
+    /// Can this tier take feed bytes laid out as `format` and convert them
+    /// in its shader? `false` = the walk converts them to RGBA first.
+    fn converts(&self, format: PixelFormat) -> bool {
+        format == PixelFormat::Rgba8
+    }
 
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
@@ -456,8 +492,14 @@ const DEDICATED_HEIGHT: u32 = 256;
 const DEDICATED_AREA: u32 = 512 * 512;
 /// Dedicated textures retained before a stale one asks the collector.
 /// A frame that reads more keeps them all: the collector can only take
-/// a texture no walk needs.
-const DEDICATED_KEEP: usize = 8;
+/// a texture no walk needs. A web page shows a dozen big pictures at a
+/// time (a landing page's screenshots, the layers a browser flattened),
+/// and a frame that needs one more than the cap drains and re-uploads
+/// every picture, frame after frame — so the cap leaves room for a few
+/// screens of them…
+const DEDICATED_KEEP: usize = 32;
+/// …while the stale ones go first once the kept ones hold these bytes.
+const DEDICATED_BYTES: u64 = 256 << 20;
 /// Feeds kept warm between frames: a camera or a video is a handful on a
 /// screen, never a crowd. A frame that reads more keeps them all.
 pub const LIVE_KEEP: usize = 16;
@@ -657,6 +699,23 @@ impl RunAtlas {
     ) -> Option<ResolvedImage<'_>> {
         if size.0 == 0 || size.1 == 0 || bytes.len() < format.bytes_for(size) {
             return None;
+        }
+        // a tier with no shader for the layout gets RGBA, converted here
+        // once per generation: an unchanged frame is the texture it was
+        if let PixelFormat::I420(yuv) = format
+            && !ground.converts(format)
+        {
+            let walk = self.walk;
+            if let Some(entry) = self.live.get_mut(&key)
+                && (entry.width, entry.height, entry.format) == (size.0, size.1, PixelFormat::Rgba8)
+                && entry.generation == generation
+                && !entry.stale
+            {
+                entry.walk = walk;
+                return Some(ResolvedImage::Live(entry.id, entry.width, entry.height));
+            }
+            let rgba = yuv.to_rgba(bytes, size);
+            return self.resolve_live(ground, key, generation, size, PixelFormat::Rgba8, &rgba);
         }
         let walk = self.walk;
         if let Some(entry) = self.live.get_mut(&key) {
@@ -964,7 +1023,12 @@ impl RunAtlas {
         // this walk read is not garbage; after the drain+reset the map
         // holds nothing else, and the walk that re-runs keeps what it
         // needs instead of running into the same wall
-        if self.dedicated.len() >= DEDICATED_KEEP {
+        let held: u64 = self
+            .dedicated
+            .values()
+            .map(|entry| u64::from(entry.width) * u64::from(entry.height) * 4)
+            .sum();
+        if self.dedicated.len() >= DEDICATED_KEEP || held > DEDICATED_BYTES {
             // the cheap road first, as for the shelves: a texture no walk
             // read for a while is one no frame in flight samples
             let stale: Vec<_> = self
@@ -1114,6 +1178,11 @@ pub enum RunKind {
     /// scaled to the destination by the tier's linear sampler. The index
     /// points into the same texture list.
     Live(u16),
+    /// Turned pictures ([`TurnedInstance`]) read from the shared atlas.
+    Turned,
+    /// Turned pictures read from a dedicated or a live texture — the index
+    /// points into the frame's texture list.
+    TurnedTexture(u16),
     /// Sprites read from a world's TARGET, which the tier drew this frame
     /// or holds from an earlier one: premultiplied, scaled to the box by
     /// the linear sampler, the box's veil in `tex.x` and the target's size
@@ -1156,6 +1225,7 @@ fn list_of(kind: RunKind) -> u8 {
         RunKind::Rects | RunKind::Knockout => 0,
         RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => 1,
         RunKind::Glass => 2,
+        RunKind::Turned | RunKind::TurnedTexture(_) => 3,
     }
 }
 
@@ -1225,6 +1295,12 @@ fn sprite_box(instance: &SpriteInstance) -> Box4 {
     (low_x.floor() as i64, low_y.floor() as i64, high_x.ceil() as i64, high_y.ceil() as i64)
 }
 
+/// The pixels a turned picture may touch: its mapped quad's box cut by
+/// its clip.
+fn turned_box(reach: Box4, clip: Box4) -> Box4 {
+    box_intersect(reach, clip).unwrap_or((clip.0, clip.1, clip.0, clip.1))
+}
+
 fn box_union(a: Box4, b: Box4) -> Box4 {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
@@ -1278,6 +1354,7 @@ pub struct FrameBatches {
     pub rects: Vec<RectInstance>,
     pub sprites: Vec<SpriteInstance>,
     pub glass: Vec<GlassInstance>,
+    pub turned: Vec<TurnedInstance>,
     pub runs: Vec<DrawRun>,
     /// The frame's interned curves — slot 0 is always [`NO_ROUND`].
     pub rounds: Vec<RoundClip>,
@@ -1321,6 +1398,7 @@ pub fn build_frame(
     batches.rects.clear();
     batches.sprites.clear();
     batches.glass.clear();
+    batches.turned.clear();
     batches.runs.clear();
     batches.textures.clear();
     batches.world_targets.clear();
@@ -1872,6 +1950,91 @@ pub fn build_frame(
                         );
                     }
                 }
+            }
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => {
+                let opacity = opacity.clamp(0.0, 1.0);
+                if opacity <= 0.0 || !transform.is_finite() {
+                    continue;
+                }
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
+                let width = physical_extent(rect.size.width, scale) as u32;
+                let height = physical_extent(rect.size.height, scale) as u32;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let device = crate::layout::Affine::scale(factor)
+                    .then(transform)
+                    .bounds(*rect);
+                if device.size.width * device.size.height <= 0.0 {
+                    continue;
+                }
+                let reach = (
+                    (device.origin.x - 1.0).floor() as i64,
+                    (device.origin.y - 1.0).floor() as i64,
+                    (device.origin.x + device.size.width + 1.0).ceil() as i64,
+                    (device.origin.y + device.size.height + 1.0).ceil() as i64,
+                );
+                if box_intersect(reach, clip).is_none() {
+                    continue;
+                }
+                let (kind, tex) =
+                    match atlas.resolve_image(ground, source, width, height, images, true)? {
+                        None => continue,
+                        Some(ResolvedImage::Tiles(entry)) => {
+                            let Some(tile) = entry.tiles.first() else {
+                                continue;
+                            };
+                            (RunKind::Turned, (tile.x, tile.y, tile.width, tile.height))
+                        }
+                        Some(
+                            ResolvedImage::Dedicated(id, tex_w, tex_h)
+                            | ResolvedImage::Live(id, tex_w, tex_h),
+                        ) => {
+                            let index = match batches.textures.iter().position(|t| *t == id) {
+                                Some(index) => index,
+                                None => {
+                                    batches.textures.push(id);
+                                    batches.textures.len() - 1
+                                }
+                            };
+                            (RunKind::TurnedTexture(index as u16), (0, 0, tex_w, tex_h))
+                        }
+                    };
+                let texels =
+                    sprite_texels(*rect, transform, scale, (tex.2 as usize, tex.3 as usize));
+                if texels.inverse().is_none() {
+                    continue;
+                }
+                batches.turned.push(TurnedInstance {
+                    axes: [
+                        texels.a as f32,
+                        texels.b as f32,
+                        texels.c as f32,
+                        texels.d as f32,
+                    ],
+                    origin: [texels.e as f32, texels.f as f32, opacity as f32, 0.0],
+                    tex: [
+                        tex.0 as f32,
+                        tex.1 as f32,
+                        (tex.0 + tex.2) as f32,
+                        (tex.1 + tex.3) as f32,
+                    ],
+                    clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                });
+                note_run(
+                    &mut batches.runs,
+                    kind,
+                    round_of(&clips),
+                    batches.turned.len() - 1,
+                    turned_box(reach, clip),
+                );
             }
             DrawCommand::PushClip { rect, corner_radius } => {
                 let snapped = snap_scaled(*rect, factor);

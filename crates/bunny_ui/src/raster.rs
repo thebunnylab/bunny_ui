@@ -1141,6 +1141,68 @@ impl Bitmap {
         }
     }
 
+    /// A straight-alpha raster under `texels`, the map from its texel
+    /// grid to device pixels ([`sprite_texels`]). Each device pixel takes
+    /// the bilinear sample at its centre, the four texels summed
+    /// PREMULTIPLIED and nothing read off the raster — so the picture's
+    /// edge fades over one texel wherever the map turns it — and the sum,
+    /// scaled by `opacity`, blends straight like every other paint. The
+    /// GPU tiers' sprite shaders compute the same sum in float.
+    fn composite_affine(
+        &mut self,
+        texels: &crate::layout::Affine,
+        opacity: f64,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) {
+        let Some(back) = texels.inverse() else {
+            return;
+        };
+        let area = texels.bounds(crate::layout::Rect {
+            origin: Point::ZERO,
+            size: crate::layout::Size {
+                width: width as f64,
+                height: height as f64,
+            },
+        });
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        let x0 = ((area.origin.x - 1.0).floor() as i64).max(cx0).max(0);
+        let y0 = ((area.origin.y - 1.0).floor() as i64).max(cy0).max(0);
+        let x1 = ((area.origin.x + area.size.width + 1.0).ceil() as i64)
+            .min(cx1)
+            .min(self.width as i64);
+        let y1 = ((area.origin.y + area.size.height + 1.0).ceil() as i64)
+            .min(cy1)
+            .min(self.height as i64);
+        let opacity = opacity.clamp(0.0, 1.0) as f32;
+        if opacity <= 0.0 {
+            return;
+        }
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let at = back.apply(Point {
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                });
+                let Some(sum) = bilinear_premultiplied(at, width, height, rgba) else {
+                    continue;
+                };
+                let alpha = (sum[3] * opacity).round();
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let straight =
+                    |total: f32| (total * 255.0 / sum[3]).round().clamp(0.0, 255.0) as u32;
+                let packed = (straight(sum[0]) << 24)
+                    | (straight(sum[1]) << 16)
+                    | (straight(sum[2]) << 8)
+                    | alpha.min(255.0) as u32;
+                self.set(x, y, packed);
+            }
+        }
+    }
+
     /// The source-over blit itself, at a PHYSICAL top-left already snapped.
     fn blit_rgba(&mut self, base_x: i64, base_y: i64, width: usize, height: usize, rgba: &[u8]) {
         // clamp the loop to the clip: a long line under a small damage
@@ -1172,6 +1234,87 @@ impl Bitmap {
 /// the engine rasters once and the bytes agree everywhere.
 pub fn physical_extent(length: f64, scale: usize) -> usize {
     (length * scale as f64).round().max(0.0) as usize
+}
+
+/// Where a [`DrawCommand::Sprite`]'s texels land: the map from the texel
+/// grid of its `width` x `height` raster to device pixels, `scale` of
+/// them a point. Texel `(0, 0)`'s corner is the rect's origin, and the
+/// raster spans the rect, wherever `transform` then lays it. The CPU
+/// raster and every GPU tier place a sprite by this one map.
+pub fn sprite_texels(
+    rect: crate::layout::Rect,
+    transform: &crate::layout::Affine,
+    scale: usize,
+    (width, height): (usize, usize),
+) -> crate::layout::Affine {
+    use crate::layout::Affine;
+    let stretch = Affine {
+        a: rect.size.width / width.max(1) as f64,
+        d: rect.size.height / height.max(1) as f64,
+        e: rect.origin.x,
+        f: rect.origin.y,
+        ..Affine::IDENTITY
+    };
+    Affine::scale(scale as f64).then(transform).then(&stretch)
+}
+
+/// The bilinear sample at `at` (texel units, texel centres at halves) of
+/// a straight-alpha raster, summed PREMULTIPLIED, alpha in 0..=255: a
+/// texel off the raster counts as clear. `None` when all four are clear.
+fn bilinear_premultiplied(at: Point, width: usize, height: usize, rgba: &[u8]) -> Option<[f32; 4]> {
+    let (sx, sy) = (at.x - 0.5, at.y - 0.5);
+    let (low_x, low_y) = (sx.floor(), sy.floor());
+    let (fx, fy) = ((sx - low_x) as f32, (sy - low_y) as f32);
+    let (low_x, low_y) = (low_x as i64, low_y as i64);
+    if low_x + 1 < 0 || low_y + 1 < 0 || low_x >= width as i64 || low_y >= height as i64 {
+        return None;
+    }
+    let mut sum = [0.0f32; 4];
+    for (dx, dy, share) in [
+        (0, 0, (1.0 - fx) * (1.0 - fy)),
+        (1, 0, fx * (1.0 - fy)),
+        (0, 1, (1.0 - fx) * fy),
+        (1, 1, fx * fy),
+    ] {
+        let (column, row) = (low_x + dx, low_y + dy);
+        if share == 0.0
+            || column < 0
+            || row < 0
+            || column as usize >= width
+            || row as usize >= height
+        {
+            continue;
+        }
+        let index = (row as usize * width + column as usize) * 4;
+        let alpha = f32::from(rgba[index + 3]);
+        if alpha == 0.0 {
+            continue;
+        }
+        let premultiply = |channel: u8| f32::from(channel) * alpha / 255.0;
+        sum[0] += share * premultiply(rgba[index]);
+        sum[1] += share * premultiply(rgba[index + 1]);
+        sum[2] += share * premultiply(rgba[index + 2]);
+        sum[3] += share * alpha;
+    }
+    (sum[3] > 0.0).then_some(sum)
+}
+
+/// The device box a sprite may touch, a pixel of fade around its mapped
+/// raster included.
+fn sprite_box(
+    rect: crate::layout::Rect,
+    transform: &crate::layout::Affine,
+    factor: f64,
+) -> DamageRect {
+    let area = crate::layout::Affine::scale(factor)
+        .then(transform)
+        .bounds(rect);
+    (
+        (area.origin.x - 1.0).floor() as i64,
+        (area.origin.y - 1.0).floor() as i64,
+        (area.origin.x + area.size.width + 1.0).ceil() as i64,
+        (area.origin.y + area.size.height + 1.0).ceil() as i64,
+    )
 }
 
 /// The physical row a line of text stands on: the baseline the layout
@@ -1335,6 +1478,17 @@ pub fn list_bounds(
                 rect.origin.x + rect.size.width,
                 rect.origin.y + rect.size.height,
             ),
+            DrawCommand::Sprite {
+                rect, transform, ..
+            } => {
+                let area = transform.bounds(*rect);
+                fold(
+                    area.origin.x - 1.0,
+                    area.origin.y - 1.0,
+                    area.origin.x + area.size.width + 1.0,
+                    area.origin.y + area.size.height + 1.0,
+                );
+            }
             // a stroke straddles its edge — one point of slack covers it
             DrawCommand::StrokeRect { rect, width, .. } => {
                 let reach = (width / 2.0).max(1.0);
@@ -1444,7 +1598,9 @@ pub fn range_covers(
                 origin.y + font.size * 3.0,
             ),
             // the command's own superset reach, which needs no engine
-            turned @ DrawCommand::TurnedText { .. } => turned.may_reach(rect),
+            turned @ (DrawCommand::TurnedText { .. } | DrawCommand::Sprite { .. }) => {
+                turned.may_reach(rect)
+            }
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
         })
 }
@@ -1504,7 +1660,9 @@ pub fn carve_covering(
         DrawCommand::TextLine { origin, font, .. } => {
             hits(origin.x - 1.0, origin.y - 1.0, f64::INFINITY, origin.y + font.size * 3.0)
         }
-        turned @ DrawCommand::TurnedText { .. } => turned.may_reach(rect),
+        turned @ (DrawCommand::TurnedText { .. } | DrawCommand::Sprite { .. }) => {
+            turned.may_reach(rect)
+        }
         DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
     };
     let mut carves: Vec<(usize, usize)> = Vec::new();
@@ -1694,6 +1852,26 @@ fn paint(
                     );
                 }
             }
+            DrawCommand::Sprite {
+                rect,
+                source,
+                transform,
+                opacity,
+            } => {
+                let width = physical_extent(rect.size.width, scale);
+                let height = physical_extent(rect.size.height, scale);
+                if let Some(raster) = raster_source(images, source, width, height) {
+                    let texels =
+                        sprite_texels(*rect, transform, scale, (raster.width, raster.height));
+                    bitmap.composite_affine(
+                        &texels,
+                        *opacity,
+                        raster.width,
+                        raster.height,
+                        &raster.rgba,
+                    );
+                }
+            }
             DrawCommand::PushClip { rect, corner_radius } => {
                 bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor)
             }
@@ -1790,6 +1968,9 @@ fn command_box(
         // nested cuts only ever REMOVE coverage). Identical clips
         // in the prefix and suffix contribute nothing, as ever.
         DrawCommand::PushClip { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        DrawCommand::Sprite {
+            rect, transform, ..
+        } => sprite_box(*rect, transform, factor),
         DrawCommand::PopClip => return None,
     };
     let clipped = match clip {
@@ -2191,6 +2372,30 @@ impl Surface {
                                 image_rect.origin,
                                 self.scale,
                                 *placement,
+                                raster.width,
+                                raster.height,
+                                &raster.rgba,
+                            );
+                        }
+                    }
+                    DrawCommand::Sprite {
+                        rect: sprite_rect,
+                        source,
+                        transform,
+                        opacity,
+                    } => {
+                        let width = physical_extent(sprite_rect.size.width, self.scale);
+                        let height = physical_extent(sprite_rect.size.height, self.scale);
+                        if let Some(raster) = raster_source(images, source, width, height) {
+                            let texels = sprite_texels(
+                                *sprite_rect,
+                                transform,
+                                self.scale,
+                                (raster.width, raster.height),
+                            );
+                            self.bitmap.composite_affine(
+                                &texels,
+                                *opacity,
                                 raster.width,
                                 raster.height,
                                 &raster.rgba,

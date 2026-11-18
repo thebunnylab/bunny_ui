@@ -589,6 +589,8 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
             Role::Slider => "AXSlider",
             Role::Stepper => "AXIncrementor",
             Role::TextField | Role::PasswordField => "AXTextField",
+            Role::Link => "AXLink",
+            Role::Heading => "AXHeading",
         })
     }
 }
@@ -607,7 +609,9 @@ extern "C" fn element_subrole(this: Id, _: Sel) -> Id {
         | Role::PopUpButton
         | Role::Slider
         | Role::Stepper
-        | Role::TextField => return empty(),
+        | Role::TextField
+        | Role::Link
+        | Role::Heading => return empty(),
     };
     unsafe { ns_string(subrole) }
 }
@@ -632,6 +636,10 @@ extern "C" fn element_value(this: Id, _: Sel) -> Id {
         return empty();
     };
     let node = element.node.borrow();
+    // a heading's value is its level, as a web view's heading reports it
+    if let Some(level) = node.level {
+        return unsafe { number_double(class("NSNumber"), sel("numberWithDouble:"), f64::from(level)) };
+    }
     if let Some(checked) = node.checked {
         return unsafe {
             number_bool(class("NSNumber"), sel("numberWithBool:"), ObjcBool::new(checked))
