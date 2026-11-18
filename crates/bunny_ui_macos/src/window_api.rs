@@ -53,6 +53,16 @@ impl App {
         ffi::focus_window(slot.window)
     }
 
+    /// Renames a live window after it opened: the title Mission Control, the
+    /// Window menu and the Dock show, also when its chrome hides the title bar.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID.
+    pub fn set_title(&self, id: WindowId, title: &str) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::set_window_title(slot.window, title)
+    }
+
     /// Reads this scene's successfully requested native parent relationship.
     /// Placement and stacking remain subject to window-manager policy.
     ///

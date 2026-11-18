@@ -1,8 +1,8 @@
 //! Native requests for registered, independently routed scenes.
 use super::ObjcBool;
 use super::{
-    Id, MODAL_WINDOWS, WINDOWS, class, lend_hand, msg_bool, msg_id, msg_void_bool, msg_void_id,
-    msg_void_id_i64, sel,
+    Id, MODAL_WINDOWS, WINDOWS, class, lend_hand, msg_bool, msg_id, msg_id_cstr, msg_void_bool,
+    msg_void_id, msg_void_id_i64, sel,
 };
 use bunny_ui::window::{WindowError, WindowParentKind};
 
@@ -15,6 +15,18 @@ fn live(window: usize) -> Result<Id, WindowError> {
             .then_some(window as Id)
             .ok_or(WindowError::StaleWindow)
     })
+}
+
+/// Names a live window: what Mission Control, the Window menu and the Dock call it, whether
+/// or not its title bar shows the name. A NUL in `title` is dropped.
+pub fn set_window_title(window: usize, title: &str) -> Result<(), WindowError> {
+    let window = live(window)?;
+    let title = std::ffi::CString::new(title.replace('\0', "")).unwrap_or_default();
+    lend_hand(|| unsafe {
+        let name = msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), title.as_ptr());
+        msg_void_id(window, sel("setTitle:"), name);
+    });
+    Ok(())
 }
 
 /// Requests the native relationship after validating both live endpoints.
