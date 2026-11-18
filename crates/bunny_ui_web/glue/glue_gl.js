@@ -165,8 +165,10 @@ const bunnyGlImports = {
       // a software context is refused: SwiftShader rasterizes through a
       // general driver with no damage knowledge, and the rasterizer this
       // tier falls back to is specialized and repaints partially. Our own
-      // floor is the better floor.
-      failIfMajorPerformanceCaveat: true,
+      // floor is the better floor — unless the page asked for this tier
+      // by name (`?present=gpu`), as a harness on a machine without a
+      // GPU does.
+      failIfMajorPerformanceCaveat: forced !== "gpu",
     });
     if (!gl) return 0;
     glKind = kind;
