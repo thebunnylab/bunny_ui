@@ -11,14 +11,21 @@ use super::cdp::{self, Session};
 use crate::error::{Error, Result};
 use crate::json::Value;
 
+/// The device pixel ratio every capture runs at.
+pub const RATIO: u32 = 2;
+
 /// The flags every capture runs under.
 ///
 /// The rasterizer is Skia on the CPU, the colors are sRGB untouched, the
 /// text is grayscale and unhinted, and no scrollbar takes room — the
 /// same picture on every run. `SwiftShader` stands in for the GPU the
 /// `WebGL` page needs: since Chrome 137 a context on it is refused
-/// without the last flag.
+/// without its flag. The ratio is the device's, as a `HiDPI` screen
+/// gives it: layout and snapping in device pixels. The debugging
+/// protocol's emulated ratio lays out in CSS pixels and scales after,
+/// which no real screen does.
 pub const FLAGS: &[&str] = &[
+    "--force-device-scale-factor=2",
     "--headless=new",
     "--disable-gpu",
     "--disable-gpu-rasterization",

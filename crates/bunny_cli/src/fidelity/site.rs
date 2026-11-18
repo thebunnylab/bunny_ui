@@ -10,8 +10,9 @@ use crate::cargo::{self, Target};
 use crate::error::{self, Error, Result};
 
 /// The size every case is captured at unless its page names another
-/// (`<meta name="fidelity" content="width=400, height=300">`).
-pub const DEFAULT_VIEWPORT: Viewport = Viewport { width: 400, height: 300, ratio: 2 };
+/// (`<meta name="fidelity" content="width=400, height=300">`). The
+/// ratio is the browser's, one for the whole sweep.
+pub const DEFAULT_VIEWPORT: Viewport = Viewport { width: 400, height: 300, ratio: super::chrome::RATIO };
 
 /// The wasm's name on the site.
 const WASM: &str = "corpus.wasm";
@@ -72,7 +73,6 @@ pub fn viewport_of(page: &str) -> Viewport {
         match key.trim() {
             "width" => viewport.width = value,
             "height" => viewport.height = value,
-            "ratio" => viewport.ratio = value,
             _ => {}
         }
     }
@@ -218,8 +218,8 @@ mod tests {
         let page = r#"<head><meta charset="utf-8"><meta name="fidelity" content="width=320, height=480"></head>"#;
         assert_eq!(viewport_of(page), Viewport { width: 320, height: 480, ratio: 2 });
         assert_eq!(viewport_of("<head></head>"), DEFAULT_VIEWPORT);
-        let ratio = r#"<meta content="ratio=1" name="fidelity">"#;
-        assert_eq!(viewport_of(ratio), Viewport { ratio: 1, ..DEFAULT_VIEWPORT });
+        let reordered = r#"<meta content="height=200" name="fidelity">"#;
+        assert_eq!(viewport_of(reordered), Viewport { height: 200, ..DEFAULT_VIEWPORT });
     }
 
     #[test]

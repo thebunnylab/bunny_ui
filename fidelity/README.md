@@ -115,8 +115,14 @@ Nothing is compared before it is repeatable:
   Chrome 150 has no WebGL2 at all under `--disable-gpu` otherwise.
   bunny's GPU tier refuses a software context on its own pages
   (`failIfMajorPerformanceCaveat`); `?present=gpu` forces it.
-- Each capture opens a fresh tab at the case's viewport and a ratio of 2
-  (`Emulation.setDeviceMetricsOverride`), light scheme, reduced motion.
+- The pixel ratio is the device's, 2, from `--force-device-scale-factor`:
+  Chrome then lays out and snaps boxes in device pixels, as on a HiDPI
+  screen. The ratio `Emulation.setDeviceMetricsOverride` emulates lays
+  out and snaps in CSS pixels and scales afterwards — a 94.67 px column
+  ends on device pixel 190 there, and on 189 on a real screen.
+- Each capture opens a fresh tab at the case's viewport
+  (`Emulation.setDeviceMetricsOverride`, ratio left to the device), light
+  scheme, reduced motion.
 - Before the page's own scripts, `Date` reads one instant
   (2026-01-01T00:00:00Z) and `Math.random` is a seeded sequence.
 - The load runs on the CDP virtual clock: paused at that instant while

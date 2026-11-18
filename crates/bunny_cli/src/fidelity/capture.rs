@@ -184,7 +184,9 @@ fn capture_on(session: &mut Session, url: &str, kind: Kind, viewport: Viewport) 
         cdp::object(&[
             ("width", cdp::number(viewport.width)),
             ("height", cdp::number(viewport.height)),
-            ("deviceScaleFactor", cdp::number(viewport.ratio)),
+            // the device's own ratio (`--force-device-scale-factor`), not an
+            // emulated one
+            ("deviceScaleFactor", cdp::number(0)),
             ("mobile", Value::Bool(false)),
             ("screenWidth", cdp::number(viewport.width)),
             ("screenHeight", cdp::number(viewport.height)),
