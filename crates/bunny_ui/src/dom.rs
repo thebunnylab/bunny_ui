@@ -7961,8 +7961,10 @@ mod tests {
                     DomPatch::SetImage { image, .. } if image.key == tiny_image(seed).key() => Some(image),
                     _ => None,
                 })
-                .map(|image| encode(&[DomPatch::SetImage { id: 1, image: *image }]).last().copied())
-                .unwrap_or_else(|| panic!("picture {seed} mounted: {mount:?}"))
+                .map_or_else(
+                    || panic!("picture {seed} mounted: {mount:?}"),
+                    |image| encode(&[DomPatch::SetImage { id: 1, image: *image }]).last().copied(),
+                )
         };
         assert_eq!([fit_of(21), fit_of(22), fit_of(23)], [Some(2), Some(1), Some(0)]);
     }
