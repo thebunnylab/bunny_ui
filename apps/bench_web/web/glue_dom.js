@@ -2188,6 +2188,10 @@ const imports = {
         italic,
         familyOf(familyPointer, familyLength),
       );
+      // kerning as the page's own text has it: a canvas left at "auto"
+      // measures a line with spaces wider than the element that shows it,
+      // and breaks a paragraph a word early
+      ink.fontKerning = "normal";
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(memory.buffer, out, 3);
       metrics[0] = text ? probe.width : 0;
@@ -2224,6 +2228,7 @@ const imports = {
         italic,
         familyOf(familyPointer, familyLength),
       );
+      ink.fontKerning = "normal";
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
