@@ -453,7 +453,10 @@ export function js_image_raster(hi, lo, width, height, out) {
   ink.setTransform(1, 0, 0, 1, 0, 0);
   ink.clearRect(0, 0, width, height);
   ink.imageSmoothingEnabled = true;
-  ink.imageSmoothingQuality = "high";
+  // the filter the page's own <img> is drawn with — bilinear, the
+  // browser's "low": "high" resamples an enlarged picture with a
+  // cubic, and every pixel of it lands one step from the page's
+  ink.imageSmoothingQuality = "low";
   ink.drawImage(bitmap, 0, 0, width, height);
   const pixels = ink.getImageData(0, 0, width, height).data;
   new Uint8Array(memory.buffer, out >>> 0, width * height * 4).set(pixels);

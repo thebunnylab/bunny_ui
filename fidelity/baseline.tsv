@@ -7,8 +7,8 @@ align	AxB	0	0	0
 align	AxC	0	0	0
 align	BxC	0	0	0
 card	AxB	6	26252	2298
-card	AxC	0	217343	466
-card	BxC	6	222700	2307
+card	AxC	0	64387	466
+card	BxC	6	69751	2307
 form	AxB	9	17890	11467
 form	AxC	0	538	658
 form	BxC	9	17926	11530
@@ -19,8 +19,8 @@ grow_shrink	AxB	0	0	0
 grow_shrink	AxC	3	0	8504
 grow_shrink	BxC	3	0	8504
 image_scale	AxB	0	0	0
-image_scale	AxC	0	118279	0
-image_scale	BxC	0	118279	0
+image_scale	AxC	0	0	0
+image_scale	BxC	0	0	0
 list	AxB	0	0	0
 list	AxC	0	414	138
 list	BxC	0	414	138
