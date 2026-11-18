@@ -472,17 +472,20 @@ export function js_measure_text(
   }
   if (!host) return;
   const line = text(pointer, length);
+  // measured at the device's size, as the page lays text out on a
+  // HiDPI screen: the face's ascent and descent round there
+  const ratio = globalThis.devicePixelRatio || 1;
   const ink = inkSurface(1, 1);
-  ink.font = cssFont(size, weight, mono, italic, text(familyPointer, familyLength) || null);
+  ink.font = cssFont(size * ratio, weight, mono, italic, text(familyPointer, familyLength) || null);
   // kerning as the page's own text has it: a canvas left at "auto"
   // measures a line with spaces wider than the element that shows it,
   // and breaks a paragraph a word early
   ink.fontKerning = "normal";
   const probe = ink.measureText(line || "Mg");
   const metrics = new Float64Array(memory.buffer, out >>> 0, 3);
-  metrics[0] = line ? probe.width : 0;
-  metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
-  metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
+  metrics[0] = line ? probe.width / ratio : 0;
+  metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
+  metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
 }
 
 // Draws one line into a width×height physical rectangle and copies the
@@ -503,8 +506,7 @@ export function js_raster_text(
   const ink = inkSurface(width, height);
   ink.setTransform(1, 0, 0, 1, 0, 0);
   ink.clearRect(0, 0, width, height);
-  ink.setTransform(scale, 0, 0, scale, 0, 0);
-  ink.font = cssFont(size, weight, mono, italic, text(familyPointer, familyLength) || null);
+  ink.font = cssFont(size * scale, weight, mono, italic, text(familyPointer, familyLength) || null);
   ink.fontKerning = "normal";
   ink.textBaseline = "alphabetic";
   const r = (color >>> 24) & 0xff;
@@ -512,9 +514,10 @@ export function js_raster_text(
   const b = (color >>> 8) & 0xff;
   const a = color & 0xff;
   ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-  // baseline sits `descent` above the box bottom — the ceil slack stays
+  // the face at the device's size, as the page draws it on a HiDPI
+      // screen; baseline sits `descent` above the box bottom — the ceil slack stays
   // on top, mirroring the desktop engine
-  ink.fillText(line, 0, height / scale - descent);
+  ink.fillText(line, 0, height - descent * scale);
   const pixels = ink.getImageData(0, 0, width, height).data;
   new Uint8Array(memory.buffer, out >>> 0, width * height * 4).set(pixels);
 }

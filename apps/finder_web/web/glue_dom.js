@@ -2186,9 +2186,12 @@ const imports = {
       out,
     ) {
       const text = decoder.decode(bytesAt(pointer, length));
+      // measured at the device's size, as the page lays text out on a
+      // HiDPI screen: the face's ascent and descent round there
+      const ratio = globalThis.devicePixelRatio || 1;
       const ink = inkSurface();
       ink.font = cssFont(
-        size,
+        size * ratio,
         weight,
         mono,
         italic,
@@ -2200,9 +2203,9 @@ const imports = {
       ink.fontKerning = "normal";
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(memory.buffer, out, 3);
-      metrics[0] = text ? probe.width : 0;
-      metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
-      metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
+      metrics[0] = text ? probe.width / ratio : 0;
+      metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
+      metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
     },
     // canvas islands raster their text through the engine — the same
     // contract as the full-canvas mode
@@ -2226,9 +2229,8 @@ const imports = {
       const ink = inkSurface(width, height);
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
-      ink.setTransform(scale, 0, 0, scale, 0, 0);
       ink.font = cssFont(
-        size,
+        size * scale,
         weight,
         mono,
         italic,
@@ -2241,7 +2243,7 @@ const imports = {
       const b = (color >>> 8) & 0xff;
       const a = color & 0xff;
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-      ink.fillText(text, 0, height / scale - descent);
+      ink.fillText(text, 0, height - descent * scale);
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },
