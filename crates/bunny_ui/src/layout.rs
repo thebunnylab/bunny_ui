@@ -1355,6 +1355,7 @@ pub enum LayoutNode {
         class: Option<std::rc::Rc<str>>,
         dom_id: Option<std::rc::Rc<str>>,
         href: Option<std::rc::Rc<str>>,
+        test_id: Option<std::rc::Rc<str>>,
         child: Box<LayoutNode>,
     },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
@@ -1575,6 +1576,9 @@ impl ElementHints {
     pub(crate) fn group(&self) -> Option<GroupSpec> {
         self.address.as_ref().and_then(|address| address.group)
     }
+    pub(crate) fn test_id(&self) -> Option<&Rc<str>> {
+        self.address.as_ref().and_then(|address| address.test_id.as_ref())
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
     }
@@ -1595,6 +1599,10 @@ pub struct Address {
     pub(crate) group: Option<GroupSpec>,
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
+    /// The name a harness finds the view by (`.test_id(…)`): the
+    /// page's `data-testid`, and an entry of the frame table the pixel
+    /// pipelines keep ([`LayoutResult::test_frames`]).
+    pub test_id: Option<Rc<str>>,
 }
 
 thread_local! {
@@ -1629,6 +1637,16 @@ impl Address {
             address.href.clone_from(href);
         }
         Some(Address::shared(address))
+    }
+
+    /// `base` answering to `test_id` — the outer name wins, as the
+    /// outer id does.
+    #[must_use]
+    pub fn tested(base: &Option<Rc<Self>>, test_id: Option<&Rc<str>>) -> Option<Rc<Self>> {
+        let Some(test_id) = test_id else { return base.clone() };
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        address.test_id = Some(Rc::clone(test_id));
+        Some(Self::shared(address))
     }
 
     /// `base` with what the control under it IS written over it. The
@@ -1690,6 +1708,17 @@ impl LayoutNode {
             | LayoutNode::Text { hints, .. }
             | LayoutNode::Styled { hints, .. } => Some(hints),
             _ => None,
+        }
+    }
+
+    /// The harness's name for this node (`.test_id(…)`), wherever the
+    /// modifier left it: on the node, on a reference to a retained
+    /// boundary, or on the wrapper around a node that holds no hints.
+    fn test_id(&self) -> Option<&Rc<str>> {
+        match self {
+            Self::Hinted { test_id, .. } => test_id.as_ref(),
+            Self::BoundaryRef { hints, .. } => hints.test_id(),
+            node => node.carried_hints().and_then(ElementHints::test_id),
         }
     }
 
@@ -4951,6 +4980,11 @@ pub struct Placement {
     accessibility_surface: Option<Rc<str>>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
+    /// Every view a `.test_id(…)` names, with its frame, in placement
+    /// order.
+    pub(crate) test_frames: Vec<(Rc<str>, Rect)>,
+    /// Every text's frame, while [`record_text_frames`] is on.
+    pub(crate) text_frames: Vec<Rect>,
     pub display: DisplayList,
     /// A Dom frame with no live island skips the display list — the
     /// clip stack still runs, only the command collection sleeps.
@@ -5426,6 +5460,23 @@ pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 /// and each keeps its own address.
 pub(crate) const FRAME_SEGMENT: &str = "/#frame";
 
+thread_local! {
+    /// Does the placement keep every text's frame? Off, a text costs
+    /// what it always did.
+    static TEXT_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep every text's frame from the next pass on
+/// ([`LayoutResult::text_frames`]) — a harness that tells the glyphs'
+/// pixels from the rest turns it on before the first frame.
+pub fn record_text_frames(on: bool) {
+    TEXT_FRAMES.with(|flag| flag.set(on));
+}
+
+fn recording_text_frames() -> bool {
+    TEXT_FRAMES.with(std::cell::Cell::get)
+}
+
 /// The absolute frames the placement pass produces, addressable by the
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
@@ -5509,6 +5560,12 @@ pub struct LayoutResult {
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub size: Size,
     pub frames: Frames,
+    /// Every view a `.test_id(…)` names, with its frame in the window's
+    /// coordinates — what a harness compares against another renderer.
+    pub test_frames: Vec<(Rc<str>, Rect)>,
+    /// Every text's frame, while [`record_text_frames`] is on — where a
+    /// harness tells a glyph's pixels from the rest.
+    pub text_frames: Vec<Rect>,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
@@ -5740,6 +5797,8 @@ pub(crate) fn layout_placing(
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
         focus_groups: out.focus_groups,
         frames: out.frames,
+        test_frames: out.test_frames,
+        text_frames: out.text_frames,
         display: out.display,
         hits: out.hits,
         scrolls: out.scrolls,
@@ -6243,6 +6302,8 @@ pub fn layout_dom(
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
             focus_groups: out.focus_groups,
             frames: out.frames,
+            test_frames: out.test_frames,
+            text_frames: out.text_frames,
             display: out.display,
             hits: out.hits,
             scrolls: out.scrolls,
@@ -7845,6 +7906,9 @@ impl LayoutNode {
         };
         let stuck = shift > 0.0;
         let frame = Rect { origin: Point { x: frame.origin.x, y: frame.origin.y + shift }, size: frame.size };
+        if let Some(id) = self.test_id() {
+            out.test_frames.push((Rc::clone(id), frame));
+        }
         if stuck {
             // springs below anchor to the box that moved: the stick
             // carries them 1:1, as scrolling does, and never flies them
@@ -7962,6 +8026,9 @@ impl LayoutNode {
             }
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
+                if recording_text_frames() {
+                    out.text_frames.push(frame);
+                }
                 let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 if let Some(dom) = out.dom.as_mut() {

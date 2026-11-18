@@ -71,7 +71,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 26;
+const EXPECTED_ABI = 27;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -1310,6 +1310,7 @@ function applyPatches(view, length) {
       const control = u8();
       const voice = u8();
       const label = text(u16());
+      const testId = text(u16());
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1318,6 +1319,7 @@ function applyPatches(view, length) {
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
       if (href) el.setAttribute("href", href);
+      if (testId) el.setAttribute("data-testid", testId);
       if (control || voice || label) applyControl(el, control, voice, label);
       if (kind === 4) {
         wireScroll(el, id);
@@ -1755,13 +1757,15 @@ function applyPatches(view, length) {
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
       // live hints: class, id, href, what a control publishes, the
-      // element's voice and its name re-attribute in place
+      // element's voice, its name and the harness's name re-attribute
+      // in place
       const cls = text(u8());
       const domId = text(u8());
       const href = text(u16());
       const control = u8();
       const voice = u8();
       const label = text(u16());
+      const testId = text(u16());
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1776,6 +1780,11 @@ function applyPatches(view, length) {
           el.setAttribute("href", href);
         } else {
           el.removeAttribute("href");
+        }
+        if (testId) {
+          el.setAttribute("data-testid", testId);
+        } else {
+          el.removeAttribute("data-testid");
         }
         applyControl(el, control, voice, label);
       }

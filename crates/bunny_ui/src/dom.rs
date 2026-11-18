@@ -1402,6 +1402,12 @@ impl DomHints {
     pub fn voice(&self) -> u8 {
         self.address.as_deref().map_or(0, |address| address.voice.wire())
     }
+
+    /// The name a harness finds the element by (`.test_id(…)`).
+    #[must_use]
+    pub fn test_id(&self) -> Option<&str> {
+        self.address.as_deref().and_then(|address| address.test_id.as_deref())
+    }
 }
 
 // MARK: - Patches
@@ -4401,7 +4407,12 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// glue writes them as `aria-hidden`, `role="status"` / `role="alert"`
 /// with `aria-live`, and `aria-label`; a focused control whose element
 /// leaves hands the focus back to the control that had it before.
-pub const ABI_VERSION: u32 = 26;
+///
+/// 27 (2026-11-18): the harness's name. After the element's name, Create
+/// (op 1) and `SetHints` (op 15) carry the view's `.test_id(…)` as a
+/// u16-length string, empty for none; the glue writes it as
+/// `data-testid`.
+pub const ABI_VERSION: u32 = 27;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4583,6 +4594,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(hints.control());
                 out.push(hints.voice());
                 push_bytes_u16(&mut out, hints.label().unwrap_or("").as_bytes());
+                push_bytes_u16(&mut out, hints.test_id().unwrap_or("").as_bytes());
                 out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
@@ -4870,6 +4882,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_bytes_u16(
                     &mut out,
                     address.and_then(|address| address.label.as_deref()).unwrap_or("").as_bytes(),
+                );
+                push_bytes_u16(
+                    &mut out,
+                    address.and_then(|address| address.test_id.as_deref()).unwrap_or("").as_bytes(),
                 );
             }
             DomPatch::SetLanguage { id, lang, dir } => {
@@ -6024,14 +6040,14 @@ mod tests {
         let hints = DomHints { address: Some(address.clone()), ..DomHints::default() };
         let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
         // count, op, id, parent, before, tag, class, id, href(u16),
-        // control, voice, name(u16), kind
+        // control, voice, name(u16), test id(u16), kind
         assert_eq!(created[4], 1);
-        assert_eq!(created[created.len() - 5..], [3 | 8 | 2 << 4, 0, 0, 0, 1]);
+        assert_eq!(created[created.len() - 7..], [3 | 8 | 2 << 4, 0, 0, 0, 0, 0, 1]);
         let live = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
         assert_eq!(live[4], 15);
-        assert_eq!(live[live.len() - 4..], [3 | 8 | 2 << 4, 0, 0, 0]);
+        assert_eq!(live[live.len() - 6..], [3 | 8 | 2 << 4, 0, 0, 0, 0, 0]);
         let plain = encode(&[DomPatch::SetHints { id: 7, class: None, address: None }]);
-        assert_eq!(plain[plain.len() - 4..], [0, 0, 0, 0], "an element that is no control and says nothing");
+        assert_eq!(plain[plain.len() - 6..], [0, 0, 0, 0, 0, 0], "an element that is no control and says nothing");
     }
 
     /// The rest of what an element says (ABI 26): whether what a control
@@ -6051,10 +6067,44 @@ mod tests {
         let address = Address::named(&Some(Address::controlling(&None, opener)), Rc::from("Language"));
         let address = Address::voiced(&Some(address), |voice| voice.live = Some(crate::accessibility::Live::Polite));
         let said = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
-        let tail = &said[said.len() - 12..];
+        let tail = &said[said.len() - 14..];
         assert_eq!(tail[..2], [1 | 8 | 2 << 6, 1 << 1], "the control, then the voice");
         assert_eq!(tail[2..4], 8u16.to_le_bytes(), "then the name's length");
-        assert_eq!(&tail[4..], b"Language");
+        assert_eq!(&tail[4..12], b"Language");
+        assert_eq!(tail[12..], [0, 0], "and no test id");
+    }
+
+    /// The harness's name (ABI 27) crosses last among the hints, on a
+    /// create and on the live hints alike, and lands on the element the
+    /// view lowered to — a stack, a text, a padded box — whatever the
+    /// modifiers around it.
+    #[test]
+    fn a_test_id_is_on_the_wire_and_on_the_element() {
+        let address = crate::layout::Address::tested(&None, Some(&Rc::from("row")));
+        let hints = DomHints { address: address.clone(), ..DomHints::default() };
+        let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
+        assert_eq!(created[created.len() - 8..created.len() - 4], [0, 0, 3, 0], "an empty name, then the id's length");
+        assert_eq!(&created[created.len() - 4..created.len() - 1], b"row", "and the kind after it");
+        let live = encode(&[DomPatch::SetHints { id: 7, class: None, address }]);
+        assert_eq!(&live[live.len() - 5..], [3, 0, b'r', b'o', b'w']);
+
+        let runtime = Runtime::new();
+        let view = vstack!(
+            text("a").test_id("word"),
+            text("b").padding_length(4.0).background_color(Color::rgba(0, 0, 0, 255)).test_id("padded"),
+            hstack!(text("c"), text("d")).spacing(3.0).test_id("row"),
+        )
+        .test_id("column");
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let mut named: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { hints, .. } => hints.test_id(),
+                _ => None,
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["column", "padded", "row", "word"], "{mount:?}");
     }
 
     /// A page has no accessibility tree, so what a view says of an
@@ -7441,10 +7491,11 @@ mod tests {
             &0u32.to_le_bytes()[..],
             &[0, 0, 0],
             &0u16.to_le_bytes()[..],
-            // no control (ABI 25), no voice and no name (ABI 26), then
-            // the kind
+            // no control (ABI 25), no voice and no name (ABI 26), no
+            // test id (ABI 27), then the kind
             &[0],
             &[0],
+            &0u16.to_le_bytes()[..],
             &0u16.to_le_bytes()[..],
             &[1],
             &[3],

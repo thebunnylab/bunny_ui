@@ -591,6 +591,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref())), None))
     }
 
+    /// The name a harness finds this view by, whatever the lowering:
+    /// the element lowering writes it as `data-testid`, and the pixel
+    /// pipelines keep the view's frame under it
+    /// ([`crate::runtime::Runtime::test_frames`]). It changes nothing a
+    /// reader sees.
+    #[track_caller]
+    fn test_id(self, id: impl AsRef<str>) -> Modified<Self> {
+        Modified::new(self, Modifier::TestId(crate::modifier::hint(id.as_ref())))
+    }
+
     /// A link: the Dom lowering builds an `<a href>` for this view, so
     /// the browser owns the navigation — a press follows it, a middle
     /// press opens a tab, a crawler reads it. `#name` reaches the

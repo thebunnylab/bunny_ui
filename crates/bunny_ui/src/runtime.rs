@@ -208,6 +208,10 @@ impl CaretPhase {
     }
 }
 
+/// The frames a harness reads back: every view a `.test_id(…)` names,
+/// and every text.
+type TestFrames = (Vec<(Rc<str>, Rect)>, Vec<Rect>);
+
 pub struct Runtime {
     accessibility: RefCell<crate::accessibility::State>,
     /// The environment every body reads. Behind a cell because the
@@ -234,6 +238,8 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// The test-id frames and the text frames of the last layout.
+    last_test_frames: RefCell<TestFrames>,
     /// The sited nodes of the last layout (`crate::provenance`) — empty
     /// unless [`Runtime::record_sites`] turned recording on.
     last_sites: RefCell<Vec<crate::provenance::SitePlacement>>,
@@ -1908,6 +1914,7 @@ impl Runtime {
             last_root: RefCell::new(None),
             last_root_type: Cell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            last_test_frames: RefCell::new((Vec::new(), Vec::new())),
             last_sites: RefCell::new(Vec::new()),
             observation_lifetime: RefCell::new(Rc::new(())),
             last_hover_sensitive: RefCell::new(Vec::new()),
@@ -6526,6 +6533,19 @@ impl Runtime {
         self.last_hits.borrow().clone()
     }
 
+    /// Every view a `.test_id(…)` names in the last layout, with its
+    /// frame in the window's coordinates, in placement order. Empty on a
+    /// frame lowered to elements: there the page itself holds the boxes.
+    pub fn test_frames(&self) -> Vec<(Rc<str>, Rect)> {
+        self.last_test_frames.borrow().0.clone()
+    }
+
+    /// Every text's frame in the last layout, while
+    /// [`crate::layout::record_text_frames`] is on.
+    pub fn text_frames(&self) -> Vec<Rect> {
+        self.last_test_frames.borrow().1.clone()
+    }
+
     /// Record where every node was written (`crate::provenance`): from the
     /// next pass on, each builder and modifier wraps its node in its site
     /// and the layout keeps a placement per site. Turn it on BEFORE the
@@ -8425,6 +8445,11 @@ impl Runtime {
         // `clone_from`, not a fresh clone: the tables keep their capacity
         // from frame to frame, and the paths inside keep their buffers
         self.last_hits.borrow_mut().clone_from(&result.hits);
+        {
+            let mut tests = self.last_test_frames.borrow_mut();
+            tests.0.clone_from(&result.test_frames);
+            tests.1.clone_from(&result.text_frames);
+        }
         self.last_sites.borrow_mut().clone_from(&result.sites);
         self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
         self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);

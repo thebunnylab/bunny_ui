@@ -610,6 +610,7 @@ impl Walk<'_> {
                 None => (None, None),
             };
             Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
+            Self::stamp_test_id(&mut out[opened..], hints.test_id());
             // what a control IS rides to the element that answers its
             // press: the page has no accessibility tree to ask, so the
             // glue says the role, the state and the tab stop as attributes
@@ -1474,10 +1475,11 @@ impl Walk<'_> {
                 // the browser keeps its own safe area outside the tab
                 self.lower_into(child, out);
             }
-            LayoutNode::Hinted { tag, class, dom_id, href, child } => {
+            LayoutNode::Hinted { tag, class, dom_id, href, test_id, child } => {
                 let opened = out.len();
                 self.lower_into(child, out);
                 Self::stamp_hints(&mut out[opened..], tag, class, dom_id, href);
+                Self::stamp_test_id(&mut out[opened..], test_id.as_ref());
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
@@ -1646,6 +1648,16 @@ impl Walk<'_> {
                 hinted.hints.class = class.clone();
             }
             hinted.hints.address = crate::layout::Address::over(&hinted.hints.address, dom_id, href);
+        }
+    }
+
+    /// The harness's name, on every element the view lowered to.
+    fn stamp_test_id(lowered: &mut [DomNode], test_id: Option<&std::rc::Rc<str>>) {
+        if test_id.is_none() {
+            return;
+        }
+        for tested in lowered {
+            tested.hints.address = crate::layout::Address::tested(&tested.hints.address, test_id);
         }
     }
 

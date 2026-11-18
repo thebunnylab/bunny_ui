@@ -262,6 +262,10 @@ fn install_panic_hook() {
 fn install_platform() {
     install_panic_hook();
     bunny_ui::clipboard::install(clipboard_write, || None);
+    // a probe build keeps every text's frame: a harness tells the glyphs'
+    // pixels from the rest by them
+    #[cfg(feature = "probe")]
+    bunny_ui::layout::record_text_frames(true);
 }
 
 /// The glue's key table, mirrored: one number per named key.
@@ -549,6 +553,10 @@ enum Event {
     /// Probe builds: the hit table of the last layout is asked for.
     #[cfg(feature = "probe")]
     Hits,
+    /// Probe builds: the test-id and text frames of the last layout are
+    /// asked for.
+    #[cfg(feature = "probe")]
+    TestFrames,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
     /// A right press (the browser's contextmenu, default prevented).
@@ -1006,6 +1014,8 @@ pub fn start_with(
             }
             #[cfg(feature = "probe")]
             Event::Hits => probe_hits(&runtime),
+            #[cfg(feature = "probe")]
+            Event::TestFrames => probe_test_frames(&runtime),
             Event::Wake => {
                 // The work always lands: the tasks are polled. The FRAME is
                 // for a turn that changed something. Most wakes change
@@ -1369,6 +1379,8 @@ fn start_dom_with(
             }
             #[cfg(feature = "probe")]
             Event::Hits => probe_hits(&runtime),
+            #[cfg(feature = "probe")]
+            Event::TestFrames => probe_test_frames(&runtime),
             // hover, wheel and the rest belong to the browser in this
             // mode — nothing to do on our side of the border
             _ => {}
@@ -1758,6 +1770,35 @@ fn probe_hits(runtime: &Runtime) {
 pub extern "C" fn bunny_hits_json() -> u32 {
     dispatch(Event::Hits);
     PROBE.with(|probe| probe.borrow().len() as u32)
+}
+
+/// The frames of the last layout a harness compares against another
+/// renderer, as JSON: every view a `.test_id(…)` names and every text,
+/// in the window's coordinates — the probe's answer, written where
+/// [`bunny_probe_ptr`] reads it.
+#[cfg(feature = "probe")]
+fn probe_test_frames(runtime: &Runtime) {
+    let rect = |rect: &bunny_ui::layout::Rect| {
+        format!("\"x\":{},\"y\":{},\"w\":{},\"h\":{}", rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+    };
+    let ids: Vec<String> = runtime
+        .test_frames()
+        .iter()
+        .map(|(id, frame)| format!("{{\"id\":\"{}\",{}}}", id.replace('\\', "\\\\").replace('"', "\\\""), rect(frame)))
+        .collect();
+    let texts: Vec<String> = runtime.text_frames().iter().map(|frame| format!("{{{}}}", rect(frame))).collect();
+    let json = format!("{{\"ids\":[{}],\"texts\":[{}]}}", ids.join(","), texts.join(","));
+    PROBE.with(|probe| *probe.borrow_mut() = json);
+}
+
+/// Probe builds only: fills the test-id and text frames of the last
+/// layout as JSON and returns its length; [`bunny_probe_ptr`] is where
+/// it starts.
+#[cfg(feature = "probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_test_frames_json() -> u32 {
+    dispatch(Event::TestFrames);
+    PROBE.with(|probe| u32::try_from(probe.borrow().len()).unwrap_or(u32::MAX))
 }
 
 /// Probe builds only: the bytes of the last probe answer.

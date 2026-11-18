@@ -190,6 +190,9 @@ pub enum Modifier {
         Option<std::rc::Rc<str>>,
         Option<std::rc::Rc<str>>,
     ),
+    /// `.test_id(…)` — the name a harness finds the view by, on every
+    /// lowering: an attribute on the page, a frame in the pixel table.
+    TestId(std::rc::Rc<str>),
     /// `.layout(Exact)` — the element lowering keeps our numbers here.
     LayoutMode(crate::layout::LayoutMode),
 
@@ -367,6 +370,7 @@ impl Modifier {
             Modifier::WindowDragRegion => "window_drag_region",
             Modifier::WindowControl { .. } => "window_control",
             Modifier::ElementHint { .. } => "element",
+            Self::TestId(_) => "test_id",
             Modifier::LayoutMode { .. } => "layout_mode",
             Modifier::OnClick { .. } => "on_click",
             Modifier::OnHover { .. } => "on_hover",
@@ -556,6 +560,7 @@ impl Modifier {
             Modifier::ElementHint(tag, class, dom_id, href) => {
                 format!(" [.element({tag:?}, {class:?}, {dom_id:?}, {href:?})]")
             }
+            Self::TestId(id) => format!(" [.test_id({id:?})]"),
             Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnHover(_) => " [.onHover()]".into(),
@@ -1844,7 +1849,7 @@ pub(crate) fn apply(
                 // where both speak, as the flow applies them anyway —
                 // `.element("a").css_class("x")` is one node, not two
                 LayoutNode::Hinted { tag, class, dom_id, href, .. } => {
-                    hint_over([tag, class, dom_id, href], outer)
+                    hint_over([tag, class, dom_id, href], outer);
                 }
                 // a hint over a kept boundary rides the reference itself:
                 // a list that re-runs makes one per row, and a box around
@@ -1861,11 +1866,29 @@ pub(crate) fn apply(
                         class: class.clone(),
                         dom_id: dom_id.clone(),
                         href: href.clone(),
+                        test_id: None,
                         child: Box::new(other),
                     }),
                 },
             }
         }
+        Modifier::TestId(id) => match out.base_from(mark) {
+            LayoutNode::Hinted { test_id, .. } => *test_id = Some(Rc::clone(id)),
+            LayoutNode::BoundaryRef { hints, .. } => {
+                hints.address = crate::layout::Address::tested(&hints.address, Some(id));
+            }
+            node => match node.carried_hints_mut() {
+                Some(hints) => hints.address = crate::layout::Address::tested(&hints.address, Some(id)),
+                None => wrap_in_place(node, |other| LayoutNode::Hinted {
+                    tag: None,
+                    class: None,
+                    dom_id: None,
+                    href: None,
+                    test_id: Some(Rc::clone(id)),
+                    child: Box::new(other),
+                }),
+            },
+        },
         Modifier::LayoutMode(mode) => {
             // Auto is what every target does already; only Exact asks
             // the element lowering to keep the engine's numbers

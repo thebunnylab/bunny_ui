@@ -286,6 +286,9 @@ impl Tree {
         if let Some(href) = hints.href() {
             element.attrs.insert("href", href.to_string());
         }
+        if let Some(test_id) = hints.test_id() {
+            element.attrs.insert("data-testid", test_id.to_string());
+        }
         write_control(&mut element, hints.control());
         write_voice(&mut element, hints.voice(), hints.label());
         self.elements.insert(id, element);
@@ -645,6 +648,7 @@ impl Tree {
                 let address = address.as_deref();
                 let dom_id = address.and_then(|address| address.dom_id.as_ref());
                 let href = address.and_then(|address| address.href.as_ref());
+                let test_id = address.and_then(|address| address.test_id.as_ref());
                 if let Some(element) = self.elements.get_mut(id) {
                     match class {
                         Some(class) => element.attrs.insert("class", class.to_string()),
@@ -657,6 +661,10 @@ impl Tree {
                     match href {
                         Some(href) => element.attrs.insert("href", href.to_string()),
                         None => element.attrs.remove("href"),
+                    };
+                    match test_id {
+                        Some(test_id) => element.attrs.insert("data-testid", test_id.to_string()),
+                        None => element.attrs.remove("data-testid"),
                     };
                     write_control(
                         element,
@@ -1956,6 +1964,17 @@ mod tests {
         assert!(page.html.contains("href=\"#top\""), "{}", page.html);
         assert!(page.html.contains("id=\"back\""), "{}", page.html);
         assert_eq!(page.html.matches("<a ").count(), 2, "{}", page.html);
+    }
+
+    /// The harness's name is served as the glue writes it.
+    #[test]
+    fn a_test_id_is_served_as_data_testid() {
+        let page = render(
+            &crate::vstack!(text("a").test_id("word")).test_id("column"),
+            Size { width: 200.0, height: 200.0 },
+        );
+        assert!(page.html.contains("data-testid=\"word\""), "{}", page.html);
+        assert!(page.html.contains("data-testid=\"column\""), "{}", page.html);
     }
 
     /// Tracking is the face's own advance: an eyebrow's wide spacing
