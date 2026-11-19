@@ -7457,8 +7457,17 @@ impl LayoutNode {
                 (size, Fit::Wrapped(upright, Box::new(fit)))
             }
 
-            LayoutNode::Stack { axis, spacing, children, .. } => {
-                measure_stack(*axis, *spacing, children, proposal, env)
+            LayoutNode::Stack { axis, spacing, align, children, .. } => {
+                let (size, fit) = measure_stack(*axis, *spacing, children, proposal, env);
+                // a row on a shared baseline drops each child to it, and
+                // holds the lowest bottom that drop reaches
+                match (&fit, axis, align) {
+                    (Fit::Children(measured), Axis::Horizontal, CrossAlign::Baseline) => {
+                        let height = size.height.max(baseline_extent(children, measured, env));
+                        (Size { height, ..size }, fit)
+                    }
+                    _ => (size, fit),
+                }
             }
 
             LayoutNode::Grid { columns, spacing, row_spacing, align, vertical, children } => {
@@ -11147,6 +11156,34 @@ fn place_target(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Each child's first baseline in a row on a shared one — a text by
+/// its ascent, a box without one by its bottom edge, a placed box out
+/// of the line. [`place_stack`] drops each child by its distance to the
+/// deepest.
+fn row_baselines(children: &[LayoutNode], sizes: impl Iterator<Item = Size>, env: &LayoutEnv<'_>) -> Vec<Px> {
+    children
+        .iter()
+        .zip(sizes)
+        .map(|(child, size)| {
+            if child.placed_at().is_some() { 0.0 } else { child.first_baseline(env).unwrap_or(size.height) }
+        })
+        .collect()
+}
+
+/// The height a row on a shared baseline reaches: every child in the
+/// line dropped to the deepest baseline, as [`place_stack`] places it.
+fn baseline_extent(children: &[LayoutNode], measured: &[(Size, Fit)], env: &LayoutEnv<'_>) -> Px {
+    let baselines = row_baselines(children, measured.iter().map(|(size, _)| *size), env);
+    let shared = baselines.iter().fold(0.0_f64, |acc, baseline| acc.max(*baseline));
+    children
+        .iter()
+        .zip(measured)
+        .zip(&baselines)
+        .filter(|((child, _), _)| child.placed_at().is_none())
+        .map(|((_, (size, _)), baseline)| shared - baseline + size.height)
+        .fold(0.0, Px::max)
+}
+
 fn place_stack(
     axis: Axis,
     spacing: Px,
@@ -11171,19 +11208,7 @@ fn place_stack(
     // only when asked; the other alignments pay nothing.
     let baselines: Option<Vec<Px>> = (align == CrossAlign::Baseline
         && axis == Axis::Horizontal)
-        .then(|| {
-            children
-                .iter()
-                .zip(fits)
-                .map(|(child, (size, _))| {
-                    if child.placed_at().is_some() {
-                        0.0
-                    } else {
-                        child.first_baseline(env).unwrap_or(size.height)
-                    }
-                })
-                .collect()
-        });
+        .then(|| row_baselines(children, fits.iter().map(|(size, _)| *size), env));
     let shared = baselines
         .as_ref()
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
