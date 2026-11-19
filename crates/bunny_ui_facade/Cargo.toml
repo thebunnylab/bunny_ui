@@ -53,6 +53,13 @@ hot = ["shell", "dep:bunny-ui-dylib", "dep:bunny-ui-hot"]
 # preview` run. `bunny preview` turns it on with `hot`; a plain build
 # keeps the functions and exports nothing.
 preview = ["dep:bunny-ui-hot", "dep:bunny-ui-preview", "bunny-ui-preview/host"]
+# The self-updater, on the desktop: `app!` runs the Windows update
+# helper before any window, and starts the checks when `bunny build`
+# wrote an updater configuration (`[package.metadata.bunny.updater]`).
+# `bunny_ui::updater` is then the state, the click and the restart.
+updater = ["shell", "dep:bunny-ui-updater"]
+# The same, with Ed25519 from ed25519-dalek.
+updater-dalek = ["updater", "bunny-ui-updater?/dalek"]
 
 [dependencies]
 bunny-ui-core.workspace = true
@@ -78,6 +85,10 @@ bunny-ui-android = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bunny-ui-web = { workspace = true, optional = true }
+
+# The self-updater is the desktop's: a store or a page updates the app.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+bunny-ui-updater = { workspace = true, optional = true }
 
 # Hot reload loads new code wherever a native debug build runs.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

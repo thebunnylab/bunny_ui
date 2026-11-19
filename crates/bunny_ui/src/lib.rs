@@ -45,6 +45,7 @@ pub mod preview;
 pub mod action;
 pub mod angle;
 pub mod audio;
+pub mod autofill;
 pub mod anim;
 pub mod beat;
 pub mod bind;
@@ -90,6 +91,7 @@ mod paranoid;
 mod reconciler;
 mod shapes;
 pub use shapes::{BorderStyle, Stripes};
+pub mod progress;
 pub mod runtime;
 pub mod search_field;
 #[cfg(feature = "canvas")]
@@ -12109,6 +12111,172 @@ mod tests {
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Email, "the address keys");
         assert!(runtime.focus_named("note"));
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Text, "a field that named nothing");
+    }
+
+    /// A field names what it holds for the platform's autofill, and the
+    /// runtime answers for whatever holds the keyboard — the shells that
+    /// own an input system hand it over with the focus: the address box
+    /// is the username, the password box a secret current password, and a
+    /// field that named nothing (or no focus at all) says nothing.
+    #[test]
+    fn the_focused_field_names_what_it_holds() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::Autocomplete;
+
+        #[derive(Clone, Copy)]
+        struct SignIn {
+            email: State<String>,
+            password: State<String>,
+            note: State<String>,
+        }
+        impl Component for SignIn {
+            fn body(self) -> impl View {
+                vstack!(
+                    text_field("email", self.email.binding())
+                        .autocomplete(Autocomplete::Username)
+                        .id("email"),
+                    text_field("password", self.password.binding())
+                        .secret(true)
+                        .autocomplete(Autocomplete::CurrentPassword)
+                        .id("password"),
+                    text_field("note", self.note.binding()).id("note"),
+                )
+            }
+        }
+
+        let form = SignIn {
+            email: State::new(String::new()),
+            password: State::new(String::new()),
+            note: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 160.0 }));
+        assert_eq!(runtime.focus_autocomplete(), None, "no focus says nothing");
+        assert!(!runtime.focus_is_secret(), "no focus hides nothing");
+        assert!(runtime.focus_named("email"));
+        assert_eq!(runtime.focus_autocomplete(), Some(Autocomplete::Username));
+        assert!(!runtime.focus_is_secret(), "an address is shown");
+        assert!(runtime.focus_named("password"));
+        assert_eq!(runtime.focus_autocomplete(), Some(Autocomplete::CurrentPassword));
+        assert!(runtime.focus_is_secret(), "the password box hides what it holds");
+        assert!(runtime.focus_named("note"));
+        assert_eq!(runtime.focus_autocomplete(), None, "a field that named nothing");
+        assert!(!runtime.focus_is_secret());
+    }
+
+    /// The form a platform's AutoFill fills from one pick: every box of
+    /// the scene that says what it holds, or hides it, read while one of
+    /// them holds the keyboard. A box that named nothing, and one that
+    /// asked for no suggestion, stay out; with the keyboard in either, or
+    /// nowhere, there is no form at all.
+    #[derive(Clone, Copy)]
+    struct AutofillForm {
+        email: State<String>,
+        password: State<String>,
+        pin: State<String>,
+        note: State<String>,
+        search: State<String>,
+    }
+
+    impl AutofillForm {
+        fn new() -> Self {
+            Self {
+                email: State::new(String::new()),
+                password: State::new(String::from("old")),
+                pin: State::new(String::new()),
+                note: State::new(String::new()),
+                search: State::new(String::new()),
+            }
+        }
+    }
+
+    impl Component for AutofillForm {
+        fn body(self) -> impl View {
+            use crate::text_input::Autocomplete;
+            vstack!(
+                text_field("email", self.email.binding())
+                    .autocomplete(Autocomplete::Username)
+                    .id("email"),
+                text_field("password", self.password.binding())
+                    .secret(true)
+                    .autocomplete(Autocomplete::CurrentPassword)
+                    .id("password"),
+                text_field("pin", self.pin.binding()).secret(true).id("pin"),
+                text_field("note", self.note.binding()).id("note"),
+                text_field("search", self.search.binding())
+                    .autocomplete(Autocomplete::Off)
+                    .id("search"),
+            )
+        }
+    }
+
+    #[test]
+    fn the_focused_fields_form_is_every_box_that_says_what_it_holds() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::Autocomplete;
+
+        let form = AutofillForm::new();
+        let runtime = Runtime::new();
+        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 240.0 }));
+        assert!(runtime.autofill_group().is_empty(), "no focus, no form");
+
+        assert!(runtime.focus_named("email"));
+        let group = runtime.autofill_group();
+        let named: Vec<_> = group
+            .iter()
+            .map(|member| (member.path.rsplit('/').next().unwrap_or(""), member.holds, member.secret))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("[email]", Some(Autocomplete::Username), false),
+                ("[password]", Some(Autocomplete::CurrentPassword), true),
+                ("[pin]", None, true),
+            ],
+            "the address, the password and the secret that named nothing, in layout order",
+        );
+        assert_eq!(&*group[1].text, "old", "a member carries what it holds now");
+        assert!(
+            group.windows(2).all(|pair| pair[0].frame.origin.y < pair[1].frame.origin.y)
+                && group.iter().all(|member| member.frame.size.width > 0.0),
+            "each member stands where its box stands",
+        );
+
+        assert!(runtime.focus_named("password"));
+        assert_eq!(runtime.autofill_group(), group, "the same form from any of its boxes");
+
+        assert!(runtime.focus_named("note"));
+        assert!(runtime.autofill_group().is_empty(), "a box that named nothing has no form");
+        assert!(runtime.focus_named("search"));
+        assert!(runtime.autofill_group().is_empty(), "a box that asked for no suggestion has none");
+    }
+
+    /// What the system writes into a box beside the one being typed into
+    /// reaches that box by its path, and the keyboard stays where it was.
+    #[test]
+    fn a_fill_writes_a_box_by_its_path_and_leaves_the_keyboard() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        let form = AutofillForm::new();
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 300.0, height: 240.0 });
+        let _ = runtime.settled_layout(&form, viewport);
+        assert!(runtime.focus_named("email"));
+        let typing = runtime.focused();
+        let password = runtime.autofill_group().remove(1).path;
+
+        assert!(runtime.autofill(&password, "hunter2"), "the whole text is replaced");
+        assert_eq!(form.password.get(), "hunter2");
+        assert_eq!(runtime.focused(), typing, "the keyboard did not move");
+        assert!(runtime.key(EditCommand::Insert(String::from("me@"))).applied);
+        assert_eq!(form.email.get(), "me@", "typing still lands in the focused box");
+        assert_eq!(form.password.get(), "hunter2");
+
+        let _ = runtime.settled_layout(&form, viewport);
+        assert_eq!(&*runtime.autofill_group()[1].text, "hunter2", "the form reads the fill back");
+        assert!(!runtime.autofill(&password, "hunter2"), "a text the box holds is no change");
+        assert!(!runtime.autofill("root/[nowhere]", "x"), "a path that holds no field");
     }
 
     /// A form that paints its own focus ring hears the keyboard move,

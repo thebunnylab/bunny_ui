@@ -150,6 +150,24 @@ months and the days. They come in sixteen languages, picked by the locale
 ([i18n](i18n.md)). `words::install` lets the app answer for the first four;
 the names of the months and the days have no such hook yet.
 
+## Progress
+
+`progress_view().value(share)` is not a control, since nothing writes it, but
+it sits beside them: a horizontal track with a fill on the leading side for
+the share of the work done. The share is clamped to `0..=1`, and NaN is
+nothing done. The bar takes the width it is offered and stands at
+`Theme::progress.height`, with `Theme::progress.radius` round ends. The track
+wears `divider` and the fill wears `accent`. A right-to-left scene fills from
+the right. Without `.value(…)` the view is the 20 × 20 placeholder it has
+always been: there is no spinner yet.
+
+```rust
+vstack!(
+    text!("Downloading {}%", (done * 100.0).round()),
+    progress_view().value(done),
+)
+```
+
 ## How they are made
 
 All but two are ordinary views: a button, a stack, a grid, a popover, put
@@ -172,3 +190,6 @@ what takes text, `panel` for a card or a list.
 - Escape does not empty a search field, and the two fields cannot be disabled.
 - On the web the controls have no ARIA roles yet.
 - iOS, Android and the web canvas have no screen reader projection yet.
+- A progress bar has no role or value of its own for assistive technology:
+  label it, or show the percentage as text.
+- `progress_view()` without a value has no spinner.

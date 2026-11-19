@@ -12,14 +12,27 @@ wasm-bindgen resolves the wasm's `./bunny.js` and `./bunny_gpu.js`
 imports beside its own loader, and the page hands the instance over
 once:
 
-```js
-import { attachDom } from "./bunny.js";
-addEventListener("TrunkApplicationStarted", async ({ detail }) => {
-  await attachDom(detail.wasm.memory, detail.wasm, (width, height, scale) =>
+```html
+<script>
+  window.trunkStarted = new Promise((resolve) => {
+    addEventListener("TrunkApplicationStarted", (event) => resolve(event.detail), { once: true });
+  });
+</script>
+<script type="module">
+  import { attachDom } from "./bunny.js";
+  const { wasm } = await window.trunkStarted;
+  await attachDom(wasm.memory, wasm, (width, height, scale) =>
     window.wasmBindings.boot(width, height, scale),
   );
-});
+</script>
 ```
+
+Two scripts, on purpose. Trunk dispatches `TrunkApplicationStarted` once,
+when the wasm is instantiated, and a module script that imports the glue
+registers its listener only after that import resolved — with the wasm in
+the cache and the glue revalidated, the event comes first and the page
+stays blank. The classic script runs as the page is parsed, so the event
+is always caught, and the module awaits it whenever it gets there.
 
 `attachDom` imports `glue_dom.js` and borrows the element shell whole —
 the patch applier, the element registry, the delegated clicks, the
@@ -47,6 +60,11 @@ aria-label="Email">` and `<input type="password"
 autocomplete="current-password" aria-label="Password">` — the pair a
 password manager recognizes. "Show password" flips the secret off and
 the input is retyped in place, value and caret kept.
+
+The page opens with the keyboard in the email box (`.auto_focus()`), Enter
+in either box signs in (`.on_submit`), and Tab reaches the checkbox and the
+button — a `role="checkbox"` and a `role="button"` with a tab stop — which
+Space and Enter activate.
 
 Build and run (trunk fetches the wasm-bindgen CLI `web/Trunk.toml`
 pins, which must match the crate in `Cargo.lock`):

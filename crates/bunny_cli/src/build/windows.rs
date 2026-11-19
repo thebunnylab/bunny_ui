@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{Info, Log, Options};
+use super::{Info, Log, Options, Shipped};
 use crate::cargo::{self, Target};
 use crate::error::{self, Error, Result};
 use crate::formats::{pe, res, zip};
@@ -35,8 +35,9 @@ pub fn check(project: &Project) -> Result<()> {
     Ok(())
 }
 
-/// Builds the executable and its zip into `out`.
-pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<()> {
+/// Builds the executable and its zip into `out`. The zip is what the
+/// updater downloads.
+pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<Shipped> {
     check(project)?;
     let bin = project.require_bin()?;
     let exe_name = format!("{bin}.exe");
@@ -123,7 +124,8 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
     if signed.is_none() {
         println!("{}", term::dim("unsigned: SmartScreen warns whoever downloads it (BUNNY_WINDOWS_PFX signs it)"));
     }
-    Ok(())
+    let target = if cfg!(target_arch = "aarch64") { "windows-aarch64" } else { "windows-x86_64" };
+    Ok(Shipped { path: out.join(&zip_name), format: "zip", targets: vec![target] })
 }
 
 /// Signs `exe` with the certificate in `BUNNY_WINDOWS_PFX`, timestamped

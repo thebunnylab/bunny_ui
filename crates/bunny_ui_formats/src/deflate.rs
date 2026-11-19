@@ -160,7 +160,7 @@ const DISTANCES: [(u32, u32, u32); 30] = [
 pub fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
     out.extend(deflate(bytes));
-    out.extend_from_slice(&super::zip::crc32(bytes).to_le_bytes());
+    out.extend_from_slice(&crate::zip::crc32(bytes).to_le_bytes());
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out
 }

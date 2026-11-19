@@ -2,7 +2,7 @@
 //! project's `build/<platform>/`.
 
 use crate::args::{HELP, Matches, Opt};
-use crate::build::{self, Info, Log, Options, Signing};
+use crate::build::{self, Info, Log, Options, Shipped, Signing};
 use crate::commands::doctor;
 use crate::devices::Platform;
 use crate::error::{Error, Result};
@@ -38,7 +38,13 @@ build.log (every command that made them).
 The version and the build number come from Cargo.toml: `version`, and
 `build` in [package.metadata.bunny]; --build-name and --build-number
 override them for one build. Windows and Linux build on their own
-system; iOS comes next.";
+system; iOS comes next.
+
+When Cargo.toml has [package.metadata.bunny.updater], a macos, windows or
+linux build also signs its package (the disk image, the zip, the tarball)
+with the key in BUNNY_SIGNING_KEY or --signing-key, and writes
+<package>.sig and latest.json beside it. `bunny updater merge` joins the
+latest.json of each platform into one.";
 
 pub const OPTIONS: &[Opt] = &[
     Opt::flag("debug", "Build without optimizations"),
@@ -53,6 +59,7 @@ pub const OPTIONS: &[Opt] = &[
     Opt::flag("universal", "macOS: one binary for Apple silicon and Intel"),
     Opt::flag("no-dmg", "macOS: the app alone, without a disk image"),
     Opt::value("abi", "LIST", "Android: the ABIs to build for (default: arm64-v8a,x86_64)"),
+    Opt::value("signing-key", "FILE", "The updater's private key, the .key of `bunny signer generate` (default: $BUNNY_SIGNING_KEY)"),
     HELP,
 ];
 
@@ -107,6 +114,7 @@ pub fn run(matches: &Matches) -> Result<()> {
         Platform::Linux => build::linux::check(&project)?,
         _ => {}
     }
+    let release = build::release::prepare(&project, checked, &options, matches.value("signing-key"))?;
     doctor::preflight(checked)?;
     if checked == Platform::Android {
         build::android::check(&project, &options)?;
@@ -115,16 +123,20 @@ pub fn run(matches: &Matches) -> Result<()> {
     let out = build::out_dir(&project, platform)?;
     let mut log = Log::default();
     let mut info = Info::new(&project, platform, &options);
-    let built = match checked {
-        Platform::Web => build::web::build(&project, &options, &out, &mut log, &mut info),
-        Platform::Android => build::android::build(&project, &options, &out, &mut log, &mut info),
-        Platform::Windows => build::windows::build(&project, &options, &out, &mut log, &mut info),
-        Platform::Linux => build::linux::build(&project, &options, &out, &mut log, &mut info),
+    let built: Result<Option<Shipped>> = match checked {
+        Platform::Web => build::web::build(&project, &options, &out, &mut log, &mut info).map(|()| None),
+        Platform::Android => build::android::build(&project, &options, &out, &mut log, &mut info).map(|()| None),
+        Platform::Windows => build::windows::build(&project, &options, &out, &mut log, &mut info).map(Some),
+        Platform::Linux => build::linux::build(&project, &options, &out, &mut log, &mut info).map(Some),
         _ => build::macos::build(&project, &options, &out, &mut log, &mut info),
     };
     // the log is written whatever happened: it is what explains a failure
     log.write(&out.join("build.log"))?;
-    built?;
+    let shipped = built?;
+    // signed last: on a Mac, notarizing and stapling change the bytes
+    if let (Some(release), Some(shipped)) = (&release, &shipped) {
+        release.publish(&project, shipped, &out, &mut info)?;
+    }
     info.write(&out.join("build-info.json"))?;
     let shown = out.strip_prefix(&cwd).unwrap_or(&out);
     println!("{} {}", term::ok("Built"), term::bold(&shown.display().to_string()));

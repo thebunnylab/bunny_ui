@@ -103,6 +103,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::AccessibilityHidden)
     }
 
+    /// Marks what is below as a region that changes by itself and is read
+    /// out when it does — the refusal under a form, a "saved". Nothing
+    /// takes the keyboard there, so without this nothing says it. An
+    /// element page writes it as `role="status"` or `role="alert"` with
+    /// `aria-live`; the native projection does not announce it yet.
+    #[track_caller]
+    fn accessibility_live(self, live: crate::accessibility::Live) -> Modified<Self> {
+        Modified::new(self, Modifier::AccessibilityLive(live))
+    }
+
     /// `.bold()` is the same door with `Weight::Bold` spelled for you.
     ///
     /// Every platform that renders a NUMBER renders all six. CoreText

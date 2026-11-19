@@ -17,15 +17,21 @@
 
 use std::cell::Cell;
 
-use crate::layout::Color;
+use crate::layout::{Color, Px};
 
 macro_rules! theme_tokens {
     ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {
-        /// A theme's token set — flat, `Copy`, open to grow along with
-        /// the chrome.
+        /// A theme's token set — the colors flat, the geometry in
+        /// groups; `Copy`, open to grow along with the chrome. Write a
+        /// variant as an update of a shipped one —
+        /// `Theme { accent, ..Theme::light() }` — so a token added later
+        /// does not break it.
         #[derive(Clone, Copy, PartialEq, Debug)]
         pub struct Theme {
             $($(#[$doc])* pub $name: Color,)+
+            /// The determinate progress bar's geometry (its colors are
+            /// `divider` for the track and `accent` for the fill).
+            pub progress: ProgressBar,
         }
 
         $(
@@ -36,10 +42,11 @@ macro_rules! theme_tokens {
         )+
 
         impl Theme {
-            /// Every token's name, in the struct's order.
+            /// Every COLOR token's name, in the struct's order — the
+            /// geometry groups are not on this list.
             pub const NAMES: &'static [&'static str] = &[$(stringify!($name)),+];
 
-            /// The tokens by name — what a theme is on a wire.
+            /// The color tokens by name — what a theme is on a wire.
             pub fn tokens(&self) -> Vec<(&'static str, Color)> {
                 vec![$((stringify!($name), self.$name)),+]
             }
@@ -101,6 +108,22 @@ theme_tokens! {
     backdrop,
 }
 
+/// The determinate progress bar: how tall its track stands and how
+/// round its ends are. The fill shares both, so a full bar is the track
+/// painted over.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ProgressBar {
+    /// The track's height, and the fill's.
+    pub height: Px,
+    /// The corner radius of the track and of the fill.
+    pub radius: Px,
+}
+
+impl ProgressBar {
+    /// The classic bar: the slider's own 4-point rail with round ends.
+    pub const CLASSIC: ProgressBar = ProgressBar { height: 4.0, radius: 2.0 };
+}
+
 impl Default for Theme {
     /// The light theme, spelled once — installing a palette should not
     /// mean writing all twenty-one tokens to reach the shipped ones.
@@ -137,6 +160,7 @@ impl Theme {
             field_border: Color::OUTLINE,
             scrollbar: Color::rgba(0, 0, 0, 90),
             backdrop: Color::hex_a(0x0F172A55),
+            progress: ProgressBar::CLASSIC,
         }
     }
 
@@ -164,6 +188,7 @@ impl Theme {
             field_border: Color::hex_a(0xFFFFFF1A),
             scrollbar: Color::hex_a(0xFFFFFF2E),
             backdrop: Color::hex_a(0x00000066),
+            progress: ProgressBar::CLASSIC,
         }
     }
 }

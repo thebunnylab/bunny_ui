@@ -19,6 +19,8 @@ bunny build macos    # a signed app and its disk image, to hand out
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
 | `bunny build` | Build the app to ship: a site, a signed and notarized Mac app, a Google Play bundle, a Windows zip, a Linux tarball |
+| `bunny signer generate` | Make the key pair that signs the app's updates |
+| `bunny updater merge` | Join the `latest.json` of each platform into one |
 | `bunny upgrade` | Bring the platform folders up to this `bunny`'s templates, your edits kept |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
@@ -161,6 +163,32 @@ override them for one build.
   icon and `StartupWMClass` are named by the app's id, the one its window gives
   Wayland and X11. The libraries the binary needs are read from it and named as
   Debian, Fedora and Arch packages, in `build-info.json` and the README.
+
+### Updates
+
+An app that updates itself names its feed and its public keys in
+`Cargo.toml`:
+
+```toml
+[package.metadata.bunny.updater]
+product = "my-app"   # default: the package name, when it is [a-z0-9-]
+feed = "https://dl.example.com/my-app/{channel}/latest.json"   # or server = "https://…"
+pubkeys = ["keys/updater.pub"]
+channel = "stable"   # BUNNY_CHANNEL at build time wins
+url = "https://dl.example.com/my-app/{version}/{file}"
+```
+
+`bunny signer generate` writes the key pair: `keys/updater.pub`, to commit,
+and `keys/updater.key`, which it adds to `.gitignore`. Every build of the app
+carries the product, the feed, the public keys and the channel. A
+`bunny build macos`, `windows` or `linux` with the private key in
+`BUNNY_SIGNING_KEY` or `--signing-key` also signs the package the updater
+downloads (the disk image after notarization, the zip, the tarball), writes
+`<package>.sig` beside it, and writes `latest.json` for that platform. Without
+a key, the build goes on and writes neither. `bunny updater merge
+build/*/latest.json -o latest.json` joins the platforms' manifests into the one
+to upload. `bunny doctor` warns when a public key is not in git: a key pair
+made again after a release signs updates that no app out there verifies.
 
 ## `bunny upgrade`
 

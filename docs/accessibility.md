@@ -304,9 +304,80 @@ text_field("", password)
 A field that names no `autocomplete` carries no attribute and leaves the
 choice with the browser; the pixel shells own no native field for an autofill
 to fill and ignore it. The served page (`ssr`) writes the same three
-attributes. Only fields carry a name into the element lowering today: a label
-on a button or on text reaches the native projection alone, and a pressable
-box is a `<div>` with no `role`.
+attributes.
+
+A built-in control says what it is on the element that answers its press. The
+state a control publishes for the native projection — its kind, whether it is
+enabled, its checked value — rides to the page as attributes: `role`
+(`button`, `checkbox`, `switch`, `radio`, `tab`; a pop-up button is a `button`
+with `aria-haspopup`), `tabindex="0"` while it is enabled, `aria-disabled`
+when it is not, and `aria-checked` (`aria-selected` on a tab). A keyboard
+reaches it with Tab and activates it with the keys its kind names: Enter and
+Space for a button, a radio and a tab, Space alone for a checkbox and a
+switch. An element whose tag is a control already — `.element("button")`, a
+link — keeps the role and the tab stop the browser gave it. A bare
+`.on_click` is a target and no control: nothing said it is a button, so it
+gets no role and no tab stop. The served page writes the same attributes.
+
+The keyboard is the browser's in this mode, and the two meet in three places.
+Enter in a one-line field runs the field's `.on_submit` (in a field of many
+lines the bare key is a break and the chord, `⌘↵` or `Ctrl+↵`, submits); an
+input method's Enter commits its composition and is not that key. A field the
+engine gives the keyboard to — `.auto_focus()`, a beat — takes the browser's
+focus, and a selecting beat selects its text. And the engine hears where the
+browser's focus is, so "nobody holds the keyboard" is true when it is true on
+the page.
+
+A landmark is a tag, and a tag is what an element was created as. When two
+faces of an app put different elements in the same place — a door's `<main>`
+where an account's `<nav>` stands — the old element leaves and the new one
+mounts under its own tag; the diff keeps an element only for a node of the
+same kind **and** the same tag.
+
+A view says the rest on the element it becomes. `accessibility_label` on
+anything but a field is that element's `aria-label`: on a button, on a text,
+on a landmark (`.element("nav").accessibility_label("Pages")`). It names one
+element — the one that answers a press when the view is a control, else the
+one element the view lowers to — and a name that changes re-attributes in
+place. `accessibility_hidden()` is `aria-hidden="true"` on what it wraps.
+
+A region that changes by itself — the refusal under a form, a "saved" — is
+read out only if it says so, since nothing takes the keyboard there:
+
+```rust,ignore
+use bunny_ui::accessibility::Live; // not in the prelude: the name is too common to take
+text(refusal).accessibility_live(Live::Polite);    // role="status", aria-live="polite"
+text(failure).accessibility_live(Live::Assertive); // role="alert", aria-live="assertive"
+```
+
+The role is written where the element is no control; a control keeps its own.
+The native projection carries the decorator and announces nothing for it yet.
+
+A button whose face the application draws says two more things when asked:
+
+```rust,ignore
+// one of a set: role="radio", aria-checked, chosen by Enter and by Space
+button(row, choose).plain().selected(is_chosen);
+// it opens something: aria-expanded, and it stays a button
+button(label, toggle).plain().expanded(is_open);
+```
+
+`selected` is the one-of-a-set twin of `checked`, which makes a two-state
+control (a checkbox: Space, and Enter left to the form). A built-in pop-up
+button publishes its expanded state the same way.
+
+When a focused control leaves the page — the row of a list that closed when
+it was chosen — the focus goes back to the control that had it before, if
+that one still stands, instead of falling to the page's body. Never to a
+field: the engine gives a field the keyboard itself when it wants to.
+
+The served page (`ssr`) writes every one of these attributes.
+
+What the element lowering still does not say: a pop-up's shown value, a
+group's arrow keys for page-drawn radios (each is its own tab stop), a
+relation between an opener and what it opens (`aria-controls`), and a focus
+trap for a modal the page draws. Landmarks and headings are the page's own
+to say, with `.element(…)`.
 
 ## Remaining work
 

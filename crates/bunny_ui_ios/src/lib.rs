@@ -11,12 +11,19 @@
 //! touch doors and lays the root out inside the safe area; the shell
 //! only forwards.
 //!
+//! The keyboard reads the focused field through `UITextInput`, answered
+//! from a mirror the shell syncs after every frame: its text, where the
+//! selection and a composition stand, and the caret — which is what
+//! puts the QuickType bar over the keys, and with it Passwords' offer of
+//! the account, the password and the one-time code. A composition is
+//! marked in the field while it lasts, as on the desktops.
+//!
 //! What this shell does not have, said once: a second window
 //! ([`MANY_WINDOWS`] is false — the screen is the window), a title bar
 //! or a chrome to choose, a cursor, a live resize, a CPU road
-//! (`BUNNY_PRESENT=cpu` leaves the view blank and says so), an IME
-//! mirror for marked text (the keyboard types through `UIKeyInput`; a
-//! composition arrives committed), and synthetic input into a hosted
+//! (`BUNNY_PRESENT=cpu` leaves the view blank and says so), UIKit's own
+//! selection handles and loupe (the field paints its selection, and the
+//! kit is handed none to draw), and synthetic input into a hosted
 //! page (the phone has no event constructor a page trusts — the
 //! capability is not claimed). Native hosts it HAS: a webview rides
 //! the shared tenant, under the same sandwich the desktops keep; and
@@ -238,6 +245,10 @@ impl App {
         // the app's life outside its window: the notifier is the shared
         // half's, installed on the main thread — the one UIKit runs on
         bunny_ui::app::install_notifier(bunny_ui_apple::notifications::notify);
+        // the saved-password sheet hangs from the app's window
+        bunny_ui::autofill::install_requester(|answer| unsafe {
+            bunny_ui_apple::autofill::request_saved_password(ffi::anchor_window(), answer);
+        });
         // the general pasteboard, for the app's own handlers too
         bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
@@ -659,16 +670,47 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             // by the core, and overlays position inside it
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
+            // what the keyboard reads of the focused field, as this frame
+            // left it — before the keys are claimed, so a keyboard coming
+            // up reads the field it comes up for
+            ffi::sync_text(runtime.ime_snapshot().zip(runtime.focused()).map(|(snapshot, field)| {
+                ffi::Document {
+                    field,
+                    text: snapshot.text,
+                    selected: (snapshot.selected.0 as u64, snapshot.selected.1 as u64),
+                    marked: snapshot.marked.map(|(location, length)| (location as u64, length as u64)),
+                    caret: cg_rect(snapshot.caret_rect),
+                }
+            }));
+            // the focused field's form, its other boxes as proxies, so one
+            // Passwords pick fills them all — before the keys are claimed,
+            // so the keyboard that comes up finds the form whole
+            ffi::sync_autofill(&runtime.autofill_group(), runtime.focused().as_deref());
             // the keyboard follows the focus: a field that took it wants
             // the keys — the ones it asks for — and a scene with none
             // wants them gone
             ffi::want_keys(runtime.focus_keyboard_type());
+            ffi::want_traits(runtime.focus_autocomplete(), runtime.focus_is_secret());
             ffi::want_keyboard(runtime.focus_takes_text());
             // wake or park the frame driver — the event may have
             // started (or finished) an animation, or a finger's clock
             sync_frame_driver(runtime);
         }
     };
+
+    // the two questions the keyboard asks beyond the mirror: the offset
+    // under a point and the caret at an offset. The view's points are
+    // the layout's, so both pass through unconverted
+    ffi::set_text_resolvers(
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| runtime.ime_index_at(x, y).map(|index| index as u64)
+        }),
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |utf16| runtime.ime_rect_for(utf16 as usize).map(cg_rect)
+        }),
+    );
 
     // the gate: keymap BEFORE the keyboard's own road — bare chars pass
     // straight through to whoever holds the keyboard AND is taking text
@@ -772,7 +814,16 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         if trace && !matches!(event, AppEvent::Blink | AppEvent::Frame { .. }) {
-            eprintln!("bunny_ui ios: {event:?}");
+            // what the keyboard writes into a box that hides it — a pick
+            // from Passwords lands here whole — is named, never printed
+            match &event {
+                AppEvent::Text(text) | AppEvent::Marked { text, .. } | AppEvent::Replace { text, .. }
+                    if runtime.focus_is_secret() =>
+                {
+                    eprintln!("bunny_ui ios: {} chars into a secret box", text.chars().count());
+                }
+                _ => eprintln!("bunny_ui ios: {event:?}"),
+            }
         }
         match event {
             AppEvent::Redraw => blit(runtime, root),
@@ -875,6 +926,44 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     blit(runtime, root);
                 }
             }
+            AppEvent::Marked { text, location, length } => {
+                let command = EditCommand::SetMarked {
+                    text,
+                    caret_utf16: (location as usize, length as usize),
+                };
+                if runtime.key(command).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Unmark => {
+                if runtime.key(EditCommand::Unmark).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Select { location, length } => {
+                let command = EditCommand::SetSelection { utf16: (location as usize, length as usize) };
+                if runtime.key(command).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Replace { location, length, text } => {
+                // the range first, then the text over it — the road a
+                // selection and a paste take
+                let command = EditCommand::SetSelection { utf16: (location as usize, length as usize) };
+                let placed = runtime.key(command).applied;
+                let replaced = runtime.key(EditCommand::Insert(text)).applied;
+                if placed || replaced {
+                    blit(runtime, root);
+                }
+            }
+            // AutoFill wrote a box beside the one being typed into: the
+            // box takes it by path, and the keyboard stays where it is.
+            // The frame runs either way — the proxy already holds what the
+            // system wrote, and a box that refused it shows it back
+            AppEvent::Fill { field, text } => {
+                let _ = runtime.autofill(&field, text.as_str());
+                blit(runtime, root);
+            }
             AppEvent::Modifiers(held) => {
                 if runtime.modifiers_changed(held).present {
                     blit(runtime, root);
@@ -958,6 +1047,15 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
 
     ffi::set_key_gate(key_gate);
     ffi::set_handler(handler);
+}
+
+/// A layout rect as UIKit's — the same points, the same top-left origin.
+fn cg_rect(rect: bunny_ui::layout::Rect) -> bunny_ui_apple::ffi::CGRect {
+    use bunny_ui_apple::ffi::{CGPoint, CGRect, CGSize};
+    CGRect {
+        origin: CGPoint { x: rect.origin.x, y: rect.origin.y },
+        size: CGSize { width: rect.size.width, height: rect.size.height },
+    }
 }
 
 fn size_class(compact: bool) -> SizeClass {

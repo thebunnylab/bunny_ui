@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::{Info, Log, Options};
+use super::{Info, Log, Options, Shipped};
 use crate::cargo::{self, Target};
 use crate::error::{self, Error, Result};
 use crate::formats::{deflate, elf, tar};
@@ -32,8 +32,9 @@ pub fn check(project: &Project) -> Result<()> {
     Ok(())
 }
 
-/// Builds the binary and its `.tar.gz` into `out`.
-pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<()> {
+/// Builds the binary and its `.tar.gz` into `out`. The `.tar.gz` is what
+/// the updater downloads.
+pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<Shipped> {
     check(project)?;
     let bin = project.require_bin()?;
     let built = cargo::build(&cargo::Build {
@@ -93,7 +94,7 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
     if !packages.debian.is_empty() {
         println!("{} {}", term::dim("needs, on Debian and Ubuntu:"), packages.debian.join(" "));
     }
-    Ok(())
+    Ok(Shipped { path: out.join(&archive_name), format: "tar.gz", targets: vec![if arch == "aarch64" { "linux-aarch64" } else { "linux-x86_64" }] })
 }
 
 #[cfg(unix)]

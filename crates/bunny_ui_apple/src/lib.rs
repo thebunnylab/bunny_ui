@@ -13,6 +13,7 @@
 
 #![cfg(target_vendor = "apple")]
 
+pub mod autofill;
 pub mod credentials;
 pub mod ffi;
 pub mod image;

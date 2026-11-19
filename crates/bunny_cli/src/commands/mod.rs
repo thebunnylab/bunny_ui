@@ -7,4 +7,6 @@ pub mod new;
 pub mod preview;
 pub mod run;
 pub mod setup;
+pub mod signer;
+pub mod updater;
 pub mod upgrade;

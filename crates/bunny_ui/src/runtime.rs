@@ -61,6 +61,24 @@ pub struct ImeSnapshot {
     pub caret_rect: Rect,
 }
 
+/// One box of the focused field's form, as a platform's AutoFill needs
+/// it ([`Runtime::autofill_group`]): which box, what it holds, whether it
+/// hides it, where it stands and what it holds now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutofillBox {
+    /// The box's path — what a fill names it by ([`Runtime::autofill`]).
+    pub path: String,
+    /// What the box says it holds (`TextField::autocomplete`); `None` for
+    /// a secret box that named nothing.
+    pub holds: Option<crate::text_input::Autocomplete>,
+    /// The box hides what it holds (`TextField::secret`).
+    pub secret: bool,
+    /// The box's frame, in LAYOUT coordinates.
+    pub frame: Rect,
+    /// The box's text, shared with the field.
+    pub text: std::sync::Arc<str>,
+}
+
 /// One live box whose picture changed on a clock step: where it sits
 /// and the fresh pixels. The shell presents it on the box's OWN
 /// surface — the window behind it never redraws.
@@ -4813,6 +4831,116 @@ impl Runtime {
         }
     }
 
+    /// What the field holding the keyboard says it holds, for the
+    /// platform's autofill (`TextField::autocomplete`) — `None` for a
+    /// field that said nothing, for a box the app owns, and for no focus.
+    /// A native shell hands it to its input system with the focus, so a
+    /// password manager offers the saved address to the address box and
+    /// the one-time code to the code box.
+    pub fn focus_autocomplete(&self) -> Option<crate::text_input::Autocomplete> {
+        self.enter_scene();
+        let path = self.focused()?;
+        if self.custom_at(&path).is_some() {
+            return None;
+        }
+        self.field_at(&path)?.autocomplete
+    }
+
+    /// Does the field holding the keyboard hide what it holds
+    /// (`TextField::secret`)? A native shell says so to its input
+    /// system: a secure box is never learned from or dictated into, and
+    /// it is the box the system's password AutoFill looks for. A box the
+    /// app owns and no focus answer `false`.
+    pub fn focus_is_secret(&self) -> bool {
+        self.enter_scene();
+        self.focused()
+            .filter(|path| self.custom_at(path).is_none())
+            .and_then(|path| self.field_at(&path))
+            .is_some_and(|field| field.secret)
+    }
+
+    /// The boxes of the focused field's form, in layout order, for a
+    /// platform whose AutoFill fills a whole form from one pick: the name
+    /// and the password of a saved account land in their two boxes
+    /// together. A shell whose fields all answer through one view mirrors
+    /// each box as a view of its own, because the system pairs boxes only
+    /// across separate views, and routes what the system writes into one
+    /// back by its path ([`Self::autofill`]).
+    ///
+    /// The form is the scene, as the window is for the platform's own
+    /// text fields: every box the keyboard can reach (above a modal's
+    /// floor) that says what it holds, or hides it. A box that asked for
+    /// no suggestion (`Autocomplete::Off`) stays out. The group is empty
+    /// unless the focused field is a member, so a search box holding the
+    /// keyboard mounts nothing, and so does no focus at all.
+    pub fn autofill_group(&self) -> Vec<AutofillBox> {
+        use crate::text_input::Autocomplete;
+        self.enter_scene();
+        let Some(focused) = self.focused() else {
+            return Vec::new();
+        };
+        // the geometry first, out of the borrows: reading a text runs the
+        // field's own closure
+        let members: Vec<_> = {
+            let order = self.last_focus_order.borrow();
+            let reachable = &order[self.last_focus_floor.get().min(order.len())..];
+            self.last_fields
+                .borrow()
+                .iter()
+                .filter(|field| match field.autocomplete {
+                    Some(Autocomplete::Off) => false,
+                    Some(_) => true,
+                    None => field.secret,
+                })
+                .filter(|field| reachable.iter().any(|stop| *stop.path == *field.path))
+                .map(|field| (field.path.clone(), field.autocomplete, field.secret, field.frame))
+                .collect()
+        };
+        if !members.iter().any(|(path, ..)| *path == focused) {
+            return Vec::new();
+        }
+        members
+            .into_iter()
+            .filter_map(|(path, holds, secret, frame)| {
+                let text = reconciler::read_editor(&path, &mut CaretState::default())?;
+                Some(AutofillBox { path, holds, secret, frame, text })
+            })
+            .collect()
+    }
+
+    /// The platform's AutoFill wrote a box of the form: its whole text,
+    /// by the box's path ([`Self::autofill_group`]). The text replaces
+    /// what the box held, through the box's own editor — the binding, the
+    /// filters and the undo typing uses, the fill one step of its own — and
+    /// the caret stands where the text ended. The keyboard stays where it
+    /// is: the system fills the boxes beside the one being typed into.
+    ///
+    /// `true` when the box's text changed. A path that holds no field, a
+    /// box not taking text, and a text the box already holds answer
+    /// `false`.
+    pub fn autofill(&self, path: &str, text: &str) -> bool {
+        self.enter_scene();
+        if !reconciler::field_takes_text(path) {
+            return false;
+        }
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        match reconciler::read_editor(path, &mut state) {
+            Some(current) if *current != *text => {}
+            _ => return false,
+        }
+        if let Some(history) = reconciler::editor_history(path) {
+            history.separate();
+        }
+        let _ = reconciler::run_editor(path, EditCommand::SelectAll, &mut state);
+        let _ = reconciler::run_editor(path, EditCommand::Insert(text.to_owned()), &mut state);
+        state.anchor = None;
+        state.marked = None;
+        self.carets.borrow_mut().insert(path.to_owned(), state);
+        // the box changed with no keystroke of its own
+        self.frame_asked.set(true);
+        true
+    }
+
     /// Focuses a field. The caret goes to the END the first time (the
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.
@@ -6212,6 +6340,9 @@ impl Runtime {
         root: &R,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
+        // the bodies this frame runs are lowered to elements: the names
+        // and voices their views carry stay in the tree for the flow
+        let _speaking = crate::dom::SpeakScope::enter();
         self.note_viewport(crate::layout::Proposal::exact(size));
         // the bindings a write reached go stale before anything reads
         // them: a walk that meets one reads it again, and the ones no
@@ -6350,8 +6481,10 @@ impl Runtime {
         drop(offsets);
         drop(carets);
         // a field that asks for the keyboard takes it by the one rule
+        let mut summoned = None;
         for (path, ask) in &output.fields {
             if self.claim_auto_focus(path, *ask) {
+                summoned = Some((path.clone(), matches!(ask, crate::layout::AutoFocus::Selecting(_))));
                 break;
             }
         }
@@ -6361,6 +6494,14 @@ impl Runtime {
         let mut patches = dom.lower(output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        // the browser owns every `<input>` here, so the keyboard the
+        // engine just gave a field is the browser's focus to move: said
+        // after the scene's own patches, when the element stands
+        if let Some((path, select)) = summoned
+            && let Some(id) = dom.field_id(&path)
+        {
+            patches.push(crate::dom::DomPatch::Focus { id, select });
         }
         // the mount's language and direction, after everything else: the
         // first frame always says them, a still frame never
@@ -6487,6 +6628,42 @@ impl Runtime {
         // so the first frame says nothing about it either
         let locale = self.locale();
         let _ = dom.note_language(locale.identifier(), self.layout_direction());
+    }
+
+    /// Dom mode: Enter in the `<input>` the engine knows by `path` — the
+    /// chord, in a field of many lines, where the bare key is a break.
+    /// The browser owns the box and its keys, so the one stroke that is
+    /// the field's own word to the app crosses by name: the field takes
+    /// the keyboard if it did not hold it, and its `.on_submit` runs.
+    /// `false` for a field that named no handler — the key stays the
+    /// browser's.
+    pub fn dom_submit(&self, path: &str) -> bool {
+        if !reconciler::has_editor(path) {
+            return false;
+        }
+        if self.focus.borrow().as_deref() != Some(path) {
+            self.focus(path);
+        }
+        self.submit(path).applied
+    }
+
+    /// Dom mode: the browser's focus entered or left the `<input>` the
+    /// engine knows by `path`. The browser decides where the keyboard is
+    /// there — a click, a Tab, a password manager — and the engine hears
+    /// it, so "nobody holds the keyboard" is true when it is true on the
+    /// page: a field that left with the focus does not keep the next
+    /// page's `.auto_focus()` from answering. Answers whether the
+    /// keyboard moved.
+    pub fn dom_field_focus(&self, path: &str, focused: bool) -> bool {
+        let holds = self.focus.borrow().as_deref() == Some(path);
+        match (focused, holds) {
+            (true, false) if reconciler::has_editor(path) => {
+                self.focus(path);
+                true
+            }
+            (false, true) => self.blur(),
+            _ => false,
+        }
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the

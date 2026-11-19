@@ -286,6 +286,8 @@ impl Tree {
         if let Some(href) = hints.href() {
             element.attrs.insert("href", href.to_string());
         }
+        write_control(&mut element, hints.control());
+        write_voice(&mut element, hints.voice(), hints.label());
         self.elements.insert(id, element);
     }
 
@@ -656,6 +658,17 @@ impl Tree {
                         Some(href) => element.attrs.insert("href", href.to_string()),
                         None => element.attrs.remove("href"),
                     };
+                    write_control(
+                        element,
+                        address
+                            .and_then(|address| address.control)
+                            .map_or(0, crate::layout::ControlState::wire),
+                    );
+                    write_voice(
+                        element,
+                        address.map_or(0, |address| address.voice.wire()),
+                        address.and_then(|address| address.label.as_deref()),
+                    );
                 }
             }
             DomPatch::Move { id, parent, before } => {
@@ -699,9 +712,10 @@ impl Tree {
             DomPatch::SetScroll { .. }
             | DomPatch::SetIcon { .. }
             | DomPatch::Reveal { .. }
-            | DomPatch::SetAnchor { .. } => {
-                // scroll offsets and icon geometry arrive
-                // after boot; a built page starts at rest
+            | DomPatch::SetAnchor { .. }
+            | DomPatch::Focus { .. } => {
+                // scroll offsets, icon geometry and the keyboard's
+                // place arrive after boot; a built page starts at rest
             }
         }
     }
@@ -1365,6 +1379,89 @@ const SERVED_TAGS: &[&str] = &[
     "blockquote", "ol", "ul", "li", "dl", "dt", "dd", "address",
 ];
 
+/// The tags the browser already makes a control of: their role and their
+/// tab stop are the element's own, and writing either over them would
+/// only say it twice.
+const NATIVE_CONTROLS: &[&str] = &["button", "a", "input", "select", "textarea", "summary"];
+
+/// What a control publishes (`ControlState::wire`), as the attributes a
+/// keyboard and a screen reader read — the same words the glue writes for
+/// an element it creates, so a served page and a mounted one agree. Zero
+/// takes them all off: the element stopped being a control.
+fn write_control(element: &mut Element, control: u8) {
+    for name in ["role", "tabindex", "aria-disabled", "aria-checked", "aria-selected", "aria-haspopup", "aria-expanded"] {
+        element.attrs.remove(name);
+    }
+    if control == 0 {
+        return;
+    }
+    let (kind, enabled, checked) = (control & 7, control & 8 != 0, (control >> 4) & 3);
+    let expanded = control >> 6;
+    if expanded != 0 {
+        element.attrs.insert("aria-expanded", (expanded == 2).to_string());
+    }
+    if !NATIVE_CONTROLS.contains(&element.tag) {
+        let role = match kind {
+            2 => "checkbox",
+            3 => "switch",
+            4 => "radio",
+            5 => "tab",
+            _ => "button",
+        };
+        element.attrs.insert("role", role.to_string());
+        if enabled {
+            element.attrs.insert("tabindex", "0".to_string());
+        }
+    }
+    if kind == 6 {
+        element.attrs.insert("aria-haspopup", "true".to_string());
+    }
+    if !enabled {
+        element.attrs.insert("aria-disabled", "true".to_string());
+    }
+    if checked != 0 {
+        let name = if kind == 5 { "aria-selected" } else { "aria-checked" };
+        element.attrs.insert(name, (checked == 2).to_string());
+    }
+}
+
+/// The elements whose name is the field's own (`SetField` writes it): a
+/// hint never names them, and never takes their name away.
+const FIELDS: &[&str] = &["input", "textarea"];
+
+/// What an element says of itself beyond what it is (`Voice::wire`) and
+/// the name it answers to, as attributes — after [`write_control`], whose
+/// role wins: a live region is a `status` or an `alert` only where the
+/// element is no control.
+fn write_voice(element: &mut Element, voice: u8, label: Option<&str>) {
+    if !FIELDS.contains(&element.tag) {
+        match label {
+            Some(label) => element.attrs.insert("aria-label", label.to_string()),
+            None => element.attrs.remove("aria-label"),
+        };
+    }
+    match voice & 1 != 0 {
+        true => element.attrs.insert("aria-hidden", "true".to_string()),
+        false => element.attrs.remove("aria-hidden"),
+    };
+    let (live, role) = match (voice >> 1) & 3 {
+        1 => (Some("polite"), "status"),
+        2 => (Some("assertive"), "alert"),
+        _ => (None, ""),
+    };
+    match live {
+        Some(live) => {
+            element.attrs.insert("aria-live", live.to_string());
+            if !element.attrs.contains_key("role") {
+                element.attrs.insert("role", role.to_string());
+            }
+        }
+        None => {
+            element.attrs.remove("aria-live");
+        }
+    }
+}
+
 fn leak_tag(tag: &str) -> &'static str {
     SERVED_TAGS.iter().find(|served| **served == tag).copied().unwrap_or("div")
 }
@@ -1761,6 +1858,77 @@ mod tests {
         );
         let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
         assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
+    }
+
+    /// A served control says what it is before any script runs: the
+    /// role, the tab stop and the state a keyboard and a screen reader
+    /// read are attributes of the page itself — the same words the glue
+    /// writes on an element it mounts. A tag that is a control already
+    /// keeps the browser's own role and tab stop.
+    #[test]
+    fn a_control_serves_its_role_its_state_and_its_tab_stop() {
+        #[derive(Clone, Copy)]
+        struct Controls;
+
+        impl Component for Controls {
+            fn body(self) -> impl View {
+                crate::vstack!(
+                    button(text("save"), || {}),
+                    button(text("gone"), || {}).disabled(true),
+                    button(text("pick"), || {}).plain().checked(true),
+                    button(text("native"), || {}).element("button"),
+                    text("bare").on_click(|| {}),
+                )
+            }
+        }
+
+        let page = render(&Controls, Size { width: 300.0, height: 300.0 });
+        assert_eq!(page.html.matches("role=\"button\"").count(), 2, "{}", page.html);
+        assert_eq!(page.html.matches("tabindex=\"0\"").count(), 2, "the enabled ones stop a Tab: {}", page.html);
+        assert_eq!(page.html.matches("aria-disabled=\"true\"").count(), 1, "{}", page.html);
+        assert!(page.html.contains("role=\"checkbox\""), "{}", page.html);
+        assert!(page.html.contains("aria-checked=\"true\""), "{}", page.html);
+        assert_eq!(page.html.matches("<button ").count(), 1, "{}", page.html);
+    }
+
+    /// The served page says what the mounted one says: a name on the
+    /// control and on the landmark, decoration hidden, a status live, an
+    /// opener collapsed, a page-drawn choice a radio.
+    #[test]
+    fn a_served_element_says_its_name_its_voice_and_whether_it_is_open() {
+        #[derive(Clone, Copy)]
+        struct Page;
+
+        impl Component for Page {
+            fn body(self) -> impl View {
+                crate::vstack!(
+                    button(text("×"), || {}).plain().accessibility_label("Close"),
+                    button(text("English"), || {}).plain().expanded(false),
+                    button(text("日本語"), || {}).plain().selected(true),
+                    text("✦").accessibility_hidden(),
+                    text("saved").accessibility_live(crate::accessibility::Live::Polite),
+                    text("gone wrong").accessibility_live(crate::accessibility::Live::Assertive),
+                    crate::vstack!(text("access")).element("nav").accessibility_label("Pages"),
+                )
+            }
+        }
+
+        let page = render(&Page, Size { width: 300.0, height: 300.0 });
+        for said in [
+            "aria-label=\"Close\"",
+            "aria-expanded=\"false\"",
+            "role=\"radio\"",
+            "aria-checked=\"true\"",
+            "aria-hidden=\"true\"",
+            "role=\"status\"",
+            "aria-live=\"polite\"",
+            "role=\"alert\"",
+            "aria-live=\"assertive\"",
+            "aria-label=\"Pages\"",
+        ] {
+            assert_eq!(page.html.matches(said).count(), 1, "{said}: {}", page.html);
+        }
+        assert!(page.html.contains("<nav "), "{}", page.html);
     }
 
     /// A link is an `<a href>`: the browser owns the navigation, and

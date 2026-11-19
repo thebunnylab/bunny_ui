@@ -255,6 +255,18 @@ impl Tree {
     }
 }
 
+/// How soon a region that changes by itself is read out — the two
+/// answers the platforms share. A refusal under a form, a "sent", a
+/// count that moved: nothing took the keyboard there, so nothing would
+/// say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Live {
+    /// Read when the reader is next idle: a status.
+    Polite,
+    /// Read now, over whatever is being said: an alert.
+    Assertive,
+}
+
 /// Semantic decorators used by the retained scene. They never affect layout.
 #[derive(Clone, Debug)]
 pub enum Semantics {
@@ -281,6 +293,11 @@ pub enum Semantics {
     Labeled,
     /// Excludes decorative descendants from assistive technology.
     Hidden,
+    /// What is below changes by itself and is read out when it does
+    /// (`.accessibility_live`). The element lowering says it on the
+    /// page; the native projection has no announcement to make of it
+    /// yet and passes it through.
+    Live(Live),
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +329,7 @@ impl Semantics {
         let start = start.min(nodes.len());
         match self {
             Self::Hidden => nodes.truncate(start),
+            Self::Live(_) => {}
             Self::Label(label) => {
                 if let [node] = &mut nodes[start..] {
                     node.label = label.get();

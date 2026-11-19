@@ -1,7 +1,8 @@
-//! Inflate — RFC 1951 by hand, the whole of it a PNG needs: stored,
-//! fixed and dynamic blocks, the 32K window, the adler check on the
-//! zlib wrapper. The framework's own codec walks the same road; this
-//! copy keeps the lane std-only.
+//! Inflate — RFC 1951 by hand: stored, fixed and dynamic blocks, the
+//! 32K window. Three wrappers: zlib with its adler check (a PNG), gzip
+//! with its CRC and length (a `.tar.gz`), and none (a zip entry). The
+//! framework's own codec walks the same road; this copy keeps the lane
+//! std-only.
 
 struct BitReader<'a> {
     bytes: &'a [u8],
@@ -99,7 +100,66 @@ pub fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
     if cmf & 0x0F != 8 || !(cmf * 256 + flg).is_multiple_of(31) || flg & 0x20 != 0 {
         return None;
     }
-    let deflate = &bytes[2..];
+    let (out, used) = inflate_stream(&bytes[2..])?;
+    // the adler tail seals the stream
+    let at = 2 + used;
+    if let Some(tail) = bytes.get(at..at + 4) {
+        let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        if adler32(&out) != want {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// A raw DEFLATE stream (RFC 1951) with no wrapper, as a zip entry holds
+/// it. `None` on any malformation.
+pub fn inflate(deflate: &[u8]) -> Option<Vec<u8>> {
+    inflate_stream(deflate).map(|(out, _)| out)
+}
+
+/// A gzip file (RFC 1952): every member, its CRC-32 and its length
+/// checked. `None` on any malformation.
+pub fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let member = bytes.get(at..)?;
+        // the magic, the method (deflate) and the flags
+        if member.len() < 18 || member[0] != 0x1f || member[1] != 0x8b || member[2] != 8 {
+            return None;
+        }
+        let flags = member[3];
+        let mut head = 10;
+        if flags & 0x04 != 0 {
+            let extra = u16::from_le_bytes([*member.get(head)?, *member.get(head + 1)?]) as usize;
+            head += 2 + extra;
+        }
+        for flag in [0x08, 0x10] {
+            // a file name, then a comment, each ending in NUL
+            if flags & flag != 0 {
+                head += member.get(head..)?.iter().position(|&byte| byte == 0)? + 1;
+            }
+        }
+        if flags & 0x02 != 0 {
+            head += 2;
+        }
+        let (data, used) = inflate_stream(member.get(head..)?)?;
+        let tail = member.get(head + used..head + used + 8)?;
+        let crc = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        let size = u32::from_le_bytes([tail[4], tail[5], tail[6], tail[7]]);
+        if crate::zip::crc32(&data) != crc || data.len() as u32 != size {
+            return None;
+        }
+        out.extend_from_slice(&data);
+        at += head + used + 8;
+    }
+    Some(out)
+}
+
+/// The raw DEFLATE stream at the start of `deflate`: what it holds, and
+/// how many bytes of `deflate` it took.
+fn inflate_stream(deflate: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut bits = BitReader::new(deflate);
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -197,15 +257,22 @@ pub fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
             break;
         }
     }
-    // the adler tail seals the stream
-    let at = 2 + bits.at;
-    if let Some(tail) = bytes.get(at..at + 4) {
-        let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
-        if super::png::adler32(&out) != want {
-            return None;
+    Some((out, bits.at))
+}
+
+/// Adler-32 (RFC 1950), what a zlib stream ends with.
+pub fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    // 5552 bytes fit before the sums can overflow a u32
+    for run in bytes.chunks(5552) {
+        for &byte in run {
+            a += u32::from(byte);
+            b += a;
         }
+        a %= 65521;
+        b %= 65521;
     }
-    Some(out)
+    (b << 16) | a
 }
 
 #[cfg(test)]
@@ -217,8 +284,8 @@ mod tests {
     fn the_lanes_own_stream_inflates() {
         let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog, ".repeat(40);
         let mut zlib = vec![0x78, 0x01];
-        zlib.extend(super::super::deflate::deflate(&text));
-        zlib.extend_from_slice(&super::super::png::adler32(&text).to_be_bytes());
+        zlib.extend(crate::deflate::deflate(&text));
+        zlib.extend_from_slice(&adler32(&text).to_be_bytes());
         assert_eq!(inflate_zlib(&zlib).as_deref(), Some(&text[..]));
         // a tail that lies is refused
         let last = zlib.len() - 1;
