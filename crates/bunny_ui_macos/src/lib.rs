@@ -145,7 +145,14 @@ fn present_live_blits(window: &ffi::WindowHandle, runtime: &Runtime, blits: Vec<
 /// very frame that presents it. `insist` is false only where the cursor is
 /// not the scene's to set — mid-resize, where the window's edge wears its
 /// resizer.
-fn point_cursor(runtime: &Runtime, insist: bool) {
+///
+/// Only the key window dresses the pointer. A window behind it repaints
+/// under the point it last saw the hand at, and dressing the cursor from
+/// there fought the window in front, frame after frame.
+fn point_cursor(runtime: &Runtime, window: usize, insist: bool) {
+    if ffi::key_window() != window {
+        return;
+    }
     let interaction = runtime.interaction();
     // a live divider drag keeps the resizer even while the pointer
     // runs ahead of the seam; hovering the grip announces it
@@ -201,8 +208,17 @@ fn point_cursor(runtime: &Runtime, insist: bool) {
         // the page sets its own cursor on every move: over it the
         // shell never insists, only answers anew — and a hand the scene
         // no longer holds is another window's to dress
-        ffi::wear_cursor(desired, insist && !over_host && interaction.pointer.is_some());
+        let held = insist && !over_host && interaction.pointer.is_some();
+        ffi::wear_cursor(window, desired, held);
     }
+}
+
+/// The window an answer is asked of: the one the event came from, else —
+/// a question AppKit asks outside any event, a beat every window shares —
+/// the one holding the keyboard. Not the oldest window: it answered for
+/// every other, and ⌘W in a second window closed a tab of the first.
+fn addressee(source: usize, key: impl FnOnce() -> usize) -> usize {
+    if source == 0 { key() } else { source }
 }
 
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
@@ -1006,10 +1022,10 @@ impl AppInner {
         self.slots.borrow().clone()
     }
 
-    /// The window the event now being answered belongs to.
+    /// The window the event now being answered belongs to ([`addressee`]).
     fn addressed(&self) -> Option<Rc<Slot>> {
-        let source = ffi::event_source();
-        self.live().into_iter().find(|slot| source == 0 || slot.window == source)
+        let window = addressee(ffi::event_source(), ffi::key_window);
+        self.live().into_iter().find(|slot| slot.window == window)
     }
 
     /// Drops the slot of a window that has gone.
@@ -2140,7 +2156,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             // Prepare only after the window has presented its frame.
             webview::prepare_pending_html();
-        point_cursor(runtime, !resizing());
+        point_cursor(runtime, window_id, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
@@ -2580,7 +2596,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // only ever fires on the parent) — and the decorations
             // freeze: they animate for eyes that are on them
             runtime.set_loops_paused(true);
-            if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
+            // and the hand is no longer this window's: the point it was
+            // last seen at lies under the window in front, and so does the
+            // hover it lit
+            let left = runtime.pointer_exited();
+            if !handler_lifecycle.is_hidden() && (runtime.dismiss_all_overlays() || left) {
                 blit(runtime, root, trace::Origin::Input);
             } else {
                 sync_frame_driver(runtime, &handler_pacer, window_id);
@@ -2614,7 +2634,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             // the cursor cannot wait for the beat, nor for a picture: the
             // answer is the last layout's, which is what is on screen
-            point_cursor(runtime, true);
+            point_cursor(runtime, window_id, true);
         }
         AppEvent::RightMouseDown { x, y, modifiers } => {
             // the box under the pointer hears it first; what it ignores
@@ -2641,7 +2661,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if runtime.button_released(x, y, button) {
                 blit(runtime, root, trace::Origin::Input);
             }
-            point_cursor(runtime, true);
+            point_cursor(runtime, window_id, true);
         }
         AppEvent::MouseDown { x, y, clicks, modifiers } => {
             if runtime.pointer_clicked(x, y, clicks, modifiers) {
@@ -2657,7 +2677,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if runtime.pointer_exited() {
                 soon(runtime, root, trace::Origin::Input);
             }
-            point_cursor(runtime, true);
+            point_cursor(runtime, window_id, true);
         }
         AppEvent::Wheel { x, y, dx, dy, modifiers, phase } => {
             // offset is engine state: repaint without render (zero bodies).
@@ -2847,7 +2867,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     handler_pacer.claim(Instant::now());
                 }
                 // a spring or a fling moved content under a still hand
-                point_cursor(runtime, !handler_resizing());
+                point_cursor(runtime, window_id, !handler_resizing());
             } else if moved.islands {
                 // mid-resize the boxes are in the drawable, not on
                 // layers — a step repaints the scene like any other
@@ -2883,7 +2903,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display, trace::Origin::Frame);
-                    point_cursor(runtime, !handler_resizing());
+                    point_cursor(runtime, window_id, !handler_resizing());
                 }
             }
             sync_frame_driver(runtime, &handler_pacer, window_id);
@@ -2989,6 +3009,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_outside_any_event_is_asked_of_the_key_window() {
+        assert_eq!(addressee(0, || 7), 7);
+        assert_eq!(addressee(3, || 7), 3, "an event's own window answers it");
+    }
 
     #[test]
     fn recovery_does_not_split_regular_display_beats() {

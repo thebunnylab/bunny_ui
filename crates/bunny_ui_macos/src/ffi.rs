@@ -576,6 +576,28 @@ pub fn event_source() -> usize {
     SOURCE.with(Cell::get)
 }
 
+/// The window holding the keyboard — the owner of a dialog or a panel
+/// that holds it — or `0` while the app holds none.
+pub fn key_window() -> usize {
+    let key = unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_id(app, sel("keyWindow"))
+    };
+    owning_window(key)
+}
+
+/// Runs `ask` as an event of the window `view` draws in. AppKit asks the
+/// gates from the view itself, outside any event the shell dispatched; with
+/// no window named, the shell answered from its oldest one, and ⌘W pressed
+/// in a second window closed a tab of the first.
+fn from_view<T>(view: Id, ask: impl FnOnce() -> T) -> T {
+    let window = owning_window(unsafe { msg_id(view, sel("window")) });
+    let previous = SOURCE.replace(window);
+    let answer = ask();
+    SOURCE.set(previous);
+    answer
+}
+
 /// The window an event ANSWERS to: itself, or — for a dialog or a
 /// popover panel, which hang off the window they belong to — the window
 /// they hang from. A dialog's key change is its parent scene's news.
@@ -715,11 +737,7 @@ fn hold(queue: &mut std::collections::VecDeque<(usize, AppEvent)>, source: usize
 /// key before AppKit sends it, and the tracking area is armed
 /// `ActiveInKeyWindow`, so a hover in a background window never fires.
 pub fn dispatch(event: AppEvent) {
-    let key = unsafe {
-        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
-        msg_id(app, sel("keyWindow"))
-    };
-    dispatch_from(owning_window(key), event);
+    dispatch_from(key_window(), event);
 }
 
 /// A knock from another thread lands here, on the main thread, as one
@@ -782,6 +800,13 @@ thread_local! {
 /// regions once, at boot.
 pub fn set_drag_gate(gate: Box<dyn Fn(f64, f64) -> bool>) {
     DRAG_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Does a press at `(x, y)` move the window `view` draws in?
+fn drags(view: Id, x: f64, y: f64) -> bool {
+    from_view(view, || {
+        DRAG_GATE.with(|gate| gate.borrow().as_ref().is_some_and(|gate| gate(x, y)))
+    })
 }
 
 /// The lifecycle of a native file drag.
@@ -961,8 +986,7 @@ extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     // the scene's own title bar: a press on a drag region (with no
     // interactive target above it) moves the WINDOW — the event goes
     // to AppKit whole and never reaches the runtime
-    let dragging =
-        DRAG_GATE.with(|gate| gate.borrow().as_ref().is_some_and(|gate| gate(x, y)));
+    let dragging = drags(this, x, y);
     if dragging {
         unsafe {
             let window = msg_id(this, sel("window"));
@@ -1097,8 +1121,12 @@ pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
     KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
 
-fn gate_consumed(stroke: &KeyStroke) -> bool {
-    KEY_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(stroke)))
+/// Offers `stroke` to the gate of the window `view` draws in: the keymap
+/// that hears a key is the one of the window it was pressed in.
+fn gate_consumed(view: Id, stroke: &KeyStroke) -> bool {
+    from_view(view, || {
+        KEY_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(stroke)))
+    })
 }
 
 // MARK: - IME sync (the input system's SYNCHRONOUS questions)
@@ -1140,6 +1168,20 @@ pub fn set_ime_resolvers(
 ) {
     IME_INDEX.with(|slot| *slot.borrow_mut() = Some(index_at));
     IME_RECT.with(|slot| *slot.borrow_mut() = Some(rect_for));
+}
+
+/// The index at `(x, y)` in the field of the window `view` draws in.
+fn ime_index(view: Id, x: f64, y: f64) -> Option<u64> {
+    from_view(view, || {
+        IME_INDEX.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
+    })
+}
+
+/// The screen rect at `index` in the field of the window `view` draws in.
+fn ime_rect(view: Id, index: u64) -> Option<CGRect> {
+    from_view(view, || {
+        IME_RECT.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(index)))
+    })
 }
 
 /// The shell syncs the focused-field mirror (`None` = no focus).
@@ -1271,7 +1313,7 @@ extern "C" fn bunny_valid_attributes(_this: Id, _sel: Sel) -> Id {
 /// Where the candidate window lands: the rect at the REQUESTED index
 /// (the composition's start, usually) — the caret rect as fallback.
 extern "C" fn bunny_first_rect(
-    _this: Id,
+    this: Id,
     _sel: Sel,
     range: NSRange,
     actual: *mut NSRange,
@@ -1280,11 +1322,7 @@ extern "C" fn bunny_first_rect(
         unsafe { *actual = NSRange { location: range.location, length: 0 } };
     }
     let ranged = (range.location != NS_NOT_FOUND)
-        .then(|| {
-            IME_RECT.with(|slot| {
-                slot.borrow().as_ref().and_then(|resolve| resolve(range.location))
-            })
-        })
+        .then(|| ime_rect(this, range.location))
         .flatten();
     ranged
         .or_else(|| ime_mirror().map(|ime| ime.caret_screen))
@@ -1311,9 +1349,7 @@ extern "C" fn bunny_character_index(this: Id, _sel: Sel, point: CGPoint) -> u64 
             .with(|origins| origins.borrow().get(&(this as usize)).copied())
             .unwrap_or((0.0, 0.0));
         let (x, y) = (in_window.x + dx, bounds.size.height - in_window.y + dy);
-        IME_INDEX
-            .with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
-            .unwrap_or(NS_NOT_FOUND)
+        ime_index(this, x, y).unwrap_or(NS_NOT_FOUND)
     }
 }
 
@@ -1466,7 +1502,7 @@ extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> Ob
             typed: typed_character(event, flags),
             chars_bare: bare_characters(event),
         };
-        if gate_consumed(&stroke) {
+        if gate_consumed(this, &stroke) {
             tell_press(event, false, true);
             return ObjcBool::YES; // the keymap dispatched — the event dies here
         }
@@ -1503,7 +1539,7 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
         if !composing && fullscreen_ops::escape_presentation(this, code) {
             return;
         }
-        if !composing && first_offer(event) && gate_consumed(&stroke) {
+        if !composing && first_offer(event) && gate_consumed(this, &stroke) {
             tell_press(event, false, true);
             return; // the keymap dispatched — the event dies here
         }
@@ -3722,9 +3758,10 @@ thread_local! {
     /// puts back when AppKit asks. `None` = YIELDED: over a platform view
     /// with only the default to say, the page owns the hand.
     static WANTED: Cell<Option<Cursor>> = const { Cell::new(Some(Cursor::Arrow)) };
-    /// The last answer insisted: the scene holds the pointer and the
-    /// cursor is its own to set — what the run loop's keeper reads.
-    static INSIST: Cell<bool> = const { Cell::new(false) };
+    /// The window whose answer was last insisted, `0` while none: the
+    /// scene holds the pointer and the cursor is its own to set — what the
+    /// run loop's keeper reads.
+    static INSIST: Cell<usize> = const { Cell::new(0) };
 }
 
 static REGISTER_SEGMENT: Once = Once::new();
@@ -4010,12 +4047,13 @@ fn host_child_container(key: &str) -> Option<Id> {
 /// platform view, whose page sets its own on every move (insisting there
 /// would flicker against its hand over a link). An app in the background
 /// insists on nothing: a file dragged in from another app wears the drag's
-/// badge.
-pub(crate) fn wear_cursor(cursor: Cursor, insist: bool) {
+/// badge. `window` is the one dressing the pointer: the keeper keeps its
+/// answer only while it holds the keyboard.
+pub(crate) fn wear_cursor(window: usize, cursor: Cursor, insist: bool) {
     let active = unsafe {
         msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")).get()
     };
-    INSIST.with(|kept| kept.set(insist));
+    INSIST.with(|kept| kept.set(if insist { window } else { 0 }));
     wear(cursor, insist && active);
 }
 
@@ -4038,7 +4076,7 @@ fn wear(cursor: Cursor, insist: bool) {
 /// shell wants — even the arrow — asserts again.
 pub(crate) fn yield_cursor() {
     WANTED.with(|wanted| wanted.set(None));
-    INSIST.with(|kept| kept.set(false));
+    INSIST.with(|kept| kept.set(0));
 }
 
 /// `kCFRunLoopBeforeWaiting`: the loop ran what it had and is about to sleep.
@@ -4076,23 +4114,27 @@ pub fn install_cursor_keeper() {
 }
 
 extern "C" fn keep_cursor(_observer: Id, _activity: u64, _info: *mut c_void) {
-    keep(|| unsafe {
+    let active = || unsafe {
         msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")).get()
-    });
+    };
+    keep(active, key_window);
 }
 
 /// The keeper's look: the answer the scene last insisted on, put back when
 /// the cursor AppKit holds is another — only while the app is the active
-/// one, asked last, because the loop turns far more often than the scene
-/// insists.
-fn keep(active: impl FnOnce() -> bool) {
-    if !INSIST.with(Cell::get) {
+/// one and the window that insisted holds the keyboard, asked last, because
+/// the loop turns far more often than the scene insists. A window behind
+/// the key one keeps nothing: it would put back what it last saw under a
+/// hand that has moved on to the window in front.
+fn keep(active: impl FnOnce() -> bool, key: impl FnOnce() -> usize) {
+    let insisting = INSIST.with(Cell::get);
+    if insisting == 0 {
         return;
     }
     let Some(cursor) = WANTED.with(Cell::get) else {
         return;
     };
-    if !active() {
+    if !active() || key() != insisting {
         return;
     }
     unsafe {
@@ -5531,20 +5573,22 @@ mod tests {
 
         // between two turns of the shell — a popover ordered in under the
         // still hand — the run loop's keeper puts the scene's cursor back
-        INSIST.with(|kept| kept.set(true));
+        INSIST.with(|kept| kept.set(1));
         wear(Cursor::Pointing, true);
         appkit_sets(arrow);
-        keep(|| true);
+        keep(|| true, || 1);
         assert_eq!(current(), hand, "the keeper puts the hand back");
         appkit_sets(arrow);
-        keep(|| false);
+        keep(|| false, || 1);
         assert_eq!(current(), arrow, "an app in the background keeps nothing");
-        INSIST.with(|kept| kept.set(false));
-        keep(|| true);
+        keep(|| true, || 2);
+        assert_eq!(current(), arrow, "nor a window behind the key one");
+        INSIST.with(|kept| kept.set(0));
+        keep(|| true, || 1);
         assert_eq!(current(), arrow, "nor does a scene that let the hand go");
-        INSIST.with(|kept| kept.set(true));
+        INSIST.with(|kept| kept.set(1));
         yield_cursor();
-        keep(|| true);
+        keep(|| true, || 1);
         assert_eq!(current(), arrow, "and a yielded scene leaves the page its own");
     }
 
