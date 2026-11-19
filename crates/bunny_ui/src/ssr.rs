@@ -1015,7 +1015,11 @@ fn rule_text(
             px(gap),
         );
     }
-    if let Some(columns) = layout.columns {
+    if matches!(kind, CreateKind::Layers) && layout.base().is_some() {
+        base.insert("grid-template-columns", "auto 0fr".into());
+        base.insert("grid-template-rows", "auto 0fr".into());
+    }
+    if let Some(columns) = layout.columns() {
         base.insert(
             "grid-template-columns",
             format!("repeat({columns},minmax(0,1fr))"),
@@ -1115,7 +1119,20 @@ fn rule_text(
     // layers: one grid cell, and every child IN it — auto-placement
     // would give each layer a row of its own
     if matches!(kind, CreateKind::Layers) {
-        states.push(format!("{selector}>*{{grid-area:1/1}}"));
+        match layout.base() {
+            // an overlay's cell: the base in the first track, every layer
+            // across it and a second track that is always empty, so no
+            // layer grows the cell
+            Some(base) => {
+                let at = match base {
+                    crate::dom::LayerBase::First => "first-child",
+                    crate::dom::LayerBase::Last => "last-child",
+                };
+                states.push(format!("{selector}>*{{grid-area:1/1/3/3}}"));
+                states.push(format!("{selector}>:{at}{{grid-area:1/1}}"));
+            }
+            None => states.push(format!("{selector}>*{{grid-area:1/1}}")),
+        }
     }
     if let Some((side, gap)) = overlap {
         states.push(format!("{selector}>*+*{{{side}:{}}}", px(gap)));
@@ -2038,6 +2055,33 @@ mod tests {
         let page = render(&Badge, Size { width: 200.0, height: 200.0 });
         assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
         assert!(page.css.contains("justify-items:center"), "{}", page.css);
+    }
+
+    /// An overlay's cell is its base's size, as `SwiftUI`'s is: a layer
+    /// larger than the box — a glow behind a button, a ribbon past a
+    /// card's edge — overflows it and never grows it. The base takes
+    /// the first track and every layer spans an empty second one,
+    /// which takes no room.
+    #[test]
+    fn an_overlay_never_grows_its_base() {
+        #[derive(Clone, Copy)]
+        struct Card;
+
+        impl Component for Card {
+            fn body(self) -> impl View {
+                crate::vstack!(
+                    rectangle().frame(100.0, 40.0).overlay(UnitPoint::TOP_LEADING, rectangle().frame(140.0, 10.0)),
+                    text("glow").background(UnitPoint::CENTER, rectangle().frame(200.0, 200.0)),
+                )
+            }
+        }
+
+        let page = render(&Card, Size { width: 300.0, height: 300.0 });
+        assert_eq!(page.css.matches("grid-template-columns:auto 0fr").count(), 2, "{}", page.css);
+        assert!(page.css.contains("grid-template-rows:auto 0fr"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1/3/3}"), "{}", page.css);
+        assert!(page.css.contains(">:first-child{grid-area:1/1}"), "the overlay's base comes first: {}", page.css);
+        assert!(page.css.contains(">:last-child{grid-area:1/1}"), "the background's, last: {}", page.css);
     }
 
     /// A served picture has no bytes yet: it wears the identity the

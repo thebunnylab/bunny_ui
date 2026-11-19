@@ -606,6 +606,14 @@ function lookRules(selector, kind, flags, style, layout, face) {
       ? `${kind === 10 ? "margin-inline-start" : "margin-block-start"}:${layout.gap}px`
       : null;
   if (layout.gap !== null && overlap === null) decl[kind === 16 ? "column-gap" : "gap"] = `${layout.gap}px`;
+  // an overlay's cell: the base in the first track, every layer across
+  // it and a second track that is always empty, so no layer grows the
+  // cell
+  const base = kind === 11 ? (flags & 2 ? "first-child" : flags & 4 ? "last-child" : null) : null;
+  if (base !== null) {
+    decl["grid-template-columns"] = "auto 0fr";
+    decl["grid-template-rows"] = "auto 0fr";
+  }
   if (layout.columns !== null) {
     decl["grid-template-columns"] = `repeat(${layout.columns},minmax(0,1fr))`;
     decl["align-items"] = "center";
@@ -769,7 +777,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
   const rules = [`${selector}{${body}}`];
   // layers: one grid cell, and every child IN it — auto-placement
   // would give each layer a row of its own
-  if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
+  if (base !== null) rules.push(`${selector}>*{grid-area:1/1/3/3}`, `${selector}>:${base}{grid-area:1/1}`);
+  else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
   if (overlap !== null) rules.push(`${selector}>*+*{${overlap}}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns

@@ -9541,9 +9541,10 @@ impl LayoutNode {
                 // a layer that FILLED the measured box follows the real
                 // frame instead: the parent may have handed the base
                 // more room than it asked for, and a rule that crossed
-                // the box must still cross it
+                // the box must still cross it. A layer larger than the
+                // box keeps its size and overflows it, as SwiftUI's does
                 let stretch = |axis_layer: Px, axis_base: Px, axis_frame: Px| {
-                    if axis_layer >= axis_base { axis_frame } else { axis_layer }
+                    if (axis_layer - axis_base).abs() <= 1e-9 { axis_frame } else { axis_layer }
                 };
                 let size = Size {
                     width: stretch(layer_size.width, base_size.width, frame.size.width),

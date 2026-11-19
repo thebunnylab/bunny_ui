@@ -112,3 +112,23 @@ fn the_page_writes_a_negative_spacing_as_margins() {
     let column = bunny_ui::ssr::render(&vstack!(text("a"), text("b")).spacing(-4.0), SIZE);
     assert!(column.css.contains(">*+*{margin-block-start:-4px}"), "{}", column.css);
 }
+
+/// A layer larger than its base keeps its size and overflows the box,
+/// as `SwiftUI`'s does — a banner bled past the page's edges, a glow
+/// behind a button — and the box keeps its own.
+#[test]
+fn a_layer_larger_than_its_base_keeps_its_size() {
+    let runtime = Runtime::new();
+    let view = vstack!(
+        rectangle()
+            .frame(100.0, 40.0)
+            .overlay(UnitPoint::TOP_LEADING, rectangle().frame(140.0, 10.0).test_id("band"))
+            .test_id("box"),
+        rectangle().frame(100.0, 40.0).overlay(UnitPoint::CENTER, rectangle().frame(140.0, 60.0).test_id("glow")),
+    )
+    .alignment(HorizontalAlignment::Leading);
+    runtime.display_frame(&view, SIZE);
+    assert_eq!(frame(&runtime, "box").size, Size { width: 100.0, height: 40.0 });
+    assert_eq!(frame(&runtime, "band"), Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 140.0, height: 10.0 } });
+    assert_eq!(frame(&runtime, "glow"), Rect { origin: Point { x: -20.0, y: 30.0 }, size: Size { width: 140.0, height: 60.0 } });
+}

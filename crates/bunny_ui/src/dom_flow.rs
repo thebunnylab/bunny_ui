@@ -654,7 +654,7 @@ impl Walk<'_> {
                 container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 let columns = (*columns).clamp(1, u16::MAX as usize);
-                layout.columns = Some(columns as u16);
+                layout.cells = Some(crate::dom::Cells::Columns(columns as u16));
                 layout.gap = Some(*spacing as f32);
                 layout.wrap = Some(*row_spacing as f32);
                 layout.align = Some(align_both(*align, *vertical));
@@ -1468,6 +1468,12 @@ impl Walk<'_> {
                 let mut under = Vec::new();
                 self.lower_into(child, &mut under);
                 Self::stamp_cell(child, &mut under);
+                // the base alone sizes the cell: a layer larger than the
+                // box overflows it, as SwiftUI's does
+                if let [_] = under.as_slice() {
+                    let base = if *behind { crate::dom::LayerBase::Last } else { crate::dom::LayerBase::First };
+                    cell.layout.as_mut().expect("flow node").cells = Some(crate::dom::Cells::Base(base));
+                }
                 if *behind {
                     cell.children.extend(over);
                     cell.children.extend(under);
@@ -2198,7 +2204,7 @@ mod tests {
         assert_eq!(grid.style.interactive.as_deref(), Some("grid-action"));
         let layout = grid.layout.as_ref().unwrap();
         assert_eq!(
-            (layout.columns, layout.gap, layout.wrap),
+            (layout.columns(), layout.gap, layout.wrap),
             (Some(2), Some(4.0), Some(8.0))
         );
         let span = |index: usize| {

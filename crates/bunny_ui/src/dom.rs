@@ -1231,8 +1231,9 @@ impl DomCapture {
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
     pub gap: Option<f32>,
-    /// Equal-width grid track count; absent on other containers.
-    pub columns: Option<u16>,
+    /// How the container cuts its cells: a grid's equal-width tracks,
+    /// or an overlay's one cell, sized by its base alone.
+    pub cells: Option<Cells>,
     /// The containing block for children taken out of flow.
     pub relative: bool,
     /// Rare child placement parameters, shared when a scene is retained.
@@ -1279,6 +1280,56 @@ pub struct DomLayout {
     /// `unicode-bidi`, so the browser orders its rows, aligns its
     /// `start` and shapes its words the island's way. `None` inherits.
     pub direction: Option<motor::state::LayoutDirection>,
+}
+
+impl DomLayout {
+    /// A grid's equal-width track count.
+    #[must_use]
+    pub const fn columns(&self) -> Option<u16> {
+        match self.cells {
+            Some(Cells::Columns(columns)) => Some(columns),
+            _ => None,
+        }
+    }
+
+    /// The child an overlay's cell takes its size from.
+    #[must_use]
+    pub const fn base(&self) -> Option<LayerBase> {
+        match self.cells {
+            Some(Cells::Base(base)) => Some(base),
+            _ => None,
+        }
+    }
+}
+
+/// How a container cuts its cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cells {
+    /// A grid's equal-width tracks.
+    Columns(u16),
+    /// An overlay's one cell, sized by its base alone: the layers are
+    /// laid over the base's box and never grow it, as `SwiftUI`'s
+    /// `.overlay` and `.background` are. A pile, which every child
+    /// sizes, names none.
+    Base(LayerBase),
+}
+
+/// Which child of an overlay's cell is its base: the first under an
+/// overlay, the last under a background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerBase {
+    First,
+    Last,
+}
+
+impl LayerBase {
+    /// The rule's flag bits: 2 the first child, 4 the last.
+    const fn flag(self) -> u8 {
+        match self {
+            Self::First => 2,
+            Self::Last => 4,
+        }
+    }
 }
 
 /// A box the browser sticks: `position: sticky; top` — the browser holds
@@ -1545,6 +1596,8 @@ pub enum DomPatch {
         kind: CreateKind,
         /// Bit 0: the element lays itself out — a table-family tag,
         /// whose display is the browser's own and takes no flex line.
+        /// Bits 1 and 2: an overlay's cell, sized by its first child
+        /// alone, or by its last ([`Cells::Base`]).
         flags: u8,
         style: Box<DomLook>,
         layout: Box<DomLayout>,
@@ -2410,7 +2463,7 @@ fn look_hash(node: &DomNode) -> u64 {
         Some(layout) => {
             1u8.hash(&mut hasher);
             hash_f32(layout.gap, &mut hasher);
-            if let Some(columns) = layout.columns {
+            if let Some(columns) = layout.columns() {
                 columns.hash(&mut hasher);
             }
             layout.align.hash(&mut hasher);
@@ -2432,6 +2485,9 @@ fn look_hash(node: &DomNode) -> u64 {
             // of its own hashes as it always did
             if let Some(direction) = layout.direction {
                 direction.is_rtl().hash(&mut hasher);
+            }
+            if let Some(base) = layout.base() {
+                (0x6261_7365u32, base.flag()).hash(&mut hasher);
             }
         }
         None => 0u8.hash(&mut hasher),
@@ -2544,7 +2600,7 @@ fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<
     patches.push(DomPatch::DefineRule {
         rule,
         kind,
-        flags: u8::from(lays_itself_out(&node.hints)),
+        flags: u8::from(lays_itself_out(&node.hints)) | node.layout.as_ref().and_then(DomLayout::base).map_or(0, LayerBase::flag),
         style: Box::new(look_style(&node.style)),
         layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
         text: match &node.kind {
@@ -3040,7 +3096,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
 /// reads of a layout.)
 fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
     a.gap == b.gap
-        && a.columns == b.columns
+        && a.cells == b.cells
         && a.align == b.align
         && a.padding == b.padding
         && a.grow == b.grow
@@ -4455,6 +4511,10 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// its turn (`.rotation_effect`, f32 degrees clockwise + f32 x + f32 y of
 /// the pivot as a fraction of the box, CSS `rotate` about a
 /// `transform-origin`) — the first mask's thirty-two bits were all taken.
+/// A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// its first child alone, or by its last — `grid-template: auto 0fr /
+/// auto 0fr` with the base in the first track and every layer across
+/// both, so a layer larger than its base never grows the cell.
 pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
@@ -5218,7 +5278,7 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     if layout.direction.is_some() {
         mask |= 1 << 13;
     }
-    if layout.columns.is_some() {
+    if layout.columns().is_some() {
         mask |= 1 << 14;
     }
     if layout.relative {
@@ -5258,7 +5318,7 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     if let Some(direction) = layout.direction {
         out.push(direction.is_rtl() as u8);
     }
-    if let Some(columns) = layout.columns {
+    if let Some(columns) = layout.columns() {
         push_u16(out, columns);
     }
 }
@@ -9366,7 +9426,7 @@ mod tests {
         encode_layout(
             &mut bytes,
             &DomLayout {
-                columns: Some(3),
+                cells: Some(Cells::Columns(3)),
                 gap: Some(4.0),
                 wrap: Some(8.0),
                 align: Some(1),
