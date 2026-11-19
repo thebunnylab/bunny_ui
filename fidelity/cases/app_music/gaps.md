@@ -1,0 +1,27 @@
+# Import gaps — apps/music.html
+
+67 views named; 46 gaps in 21 features.
+
+| feature | count | where | what |
+|---|---|---|---|
+| `box-shadow: offset` | 8 | div.vinyl-12, span.play-30, section.card-10, img.art-13, … | 0.0 10.0 |
+| `font-variant` | 7 | span-24, span-25, span.d-47, span.d-53, … | tabular-nums |
+| `gradient: stops` | 6 | div.vinyl-12, span.play-30, div.fill-21, div.scrim-2, … | 3 stops drawn as the first and the last |
+| `box-shadow: layers` | 4 | div.knob-22, section.card-10, span.play-30, img.art-13 | rgba(0, 0, 0, 0.3) 0px -2px 3px 0px inset, rgb(255, 255, 255) 0px 1px 1px 0px inset, rgba(0, 0, 0, 0.4) 0px 2px 6px 0px |
+| `clip-path` | 3 | span.play-30::after, span.spk-35, span.heart-18::after | polygon(0px 0px, 100% 50%, 0px 100%) |
+| `conic-gradient` | 2 | div.vinyl-12, div.vinyl-12::before | not drawn |
+| `transform: rotate` | 2 | div.vinyl-12, span.chev-4 | 12.0deg |
+| `background-blend-mode` | 1 | div.vinyl-12 | normal, normal, normal |
+| `background-image: layers` | 1 | div.vinyl-12 | 3 layers |
+| `border-style: one side` | 1 | i-33 | dashed |
+| `box-shadow: inset` | 1 | div.knob-22 | rgba(0, 0, 0, 0.3) 0px -2px 3px 0px inset, rgb(255, 255, 255) 0px 1px 1px 0px inset, rgba(0, 0, 0, 0.4) 0px 2px 6px 0px |
+| `filter: drop-shadow` | 1 | span.play-30::after | drop-shadow(rgba(0, 0, 0, 0.4) 0px 1px 2px) |
+| `filter: saturate` | 1 | img.bg-1 | saturate(1.4) |
+| `input type=range` | 1 | input-36 | drawn as an empty box |
+| `mix-blend-mode` | 1 | span.lyric-52 | overlay |
+| `position: negative offset` | 1 | img.bg-1 | -60.0 -60.0 |
+| `radial-gradient: shape` | 1 | span.play-30 | circle at 30% 25% |
+| `repeating-radial-gradient` | 1 | div.vinyl-12 | drawn once |
+| `text-shadow` | 1 | span.title-16 | rgba(0, 0, 0, 0.55) 0px 2px 10px, rgba(255, 255, 255, 0.4) 0px 0px 1px |
+| `transform: translate` | 1 | span.cbtn-29::after | -3.0 0.0 |
+| `width: %` | 1 | div.fill-21 | 38% written as 121.98 points |

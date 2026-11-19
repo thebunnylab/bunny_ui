@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=1024, height=640" />
+    <title>Kanban</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 14px "Fid Sans"; color: #1d1d1f; width: 1024px; height: 640px; overflow: hidden; background: #eef0f5; }
+
+      :root { --muted: #6b7280; --line: #e2e5ec; --accent: #2563eb; --col: 262px; }
+
+      .top { height: 56px; background: #fff; border-bottom: 1px solid var(--line); display: flex; align-items: center; padding: 0 20px; gap: 16px; }
+      /* breadcrumb with rotated-border chevron separators */
+      .crumbs { display: flex; align-items: center; font-size: 13px; color: var(--muted); }
+      .crumbs span { display: flex; align-items: center; }
+      .crumbs span + span::before { content: ""; width: 6px; height: 6px; margin: 0 12px 0 10px; border-top: 1.5px solid #9ca3af; border-right: 1.5px solid #9ca3af; transform: rotate(45deg); }
+      .crumbs span:last-child { color: #1d1d1f; font-weight: 800; font-size: 15px; }
+      .spacer { flex: 1; }
+      .stack { display: flex; align-items: center; }
+      /* overlapping avatars via negative margin + white ring */
+      .stack img, .stack .more { width: 30px; height: 30px; border-radius: 50%; border: 2px solid #fff; object-fit: cover; margin-left: -9px; background: #fff; }
+      .stack > :first-child { margin-left: 0; }
+      .stack .more { background: #e0e7ff; color: #3730a3; font-size: 11px; font-weight: 800; display: flex; align-items: center; justify-content: center; }
+      .share { height: 30px; padding: 0 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; font: 700 12px "Fid Sans"; }
+      .filter { height: 30px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font: 12px "Fid Sans"; color: #374151; }
+
+      /* horizontal scroll-snap board */
+      .board { display: flex; gap: 14px; padding: 16px 20px; height: calc(640px - 56px); overflow-x: auto; scroll-snap-type: x mandatory; align-items: flex-start; }
+      .column { flex: none; width: var(--col); scroll-snap-align: start; background: #e4e7ef; border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 10px; max-height: 100%; overflow: hidden; }
+      .chead { display: flex; align-items: center; gap: 8px; padding: 2px 4px; }
+      .chead h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #374151; }
+      .count { font-size: 11px; font-weight: 800; background: #fff; color: #4b5563; border-radius: 10px; padding: 1px 8px; font-variant-numeric: tabular-nums; }
+      .menu { margin-left: auto; font-size: 16px; line-height: 10px; letter-spacing: 1px; color: var(--muted); padding-bottom: 6px; }
+
+      .card { --prio: #9ca3af; background: #fff; border-radius: 10px; border-left: 4px solid var(--prio); padding: 10px 11px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08), 0 0 0 1px rgba(16, 24, 40, 0.03); display: flex; flex-direction: column; gap: 7px; }
+      .p-high { --prio: #ef4444; } .p-med { --prio: #f59e0b; } .p-low { --prio: #22c55e; } .p-info { --prio: #3b82f6; }
+      /* flex-wrap tag pills */
+      .tags { display: flex; flex-wrap: wrap; gap: 4px; }
+      .tag { font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 8px; background: #e0e7ff; color: #3730a3; }
+      .tag.g { background: #dcfce7; color: #166534; } .tag.o { background: #ffedd5; color: #9a3412; } .tag.p { background: #fce7f3; color: #9d174d; }
+      .card h4 { margin: 0; font-size: 13.5px; line-height: 1.25; letter-spacing: -0.1px; }
+      /* multi-line clamp */
+      .desc { margin: 0; font-size: 12px; line-height: 1.35; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+      progress { appearance: none; -webkit-appearance: none; width: 100%; height: 5px; border: 0; border-radius: 3px; background: #e5e7eb; overflow: hidden; }
+      progress::-webkit-progress-bar { background: #e5e7eb; }
+      progress::-webkit-progress-value { background: #22c55e; border-radius: 3px; }
+      .foot { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--muted); }
+      /* CSS calendar icon */
+      .cal { display: inline-flex; align-items: center; gap: 4px; }
+      .cal::before { content: ""; width: 11px; height: 10px; border: 1.5px solid currentColor; border-top-width: 3px; border-radius: 2px; }
+      .cmt { display: inline-flex; align-items: center; gap: 4px; }
+      .cmt::before { content: ""; width: 11px; height: 8px; border: 1.5px solid currentColor; border-radius: 3px; margin-bottom: 2px; }
+      .foot .stack { margin-left: auto; }
+      .foot .stack img { width: 20px; height: 20px; margin-left: -6px; border-width: 1.5px; }
+      .foot .stack > :first-child { margin-left: 0; }
+      .late { color: #b91c1c; font-weight: 700; }
+
+      /* sibling spacing tweaks */
+      .column .card:first-of-type { margin-top: 0; }
+      .column .card:last-of-type { margin-bottom: 2px; }
+      .tags .tag:first-child { margin-left: 0; }
+      .tags .tag:last-child { margin-right: 0; }
+
+      /* image card with object-fit cover */
+      .imgcard { padding: 0 0 10px; overflow: hidden; gap: 7px; }
+      .imgcard img { width: 100%; height: 70px; object-fit: cover; display: block; }
+      .imgcard > :not(img) { margin: 0 11px; }
+      .imgcard .tags { margin-top: 2px; }
+
+      /* dragged card: rotate + translate, offset shadow, z-index */
+      .dragging { position: relative; z-index: 10; transform: rotate(-3deg) translate(6px, -4px); box-shadow: 10px 14px 0 rgba(37, 99, 235, 0.14), 6px 18px 28px rgba(17, 24, 39, 0.28); }
+      /* dashed drop placeholder */
+      .ph { height: 62px; border: 2px dashed #93a3c4; border-radius: 10px; background: rgba(255, 255, 255, 0.4); display: flex; align-items: center; justify-content: center; font-size: 11px; color: #64748b; }
+
+      /* add-card button with plus from ::before / ::after bars */
+      .add { position: relative; height: 32px; border: 0; background: transparent; border-radius: 8px; color: #4b5563; font: 700 12px "Fid Sans"; text-align: left; padding-left: 30px; }
+      .add::before, .add::after { content: ""; position: absolute; background: #4b5563; left: 11px; top: 15px; width: 10px; height: 2px; border-radius: 1px; }
+      .add::after { left: 15px; top: 11px; width: 2px; height: 10px; }
+
+      /* archived column: striped repeating-linear-gradient */
+      .archived { background: repeating-linear-gradient(45deg, #e9ebf1 0 10px, #dfe2ea 10px 20px); }
+      .archived .card { filter: grayscale(1); opacity: 0.6; }
+      .archived h3 { color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <nav class="crumbs"><span>Projects</span><span>Mobile app</span><span>Sprint 14 board</span></nav>
+      <div class="spacer"></div>
+      <div class="stack">
+        <img src="/assets/avatar.png" alt="" /><img src="/assets/photo1.png" alt="" /><img src="/assets/photo2.png" alt="" /><span class="more">+3</span>
+      </div>
+      <button class="filter">Filter</button>
+      <button class="share">Share</button>
+    </header>
+
+    <div class="board">
+      <section class="column">
+        <div class="chead"><h3>Backlog</h3><span class="count">3</span><span class="menu">•••</span></div>
+        <article class="card p-high">
+          <div class="tags"><span class="tag">Auth</span><span class="tag o">Bug</span><span class="tag p">Customer</span><span class="tag g">Mobile</span></div>
+          <h4>Session expires during onboarding</h4>
+          <p class="desc">Users who leave the app for longer than five minutes are logged out in the middle of the second step and lose every field they entered so far.</p>
+          <progress max="100" value="25"></progress>
+          <div class="foot"><span class="cal late">Nov 21</span><span class="cmt">4</span><div class="stack"><img src="/assets/avatar.png" alt="" /><img src="/assets/photo3.png" alt="" /></div></div>
+        </article>
+        <article class="card p-low">
+          <div class="tags"><span class="tag g">Design</span></div>
+          <h4>Empty states for the inbox</h4>
+          <p class="desc">Illustrations and copy for the three empty inbox states.</p>
+          <div class="foot"><span class="cal">Dec 02</span><span class="cmt">1</span><div class="stack"><img src="/assets/photo2.png" alt="" /></div></div>
+        </article>
+        <article class="card imgcard p-info">
+          <img src="/assets/photo1.png" alt="" />
+          <div class="tags"><span class="tag">Marketing</span><span class="tag p">Launch</span></div>
+          <h4>Store listing screenshots</h4>
+          <div class="foot"><span class="cal">Dec 10</span><span class="cmt">7</span></div>
+        </article>
+        <button class="add">Add card</button>
+      </section>
+
+      <section class="column">
+        <div class="chead"><h3>In progress</h3><span class="count">3</span><span class="menu">•••</span></div>
+        <article class="card p-med">
+          <div class="tags"><span class="tag">API</span><span class="tag o">Perf</span></div>
+          <h4>Paginate the activity feed</h4>
+          <p class="desc">Switch from offset to cursor pagination so the feed stays fast for accounts with more than ten thousand events and avoids duplicate rows.</p>
+          <progress max="100" value="60"></progress>
+          <div class="foot"><span class="cal">Nov 28</span><span class="cmt">9</span><div class="stack"><img src="/assets/avatar.png" alt="" /><img src="/assets/photo1.png" alt="" /><img src="/assets/photo2.png" alt="" /></div></div>
+        </article>
+        <div class="ph">Drop here</div>
+        <article class="card p-high dragging">
+          <div class="tags"><span class="tag p">Payments</span></div>
+          <h4>Retry failed card charges</h4>
+          <p class="desc">Add exponential backoff and surface a clear message after the third attempt fails.</p>
+          <progress max="100" value="40"></progress>
+          <div class="foot"><span class="cal">Nov 25</span><span class="cmt">2</span><div class="stack"><img src="/assets/photo3.png" alt="" /></div></div>
+        </article>
+        <button class="add">Add card</button>
+      </section>
+
+      <section class="column">
+        <div class="chead"><h3>Review</h3><span class="count">2</span><span class="menu">•••</span></div>
+        <article class="card p-low">
+          <div class="tags"><span class="tag g">Docs</span><span class="tag">Dev</span></div>
+          <h4>Update contribution guide</h4>
+          <p class="desc">Rewrite the setup steps, add the new lint rules, and describe the release branch flow.</p>
+          <progress max="100" value="90"></progress>
+          <div class="foot"><span class="cal">Nov 22</span><span class="cmt">3</span><div class="stack"><img src="/assets/photo1.png" alt="" /><img src="/assets/avatar.png" alt="" /></div></div>
+        </article>
+        <article class="card p-info">
+          <div class="tags"><span class="tag">UI</span></div>
+          <h4>Dark mode contrast pass</h4>
+          <p class="desc">Check every text and surface token pair against the contrast thresholds.</p>
+          <progress max="100" value="75"></progress>
+          <div class="foot"><span class="cal">Nov 30</span><span class="cmt">5</span><div class="stack"><img src="/assets/photo2.png" alt="" /></div></div>
+        </article>
+        <button class="add">Add card</button>
+      </section>
+
+      <section class="column archived">
+        <div class="chead"><h3>Archived</h3><span class="count">2</span><span class="menu">•••</span></div>
+        <article class="card p-med">
+          <div class="tags"><span class="tag">Legacy</span></div>
+          <h4>Remove v1 search endpoint</h4>
+          <p class="desc">Deprecated since March and no longer called by any released client version.</p>
+          <div class="foot"><span class="cal">Oct 04</span><span class="cmt">12</span></div>
+        </article>
+        <article class="card p-low">
+          <div class="tags"><span class="tag g">Ops</span></div>
+          <h4>Migrate logging provider</h4>
+          <p class="desc">All services now ship logs to the new provider.</p>
+          <div class="foot"><span class="cal">Sep 18</span><span class="cmt">6</span></div>
+        </article>
+      </section>
+    </div>
+  </body>
+</html>

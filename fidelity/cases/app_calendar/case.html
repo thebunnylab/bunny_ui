@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en"><head>
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=820, height=640">
+    <title>Calendar</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 15px "Fid Sans"; color: #1d1d1f; width: 820px; height: 640px; overflow: hidden; background: #fff; }
+      button, input { font: inherit; color: inherit; }
+      .app { display: grid; grid-template-columns: 176px 1fr 184px; grid-template-rows: 48px 1fr; width: 820px; height: 640px; }
+
+      /* header: month title, chevrons from borders, segmented control, gradient button */
+      header { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-bottom: 1px solid #e5e5ea; background: #fbfbfd; }
+      header h1 { font-size: 18px; margin: 0; letter-spacing: -.3px; width: 150px; }
+      header h1 span { color: #8e8e93; font-weight: 400; }
+      .nav { display: flex; gap: 2px; }
+      .nav i { width: 24px; height: 24px; border-radius: 6px; background: #f2f2f7; position: relative; }
+      .nav i::before { content: ""; position: absolute; top: 8px; width: 7px; height: 7px; border-left: 2px solid #3a3a3c; border-bottom: 2px solid #3a3a3c; }
+      .nav i.p::before { left: 10px; transform: rotate(45deg); }
+      .nav i.n::before { left: 6px; transform: rotate(-135deg); }
+      .today-btn { border: 1px solid #d1d1d6; background: #fff; border-radius: 6px; padding: 3px 10px; font-size: 12px; }
+      .sp { flex: 1; }
+      .seg { display: inline-flex; background: #e9e9ee; border-radius: 7px; padding: 2px; }
+      .seg span { padding: 3px 12px; font-size: 12px; border-radius: 5px; color: #48484a; }
+      .seg span.on { background: #fff; font-weight: 700; color: #000; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+      .new { border: 0; color: #fff; font-weight: 700; font-size: 12px; padding: 6px 14px 6px 12px; border-radius: 8px; background: linear-gradient(135deg, #5ac8fa, #3478f6 55%, #5856d6); box-shadow: 0 2px 6px rgba(52,120,246,.4); display: flex; align-items: center; gap: 6px; }
+      .new::before { content: ""; width: 10px; height: 10px; background: linear-gradient(#fff,#fff) center / 10px 2px no-repeat, linear-gradient(#fff,#fff) center / 2px 10px no-repeat; }
+
+      /* sidebar */
+      aside { padding: 10px 12px; border-right: 1px solid #e5e5ea; background: #f7f7fa; overflow: hidden; }
+      .mh { display: flex; justify-content: space-between; font-weight: 700; font-size: 12px; margin-bottom: 5px; }
+      .mh em { font-style: normal; color: #3478f6; font-size: 10px; }
+      .mini { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 9px; }
+      .mini .w { color: #8e8e93; font-weight: 700; padding-bottom: 2px; }
+      /* aspect-ratio keeps every mini day square */
+      .mini .m { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+      .mini .m.out { opacity: .35; }
+      .mini .m.t { background: #ff3b30; color: #fff; font-weight: 700; }
+      aside h3 { font-size: 10px; letter-spacing: .8px; text-transform: uppercase; color: #8e8e93; margin: 12px 0 5px; }
+      /* coloured checkboxes: appearance none + ::after tick */
+      .cal { display: flex; align-items: center; gap: 7px; font-size: 12px; height: 22px; }
+      .cal input { appearance: none; width: 13px; height: 13px; margin: 0; border-radius: 4px; border: 1.5px solid var(--c); background: var(--c); position: relative; flex: none; }
+      .cal input:not(:checked) { background: transparent; }
+      .cal input:checked::after { content: ""; position: absolute; left: 3px; top: 0; width: 3px; height: 7px; border-right: 1.5px solid #fff; border-bottom: 1.5px solid #fff; transform: rotate(40deg); }
+      .cal small { margin-left: auto; color: #aeaeb2; font-size: 10px; }
+      .tag { display: flex; flex-wrap: wrap; gap: 4px; }
+      .tag span { font-size: 10px; padding: 2px 7px; border-radius: 9px; background: color-mix(in srgb, var(--c) 16%, white); color: color-mix(in srgb, var(--c) 70%, black); }
+
+      /* main month view */
+      main { position: relative; padding: 0; min-width: 0; }
+      .wkhead, .body { display: grid; grid-template-columns: 16px 1fr; }
+      .days { display: grid; grid-template-columns: repeat(7, 1fr); }
+      /* uppercase weekday headers */
+      .days.hd span { text-transform: uppercase; font-size: 9px; letter-spacing: .7px; font-weight: 700; color: #8e8e93; text-align: center; line-height: 22px; border-bottom: 1px solid #e5e5ea; }
+      /* week numbers: rotate(-90deg) in a fixed box */
+      .wn { display: grid; grid-template-rows: repeat(6, 90px); border-right: 1px solid #e5e5ea; }
+      .wn span { position: relative; }
+      .wn em { position: absolute; left: 50%; top: 50%; width: 40px; margin: -6px 0 0 -20px; text-align: center; font-style: normal; font-size: 9px; color: #aeaeb2; letter-spacing: .5px; transform: rotate(-90deg); }
+      .grid { position: relative; grid-template-rows: repeat(6, 90px); }
+      .d { border-right: 1px solid #ececf0; border-bottom: 1px solid #ececf0; padding: 3px 3px 0; overflow: hidden; min-width: 0; }
+      /* weekend columns tinted via nth-child */
+      .d:nth-child(7n+6), .d:nth-child(7n) { background: #f8f8fb; }
+      .d.out { opacity: .35; }
+      .d b { display: inline-block; min-width: 17px; height: 17px; line-height: 17px; text-align: center; font-size: 10px; font-weight: 400; margin-bottom: 2px; position: relative; z-index: 1; }
+      /* today: filled circle behind the number */
+      .d b.today { background: #ff3b30; color: #fff; border-radius: 50%; font-weight: 700; }
+      /* chips pushed below the multi-day lanes using :nth-child ranges */
+      .chips { display: flex; flex-direction: column; gap: 2px; }
+      .d:nth-child(n+15):nth-child(-n+28) .chips { margin-top: 36px; }
+      .d:nth-child(n+8):nth-child(-n+14) .chips { margin-top: 18px; }
+      .d:nth-child(n+29):nth-child(-n+35) .chips { margin-top: 18px; }
+      .chip { display: block; height: 15px; line-height: 15px; font-size: 9px; padding: 0 3px 0 4px; border-radius: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; --c: #3478f6;
+        /* translucent tint with color-mix + solid left border */
+        background: color-mix(in srgb, var(--c) 18%, white); border-left: 3px solid var(--c); color: color-mix(in srgb, var(--c) 65%, black); }
+      .chip i { display: none; }
+      .chip.dot { background: none; border-left: 0; padding-left: 0; color: #3a3a3c; }
+      .chip.dot i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--c); margin-right: 3px; vertical-align: 0; }
+      .more { text-decoration: underline; font-size: 9px; color: #3478f6; font-weight: 700; margin-top: 1px; display: block; }
+      /* overlay layer: multi-day bars span columns with grid-column */
+      .layer { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(7, 1fr); grid-template-rows: repeat(6, 90px); pointer-events: none; }
+      .bar { margin: 21px 2px 0; height: 16px; line-height: 16px; padding: 0 6px; font-size: 9px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; align-self: start; border-radius: 4px; border-left: 3px solid var(--c); background: color-mix(in srgb, var(--c) 22%, white); color: color-mix(in srgb, var(--c) 60%, black); }
+      .bar.l2 { margin-top: 39px; }
+      .bar.cont { border-top-right-radius: 0; border-bottom-right-radius: 0; margin-right: 0; }
+
+      /* right day panel with timeline */
+      .panel { border-left: 1px solid #e5e5ea; padding: 10px 10px 0 8px; overflow: hidden; background: #fff; }
+      .ph { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+      .ph b { font-size: 13px; }
+      .ph span { font-size: 10px; color: #8e8e93; }
+      /* hour lines every 40px with repeating-linear-gradient */
+      .tl { position: relative; height: 400px; margin-left: 26px; background: repeating-linear-gradient(to bottom, #e5e5ea 0 1px, transparent 1px 40px); }
+      .hr { position: absolute; left: -26px; top: calc(var(--h) * 40px - 6px); font-size: 9px; color: #aeaeb2; width: 22px; text-align: right; }
+      /* absolutely positioned events, top/height from calc() */
+      .ev { position: absolute; left: 3px; width: calc(100% - 6px); top: calc((var(--s) - 8) * 40px + 1px); height: calc(var(--d) * 40px - 2px); border-radius: 5px; padding: 2px 5px; font-size: 9px; line-height: 1.25; overflow: hidden; border-left: 3px solid var(--c); background: color-mix(in srgb, var(--c) 20%, white); color: color-mix(in srgb, var(--c) 60%, black); }
+      .ev b { display: block; font-size: 10px; }
+      /* two overlapping events side by side at width 50% */
+      .ev.half { width: calc(50% - 4px); }
+      .ev.half.r { left: calc(50% + 1px); }
+      /* current-time line with a dot via ::before */
+      .now { position: absolute; left: -4px; right: 0; top: calc(40px * 2 + 40px * 2 / 3); height: 2px; background: #ff3b30; z-index: 3; }
+      .now::before { content: ""; position: absolute; left: -2px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: #ff3b30; }
+      .up { margin-top: 10px; border-radius: 8px; overflow: hidden; border: 1px solid #e5e5ea; font-size: 10px; }
+      .up img { display: block; width: 100%; aspect-ratio: 16 / 5; object-fit: cover; }
+      .up div { padding: 4px 7px; color: #6e6e73; }
+      .up b { color: #1d1d1f; font-size: 11px; }
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <div class="app" data-fid="div.app-1">
+      <header data-fid="header-2">
+        <h1 data-fid="h1-3">November <span>2026</span></h1>
+        <div class="nav" data-fid="div.nav-5"><i class="p" data-fid="i.p-6"></i><i class="n" data-fid="i.n-7"></i></div>
+        <button class="today-btn" data-fid="button.today-btn-8">Today</button>
+        <div class="sp" data-fid="div.sp-9"></div>
+        <div class="seg" data-fid="div.seg-10"><span data-fid="span-11">Day</span><span data-fid="span-12">Week</span><span class="on" data-fid="span.on-13">Month</span></div>
+        <button class="new" data-fid="button.new-14">New event</button>
+      </header>
+
+      <aside data-fid="aside-15">
+        <div class="mh" data-fid="div.mh-16"><span data-fid="span-17">November 2026</span><em data-fid="em-18">Go to today</em></div>
+        <div class="mini" data-fid="div.mini-19">
+          <span class="w" data-fid="span.w-20">M</span><span class="w" data-fid="span.w-21">T</span><span class="w" data-fid="span.w-22">W</span><span class="w" data-fid="span.w-23">T</span><span class="w" data-fid="span.w-24">F</span><span class="w" data-fid="span.w-25">S</span><span class="w" data-fid="span.w-26">S</span>
+          <span class="m out" data-fid="span.m-27">26</span><span class="m out" data-fid="span.m-28">27</span><span class="m out" data-fid="span.m-29">28</span><span class="m out" data-fid="span.m-30">29</span><span class="m out" data-fid="span.m-31">30</span><span class="m out" data-fid="span.m-32">31</span><span class="m" data-fid="span.m-33">1</span><span class="m" data-fid="span.m-34">2</span><span class="m" data-fid="span.m-35">3</span><span class="m" data-fid="span.m-36">4</span><span class="m" data-fid="span.m-37">5</span><span class="m" data-fid="span.m-38">6</span><span class="m" data-fid="span.m-39">7</span><span class="m" data-fid="span.m-40">8</span><span class="m" data-fid="span.m-41">9</span><span class="m" data-fid="span.m-42">10</span><span class="m" data-fid="span.m-43">11</span><span class="m" data-fid="span.m-44">12</span><span class="m" data-fid="span.m-45">13</span><span class="m" data-fid="span.m-46">14</span><span class="m" data-fid="span.m-47">15</span><span class="m" data-fid="span.m-48">16</span><span class="m" data-fid="span.m-49">17</span><span class="m" data-fid="span.m-50">18</span><span class="m t" data-fid="span.m-51">19</span><span class="m" data-fid="span.m-52">20</span><span class="m" data-fid="span.m-53">21</span><span class="m" data-fid="span.m-54">22</span><span class="m" data-fid="span.m-55">23</span><span class="m" data-fid="span.m-56">24</span><span class="m" data-fid="span.m-57">25</span><span class="m" data-fid="span.m-58">26</span><span class="m" data-fid="span.m-59">27</span><span class="m" data-fid="span.m-60">28</span><span class="m" data-fid="span.m-61">29</span><span class="m" data-fid="span.m-62">30</span><span class="m out" data-fid="span.m-63">1</span><span class="m out" data-fid="span.m-64">2</span><span class="m out" data-fid="span.m-65">3</span><span class="m out" data-fid="span.m-66">4</span><span class="m out" data-fid="span.m-67">5</span><span class="m out" data-fid="span.m-68">6</span>
+        </div>
+        <h3 data-fid="h3-69">My calendars</h3>
+        <label class="cal" style="--c:#3478f6" data-fid="label.cal-70"><input type="checkbox" checked="" data-fid="input-71">Work<small data-fid="small-72">12</small></label>
+        <label class="cal" style="--c:#34c759" data-fid="label.cal-73"><input type="checkbox" checked="" data-fid="input-74">Health<small data-fid="small-75">5</small></label>
+        <label class="cal" style="--c:#af52de" data-fid="label.cal-76"><input type="checkbox" checked="" data-fid="input-77">Social<small data-fid="small-78">4</small></label>
+        <label class="cal" style="--c:#ff9500" data-fid="label.cal-79"><input type="checkbox" checked="" data-fid="input-80">Errands<small data-fid="small-81">3</small></label>
+        <label class="cal" style="--c:#ff3b30" data-fid="label.cal-82"><input type="checkbox" data-fid="input-83">Deadlines<small data-fid="small-84">2</small></label>
+        <h3 data-fid="h3-85">Labels</h3>
+        <div class="tag" data-fid="div.tag-86"><span style="--c:#3478f6" data-fid="span-87">focus</span><span style="--c:#34c759" data-fid="span-88">travel</span><span style="--c:#af52de" data-fid="span-89">family</span><span style="--c:#ff9500" data-fid="span-90">billing</span></div>
+      </aside>
+
+      <main data-fid="main-91">
+        <div class="wkhead" data-fid="div.wkhead-92">
+          <span data-fid="span-93"></span>
+          <div class="days hd" data-fid="div.days-94"><span data-fid="span-95">Mon</span><span data-fid="span-96">Tue</span><span data-fid="span-97">Wed</span><span data-fid="span-98">Thu</span><span data-fid="span-99">Fri</span><span data-fid="span-100">Sat</span><span data-fid="span-101">Sun</span></div>
+        </div>
+        <div class="body" data-fid="div.body-102">
+          <div class="wn" data-fid="div.wn-103">
+            <span data-fid="span-104"><em data-fid="em-105">W44</em></span>
+            <span data-fid="span-106"><em data-fid="em-107">W45</em></span>
+            <span data-fid="span-108"><em data-fid="em-109">W46</em></span>
+            <span data-fid="span-110"><em data-fid="em-111">W47</em></span>
+            <span data-fid="span-112"><em data-fid="em-113">W48</em></span>
+            <span data-fid="span-114"><em data-fid="em-115">W49</em></span>
+          </div>
+          <div class="days grid" data-fid="div.days-116">
+          <div class="d out" data-fid="div.d-117"><b data-fid="b-118">26</b></div>
+          <div class="d out" data-fid="div.d-119"><b data-fid="b-120">27</b></div>
+          <div class="d out" data-fid="div.d-121"><b data-fid="b-122">28</b></div>
+          <div class="d out" data-fid="div.d-123"><b data-fid="b-124">29</b><div class="chips" data-fid="div.chips-125"><span class="chip dot" style="--c:#ff9500" data-fid="span.chip-126"><i data-fid="i-127"></i>Wrap</span></div></div>
+          <div class="d out" data-fid="div.d-128"><b data-fid="b-129">30</b></div>
+          <div class="d out" data-fid="div.d-130"><b data-fid="b-131">31</b></div>
+          <div class="d" data-fid="div.d-132"><b data-fid="b-133">1</b></div>
+          <div class="d" data-fid="div.d-134"><b data-fid="b-135">2</b></div>
+          <div class="d" data-fid="div.d-136"><b data-fid="b-137">3</b><div class="chips" data-fid="div.chips-138"><span class="chip dot" style="--c:#3478f6" data-fid="span.chip-139"><i data-fid="i-140"></i>Standup</span></div></div>
+          <div class="d" data-fid="div.d-141"><b data-fid="b-142">4</b></div>
+          <div class="d" data-fid="div.d-143"><b data-fid="b-144">5</b><div class="chips" data-fid="div.chips-145"><span class="chip" style="--c:#34c759" data-fid="span.chip-146"><i></i>Dentist</span><span class="chip dot" style="--c:#ff9500" data-fid="span.chip-147"><i data-fid="i-148"></i>Call</span></div></div>
+          <div class="d" data-fid="div.d-149"><b data-fid="b-150">6</b></div>
+          <div class="d" data-fid="div.d-151"><b data-fid="b-152">7</b></div>
+          <div class="d" data-fid="div.d-153"><b data-fid="b-154">8</b></div>
+          <div class="d" data-fid="div.d-155"><b data-fid="b-156">9</b></div>
+          <div class="d" data-fid="div.d-157"><b data-fid="b-158">10</b></div>
+          <div class="d" data-fid="div.d-159"><b data-fid="b-160">11</b></div>
+          <div class="d" data-fid="div.d-161"><b data-fid="b-162">12</b><div class="chips" data-fid="div.chips-163"><span class="chip" style="--c:#af52de" data-fid="span.chip-164"><i></i>Lunch</span></div></div>
+          <div class="d" data-fid="div.d-165"><b data-fid="b-166">13</b><div class="chips" data-fid="div.chips-167"><span class="chip dot" style="--c:#34c759" data-fid="span.chip-168"><i data-fid="i-169"></i>Run</span></div></div>
+          <div class="d" data-fid="div.d-170"><b data-fid="b-171">14</b></div>
+          <div class="d" data-fid="div.d-172"><b data-fid="b-173">15</b></div>
+          <div class="d" data-fid="div.d-174"><b data-fid="b-175">16</b></div>
+          <div class="d" data-fid="div.d-176"><b data-fid="b-177">17</b><div class="chips" data-fid="div.chips-178"><span class="chip" style="--c:#3478f6" data-fid="span.chip-179"><i></i>Review</span><span class="chip dot" style="--c:#ff9500" data-fid="span.chip-180"><i data-fid="i-181"></i>Pay rent</span></div></div>
+          <div class="d" data-fid="div.d-182"><b data-fid="b-183">18</b></div>
+          <div class="d" data-fid="div.d-184"><b class="today" data-fid="b.today-185">19</b><div class="chips" data-fid="div.chips-186"><span class="chip" style="--c:#ff3b30" data-fid="span.chip-187"><i></i>Demo day</span><span class="chip dot" style="--c:#3478f6" data-fid="span.chip-188"><i data-fid="i-189"></i>1:1 Priya</span></div></div>
+          <div class="d" data-fid="div.d-190"><b data-fid="b-191">20</b></div>
+          <div class="d" data-fid="div.d-192"><b data-fid="b-193">21</b><div class="chips" data-fid="div.chips-194"><span class="chip dot" style="--c:#34c759" data-fid="span.chip-195"><i data-fid="i-196"></i>Yoga</span></div></div>
+          <div class="d" data-fid="div.d-197"><b data-fid="b-198">22</b></div>
+          <div class="d" data-fid="div.d-199"><b data-fid="b-200">23</b></div>
+          <div class="d" data-fid="div.d-201"><b data-fid="b-202">24</b><div class="chips" data-fid="div.chips-203"><span class="chip" style="--c:#af52de" data-fid="span.chip-204"><i></i>Book club</span><span class="chip dot" style="--c:#3478f6" data-fid="span.chip-205"><i data-fid="i-206"></i>Sync</span><a class="more" data-fid="a.more-207">+2 more</a></div></div>
+          <div class="d" data-fid="div.d-208"><b data-fid="b-209">25</b><div class="chips" data-fid="div.chips-210"><span class="chip dot" style="--c:#34c759" data-fid="span.chip-211"><i data-fid="i-212"></i>Gym</span></div></div>
+          <div class="d" data-fid="div.d-213"><b data-fid="b-214">26</b></div>
+          <div class="d" data-fid="div.d-215"><b data-fid="b-216">27</b></div>
+          <div class="d" data-fid="div.d-217"><b data-fid="b-218">28</b><div class="chips" data-fid="div.chips-219"><span class="chip" style="--c:#af52de" data-fid="span.chip-220"><i></i>Dinner</span></div></div>
+          <div class="d" data-fid="div.d-221"><b data-fid="b-222">29</b></div>
+          <div class="d" data-fid="div.d-223"><b data-fid="b-224">30</b><div class="chips" data-fid="div.chips-225"><span class="chip" style="--c:#ff3b30" data-fid="span.chip-226"><i></i>Deadline</span></div></div>
+          <div class="d out" data-fid="div.d-227"><b data-fid="b-228">1</b><div class="chips" data-fid="div.chips-229"><span class="chip dot" style="--c:#3478f6" data-fid="span.chip-230"><i data-fid="i-231"></i>Kickoff</span></div></div>
+          <div class="d out" data-fid="div.d-232"><b data-fid="b-233">2</b></div>
+          <div class="d out" data-fid="div.d-234"><b data-fid="b-235">3</b></div>
+          <div class="d out" data-fid="div.d-236"><b data-fid="b-237">4</b></div>
+          <div class="d out" data-fid="div.d-238"><b data-fid="b-239">5</b></div>
+          <div class="d out" data-fid="div.d-240"><b data-fid="b-241">6</b></div>
+            <div class="layer" data-fid="div.layer-242">
+              <div class="bar" style="--c:#3478f6; grid-row:3; grid-column: 2 / span 4" data-fid="div.bar-243">Design sprint</div>
+              <div class="bar l2" style="--c:#af52de; grid-row:3; grid-column: 4 / span 3" data-fid="div.bar-244">Conference — Lisbon</div>
+              <div class="bar" style="--c:#34c759; grid-row:4; grid-column: 1 / span 5" data-fid="div.bar-245">Launch week</div>
+              <div class="bar l2" style="--c:#ff9500; grid-row:4; grid-column: 5 / span 3" data-fid="div.bar-246">Trip: Porto</div>
+              <div class="bar" style="--c:#ff3b30; grid-row:5; grid-column: 3 / span 3" data-fid="div.bar-247">Holiday break</div>
+              <div class="bar" style="--c:#5856d6; grid-row:2; grid-column: 3 / span 2" data-fid="div.bar-248">Workshop</div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <section class="panel" data-fid="section.panel-249">
+        <div class="ph" data-fid="div.ph-250"><b data-fid="b-251">Thu, Nov 19</b><span data-fid="span-252">5 events</span></div>
+        <div class="tl" data-fid="div.tl-253">
+          <span class="hr" style="--h:0" data-fid="span.hr-254">8 am</span><span class="hr" style="--h:1" data-fid="span.hr-255">9</span><span class="hr" style="--h:2" data-fid="span.hr-256">10</span><span class="hr" style="--h:3" data-fid="span.hr-257">11</span><span class="hr" style="--h:4" data-fid="span.hr-258">12 pm</span><span class="hr" style="--h:5" data-fid="span.hr-259">1</span><span class="hr" style="--h:6" data-fid="span.hr-260">2</span><span class="hr" style="--h:7" data-fid="span.hr-261">3</span><span class="hr" style="--h:8" data-fid="span.hr-262">4</span><span class="hr" style="--h:9" data-fid="span.hr-263">5</span>
+          <div class="ev" style="--c:#34c759; --s:9; --d:.5" data-fid="div.ev-264"><b data-fid="b-265">Standup</b></div>
+          <div class="ev half" style="--c:#3478f6; --s:10; --d:1.5" data-fid="div.ev-266"><b data-fid="b-267">Design review</b>Room 4</div>
+          <div class="ev half r" style="--c:#af52de; --s:10.5; --d:1" data-fid="div.ev-268"><b data-fid="b-269">1:1 Priya</b>Video</div>
+          <div class="ev" style="--c:#ff9500; --s:12; --d:1" data-fid="div.ev-270"><b data-fid="b-271">Lunch</b>Cafe Nova</div>
+          <div class="ev" style="--c:#ff3b30; --s:14; --d:2" data-fid="div.ev-272"><b data-fid="b-273">Demo day</b>Main stage</div>
+          <div class="now" data-fid="div.now-274"></div>
+        </div>
+        <div class="up" data-fid="div.up-275"><img src="/assets/cover.png" alt="" data-fid="img-276"><div data-fid="div-277"><b>Up next: Design review</b><br data-fid="br-279">in 20 min • Room 4</div></div>
+      </section>
+    </div>
+  
+
+</body></html>
