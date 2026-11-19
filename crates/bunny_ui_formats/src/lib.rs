@@ -9,6 +9,7 @@
 
 pub mod base64;
 pub mod deflate;
+pub mod ed25519;
 pub mod inflate;
 pub mod random;
 pub mod sha;

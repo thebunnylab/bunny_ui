@@ -29,7 +29,7 @@ pub fn encode(bytes: &[u8]) -> String {
 #[must_use]
 pub fn decode(text: &str) -> Option<Vec<u8>> {
     let text = text.as_bytes();
-    if text.len() % 4 != 0 {
+    if !text.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
