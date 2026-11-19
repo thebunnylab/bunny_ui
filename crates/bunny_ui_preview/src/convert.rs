@@ -355,6 +355,7 @@ pub fn font(spec: &FontSpec, strings: &mut Strings) -> wire::Font {
         },
         family: spec.family.name().map(|name| strings.intern(&name)),
         tracking: spec.tracking,
+        monospaced_digits: spec.monospaced_digits,
     }
 }
 
@@ -377,7 +378,7 @@ pub fn font_spec(font: &wire::Font, strings: &[String]) -> Result<FontSpec, Miss
         },
         family,
         tracking: font.tracking,
-        monospaced_digits: false,
+        monospaced_digits: font.monospaced_digits,
     })
 }
 

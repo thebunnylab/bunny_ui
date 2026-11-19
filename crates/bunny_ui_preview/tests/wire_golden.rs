@@ -35,7 +35,7 @@ fn traits() -> Traits {
 
 /// One of every draw, in a frame with every other field set.
 fn frame() -> Frame {
-    let font = Font { size: 13.0, weight: Weight::Semibold, design: Design::Mono, slant: Slant::Italic, family: Some(1), tracking: 0.5 };
+    let font = Font { size: 13.0, weight: Weight::Semibold, design: Design::Mono, slant: Slant::Italic, family: Some(1), tracking: 0.5, monospaced_digits: false };
     Frame {
         preview: String::from("home"),
         variant: 1,
@@ -321,6 +321,26 @@ fn a_picture_between_pixels_rides_a_tag_of_its_own() {
     assert_eq!(moved, vec![(6, 9)]);
     let mut reader = Reader::new();
     reader.feed(&between);
+    assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(true))), "and it decodes to itself");
+}
+
+#[test]
+fn a_line_of_tabular_figures_rides_a_tag_of_its_own() {
+    // the golden frame's one line, its figures one advance each
+    let with = |monospaced_digits: bool| {
+        let mut framed = frame();
+        for command in &mut framed.commands {
+            if let Draw::TextLine { font, .. } = command {
+                font.monospaced_digits = monospaced_digits;
+            }
+        }
+        Message::ToIde(ToIde::Frame(framed))
+    };
+    let (plain, tabular) = (encode(&with(false)), encode(&with(true)));
+    let moved: Vec<(u8, u8)> = plain.iter().zip(&tabular).filter(|(a, b)| a != b).map(|(a, b)| (*a, *b)).collect();
+    assert_eq!(moved, vec![(5, 13)]);
+    let mut reader = Reader::new();
+    reader.feed(&tabular);
     assert_eq!(reader.pull().unwrap(), Some(Received::Message(with(true))), "and it decodes to itself");
 }
 

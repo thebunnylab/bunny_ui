@@ -34,6 +34,8 @@
 //! with colors between its ends grew the gradients the same way
 //! (`GradientPaint` and `Gradient` tags 2 and 3, their stops after the
 //! two-color bytes): a two-color ramp keeps tags 0 and 1 and its bytes.
+//! A line whose figures take one advance each grew the draws once more
+//! (`Draw` tag 13, the `TextLine` bytes): any other line keeps tag 5.
 
 use std::fmt;
 
@@ -313,6 +315,9 @@ pub struct Font {
     pub slant: Slant,
     pub family: Option<u32>,
     pub tracking: f64,
+    /// The figures take one advance each. It rides the draw's tag, not
+    /// the font's bytes.
+    pub monospaced_digits: bool,
 }
 
 /// An image, by the key of its resource, with the fades and flips the
@@ -1430,6 +1435,7 @@ impl Wire for Font {
             slant: Slant::get(c)?,
             family: c.option(|c| c.u32())?,
             tracking: c.f64()?,
+            monospaced_digits: false,
         })
     }
 }
@@ -1487,7 +1493,7 @@ impl Wire for Draw {
                 corners.put(out);
             }
             Draw::TextLine { origin, text, range, color, font } => {
-                out.u8(5);
+                out.u8(if font.monospaced_digits { 13 } else { 5 });
                 origin.put(out);
                 out.u32(*text);
                 out.u32(range.0);
@@ -1521,12 +1527,12 @@ impl Wire for Draw {
             2 => Draw::Backdrop { rect: Rect::get(c)?, glass: Glass::get(c)?, corners: Corners::get(c)? },
             3 => Draw::Shadow { rect: Rect::get(c)?, radius: c.f64()?, color: Color::get(c)?, corners: Corners::get(c)? },
             4 => Draw::StrokeRect { rect: Rect::get(c)?, color: Color::get(c)?, width: c.f64()?, corners: Corners::get(c)? },
-            5 => Draw::TextLine {
+            tag @ (5 | 13) => Draw::TextLine {
                 origin: Point::get(c)?,
                 text: c.u32()?,
                 range: (c.u32()?, c.u32()?),
                 color: Color::get(c)?,
-                font: Font::get(c)?,
+                font: Font { monospaced_digits: tag == 13, ..Font::get(c)? },
             },
             6 => Draw::Image { rect: Rect::get(c)?, image: ImageRef::get(c)?, subpixel: false },
             7 => Draw::PushClip { rect: Rect::get(c)?, corners: Corners::get(c)? },
