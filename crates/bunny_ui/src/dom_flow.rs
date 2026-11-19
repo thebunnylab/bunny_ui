@@ -1136,6 +1136,7 @@ impl Walk<'_> {
                 self.direction = outer_direction;
                 Self::stamp_fill(child, &mut boxed.children);
                 Self::inherit_stretch(boxed);
+                Self::inherit_offer(boxed);
             }
             LayoutNode::Text { content, highlights, truncation, .. } => {
                 // a text that reads for itself carries its binding into
@@ -2025,6 +2026,23 @@ impl Walk<'_> {
     /// A hungry interior keeps its hunger through a pure wrapper —
     /// the stretch has to reach the flex line that can actually feed
     /// it, or the wrapper sizes to its content and starves the child.
+    /// A box around a picture that takes its offer — its clip, its
+    /// corners, its border — is laid out as the picture: it takes the
+    /// offer and stretches across, or the picture's own stretch stops at
+    /// the box and the box keeps the picture's natural width.
+    fn inherit_offer(container: &mut DomNode) {
+        let takes_offer = |node: &DomNode| {
+            node.layout.as_ref().is_some_and(|layout| layout.fill && (matches!(node.kind, DomKind::Image(_)) || layout.stretch))
+        };
+        if let [only] = container.children.as_slice()
+            && takes_offer(only)
+            && let Some(layout) = container.layout.as_mut()
+        {
+            layout.fill = true;
+            layout.stretch = true;
+        }
+    }
+
     fn inherit_stretch(container: &mut DomNode) {
         if container
             .children
