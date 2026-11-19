@@ -30,6 +30,9 @@ pub struct Options {
     pub site_root: PathBuf,
     /// The page's own folder, for relative picture paths.
     pub page_dir: PathBuf,
+    /// The folder the page's inline drawings are written to, one file
+    /// each.
+    pub drawings_dir: PathBuf,
     /// The page, as the module's header names it.
     pub source: String,
 }
@@ -52,6 +55,9 @@ pub struct Converted {
     /// Every `data-fid` the view names with `.test_id(…)`.
     pub named: BTreeSet<String>,
     pub gaps: Vec<Gap>,
+    /// The inline drawings the module reads, by file name in
+    /// [`Options::drawings_dir`], each with its markup.
+    pub drawings: Vec<(String, String)>,
 }
 
 /// Writes the page as a module with `pub fn view() -> impl View`.
@@ -62,9 +68,11 @@ pub fn convert(page: &Page, options: &Options) -> Converted {
         named: BTreeSet::new(),
         gaps: Vec::new(),
         pictures: BTreeMap::new(),
+        drawings: BTreeMap::new(),
         root: TextStyle::of(&page.root),
         hug: (false, false),
         container_width: page.width,
+        auto_room: false,
     };
     let body = writer.root(&page.root, page.width, page.height);
     let mut code = format!("//! Written by `bunny import html` from {}.\n\n{}\n", options.source, options.prelude);
@@ -76,7 +84,9 @@ pub fn convert(page: &Page, options: &Options) -> Converted {
     let _ = write!(code, "\n#[must_use]\npub fn view() -> impl View {{\n    {}\n}}\n", indent(&body, 1));
     writer.gaps.sort();
     writer.gaps.dedup();
-    Converted { code, named: writer.named, gaps: writer.gaps }
+    let mut drawings: Vec<(String, String)> = writer.drawings.into_iter().map(|(markup, file)| (file, markup)).collect();
+    drawings.sort();
+    Converted { code, named: writer.named, gaps: writer.gaps, drawings }
 }
 
 /// How a box sizes itself on one axis.
@@ -308,6 +318,76 @@ fn is_layer(node: &Node) -> bool {
     matches!(node.css("position"), "absolute" | "fixed")
 }
 
+/// Where a box out of the flow is written among its holder's paint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// Painted under the flow: a background, on the holder's fill.
+    Under,
+    /// Over the flow, inside the holder's clip: an overlay its corners
+    /// and its clip cut.
+    Clipped,
+    /// Over the flow and the holder's paint: an overlay.
+    Over,
+}
+
+impl Pass {
+    fn of(holder: &Node, layer: &Node) -> Self {
+        // a positioned box that clips its overflow clips what it holds
+        // out of the flow too, the viewport's boxes excepted
+        let clips = ["overflow-x", "overflow-y"].iter().any(|axis| !matches!(holder.css(axis), "visible" | ""));
+        if paints_under(holder, layer) {
+            Self::Under
+        } else if clips && !matches!(holder.css("position"), "static" | "") && layer.css("position") == "absolute" {
+            Self::Clipped
+        } else {
+            Self::Over
+        }
+    }
+}
+
+/// A box's `z-index`; `None` for `auto`.
+fn z_index(node: &Node) -> Option<i64> {
+    node.css("z-index").parse().ok()
+}
+
+/// The boxes of `holder`'s flow that draw something, by their place
+/// among its children.
+fn flow_boxes(holder: &Node) -> impl Iterator<Item = (usize, &Node)> {
+    holder.children.iter().enumerate().filter(|(_, child)| match child.kind {
+        Kind::Space => false,
+        Kind::Text => !child.text.trim().is_empty(),
+        _ => !is_layer(child),
+    })
+}
+
+/// Whether the page paints the box of the flow at `at` over `layer`, at
+/// `layer_at`: a positioned box above its level, or at its level and
+/// after it.
+fn paints_over(child: &Node, at: usize, layer: &Node, layer_at: usize) -> bool {
+    let level = z_index(layer).unwrap_or(0);
+    let positioned = child.kind == Kind::Element && !matches!(child.css("position"), "static" | "");
+    positioned && z_index(child).map_or(level == 0 && at > layer_at, |z| z > level || (z == level && at > layer_at))
+}
+
+/// Whether the page paints `layer` under the flow of `holder` — a box
+/// out of the flow drawn over the flow unless its `z-index` is negative
+/// or every box of the flow is positioned above it.
+fn paints_under(holder: &Node, layer: &Node) -> bool {
+    if z_index(layer).is_some_and(|z| z < 0) {
+        return true;
+    }
+    let Some(layer_at) = holder.children.iter().position(|child| std::ptr::eq(child, layer)) else { return false };
+    let mut flow = flow_boxes(holder).peekable();
+    flow.peek().is_some() && flow.all(|(at, child)| paints_over(child, at, layer, layer_at))
+}
+
+/// Whether some of `holder`'s flow is painted over `layer` while the rest
+/// is under it: no single side says it.
+fn crosses_flow(holder: &Node, layer: &Node) -> bool {
+    let Some(layer_at) = holder.children.iter().position(|child| std::ptr::eq(child, layer)) else { return false };
+    flow_boxes(holder).any(|(at, child)| paints_over(child, at, layer, layer_at))
+}
+
 fn is_inline(node: &Node) -> bool {
     match node.kind {
         Kind::Text | Kind::Space => true,
@@ -320,7 +400,7 @@ fn is_inline(node: &Node) -> bool {
                 && css::px(node.size("width")).is_none()
                 && css::px(node.size("height")).is_none();
             (node.css("display") == "inline" || text_block)
-                && !matches!(node.tag.as_str(), "img" | "svg" | "input" | "select" | "textarea" | "button" | "br" | "progress" | "meter" | "video" | "canvas" | "iframe")
+                && !matches!(node.tag.as_str(), "img" | "svg" | "input" | "select" | "textarea" | "button" | "progress" | "meter" | "video" | "canvas" | "iframe")
                 && node.children.iter().all(|child| is_inline(child) || is_layer(child))
         }
     }
@@ -333,6 +413,8 @@ struct Writer<'a> {
     /// Pictures by their path from the module, and the function that
     /// reads each.
     pictures: BTreeMap<String, String>,
+    /// The inline drawings: each markup once, by the file it is written to.
+    drawings: BTreeMap<String, String>,
     /// The page's own text: a view says only what differs.
     root: TextStyle,
     /// Whether the box whose children are being written hugs its content
@@ -341,6 +423,10 @@ struct Writer<'a> {
     hug: (bool, bool),
     /// The width of the content box whose children are being written.
     container_width: f64,
+    /// The flex line being written gives its free room to `auto` margins
+    /// too: the page grows its items first and the margins take what is
+    /// left, where a bunny stack shares it alike.
+    auto_room: bool,
 }
 
 impl Writer<'_> {
@@ -380,20 +466,35 @@ impl Writer<'_> {
                 None
             }
         };
+        // a picture is the size the browser gave it: an axis left `auto`
+        // follows its proportion, which the page resolved
+        if matches!(node.tag.as_str(), "img" | "svg") {
+            return (Size::Exact(node.rect.w), Size::Exact(node.rect.h));
+        }
         let (width_spec, height_spec) = (node.size("width").to_owned(), node.size("height").to_owned());
         if css::percent(&width_spec).is_some() {
             self.gap(node, "width: %", format!("{width_spec} written as {} points", num(node.rect.w)));
         }
         let grows = node.css("flex-grow").parse::<f64>().unwrap_or(0.0) > 0.0;
-        let max_width = ceiling(node.size("max-width"));
-        let max_height = ceiling(node.size("max-height"));
+        // a content-box ceiling holds the content: the box the frame wraps
+        // is that much wider by its padding and border
+        let content_box = node.css("box-sizing") == "content-box";
+        let across = node.px("padding-left") + node.px("padding-right") + node.px("border-left-width") + node.px("border-right-width");
+        let down = node.px("padding-top") + node.px("padding-bottom") + node.px("border-top-width") + node.px("border-bottom-width");
+        let max_width = ceiling(node.size("max-width")).map(|max| if content_box { max + across } else { max });
+        let max_height = ceiling(node.size("max-height")).map(|max| if content_box { max + down } else { max });
         let fill_width = Size::Fill(max_width);
         let fill_height = Size::Fill(max_height);
         let inline_level = node.css("display").starts_with("inline");
         let pinned = matches!(node.css("align-self"), "center" | "flex-start" | "flex-end");
+        // an item that grows from a basis takes the basis and a share of
+        // what is left, where a bunny row shares it alike: it is the width
+        // the page gave it
+        let basis = css::px(node.size("flex-basis")).is_some_and(|basis| basis > 0.0);
         let width = axis(&width_spec, node.rect.w).unwrap_or_else(|| match flow {
             Flow::Root | Flow::Cell | Flow::Layer => Size::Exact(node.rect.w),
             Flow::Block if !inline_level && node.css("float") == "none" => fill_width,
+            Flow::Row { .. } if grows && (basis || self.auto_room) => Size::Exact(node.rect.w),
             Flow::Row { .. } if grows => fill_width,
             Flow::Column { stretch: true } if !pinned => fill_width,
             Flow::Block | Flow::Row { .. } | Flow::Column { .. } => Size::Hug,
@@ -401,14 +502,22 @@ impl Writer<'_> {
         // a ratio decides the axis its box leaves open: the page resolved
         // it, and a picture that fills its box must be told
         let ratio = !matches!(node.css("aspect-ratio"), "" | "auto");
+        // a row that wraps fills the width of a column that holds it in
+        // bunny, where the page fits it to its items: one that hugs there
+        // is the width the page gave it
+        let wraps = matches!(flow, Flow::Column { .. })
+            && node.css("display").ends_with("flex")
+            && node.css("flex-wrap").starts_with("wrap")
+            && !node.css("flex-direction").starts_with("column");
         let width = match width {
-            Size::Hug if ratio => Size::Exact(node.rect.w),
+            Size::Hug if ratio || wraps => Size::Exact(node.rect.w),
             other => other,
         };
         let baseline = node.css("align-self") == "baseline";
         let height = axis(&height_spec, node.rect.h).or_else(|| ratio.then_some(Size::Exact(node.rect.h))).unwrap_or(match flow {
             Flow::Root | Flow::Cell | Flow::Layer => Size::Exact(node.rect.h),
             Flow::Row { stretch: true } if !pinned && !baseline => fill_height,
+            Flow::Column { .. } if grows && self.auto_room => Size::Exact(node.rect.h),
             Flow::Column { .. } if grows => fill_height,
             Flow::Block | Flow::Row { .. } | Flow::Column { .. } => Size::Hug,
         });
@@ -428,6 +537,24 @@ impl Writer<'_> {
             other => other,
         };
         (width, height)
+    }
+
+    /// The ceilings of a box that hugs its content (`max-width`,
+    /// `max-height`), at the border edge its frame wraps; none where it
+    /// has none or does not hug.
+    fn ceilings(&self, node: &Node, width: Size, height: Size) -> (Option<f64>, Option<f64>) {
+        let content_box = node.css("box-sizing") == "content-box";
+        let ceiling = |property: &str, hugs: bool, insets: f64, room: Option<f64>| {
+            let value = node.size(property);
+            let length = css::px(value).or_else(|| css::percent(value).and_then(|share| room.map(|room| share * room)))?;
+            (hugs && length.is_finite()).then_some(length + if content_box { insets } else { 0.0 })
+        };
+        let across = node.px("padding-left") + node.px("padding-right") + node.px("border-left-width") + node.px("border-right-width");
+        let down = node.px("padding-top") + node.px("padding-bottom") + node.px("border-top-width") + node.px("border-bottom-width");
+        (
+            ceiling("max-width", matches!(width, Size::Hug), across, Some(self.container_width)),
+            ceiling("max-height", matches!(height, Size::Hug), down, None),
+        )
     }
 
     /// The floors of a box that hugs its content (`min-width`,
@@ -466,7 +593,9 @@ impl Writer<'_> {
                 "right" | "end" | "-webkit-right" => Edge::End,
                 _ => Edge::Start,
             };
-            (text, Edge::Start)
+            // a line field and a button center what they hold, however tall
+            let across = if matches!(node.tag.as_str(), "input" | "button") { Edge::Center } else { Edge::Start };
+            (text, across)
         }
     }
 
@@ -497,12 +626,21 @@ impl Writer<'_> {
         }
         let (horizontal, vertical) = Self::content_alignment(node);
         view.push_str(&frame(width, height, alignment(horizontal, vertical)));
+        // a box that hugs its content stops at its ceiling (`max-width`):
+        // bunny's finite `frame_max` is a ceiling over the child
+        let (ceiling_w, ceiling_h) = self.ceilings(node, width, height);
+        if ceiling_w.is_some() || ceiling_h.is_some() {
+            let limit = |ceiling: Option<f64>| ceiling.map_or_else(|| "f64::MAX".to_owned(), num);
+            let _ = write!(view, "\n.frame_max({}, {}, {})", limit(ceiling_w), limit(ceiling_h), alignment(horizontal, vertical));
+        }
         let (floor_w, floor_h) = self.floors(node, width, height);
         if floor_w > 0.0 || floor_h > 0.0 {
             let _ = write!(view, "\n.frame_min({}, {}, {})", num(floor_w), num(floor_h), alignment(horizontal, vertical));
         }
+        self.layers(node, &mut view, Pass::Under);
+        self.layers(node, &mut view, Pass::Clipped);
         self.paint(node, &mut view);
-        self.layers(node, &mut view);
+        self.layers(node, &mut view, Pass::Over);
         if node.kind == Kind::Element && !node.id.is_empty() {
             let _ = write!(view, "\n.test_id({})", quote(&node.id));
             self.named.insert(node.id.clone());
@@ -782,11 +920,26 @@ impl Writer<'_> {
     }
 
     /// The boxes out of the flow — positioned children, and pseudo-boxes
-    /// positioned over the box — as overlays at their place.
-    fn layers(&mut self, node: &Node, view: &mut String) {
-        for child in &node.children {
-            if !is_layer(child) {
-                continue;
+    /// positioned over the box — at their place, in the order the page
+    /// paints them, those of one [`Pass`].
+    fn layers(&mut self, node: &Node, view: &mut String, pass: Pass) {
+        let under = pass == Pass::Under;
+        let mut layers: Vec<(i64, usize, &Node)> = node
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| is_layer(child) && Pass::of(node, child) == pass)
+            .map(|(at, child)| (z_index(child).unwrap_or(0), at, child))
+            .collect();
+        layers.sort_by_key(|(z, at, _)| (*z, *at));
+        // a background goes behind what is there: the first painted is
+        // written last
+        if under {
+            layers.reverse();
+        }
+        for (_, _, child) in layers {
+            if !under && crosses_flow(node, child) {
+                self.gap(child, "z-index", "painted over the flow, part of which the page paints over it");
             }
             let (offset, layer) = match child.kind {
                 Kind::Element => {
@@ -806,7 +959,8 @@ impl Writer<'_> {
             } else {
                 with_offset(&layer, x, y)
             };
-            let _ = write!(view, "\n.overlay(UnitPoint::TOP_LEADING, {})", indent(&placed, 1));
+            let side = if under { "background" } else { "overlay" };
+            let _ = write!(view, "\n.{side}(UnitPoint::TOP_LEADING, {})", indent(&placed, 1));
         }
     }
 
@@ -843,7 +997,8 @@ impl Writer<'_> {
                 return self.words_view(node, &label);
             }
             "progress" | "meter" => return self.meter(node),
-            "svg" | "video" | "canvas" | "iframe" => {
+            "svg" => return self.drawing(node),
+            "video" | "canvas" | "iframe" => {
                 self.gap(node, &node.tag.clone(), "drawn as an empty box");
                 return "spacer()".to_owned();
             }
@@ -902,16 +1057,18 @@ impl Writer<'_> {
                 line.clear();
                 return;
             }
-            // the next block stands under the line's lowest words
+            // the next block stands under the line's lowest words; a line
+            // of no words (the breaks of a `pre`) draws nothing, and its
+            // height stays the gap before the next block
             let bottom = line
                 .iter()
                 .filter(|item| matches!(item.kind, Kind::Text | Kind::Element) && item.rect.h > 0.0)
                 .map(|item| item.rect.bottom())
                 .fold(f64::NEG_INFINITY, f64::max);
-            if bottom.is_finite() {
-                *previous_bottom = previous_bottom.max(bottom);
-            }
             if let Some(paragraph) = writer.paragraph(node, line) {
+                if bottom.is_finite() {
+                    *previous_bottom = previous_bottom.max(bottom);
+                }
                 let edge = match Self::content_alignment(node).0 {
                     Edge::Center => "Center",
                     Edge::End => "Trailing",
@@ -930,7 +1087,11 @@ impl Writer<'_> {
                 line.push(child);
                 continue;
             }
-            let after_line = line.iter().any(|item| item.kind != Kind::Space);
+            let after_line = line.iter().any(|item| match item.kind {
+                Kind::Space => false,
+                Kind::Text => !item.text.trim().is_empty(),
+                _ => true,
+            });
             flush(self, &mut line, &mut views, &mut previous_bottom);
             let Some(mut view) = self.block_child(child) else { continue };
             let rect = child_rect(node, child);
@@ -953,7 +1114,23 @@ impl Writer<'_> {
             }
             views.push(view);
         }
+        // a closing line of no words (the last break of a `pre`) still
+        // takes its height under the last block: its line box, the glyphs'
+        // box and the half of the leading under them
+        let line_height = css::px(node.css("line-height"));
+        let trailing = line
+            .iter()
+            .filter(|item| item.kind == Kind::Text && item.text.trim().is_empty() && item.rect.h > 0.0)
+            .map(|item| item.rect.bottom() + line_height.map_or(0.0, |line| ((line - item.rect.h) / 2.0).max(0.0)))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let drawn = views.len();
         flush(self, &mut line, &mut views, &mut previous_bottom);
+        if views.len() == drawn
+            && trailing - previous_bottom > 0.25
+            && let Some(last) = views.last_mut()
+        {
+            let _ = write!(last, "\n.padding_edge(Edge::Bottom, {})", num(trailing - previous_bottom));
+        }
         if views.len() == 1 {
             return views.pop().unwrap_or_default();
         }
@@ -1169,7 +1346,7 @@ impl Writer<'_> {
             let _ = write!(view, "\n.foreground_color({})", color.code());
         }
         if !style.family.is_empty() && style.family != self.root.family {
-            self.gap(node, "font-family", style.family.clone());
+            let _ = write!(view, "\n.font_family({})", quote(&style.family));
         }
         if style.tracking.abs() > 0.001 {
             let _ = write!(view, "\n.tracking({})", num(style.tracking));
@@ -1196,8 +1373,15 @@ impl Writer<'_> {
         }
         if node.css("text-overflow") == "ellipsis" && node.css("white-space") == "nowrap" {
             view.push_str("\n.truncation_mode(Truncation::End)");
-        } else if node.css("white-space") == "nowrap" {
-            self.gap(node, "white-space: nowrap", "the words may wrap");
+        } else if matches!(node.css("white-space"), "nowrap" | "pre") {
+            // lines that never wrap: as wide as the page set them, a
+            // point to spare, running past the box as on the page
+            match words_width(node) {
+                Some(width) => {
+                    let _ = write!(view, "\n.frame_width_aligned({}, Alignment::Leading)", num((width + 1.0).ceil()));
+                }
+                None => self.gap(node, "white-space: nowrap", "the words may wrap"),
+            }
         }
         // the clamped lines show, the last one closed with an ellipsis, in
         // the height the page gave them: the browser rounds a line's height
@@ -1263,6 +1447,10 @@ impl Writer<'_> {
             .flatten()
             .filter(|_| items.len() > 1);
         let gap = gap + overlap.unwrap_or(0.0);
+        let (before, after) = if row { ("margin-left", "margin-right") } else { ("margin-top", "margin-bottom") };
+        let auto = |child: &Node, side: &str| child.kind == Kind::Element && child.sizes.get(side).is_some_and(|value| value == "auto");
+        let saved_room = self.auto_room;
+        self.auto_room = items.iter().any(|child| auto(child, before) || auto(child, after));
         let mut views = Vec::new();
         for (index, child) in items.iter().enumerate() {
             let view = match child.kind {
@@ -1284,16 +1472,15 @@ impl Writer<'_> {
                 view.push_str(&self.self_alignment(node, child, row));
             }
             // an `auto` margin takes the line's free room: a spacer
-            let (before, after) = if row { ("margin-left", "margin-right") } else { ("margin-top", "margin-bottom") };
-            let auto = |side: &str| child.kind == Kind::Element && child.sizes.get(side).is_some_and(|value| value == "auto");
-            if auto(before) {
+            if auto(child, before) {
                 views.push("spacer()".to_owned());
             }
             views.push(view);
-            if auto(after) {
+            if auto(child, after) {
                 views.push("spacer()".to_owned());
             }
         }
+        self.auto_room = saved_room;
         let justify = node.css("justify-content");
         let spaced = grows.iter().all(|grow| *grow == 0.0) && views.len() > 1;
         let views = match justify {
@@ -1318,7 +1505,13 @@ impl Writer<'_> {
                 "baseline" | "first baseline" => code.push_str("\n.alignment(VerticalAlignment::Baseline)"),
                 _ => code.push_str("\n.alignment(VerticalAlignment::Top)"),
             }
-            if node.css("flex-wrap").starts_with("wrap") {
+            // a row that wraps but holds one line on the page is a row: its
+            // items share the line's leftover as the page's do, which a
+            // bunny flow does not
+            let shown: Vec<&&Node> = items.iter().filter(|item| item.rect.w > 0.0 && item.rect.h > 0.0).collect();
+            let top = shown.iter().map(|item| item.rect.y).fold(f64::NEG_INFINITY, f64::max);
+            let bottom = shown.iter().map(|item| item.rect.bottom()).fold(f64::INFINITY, f64::min);
+            if node.css("flex-wrap").starts_with("wrap") && top >= bottom {
                 code.push_str("\n.wrapping()");
                 let row_gap = css::px(node.css("row-gap")).unwrap_or(0.0);
                 if row_gap > 0.0 {
@@ -1470,7 +1663,10 @@ impl Writer<'_> {
             num(node.px("padding-bottom") + node.px("border-bottom-width")),
             num(node.px("padding-left") + node.px("border-left-width"))
         );
-        let field = |maker: &str| format!("{maker}({placeholder}, State::new(String::from({value})).binding())\n.bare()\n.content_inset({inset})");
+        // a CSS field inherits no type: the page's own face, size and ink
+        // on it are written, where the view would take the page's
+        let face = self.field_face(node);
+        let field = |maker: &str| format!("{maker}({placeholder}, State::new(String::from({value})).binding())\n.bare()\n.content_inset({inset}){face}");
         match (node.tag.as_str(), kind) {
             ("textarea", _) => field("text_editor"),
             (_, "text" | "email" | "search" | "url" | "tel" | "number") => field("text_field"),
@@ -1481,6 +1677,25 @@ impl Writer<'_> {
                 "spacer()".to_owned()
             }
         }
+    }
+
+    /// The type a field draws in, where it is not the page's.
+    fn field_face(&self, node: &Node) -> String {
+        let style = TextStyle::of(node);
+        let mut face = String::new();
+        if (style.size - self.root.size).abs() > 0.01 {
+            let _ = write!(face, "\n.font_size({})", num(style.size));
+        }
+        if style.weight != self.root.weight {
+            let _ = write!(face, "\n.font_weight({})", weight(style.weight));
+        }
+        if let Some(color) = style.color.filter(|color| Some(*color) != self.root.color) {
+            let _ = write!(face, "\n.foreground_color({})", color.code());
+        }
+        if !style.family.is_empty() && style.family != self.root.family {
+            let _ = write!(face, "\n.font_family({})", quote(&style.family));
+        }
+        face
     }
 
     /// A native `<progress>` or `<meter>`: a track and its fill.
@@ -1495,6 +1710,20 @@ impl Writer<'_> {
             num(node.rect.w),
             num(node.rect.h / 2.0)
         )
+    }
+
+    /// An inline `<svg>`: a picture of its own, written beside the module
+    /// once however often the page draws it.
+    fn drawing(&mut self, node: &Node) -> String {
+        let Some(markup) = node.attr("drawing") else {
+            self.gap(node, "svg", "drawn as an empty box");
+            return "spacer()".to_owned();
+        };
+        let count = self.drawings.len();
+        let file = self.drawings.entry(markup.to_owned()).or_insert_with(|| format!("drawing-{}.svg", count + 1)).clone();
+        let path = relative(&self.options.module_dir, &self.options.drawings_dir.join(&file));
+        let name = self.pictures.entry(path).or_insert_with(|| file.trim_end_matches(".svg").replace('-', "_")).clone();
+        format!("image({name}())\n.resizable()")
     }
 
     /// The function that reads the picture at `url`, written once per file.
@@ -1676,6 +1905,23 @@ fn lerp(from: Rgba, to: Rgba, t: f64) -> Rgba {
     Rgba { r: channel(from.r, to.r), g: channel(from.g, to.g), b: channel(from.b, to.b), a: (to.a - from.a).mul_add(t, from.a) }
 }
 
+/// How wide the words under `node` run on the page: from the leftmost to
+/// the rightmost of their boxes.
+fn words_width(node: &Node) -> Option<f64> {
+    fn walk(node: &Node, span: &mut (f64, f64)) {
+        for child in &node.children {
+            if child.kind == Kind::Text && child.rect.w > 0.0 {
+                span.0 = span.0.min(child.rect.x);
+                span.1 = span.1.max(child.rect.right());
+            }
+            walk(child, span);
+        }
+    }
+    let mut span = (f64::INFINITY, f64::NEG_INFINITY);
+    walk(node, &mut span);
+    (span.1 > span.0).then_some(span.1 - span.0)
+}
+
 /// The view with `.offset(x, y)` around it, its name inside: the
 /// offset moves the frame the named view is placed in, so the view is
 /// found where it is drawn, on both roads.
@@ -1763,18 +2009,29 @@ fn padding(inset: &[f64]) -> String {
 }
 
 fn frame(width: Size, height: Size, alignment: &str) -> String {
-    let ceiling = |limit: Option<f64>| limit.map_or_else(|| "f64::INFINITY".to_owned(), num);
-    match (width, height) {
+    let mut code = match (width, height) {
         (Size::Exact(w), Size::Exact(h)) => format!("\n.frame_aligned({}, {}, {alignment})", num(w), num(h)),
-        (Size::Exact(w), Size::Fill(limit)) => format!("\n.frame_width_aligned({}, {alignment})\n.frame_max(f64::MAX, {}, {alignment})", num(w), ceiling(limit)),
-        (Size::Exact(w), Size::Hug) => format!("\n.frame_width_aligned({}, {alignment})", num(w)),
-        (Size::Fill(limit), Size::Exact(h)) => format!("\n.frame_height_aligned({}, {alignment})\n.frame_max({}, f64::MAX, {alignment})", num(h), ceiling(limit)),
-        (Size::Fill(across), Size::Fill(down)) => format!("\n.frame_max({}, {}, {alignment})", ceiling(across), ceiling(down)),
-        (Size::Fill(limit), Size::Hug) => format!("\n.frame_max({}, f64::MAX, {alignment})", ceiling(limit)),
-        (Size::Hug, Size::Exact(h)) => format!("\n.frame_height_aligned({}, {alignment})", num(h)),
-        (Size::Hug, Size::Fill(limit)) => format!("\n.frame_max(f64::MAX, {}, {alignment})", ceiling(limit)),
-        (Size::Hug, Size::Hug) => String::new(),
+        (Size::Exact(w), _) => format!("\n.frame_width_aligned({}, {alignment})", num(w)),
+        (_, Size::Exact(h)) => format!("\n.frame_height_aligned({}, {alignment})", num(h)),
+        _ => String::new(),
+    };
+    // a box that fills takes what it is offered, up to its ceiling: bunny
+    // fills with an open `frame_max`, and caps with a finite one, which
+    // holds what is under it
+    let fills = |size: Size| matches!(size, Size::Fill(_));
+    if fills(width) || fills(height) {
+        let open = |size: Size| if fills(size) { "f64::INFINITY" } else { "f64::MAX" };
+        let _ = write!(code, "\n.frame_max({}, {}, {alignment})", open(width), open(height));
     }
+    let cap = |size: Size| match size {
+        Size::Fill(Some(limit)) => Some(limit),
+        _ => None,
+    };
+    if cap(width).is_some() || cap(height).is_some() {
+        let limit = |size: Size| cap(size).map_or_else(|| "f64::MAX".to_owned(), num);
+        let _ = write!(code, "\n.frame_max({}, {}, {alignment})", limit(width), limit(height));
+    }
+    code
 }
 
 /// The width of a box's content: inside its padding and its border.
@@ -1811,6 +2068,9 @@ fn run(words: &str, style: &TextStyle, base: &TextStyle) -> String {
     }
     if (style.size - base.size).abs() > 0.01 {
         let _ = write!(code, ".font_size({})", num(style.size));
+    }
+    if !style.family.is_empty() && style.family != base.family {
+        let _ = write!(code, ".family({})", quote(&style.family));
     }
     if style.color != base.color
         && let Some(color) = style.color
@@ -1927,6 +2187,7 @@ mod tests {
             module_dir: PathBuf::new(),
             site_root: PathBuf::new(),
             page_dir: PathBuf::new(),
+            drawings_dir: PathBuf::new(),
             source: String::new(),
         };
         let mut writer = Writer {
@@ -1934,9 +2195,11 @@ mod tests {
             named: BTreeSet::new(),
             gaps: Vec::new(),
             pictures: BTreeMap::new(),
+            drawings: BTreeMap::new(),
             root: TextStyle::of(&Node::default()),
             hug: (false, false),
             container_width: 300.0,
+            auto_room: false,
         };
         let mut clamped = Node { id: "p-1".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 300.0, h: 32.0 }, ..Node::default() };
         clamped.style.insert("-webkit-line-clamp".to_owned(), "2".to_owned());
@@ -1987,6 +2250,7 @@ mod tests {
                 module_dir: PathBuf::new(),
                 site_root: PathBuf::new(),
                 page_dir: PathBuf::new(),
+                drawings_dir: PathBuf::new(),
                 source: "page.html".to_owned(),
             };
             convert(&Page { root: body, html: String::new(), width: 100.0, height: 50.0 }, &options)
@@ -1998,6 +2262,124 @@ mod tests {
         assert!(!plain.code.contains(".monospaced_digit()"), "{}", plain.code);
         let slashed = page("slashed-zero tabular-nums");
         assert!(slashed.gaps.iter().any(|gap| gap.feature == "font-variant" && gap.detail == "slashed-zero"), "{:?}", slashed.gaps);
+    }
+
+    /// An inline drawing is a picture of its own beside the module, the
+    /// size the page drew it at; the page's second copy of an icon reads
+    /// the same file.
+    #[test]
+    fn an_inline_drawing_is_a_picture_beside_the_module() {
+        let icon = |id: &str, markup: &str, x: f64| {
+            let mut svg = Node { tag: "svg".to_owned(), id: id.to_owned(), rect: Rect { x, y: 0.0, w: 16.0, h: 16.0 }, ..Node::default() };
+            svg.style.insert("display".to_owned(), "block".to_owned());
+            svg.attrs.insert("drawing".to_owned(), markup.to_owned());
+            svg
+        };
+        let mut row = Node { tag: "div".to_owned(), id: "row".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 16.0 }, ..Node::default() };
+        row.style.insert("display".to_owned(), "flex".to_owned());
+        row.children = vec![icon("a", "<svg>a</svg>", 0.0), icon("b", "<svg>b</svg>", 20.0), icon("c", "<svg>a</svg>", 40.0)];
+        let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 }, ..Node::default() };
+        body.style.insert("display".to_owned(), "block".to_owned());
+        body.children.push(row);
+        let options = Options {
+            prelude: String::new(),
+            module_dir: PathBuf::from("/case"),
+            site_root: PathBuf::new(),
+            page_dir: PathBuf::new(),
+            drawings_dir: PathBuf::from("/case/drawings"),
+            source: "page.html".to_owned(),
+        };
+        let converted = convert(&Page { root: body, html: String::new(), width: 100.0, height: 50.0 }, &options);
+        assert_eq!(converted.drawings, [("drawing-1.svg".to_owned(), "<svg>a</svg>".to_owned()), ("drawing-2.svg".to_owned(), "<svg>b</svg>".to_owned())]);
+        assert!(converted.code.contains("fn drawing_1() -> ImageSource {\n    ImageSource::from_bytes(include_bytes!(\"drawings/drawing-1.svg\")"), "{}", converted.code);
+        assert_eq!(converted.code.matches("image(drawing_1())\n").count(), 2, "{}", converted.code);
+        assert!(converted.code.contains("image(drawing_2())"), "{}", converted.code);
+        assert!(converted.code.contains(".frame_aligned(16.0, 16.0, Alignment::TopLeading)"), "{}", converted.code);
+        assert!(!converted.gaps.iter().any(|gap| gap.feature == "svg"), "{:?}", converted.gaps);
+    }
+
+    /// A box out of the flow is painted over the flow, unless every box
+    /// of the flow is positioned above it: then it lies on the holder's
+    /// fill, under its content.
+    #[test]
+    fn a_layer_under_a_raised_flow_is_a_background() {
+        let page = |z: &str, overflow: &str| {
+            let mut hills = Node { tag: "div".to_owned(), id: "hills".to_owned(), rect: Rect { x: 0.0, y: 60.0, w: 100.0, h: 40.0 }, ..Node::default() };
+            for (property, value) in [("display", "block"), ("position", "absolute"), ("z-index", "auto")] {
+                hills.style.insert(property.to_owned(), value.to_owned());
+            }
+            let mut window = Node { tag: "div".to_owned(), id: "window".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 80.0 }, ..Node::default() };
+            for (property, value) in [("display", "block"), ("position", "relative"), ("z-index", z)] {
+                window.style.insert(property.to_owned(), value.to_owned());
+            }
+            let mut hero = Node { tag: "section".to_owned(), id: "hero".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, ..Node::default() };
+            for (property, value) in [
+                ("display", "block"),
+                ("position", "relative"),
+                ("background-color", "rgb(11, 15, 23)"),
+                ("overflow-x", overflow),
+                ("overflow-y", overflow),
+            ] {
+                hero.style.insert(property.to_owned(), value.to_owned());
+            }
+            hero.children = vec![hills, Node { kind: Kind::Space, ..Node::default() }, window];
+            let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, ..Node::default() };
+            body.style.insert("display".to_owned(), "block".to_owned());
+            body.children.push(hero);
+            let options = Options {
+                prelude: String::new(),
+                module_dir: PathBuf::new(),
+                site_root: PathBuf::new(),
+                page_dir: PathBuf::new(),
+                drawings_dir: PathBuf::new(),
+                source: "page.html".to_owned(),
+            };
+            convert(&Page { root: body, html: String::new(), width: 100.0, height: 100.0 }, &options).code
+        };
+        let raised = page("2", "visible");
+        let (under, fill) = (raised.find(".background(UnitPoint::TOP_LEADING").expect("a background"), raised.find(".background_color(").expect("a fill"));
+        assert!(under < fill, "the layer lies on the fill: {raised}");
+        assert!(!raised.contains(".overlay("), "{raised}");
+        // the window at the layer's level, after it in the page, is
+        // painted over it too
+        assert!(page("auto", "visible").contains(".background(UnitPoint::TOP_LEADING"));
+        let over = page("-1", "visible");
+        assert!(over.find(".overlay(UnitPoint::TOP_LEADING") > over.find(".background_color("), "a window under the layer: {over}");
+        // a holder that clips cuts the layer over its flow too
+        let cut = page("-1", "hidden");
+        assert!(cut.find(".overlay(UnitPoint::TOP_LEADING") < cut.find(".clipped()"), "{cut}");
+    }
+
+    /// A line that grows an item and has an `auto` margin grows the item
+    /// first, up to its ceiling, and the margin takes what is left: the
+    /// item is the width the page gave it, where a bunny row would share
+    /// the room between it and the spacer.
+    #[test]
+    fn a_grown_item_beside_an_auto_margin_keeps_its_width() {
+        let mut search = Node { tag: "div".to_owned(), id: "search".to_owned(), rect: Rect { x: 600.0, y: 0.0, w: 300.0, h: 34.0 }, ..Node::default() };
+        for (property, value) in [("display", "block"), ("flex-grow", "1")] {
+            search.style.insert(property.to_owned(), value.to_owned());
+        }
+        search.sizes.insert("max-width".to_owned(), "300px".to_owned());
+        search.sizes.insert("margin-left".to_owned(), "auto".to_owned());
+        let mut bar = Node { tag: "header".to_owned(), id: "bar".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 900.0, h: 34.0 }, ..Node::default() };
+        bar.style.insert("display".to_owned(), "flex".to_owned());
+        bar.children.push(search);
+        let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 900.0, h: 34.0 }, ..Node::default() };
+        body.style.insert("display".to_owned(), "block".to_owned());
+        body.children.push(bar);
+        let options = Options {
+            prelude: String::new(),
+            module_dir: PathBuf::new(),
+            site_root: PathBuf::new(),
+            page_dir: PathBuf::new(),
+            drawings_dir: PathBuf::new(),
+            source: "page.html".to_owned(),
+        };
+        let code = convert(&Page { root: body, html: String::new(), width: 900.0, height: 34.0 }, &options).code;
+        assert!(code.contains("spacer(),"), "{code}");
+        assert!(code.contains(".frame_aligned(300.0, 34.0"), "{code}");
+        assert!(!code.contains("frame_max(f64::INFINITY"), "{code}");
     }
 
     #[test]

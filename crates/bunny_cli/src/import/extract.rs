@@ -70,6 +70,25 @@ pub const SCRIPT: &str = r"(() => {
     const transform = getComputedStyle(el).transform;
     if (transform !== 'none') turns.set(el, transform);
   }
+  // an inline drawing as a file of its own: its ink where it says
+  // `currentColor`, the paint it inherits from the page, the size the
+  // page drew it at, and none of the page's layout on it
+  const drawing = (el, [, , width, height]) => {
+    const copy = el.cloneNode(true);
+    const originals = [el, ...el.querySelectorAll('*')];
+    [copy, ...copy.querySelectorAll('*')].forEach((target, at) => {
+      const ink = getComputedStyle(originals[at]).color;
+      for (const { name, value } of [...target.attributes])
+        if (/currentcolor/i.test(value)) target.setAttribute(name, value.replace(/currentcolor/gi, ink));
+    });
+    const cs = getComputedStyle(el);
+    if (!copy.hasAttribute('fill') && cs.fill !== 'rgb(0, 0, 0)') copy.setAttribute('fill', cs.fill);
+    if (!copy.hasAttribute('stroke') && cs.stroke !== 'none') copy.setAttribute('stroke', cs.stroke);
+    for (const name of ['style', 'class', 'data-fid', 'aria-hidden']) copy.removeAttribute(name);
+    copy.setAttribute('width', String(Math.round(width * 100) / 100));
+    copy.setAttribute('height', String(Math.round(height * 100) / 100));
+    return new XMLSerializer().serializeToString(copy);
+  };
   const flat = document.createElement('style');
   flat.textContent = '*{transform:none!important}';
   document.head.appendChild(flat);
@@ -89,6 +108,7 @@ pub const SCRIPT: &str = r"(() => {
     if (tag === 'input' || tag === 'textarea') node.attrs.current = el.value;
     if (tag === 'progress' || tag === 'meter') node.attrs.position = String(el.position !== undefined && el.position >= 0 ? el.position : (el.value - (el.min || 0)) / ((el.max || 1) - (el.min || 0)));
     el.setAttribute('data-fid', node.id);
+    if (tag === 'svg') node.attrs.drawing = drawing(el, node.rect);
     const before = pseudo(el, '::before');
     if (before) node.children.push(before);
     if (!LEAVES.includes(tag)) {

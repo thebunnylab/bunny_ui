@@ -68,6 +68,10 @@ pub fn run(options: &Options) -> Result<()> {
     };
     let module_dir = module.parent().map(Path::to_path_buf).unwrap_or_default();
     let module_dir = fs::canonicalize(&module_dir).unwrap_or(module_dir);
+    let drawings_dir = match &options.case {
+        Some(_) => module_dir.join("drawings"),
+        None => module_dir.join(format!("{}-drawings", module.file_stem().unwrap_or_default().to_string_lossy())),
+    };
 
     let pages = crate::serve::Server::start(root.clone(), "127.0.0.1", 0).map_err(|error| Error::new(format!("the page server: {error}")))?;
     let url = format!("http://127.0.0.1:{}/{}", pages.address.port(), url_path.join("/"));
@@ -86,13 +90,22 @@ pub fn run(options: &Options) -> Result<()> {
             module_dir,
             site_root: root,
             page_dir: page.parent().map(Path::to_path_buf).unwrap_or_default(),
+            drawings_dir: drawings_dir.clone(),
             source: served.display().to_string(),
         },
     );
     fs::write(&module, &converted.code).map_err(error::at(&module))?;
     println!("{} {}", term::green("wrote"), module.display());
+    write_drawings(&drawings_dir, &converted.drawings)?;
     if let Some(html_out) = &html_out {
-        let named = named_only(&read.html, &converted.named);
+        // the case page lives in its own folder: its relative addresses
+        // still resolve from the folder the page came from
+        let folder = url_path[..url_path.len().saturating_sub(1)].iter().fold(String::from("/"), |mut folder, part| {
+            folder.push_str(part);
+            folder.push('/');
+            folder
+        });
+        let named = with_base(&named_only(&read.html, &converted.named), &folder);
         fs::write(html_out, named).map_err(error::at(html_out))?;
         println!("{} {}", term::green("wrote"), html_out.display());
     }
@@ -112,6 +125,44 @@ pub fn run(options: &Options) -> Result<()> {
         report_path.display()
     );
     Ok(())
+}
+
+/// The page's inline drawings, one file each, in place of the ones an
+/// earlier import wrote there.
+fn write_drawings(dir: &Path, drawings: &[(String, String)]) -> Result<()> {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("drawing-") && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("svg")) {
+                fs::remove_file(&path).map_err(error::at(&path))?;
+            }
+        }
+    }
+    if drawings.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir).map_err(error::at(dir))?;
+    for (file, markup) in drawings {
+        let path = dir.join(file);
+        fs::write(&path, markup).map_err(error::at(&path))?;
+    }
+    println!("{} {} drawings in {}", term::green("wrote"), drawings.len(), dir.display());
+    Ok(())
+}
+
+/// The page with a `<base>` at the head of its `<head>`, so its relative
+/// addresses resolve from `folder` wherever it is served; a page that
+/// names its own base keeps it.
+#[must_use]
+pub fn with_base(html: &str, folder: &str) -> String {
+    if html.contains("<base ") || folder == "/" {
+        return html.to_owned();
+    }
+    html.find("<head>").map_or_else(
+        || html.to_owned(),
+        |at| format!("{}<base href=\"{folder}\">{}", &html[..at + "<head>".len()], &html[at + "<head>".len()..]),
+    )
 }
 
 /// The page's markup with only the names the view kept: a box the view
@@ -163,6 +214,20 @@ pub fn gap_report(source: &str, converted: &emit::Converted) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A case page served from its own folder keeps its relative
+    /// addresses: they resolve from the folder the page came from.
+    #[test]
+    fn a_case_page_resolves_from_its_source_folder() {
+        let page = "<html><head><title>t</title></head><body><img src=\"../assets/a.svg\"></body></html>";
+        assert_eq!(
+            with_base(page, "/apps/"),
+            "<html><head><base href=\"/apps/\"><title>t</title></head><body><img src=\"../assets/a.svg\"></body></html>"
+        );
+        assert_eq!(with_base(page, "/"), page, "a page at the root needs none");
+        let based = "<html><head><base href=\"/x/\"></head></html>";
+        assert_eq!(with_base(based, "/apps/"), based, "a page's own base stays");
+    }
 
     #[test]
     fn only_the_named_boxes_keep_their_names() {
