@@ -270,6 +270,36 @@ fn pseudo_text(content: &str) -> Option<String> {
     Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
 }
 
+/// A box laid inside a line of words (`inline-block` and its kin, an
+/// inline picture) rather than under it.
+fn is_inline_box(node: &Node) -> bool {
+    node.kind == Kind::Element && !is_layer(node) && (node.css("display").starts_with("inline-") || (node.tag == "img" && node.css("display") == "inline"))
+}
+
+/// The children of a block that share a line with words: a run of inline
+/// items and inline boxes that holds both words and a box. An inline box
+/// with no words beside it stays a box of the block, as it was.
+fn shares_words(children: &[&Node]) -> Vec<bool> {
+    let mut shares = vec![false; children.len()];
+    let mut start = 0;
+    while start < children.len() {
+        let on_line = |child: &Node| is_inline(child) || is_inline_box(child);
+        if !on_line(children[start]) {
+            start += 1;
+            continue;
+        }
+        let end = (start..children.len()).find(|at| !on_line(children[*at])).unwrap_or(children.len());
+        let run = &children[start..end];
+        let words = run.iter().any(|item| item.kind == Kind::Text && !item.text.trim().is_empty());
+        let boxes = run.iter().any(|item| !is_inline(item));
+        if words && boxes {
+            shares[start..end].iter_mut().for_each(|share| *share = true);
+        }
+        start = end;
+    }
+    shares
+}
+
 fn is_layer(node: &Node) -> bool {
     matches!(node.css("position"), "absolute" | "fixed")
 }
@@ -849,8 +879,17 @@ impl Writer<'_> {
         let content_left = node.rect.x + node.px("padding-left") + node.px("border-left-width");
         let content_right = node.rect.right() - node.px("padding-right") - node.px("border-right-width");
         let mut previous_bottom = content_top;
+        let shares = shares_words(children);
         let flush = |writer: &mut Self, line: &mut Vec<&Node>, views: &mut Vec<String>, previous_bottom: &mut f64| {
             if line.iter().all(|item| item.kind == Kind::Space) {
+                line.clear();
+                return;
+            }
+            if line.iter().any(|item| !is_inline(item)) {
+                if let Some(row) = writer.mixed_line(node, line) {
+                    *previous_bottom = previous_bottom.max(line.iter().map(|item| item.rect.bottom()).fold(f64::NEG_INFINITY, f64::max));
+                    views.push(row);
+                }
                 line.clear();
                 return;
             }
@@ -877,8 +916,8 @@ impl Writer<'_> {
             }
             line.clear();
         };
-        for child in children {
-            if is_inline(child) {
+        for (child, shares) in children.iter().zip(shares) {
+            if is_inline(child) || shares {
                 line.push(child);
                 continue;
             }
@@ -910,6 +949,70 @@ impl Writer<'_> {
             return views.pop().unwrap_or_default();
         }
         format!("{}\n.alignment(HorizontalAlignment::Leading)", stack("vstack", &views))
+    }
+
+    /// A line of words with boxes in it: a row of its runs of words and
+    /// its boxes, each where the browser set it on the line — its offset
+    /// from the line's top, its gap from the item before.
+    fn mixed_line(&mut self, node: &Node, line: &[&Node]) -> Option<String> {
+        let line_height = css::px(node.css("line-height"));
+        // a run of words stands in its line box: the words' own box, grown
+        // by the half-leading on each side
+        let top_of = |item: &Node| match (item.kind, line_height) {
+            (Kind::Text, Some(height)) => item.rect.y - (height - item.rect.h) / 2.0,
+            _ => item.rect.y,
+        };
+        let mut segments: Vec<(f64, f64, f64, String)> = Vec::new();
+        let mut words: Vec<&Node> = Vec::new();
+        let close = |writer: &mut Self, words: &mut Vec<&Node>, segments: &mut Vec<(f64, f64, f64, String)>| {
+            let shown: Vec<&&Node> = words.iter().filter(|item| item.kind != Kind::Space && item.rect.w > 0.0).collect();
+            if let (Some(first), Some(paragraph)) = (shown.first(), writer.paragraph(node, words)) {
+                let left = shown.iter().map(|item| item.rect.x).fold(f64::INFINITY, f64::min);
+                let right = shown.iter().map(|item| item.rect.right()).fold(f64::NEG_INFINITY, f64::max);
+                segments.push((left, right, top_of(first), paragraph));
+            }
+            words.clear();
+        };
+        for item in line {
+            if is_inline(item) {
+                words.push(item);
+                continue;
+            }
+            close(self, &mut words, &mut segments);
+            // the box's own edges: its margins are the gaps around it
+            if let Some(view) = self.element(item, Flow::Row { stretch: false }) {
+                segments.push((item.rect.x, item.rect.right(), item.rect.y, view));
+            }
+        }
+        close(self, &mut words, &mut segments);
+        let top = segments.iter().map(|segment| segment.2).fold(f64::INFINITY, f64::min);
+        if !top.is_finite() {
+            return None;
+        }
+        let mut views = Vec::new();
+        let mut right = None;
+        for (left, end, at, mut view) in segments {
+            let gap = right.map_or(0.0, |right: f64| left - right);
+            if gap.abs() > 0.25 {
+                let _ = write!(view, "\n.padding_edge(Edge::Leading, {})", num(gap));
+            }
+            if at - top > 0.25 {
+                let _ = write!(view, "\n.padding_edge(Edge::Top, {})", num(at - top));
+            }
+            views.push(view);
+            right = Some(end);
+        }
+        let edge = match Self::content_alignment(node).0 {
+            Edge::Center => "Center",
+            Edge::End => "Trailing",
+            Edge::Start => "Leading",
+        };
+        let row = format!("{}\n.spacing(0.0)\n.alignment(VerticalAlignment::Top)", stack("hstack", &views));
+        Some(if self.hug.0 {
+            format!("{row}\n.frame_width_aligned({}, Alignment::{edge})", num(content_width(node)))
+        } else {
+            format!("{row}\n.frame_max(f64::INFINITY, f64::MAX, Alignment::{edge})")
+        })
     }
 
     /// A block-level child: an element, or a pseudo-element in the flow.
