@@ -2857,7 +2857,12 @@ impl VisualProps {
             flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
             shadow_offset: self.shadow_offset.or(outer.shadow_offset),
-            offset: self.offset.or(outer.offset),
+            // two offsets add up, as SwiftUI's do: `.offset(x: 1).offset(x: 2)`
+            // is three
+            offset: match (self.offset, outer.offset) {
+                (Some((x, y)), Some((outer_x, outer_y))) => Some((x + outer_x, y + outer_y)),
+                (inner, outer) => inner.or(outer),
+            },
             opacity: self.opacity.or(outer.opacity),
             blur: self.blur.or(outer.blur),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),

@@ -83,3 +83,11 @@ fn the_page_writes_a_negative_padding_as_a_margin() {
     assert!(page.css.contains("margin-block-start:-20px"), "{}", page.css);
     assert!(!page.css.contains("padding-block:-20px"), "{}", page.css);
 }
+
+/// Two offsets add up, as SwiftUI's do.
+#[test]
+fn offsets_add_up() {
+    let runtime = Runtime::new();
+    runtime.display_frame(&rectangle().frame(10.0, 10.0).test_id("moved").offset(1.0, 2.0).offset(3.0, 4.0), SIZE);
+    assert_eq!(frame(&runtime, "moved").origin, Point { x: 4.0, y: 6.0 });
+}
