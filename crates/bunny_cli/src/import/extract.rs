@@ -23,7 +23,7 @@ pub const SCRIPT: &str = r"(() => {
     'background-color', 'background-image', 'background-size', 'background-position', 'background-repeat', 'background-clip',
     'box-shadow', 'opacity', 'overflow-x', 'overflow-y', 'transform', 'transform-origin', 'filter', 'backdrop-filter', 'mix-blend-mode',
     'clip-path', 'mask-image', 'outline-width', 'outline-style', 'outline-color', 'outline-offset',
-    'color', 'font-size', 'font-weight', 'font-style', 'font-family', 'font-variant', 'line-height', 'letter-spacing',
+    'color', 'font-size', 'font-weight', 'font-style', 'font-family', 'font-variant', 'font-variant-numeric', 'line-height', 'letter-spacing',
     'text-align', 'text-transform', 'text-decoration-line', 'text-decoration-color', 'text-decoration-style',
     'text-shadow', 'white-space', 'text-overflow', '-webkit-line-clamp', 'writing-mode', 'direction', 'vertical-align',
     'object-fit', 'object-position', 'column-count', 'appearance', 'box-sizing', 'aspect-ratio', 'content', 'list-style-type', 'shape-outside',

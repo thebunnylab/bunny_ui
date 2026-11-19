@@ -144,6 +144,9 @@ struct TextStyle {
     underline: bool,
     strike: bool,
     ground: Option<Rgba>,
+    /// `font-variant-numeric: tabular-nums`: the figures take one
+    /// advance each.
+    tabular: bool,
 }
 
 impl TextStyle {
@@ -167,6 +170,7 @@ impl TextStyle {
             underline: decoration.contains("underline"),
             strike: decoration.contains("line-through"),
             ground: if node.css("display").starts_with("inline") && node.css("display") == "inline" { ground } else { None },
+            tabular: node.css("font-variant-numeric").split_whitespace().any(|value| value == "tabular-nums"),
         }
     }
 }
@@ -358,6 +362,9 @@ impl Writer<'_> {
         }
         if self.root.weight != 400 {
             let _ = write!(view, "\n.font_weight({})", weight(self.root.weight));
+        }
+        if self.root.tabular {
+            view.push_str("\n.monospaced_digit()");
         }
         view
     }
@@ -1082,6 +1089,9 @@ impl Writer<'_> {
         if merged.is_empty() {
             return None;
         }
+        if merged.iter().any(|(_, style)| style.tabular != base.tabular) {
+            self.gap(node, "font-variant-numeric: a run", "set as the paragraph's");
+        }
         let view = if merged.len() == 1 && merged[0].1 == base {
             format!("text({})", quote(&merged[0].0))
         } else {
@@ -1164,6 +1174,11 @@ impl Writer<'_> {
         if style.tracking.abs() > 0.001 {
             let _ = write!(view, "\n.tracking({})", num(style.tracking));
         }
+        if style.tabular && !self.root.tabular {
+            view.push_str("\n.monospaced_digit()");
+        } else if !style.tabular && self.root.tabular {
+            self.gap(node, "font-variant-numeric", "proportional under tabular-nums, set tabular");
+        }
         if let Some(height) = style.line_height {
             let _ = write!(view, "\n.line_height({})", num(height));
         }
@@ -1196,8 +1211,11 @@ impl Writer<'_> {
                 Err(_) => self.gap(node, "-webkit-line-clamp", format!("{clamp} lines, drawn whole")),
             },
         }
-        if !node.css("font-variant").is_empty() && node.css("font-variant") != "normal" {
-            self.gap(node, "font-variant", node.css("font-variant").to_owned());
+        // what the shorthand says beyond the tabular figures
+        let variant: Vec<&str> =
+            node.css("font-variant").split_whitespace().filter(|value| !matches!(*value, "normal" | "tabular-nums")).collect();
+        if !variant.is_empty() {
+            self.gap(node, "font-variant", variant.join(" "));
         }
         if node.css("text-shadow") != "none" && !node.css("text-shadow").is_empty() {
             self.gap(node, "text-shadow", node.css("text-shadow").to_owned());
@@ -1946,6 +1964,40 @@ mod tests {
         assert_eq!(color_filter("brightness(1.2)"), None, "SwiftUI's brightness adds, CSS's multiplies");
         assert_eq!(color_filter("sepia(0.6)"), None);
         assert_eq!(color_filter("drop-shadow(rgba(0, 0, 0, 0.4) 0px 1px 2px)"), None);
+    }
+
+    /// `font-variant-numeric: tabular-nums` is `.monospaced_digit()`, and
+    /// the `font-variant` shorthand that also says it is no gap.
+    #[test]
+    fn tabular_figures_are_monospaced_digits() {
+        let page = |numeric: &str| {
+            let mut words = Node { kind: Kind::Text, text: "12:30".to_owned(), ..Node::default() };
+            words.style.insert("font-size".to_owned(), "16px".to_owned());
+            let mut clock = Node { tag: "div".to_owned(), id: "clock".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 40.0, h: 20.0 }, ..Node::default() };
+            for (property, value) in [("display", "block"), ("font-size", "16px"), ("font-variant-numeric", numeric), ("font-variant", numeric)] {
+                clock.style.insert(property.to_owned(), value.to_owned());
+            }
+            clock.children.push(words);
+            let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 }, ..Node::default() };
+            body.style.insert("font-size".to_owned(), "16px".to_owned());
+            body.style.insert("display".to_owned(), "block".to_owned());
+            body.children.push(clock);
+            let options = Options {
+                prelude: String::new(),
+                module_dir: PathBuf::new(),
+                site_root: PathBuf::new(),
+                page_dir: PathBuf::new(),
+                source: "page.html".to_owned(),
+            };
+            convert(&Page { root: body, html: String::new(), width: 100.0, height: 50.0 }, &options)
+        };
+        let tabular = page("tabular-nums");
+        assert!(tabular.code.contains(".monospaced_digit()"), "{}", tabular.code);
+        assert!(!tabular.gaps.iter().any(|gap| gap.feature.starts_with("font-variant")), "{:?}", tabular.gaps);
+        let plain = page("normal");
+        assert!(!plain.code.contains(".monospaced_digit()"), "{}", plain.code);
+        let slashed = page("slashed-zero tabular-nums");
+        assert!(slashed.gaps.iter().any(|gap| gap.feature == "font-variant" && gap.detail == "slashed-zero"), "{:?}", slashed.gaps);
     }
 
     #[test]
