@@ -35,7 +35,8 @@ sheet.sheet.insertRule("a[href][href]{cursor:pointer;pointer-events:auto}", 1);
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}", 2);
 // a control the keyboard reached shows where the keyboard is. At no
 // specificity, so a page that draws its own ring only has to say so
-sheet.sheet.insertRule(":where(#app [role][tabindex]):focus-visible{outline:2px solid Highlight;outline-offset:2px}", 3);
+const FOCUS_RING = "outline:2px solid Highlight;outline-offset:2px";
+sheet.sheet.insertRule(`:where(#app [role][tabindex]):focus-visible{${FOCUS_RING}}`, 3);
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}", 3);
 sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
 sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
@@ -661,7 +662,13 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.background) decl["background-color"] = style.background;
   // background-image sits OVER the flat background
   if (style.image) decl["background-image"] = style.image;
-  if (style.border) decl.border = style.border;
+  // a line drawn inward over the box and its children: an outline
+  // pulled in by its own width paints a CSS border's pixels and lays
+  // nothing out, where a border would push the content in
+  if (style.border) {
+    decl.outline = style.border;
+    decl["outline-offset"] = `${-style.borderWidth}px`;
+  }
   if (style.radius) decl["border-radius"] = style.radius;
   // the halo and the glass rim share one property
   if (style.shadows.length) decl["box-shadow"] = style.shadows.join(",");
@@ -751,9 +758,17 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.hoverFade !== null) rules.push(`${on("hover")}{opacity:${style.hoverFade}}`);
   if (style.pressedFade !== null) rules.push(`${on("active")}{opacity:${style.pressedFade}}`);
   if (style.focus) {
-    rules.push(`${selector}:focus{border-color:${style.focus};caret-color:${style.focus}}`);
+    rules.push(`${selector}:focus{outline-color:${style.focus};caret-color:${style.focus}}`);
   }
   if (style.placeholder) rules.push(`${selector}::placeholder{color:${style.placeholder}}`);
+  // the keyboard's ring is an outline as well: while it shows on a
+  // control, the ring takes the outline and the line moves beneath it
+  // as an inset shadow — the box keeps its line
+  if (style.border) {
+    const line = `inset 0 0 0 ${style.borderWidth}px ${style.borderColor}`;
+    const shadows = [...style.shadows, line].join(",");
+    rules.push(`${selector}[role][tabindex]:focus-visible{${FOCUS_RING};box-shadow:${shadows}}`);
+  }
   return rules;
 }
 
@@ -1002,6 +1017,8 @@ function applyPatches(view, length) {
       hover: null,
       pressed: null,
       border: null,
+      borderWidth: 0,
+      borderColor: null,
       radius: null,
       shadows: [],
       transition: null,
@@ -1030,6 +1047,8 @@ function applyPatches(view, length) {
       const borderColor = u32();
       const borderWidth = f32();
       style.border = `${borderWidth}px solid ${rgba(borderColor)}`;
+      style.borderWidth = borderWidth;
+      style.borderColor = rgba(borderColor);
     }
     // bit 4 is the one radius every corner shares; bit 22 below is the
     // four, and a box sends one or the other, never both
@@ -1043,7 +1062,7 @@ function applyPatches(view, length) {
       f32(); // damping — the CSS side keeps the duration
       // every colour the engine's springs move — the fill, the ink,
       // the border, the halo — and the transform
-      style.transition = ["background-color", "color", "border-color", "box-shadow", "transform"]
+      style.transition = ["background-color", "color", "outline-color", "box-shadow", "transform"]
         .map((property) => `${property} ${response}s ease-out`)
         .join(", ");
     }

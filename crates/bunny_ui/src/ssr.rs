@@ -928,6 +928,10 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
     }
 }
 
+/// The ring a control the keyboard reached wears — the glue's sheet
+/// spells the same one.
+const FOCUS_RING: &str = "outline:2px solid Highlight;outline-offset:2px";
+
 /// The look's rule: the kind's defaults, the flow record, the style,
 /// the text's face — and its states, one rule each. The twin of the
 /// glue's `defineRule`: a served page must agree with a mounted one.
@@ -1079,7 +1083,12 @@ fn rule_text(
         states.push(format!("{}{{background-color:{}}}", on("active"), color(pressed)));
     }
     if let Some((border, width)) = style.border {
-        base.insert("border", format!("{} solid {}", px(width), color(border)));
+        // a line drawn inward over the box and its children: an outline
+        // pulled in by its own width paints a CSS border's pixels and
+        // lays nothing out, where a border would push the content in
+        let line = style.border_style.map_or("solid", crate::shapes::BorderStyle::css);
+        base.insert("outline", format!("{} {line} {}", px(width), color(border)));
+        base.insert("outline-offset", px(-width));
     }
     if let Some(radii) = style.corner_radius {
         // one number when every corner shares it, four in the CSS
@@ -1108,14 +1117,14 @@ fn rule_text(
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
         // the border, the halo — and the transform
-        let eased: Vec<String> = ["background-color", "color", "border-color", "box-shadow", "transform"]
+        let eased: Vec<String> = ["background-color", "color", "outline-color", "box-shadow", "transform"]
             .iter()
             .map(|property| format!("{property} {response}s ease-out"))
             .collect();
         base.insert("transition", eased.join(", "));
     }
     if let Some(focus) = style.focus_border {
-        states.push(format!("{selector}:focus{{border-color:{c};caret-color:{c}}}", c = color(focus)));
+        states.push(format!("{selector}:focus{{outline-color:{c};caret-color:{c}}}", c = color(focus)));
     }
     if let Some(placeholder) = style.placeholder_color {
         states.push(format!("{selector}::placeholder{{color:{}}}", color(placeholder)));
@@ -1184,6 +1193,13 @@ fn rule_text(
     }
     if !shadows.is_empty() {
         base.insert("box-shadow", shadows.join(","));
+    }
+    // the keyboard's ring is an outline as well (the glue's sheet): while
+    // it shows on a control, the ring takes the outline and the line
+    // moves beneath it as an inset shadow — the box keeps its line
+    if let Some((border, width)) = style.border {
+        shadows.push(format!("inset 0 0 0 {} {}", px(width), color(border)));
+        states.push(format!("{selector}[role][tabindex]:focus-visible{{{FOCUS_RING};box-shadow:{}}}", shadows.join(",")));
     }
     if let Some(text) = text {
         // a text with the face declared above it names none of its own
@@ -1507,6 +1523,39 @@ mod tests {
         assert!(rule.contains("padding-block:1px 3px"), "{rule}");
         assert!(rule.contains("padding-inline:4px 2px"), "leading first: {rule}");
         assert!(!rule.contains("padding:"), "no physical padding: {rule}");
+    }
+
+    /// A border is a line drawn inward over the box and its children,
+    /// laying nothing out: the page draws it as an outline pulled in by
+    /// its own width — which paints a CSS border's very pixels — never
+    /// as a CSS border, which would push the content in. A broken line
+    /// keeps its dashes, and a field's focus colors the same line.
+    #[test]
+    fn a_served_border_is_drawn_inward_and_lays_nothing_out() {
+        #[derive(Clone)]
+        struct Bordered(State<String>);
+        impl Component for Bordered {
+            fn body(self) -> impl View {
+                vstack!(
+                    text("solid").border(Color::rgb(1, 2, 3), 2.0),
+                    text("dashed").border(Color::rgb(1, 2, 3), 1.5).border_style(BorderStyle::Dashed),
+                    text_field("name", self.0.binding()),
+                )
+            }
+        }
+
+        let page = render(&Bordered(State::new(String::new())), Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        assert!(css.contains("outline:2px solid rgba(1, 2, 3, 1);outline-offset:-2px"), "{css}");
+        assert!(css.contains("outline:1.5px dashed rgba(1, 2, 3, 1);outline-offset:-1.5px"), "{css}");
+        assert!(css.contains(":focus{outline-color:"), "{css}");
+        // the keyboard's ring takes the outline, the line moves beneath it
+        assert!(
+            css.contains("[role][tabindex]:focus-visible{outline:2px solid Highlight;outline-offset:2px;box-shadow:inset 0 0 0 2px rgba(1, 2, 3, 1)}"),
+            "{css}"
+        );
+        let pushes = css.split(['{', ';']).filter(|declaration| declaration.starts_with("border:") && *declaration != "border:0");
+        assert_eq!(pushes.count(), 0, "{css}");
     }
 
     /// A served field says what the mounted one says — the glue's op 7,

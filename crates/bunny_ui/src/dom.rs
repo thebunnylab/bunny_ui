@@ -333,8 +333,11 @@ pub struct DomLook {
     pub color: Option<Color>,
     pub hover_color: Option<Color>,
     pub pressed_color: Option<Color>,
+    /// The line drawn inward over the box and its children. The page
+    /// draws it as an outline pulled in by its width: a CSS border
+    /// would push the content in.
     pub border: Option<(Color, Px)>,
-    /// `border-style` — the browser fits its own dashes, the same
+    /// The line's style — the browser fits its own dashes, the same
     /// rhythm the house traces.
     pub border_style: Option<crate::shapes::BorderStyle>,
     /// A `repeating-linear-gradient` over the background.
