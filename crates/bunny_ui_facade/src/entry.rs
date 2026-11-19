@@ -34,12 +34,13 @@ use bunny_ui_core::layout::Size;
 pub struct AppConfig {
     title: Option<String>,
     size: Size,
+    update_checks: bool,
 }
 
 impl AppConfig {
     /// The window titled after the app, at the house size.
     pub fn new() -> AppConfig {
-        AppConfig { title: None, size: Size { width: 1024.0, height: 640.0 } }
+        AppConfig { title: None, size: Size { width: 1024.0, height: 640.0 }, update_checks: true }
     }
 
     /// The window's title, when it is not the app's name.
@@ -51,6 +52,16 @@ impl AppConfig {
     /// The window's first size, in points.
     pub fn size(mut self, width: f64, height: f64) -> AppConfig {
         self.size = Size { width, height };
+        self
+    }
+
+    /// Whether the updater checks for a new build by itself: after a
+    /// short wait at start, every few hours, and on a return to the app.
+    /// On by default. Off, it checks only when the app calls
+    /// `bunny_ui::updater::check_now`. It means something only with the
+    /// `updater` feature and an updater configuration.
+    pub fn check_for_updates(mut self, on: bool) -> AppConfig {
+        self.update_checks = on;
         self
     }
 }
@@ -84,7 +95,13 @@ macro_rules! app {
         /// page's `start` export instead, and this returns at once.
         pub fn run() {
             $crate::__bunny_app_preview_entry!($root, $config);
-            $crate::__private::run($crate::__bunny_identity!(), $config, $root, $crate::__bunny_preview_config!())
+            $crate::__private::run(
+                $crate::__bunny_identity!(),
+                $config,
+                $root,
+                $crate::__bunny_preview_config!(),
+                $crate::__bunny_updater_settings!(),
+            )
         }
         $crate::__bunny_entry!(run, $root, $config);
     };
@@ -103,6 +120,24 @@ macro_rules! __bunny_identity {
                 ::core::option::Option::None => ::core::env!("CARGO_PKG_NAME"),
             },
             id: ::core::option_env!("BUNNY_APP_ID"),
+            version: ::core::env!("CARGO_PKG_VERSION"),
+        }
+    };
+}
+
+/// The app's updater configuration as its OWN crate was built: what
+/// `bunny build` set from `[package.metadata.bunny.updater]`, and the
+/// app's version.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_updater_settings {
+    () => {
+        $crate::__private::UpdaterSettings {
+            product: ::core::option_env!("BUNNY_UPDATER_PRODUCT"),
+            feed: ::core::option_env!("BUNNY_UPDATER_FEED"),
+            server: ::core::option_env!("BUNNY_UPDATER_SERVER"),
+            pubkeys: ::core::option_env!("BUNNY_UPDATER_PUBKEYS"),
+            channel: ::core::option_env!("BUNNY_CHANNEL"),
             version: ::core::env!("CARGO_PKG_VERSION"),
         }
     };
@@ -358,6 +393,49 @@ pub mod __private {
         hot::preview::Output::of(bunny_ui_core::preview::Preview::new(root).size(config.size.width, config.size.height))
     }
 
+    /// What the app's build said about its updater; every field `None`
+    /// when it said nothing.
+    #[derive(Clone, Copy, Debug)]
+    pub struct UpdaterSettings {
+        pub product: Option<&'static str>,
+        pub feed: Option<&'static str>,
+        pub server: Option<&'static str>,
+        pub pubkeys: Option<&'static str>,
+        pub channel: Option<&'static str>,
+        pub version: &'static str,
+    }
+
+    /// The updater, before the window: a Windows update helper launch does
+    /// its work and exits here, and an ordinary launch starts the checks
+    /// when the build has an updater configuration. A configuration that
+    /// is wrong is said on stderr, and the app runs with no updater.
+    #[cfg(all(feature = "updater", any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    fn updater_host(settings: UpdaterSettings, checks: bool) {
+        if bunny_ui_updater::run_helper_if_asked() {
+            std::process::exit(0);
+        }
+        let build = bunny_ui_updater::BuildSettings {
+            product: settings.product,
+            feed: settings.feed,
+            server: settings.server,
+            pubkeys: settings.pubkeys,
+            channel: settings.channel,
+            version: settings.version,
+        };
+        match bunny_ui_updater::UpdaterConfig::from_build(&build) {
+            Ok(Some(config)) => {
+                let schedule =
+                    if checks { bunny_ui_updater::Schedule::Automatic } else { bunny_ui_updater::Schedule::Manual };
+                bunny_ui_updater::start(config, schedule);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("bunny-ui: the updater is off: {error}"),
+        }
+    }
+
+    #[cfg(not(all(feature = "updater", any(target_os = "macos", target_os = "windows", target_os = "linux"))))]
+    fn updater_host(_settings: UpdaterSettings, _checks: bool) {}
+
     /// The app's package and manifest directory, for the preview host.
     #[derive(Clone, Copy, Debug)]
     pub struct PreviewConfig {
@@ -479,11 +557,18 @@ pub mod __private {
         ),
         not(feature = "hot"),
     ))]
-    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl FnOnce() -> V, preview: PreviewConfig) {
+    pub fn run<V: View>(
+        identity: Identity,
+        config: AppConfig,
+        root: impl FnOnce() -> V,
+        preview: PreviewConfig,
+        updater: UpdaterSettings,
+    ) {
         set_identity(identity);
         // a preview build asked to host: the previews resolve in this
         // very binary, and no window opens
         preview_host(preview);
+        updater_host(updater, config.update_checks);
         let title = config.title.unwrap_or_else(|| identity.name.to_string());
         crate::run_window(&title, config.size, root())
     }
@@ -493,7 +578,15 @@ pub mod __private {
     /// view is built again with each generation's code, inside the pass,
     /// so the state it makes is found again — `root` runs more than once.
     #[cfg(all(feature = "shell", all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android"))))]
-    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl Fn() -> V + 'static, preview: PreviewConfig) {
+    pub fn run<V: View>(
+        identity: Identity,
+        config: AppConfig,
+        root: impl Fn() -> V + 'static,
+        preview: PreviewConfig,
+        // a hot run is a debug run under `bunny run`: it never replaces
+        // itself with a release
+        _updater: UpdaterSettings,
+    ) {
         set_identity(identity);
         let title = config.title.unwrap_or_else(|| identity.name.to_string());
         // Android names no folder an app may write but the activity's own
@@ -520,7 +613,13 @@ pub mod __private {
             target_os = "android",
         )
     )))]
-    pub fn run<V: View>(identity: Identity, _config: AppConfig, _root: impl FnOnce() -> V, _preview: PreviewConfig) {
+    pub fn run<V: View>(
+        identity: Identity,
+        _config: AppConfig,
+        _root: impl FnOnce() -> V,
+        _preview: PreviewConfig,
+        _updater: UpdaterSettings,
+    ) {
         set_identity(identity);
     }
 

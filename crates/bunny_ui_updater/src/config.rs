@@ -113,6 +113,60 @@ impl UpdaterConfig {
     }
 }
 
+/// What `bunny build` wrote into the app's build: the
+/// `[package.metadata.bunny.updater]` of its `Cargo.toml`, as the
+/// `BUNNY_UPDATER_*` and `BUNNY_CHANNEL` settings of the compiler.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildSettings<'a> {
+    pub product: Option<&'a str>,
+    /// A static feed's URL.
+    pub feed: Option<&'a str>,
+    /// A release server's base.
+    pub server: Option<&'a str>,
+    /// The public keys, base64, separated by commas.
+    pub pubkeys: Option<&'a str>,
+    pub channel: Option<&'a str>,
+    /// The app's own version.
+    pub version: &'a str,
+}
+
+impl UpdaterConfig {
+    /// The configuration that the build settings describe.
+    ///
+    /// `Ok(None)` when the build has no updater: no product, or no feed
+    /// and no server.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdateError::Parse`] when the settings are there but wrong: a
+    /// feed and a server both, a product or a version that does not parse,
+    /// no key, or a key that is not one. An updater that cannot verify is
+    /// worse than none.
+    pub fn from_build(settings: &BuildSettings<'_>) -> Result<Option<UpdaterConfig>, UpdateError> {
+        fn given(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|value| !value.is_empty())
+        }
+        let (Some(product), feed, server) = (given(settings.product), given(settings.feed), given(settings.server)) else {
+            return Ok(None);
+        };
+        let feed = match (feed, server) {
+            (Some(_), Some(_)) => return Err(UpdateError::Parse("the updater has a feed and a server: give one".into())),
+            (Some(url), None) => Feed::Static(url.to_owned()),
+            (None, Some(base)) => Feed::Server(base.to_owned()),
+            (None, None) => return Ok(None),
+        };
+        let mut config = UpdaterConfig::new(feed, ProductId::parse(product)?, Version::parse_strict(settings.version)?)
+            .channel(Channel::from_build(given(settings.channel)));
+        for text in given(settings.pubkeys).unwrap_or_default().split(',').map(str::trim).filter(|text| !text.is_empty()) {
+            config = config.key_base64(text)?;
+        }
+        if config.keys.is_empty() {
+            return Err(UpdateError::Parse("the updater has no public key".into()));
+        }
+        Ok(Some(config))
+    }
+}
+
 /// A public key from the base64 text of its 32 bytes.
 ///
 /// # Errors

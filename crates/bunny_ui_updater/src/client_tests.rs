@@ -408,3 +408,44 @@ fn the_staged_name_is_the_product_the_content_and_the_format() {
     assert_eq!(staged_name(&product(), Format::Zip, "0123456789abcdef0123"), "app-0123456789abcdef.zip");
     assert_eq!(staged_name(&product(), Format::TarGz, "ab"), "app-ab.tar.gz");
 }
+
+#[test]
+fn the_build_settings_make_a_configuration_or_none() {
+    use crate::BuildSettings;
+    let pubkey = base64::encode(key(1).verifying_key().as_bytes());
+    let other = base64::encode(key(2).verifying_key().as_bytes());
+    let keys = format!("{pubkey}, {other}");
+    let settings = BuildSettings {
+        product: Some("app"),
+        feed: Some("https://dl/{channel}/latest.json"),
+        server: None,
+        pubkeys: Some(&keys),
+        channel: Some("preview"),
+        version: "1.2.0",
+    };
+    let config = UpdaterConfig::from_build(&settings).unwrap().unwrap();
+    assert_eq!(config.feed, Feed::Static("https://dl/{channel}/latest.json".into()));
+    assert_eq!(config.channel, Channel::Preview);
+    assert_eq!(config.current, v("1.2.0"));
+    assert_eq!(config.keys, [key(1).verifying_key(), key(2).verifying_key()]);
+
+    let server = BuildSettings { feed: None, server: Some("https://api"), channel: None, ..settings };
+    let config = UpdaterConfig::from_build(&server).unwrap().unwrap();
+    assert_eq!((config.feed, config.channel), (Feed::Server("https://api".into()), Channel::Stable));
+
+    // no updater in this build: nothing, and no error
+    assert!(UpdaterConfig::from_build(&BuildSettings { version: "1.0.0", ..BuildSettings::default() }).unwrap().is_none());
+    assert!(UpdaterConfig::from_build(&BuildSettings { feed: None, server: None, ..settings }).unwrap().is_none());
+    assert!(UpdaterConfig::from_build(&BuildSettings { product: Some(" "), ..settings }).unwrap().is_none());
+
+    // an updater given wrongly is an error
+    for wrong in [
+        BuildSettings { server: Some("https://api"), ..settings },
+        BuildSettings { pubkeys: None, ..settings },
+        BuildSettings { pubkeys: Some("not a key"), ..settings },
+        BuildSettings { product: Some("Not A Slug"), ..settings },
+        BuildSettings { version: "one", ..settings },
+    ] {
+        assert!(UpdaterConfig::from_build(&wrong).is_err(), "{wrong:?}");
+    }
+}
