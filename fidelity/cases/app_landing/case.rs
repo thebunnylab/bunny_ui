@@ -22,7 +22,7 @@ pub fn view() -> impl View {
     .clipped()
     .overlay(UnitPoint::TOP_LEADING, spacer()
         .frame_aligned(1024.0, 330.0, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0552, y: -0.2968 }, end: UnitPoint { x: 0.9448, y: 1.2968 }, from: Color::rgb(237, 233, 254), to: Color::rgb(252, 231, 243) })
+        .background_gradient(Gradient::linear(Color::rgb(237, 233, 254), Color::rgb(252, 231, 243)).direction(UnitPoint { x: 0.0552, y: -0.2968 }, UnitPoint { x: 0.9448, y: 1.2968 }))
         .test_id("div.hero-bg-1"))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             text("Lumen")
@@ -260,7 +260,7 @@ pub fn view() -> impl View {
             hstack!(
                 spacer()
                 .frame_aligned(36.0, 36.0, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.0 }, end: UnitPoint { x: 1.0, y: 1.0 }, from: Color::rgb(139, 92, 246), to: Color::rgb(236, 72, 153) })
+                .background_gradient(Gradient::linear(Color::rgb(139, 92, 246), Color::rgb(236, 72, 153)).direction(UnitPoint { x: 0.0, y: 0.0 }, UnitPoint { x: 1.0, y: 1.0 }))
                 .corner_radius(10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(16.0, 16.0, Alignment::TopLeading)
@@ -302,7 +302,7 @@ pub fn view() -> impl View {
             hstack!(
                 spacer()
                 .frame_aligned(36.0, 36.0, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.0 }, end: UnitPoint { x: 1.0, y: 1.0 }, from: Color::rgb(139, 92, 246), to: Color::rgb(236, 72, 153) })
+                .background_gradient(Gradient::linear(Color::rgb(139, 92, 246), Color::rgb(236, 72, 153)).direction(UnitPoint { x: 0.0, y: 0.0 }, UnitPoint { x: 1.0, y: 1.0 }))
                 .corner_radius(10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(18.0, 16.0, Alignment::TopLeading)
@@ -344,7 +344,7 @@ pub fn view() -> impl View {
             hstack!(
                 spacer()
                 .frame_aligned(36.0, 36.0, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.0 }, end: UnitPoint { x: 1.0, y: 1.0 }, from: Color::rgb(139, 92, 246), to: Color::rgb(236, 72, 153) })
+                .background_gradient(Gradient::linear(Color::rgb(139, 92, 246), Color::rgb(236, 72, 153)).direction(UnitPoint { x: 0.0, y: 0.0 }, UnitPoint { x: 1.0, y: 1.0 }))
                 .corner_radius(10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(14.0, 14.0, Alignment::TopLeading)
@@ -782,7 +782,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Bottom, 10.0)
         .padding_edge(Edge::Leading, 14.0)
         .frame_aligned(360.0, 76.0, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.1972, y: 1.9342 }, end: UnitPoint { x: 0.8028, y: -0.9342 }, from: Color::rgb(109, 40, 217), to: Color::rgb(124, 58, 237) })
+        .background_gradient(Gradient::linear(Color::rgb(109, 40, 217), Color::rgb(124, 58, 237)).direction(UnitPoint { x: 0.1972, y: 1.9342 }, UnitPoint { x: 0.8028, y: -0.9342 }).stop(0.0324, Color::rgb(109, 40, 217)).stop(0.0324, Color::rgb(124, 58, 237)).stop(0.0649, Color::rgb(124, 58, 237)))
         .corner_radius(10.0)
         .test_id("div.newsletter-82")
         .offset(624.0, 784.0))
@@ -790,7 +790,7 @@ pub fn view() -> impl View {
             spacer()
             .frame_height_aligned(2.0, Alignment::TopLeading)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(109, 40, 217), to: Color::rgba(0, 0, 0, 0) })
+            .background_gradient(Gradient::linear(Color::rgb(109, 40, 217), Color::rgba(236, 72, 153, 0)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }).stop(0.5, Color::rgb(236, 72, 153)))
             .clipped()
             .test_id("hr-86"),
             hstack!(

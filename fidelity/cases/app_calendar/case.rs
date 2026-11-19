@@ -109,8 +109,8 @@ pub fn view() -> impl View {
             hstack!(
                 spacer()
                 .frame_aligned(10.0, 10.0, Alignment::Top)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) })
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) }),
+                .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
+                .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 })),
                 text("New event")
                 .font_size(12.0)
                 .font_weight(Weight::Bold)
@@ -123,7 +123,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 14.0)
             .padding_edge(Edge::Bottom, 6.0)
             .padding_edge(Edge::Leading, 12.0)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.1832, y: -0.6854 }, end: UnitPoint { x: 0.8168, y: 1.6854 }, from: Color::rgb(90, 200, 250), to: Color::rgb(88, 86, 214) })
+            .background_gradient(Gradient::linear(Color::rgb(90, 200, 250), Color::rgb(88, 86, 214)).direction(UnitPoint { x: 0.1832, y: -0.6854 }, UnitPoint { x: 0.8168, y: 1.6854 }).stop(0.55, Color::rgb(52, 120, 246)))
             .corner_radius(8.0)
             .shadow_color(6.0, Color::rgba(52, 120, 246, 102))
             .shadow_offset(0.0, 2.0)
@@ -2322,7 +2322,7 @@ pub fn view() -> impl View {
                 spacer()
                 .frame_height_aligned(400.0, Alignment::TopLeading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(229, 229, 234), to: Color::rgba(0, 0, 0, 0) })
+                .background_gradient(Gradient::linear(Color::rgb(229, 229, 234), Color::rgba(229, 229, 234, 0)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }).stop(0.0025, Color::rgb(229, 229, 234)).stop(0.0025, Color::rgba(229, 229, 234, 0)).stop(0.1, Color::rgba(229, 229, 234, 0)))
                 .overlay(UnitPoint::TOP_LEADING, text("8 am")
                     .font_size(9.0)
                     .foreground_color(Color::rgb(174, 174, 178))

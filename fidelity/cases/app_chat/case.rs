@@ -122,7 +122,7 @@ pub fn view() -> impl View {
                 spacer()
                 .frame_height_aligned(1.0, Alignment::TopLeading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgba(0, 0, 0, 0), to: Color::rgba(0, 0, 0, 46) }),
+                .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 0), Color::rgba(0, 0, 0, 46)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 })),
                 text("TODAY")
                 .font_size(11.0)
                 .foreground_color(Color::rgb(138, 143, 156))
@@ -130,7 +130,7 @@ pub fn view() -> impl View {
                 spacer()
                 .frame_height_aligned(1.0, Alignment::TopLeading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 1.0, y: 0.5 }, end: UnitPoint { x: 0.0, y: 0.5 }, from: Color::rgba(0, 0, 0, 0), to: Color::rgba(0, 0, 0, 46) }),
+                .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 0), Color::rgba(0, 0, 0, 46)).direction(UnitPoint { x: 1.0, y: 0.5 }, UnitPoint { x: 0.0, y: 0.5 })),
             )
             .spacing(10.0)
             .alignment(VerticalAlignment::Center)
@@ -187,7 +187,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 12.0)
             .padding_edge(Edge::Bottom, 8.0)
             .padding_edge(Edge::Leading, 12.0)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.187, y: -0.7415 }, end: UnitPoint { x: 0.813, y: 1.7415 }, from: Color::rgb(59, 130, 255), to: Color::rgb(155, 77, 255) })
+            .background_gradient(Gradient::linear(Color::rgb(59, 130, 255), Color::rgb(155, 77, 255)).direction(UnitPoint { x: 0.187, y: -0.7415 }, UnitPoint { x: 0.813, y: 1.7415 }).stop(0.6, Color::rgb(106, 76, 255)))
             .corner_radius(Corners { top_left: 18.0, top_right: 18.0, bottom_right: 4.0, bottom_left: 18.0 })
             .shadow_color(6.0, Color::rgba(70, 80, 255, 77))
             .shadow_offset(0.0, 2.0)
@@ -254,7 +254,7 @@ pub fn view() -> impl View {
                 .padding_edge(Edge::Bottom, 7.0)
                 .padding_edge(Edge::Leading, 10.0)
                 .frame_aligned(266.5, 44.5938, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgba(0, 0, 0, 0), to: Color::rgba(0, 0, 0, 179) })
+                .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 0), Color::rgba(0, 0, 0, 179)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
                 .test_id("div.cap-28")
                 .offset(0.0, 155.2813))
             .test_id("div.ph-26")
@@ -315,7 +315,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 12.0)
             .padding_edge(Edge::Bottom, 8.0)
             .padding_edge(Edge::Leading, 12.0)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.2004, y: -1.0106 }, end: UnitPoint { x: 0.7996, y: 2.0106 }, from: Color::rgb(59, 130, 255), to: Color::rgb(155, 77, 255) })
+            .background_gradient(Gradient::linear(Color::rgb(59, 130, 255), Color::rgb(155, 77, 255)).direction(UnitPoint { x: 0.2004, y: -1.0106 }, UnitPoint { x: 0.7996, y: 2.0106 }).stop(0.6, Color::rgb(106, 76, 255)))
             .corner_radius(Corners { top_left: 18.0, top_right: 18.0, bottom_right: 4.0, bottom_left: 18.0 })
             .shadow_color(6.0, Color::rgba(70, 80, 255, 77))
             .shadow_offset(0.0, 2.0)
@@ -396,7 +396,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Bottom, 6.0)
         .padding_edge(Edge::Leading, 12.0)
         .frame_max(f64::INFINITY, f64::INFINITY, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(243, 245, 250), to: Color::rgb(232, 236, 244) })
+        .background_gradient(Gradient::linear(Color::rgb(243, 245, 250), Color::rgb(232, 236, 244)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
         .clipped()
         .test_id("main-12"),
         hstack!(
@@ -423,7 +423,7 @@ pub fn view() -> impl View {
             .test_id("input.field-42"),
             spacer()
             .frame_aligned(40.0, 40.0, Alignment::TopLeading)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.0 }, end: UnitPoint { x: 1.0, y: 1.0 }, from: Color::rgb(59, 130, 255), to: Color::rgb(155, 77, 255) })
+            .background_gradient(Gradient::linear(Color::rgb(59, 130, 255), Color::rgb(155, 77, 255)).direction(UnitPoint { x: 0.0, y: 0.0 }, UnitPoint { x: 1.0, y: 1.0 }))
             .corner_radius(20.0)
             .shadow_color(10.0, Color::rgba(80, 80, 255, 102))
             .shadow_offset(0.0, 4.0)

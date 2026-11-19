@@ -1,6 +1,6 @@
 # Import gaps — apps/settings.html
 
-100 views named; 41 gaps in 15 features.
+100 views named; 39 gaps in 14 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -8,7 +8,6 @@
 | `width: %` | 9 | input-16, input-22, input-58, input.bad-19, … | 100% written as 398.0 points |
 | `min-width` | 7 | kbd-80, kbd-81, kbd-83, kbd-84, … | 18px |
 | `input type=radio` | 3 | input-46, input-48, input-50 | drawn as an empty box |
-| `gradient: stops` | 2 | div.drop-11, hr-96 | 4 stops drawn as the first and the last |
 | `box-shadow: layers` | 1 | img-10 | rgb(255, 255, 255) 0px 0px 0px 2px, rgb(199, 199, 204) 0px 0px 0px 3px |
 | `box-shadow: spread` | 1 | img-10 | 2.0 |
 | `input type=range` | 1 | input-58 | drawn as an empty box |

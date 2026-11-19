@@ -1,11 +1,10 @@
 # Import gaps — apps/music.html
 
-67 views named; 34 gaps in 17 features.
+67 views named; 28 gaps in 16 features.
 
 | feature | count | where | what |
 |---|---|---|---|
 | `font-variant` | 7 | span-24, span-25, span.d-47, span.d-53, … | tabular-nums |
-| `gradient: stops` | 6 | div.vinyl-12, span.play-30, div.fill-21, div.scrim-2, … | 3 stops drawn as the first and the last |
 | `box-shadow: layers` | 4 | div.knob-22, section.card-10, span.play-30, img.art-13 | rgba(0, 0, 0, 0.3) 0px -2px 3px 0px inset, rgb(255, 255, 255) 0px 1px 1px 0px inset, rgba(0, 0, 0, 0.4) 0px 2px 6px 0px |
 | `clip-path` | 3 | span.play-30::after, span.spk-35, span.heart-18::after | polygon(0px 0px, 100% 50%, 0px 100%) |
 | `conic-gradient` | 2 | div.vinyl-12, div.vinyl-12::before | not drawn |

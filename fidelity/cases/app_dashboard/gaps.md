@@ -1,6 +1,6 @@
 # Import gaps — apps/dashboard.html
 
-227 views named; 39 gaps in 15 features.
+227 views named; 37 gaps in 14 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -10,7 +10,6 @@
 | `inline-block in a line` | 4 | span.trend-44, span.trend-56, span.trend-68, span.trend-80 | drawn as a run of its words |
 | `background-blend-mode` | 2 | div.donut-96, span.ico-8 | normal, normal |
 | `background-image: layers` | 2 | div.donut-96, span.ico-8 | 2 layers |
-| `gradient: stops` | 2 | div.donut-96, div.plot-121 | 3 stops drawn as the first and the last |
 | `border-style` | 1 | span.ico-26 | double |
 | `border-style: one side` | 1 | hr.div-d-166 | dashed |
 | `box-shadow: inset` | 1 | div.user-card-27 | rgba(255, 255, 255, 0.08) 0px 0px 0px 1px inset |

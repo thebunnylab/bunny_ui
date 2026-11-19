@@ -1,6 +1,6 @@
 # Import gaps — apps/kanban.html
 
-138 views named; 38 gaps in 10 features.
+138 views named; 37 gaps in 9 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -10,7 +10,6 @@
 | `progress` | 5 | progress-110, progress-28, progress-66, progress-80, … | the native bar drawn as a track and a fill |
 | `font-variant` | 4 | span.count-120, span.count-18, span.count-58, span.count-90 | tabular-nums |
 | `filter: grayscale` | 2 | article.card-122, article.card-130 | grayscale(1) |
-| `gradient: stops` | 1 | section.column-117 | 4 stops drawn as the first and the last |
 | `overflow: scroll` | 1 | div.board-14 | drawn as a clip |
 | `repeating-linear-gradient` | 1 | section.column-117 | drawn once |
 | `scroll position` | 1 | div.board-14 | drawn scrolled by 20.0 0.0 |

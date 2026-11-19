@@ -59,7 +59,7 @@ pub fn view() -> impl View {
             .offset(18.0, 8.0))
         .overlay(UnitPoint::TOP_LEADING, spacer()
             .frame_aligned(390.0, 130.0, Alignment::TopLeading)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgba(0, 0, 0, 89), to: Color::rgba(124, 58, 237, 89) }))
+            .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 89), Color::rgba(124, 58, 237, 89)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }).stop(0.4, Color::rgba(0, 0, 0, 0)).stop(0.4, Color::rgba(124, 58, 237, 0))))
         .test_id("div.cover-1"),
         hstack!(
             image(picture_avatar_1())
@@ -104,7 +104,7 @@ pub fn view() -> impl View {
                 .padding_edge(Edge::Trailing, 16.0)
                 .padding_edge(Edge::Leading, 16.0)
                 .frame_height_aligned(34.0, Alignment::Leading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.1285, y: -0.2644 }, end: UnitPoint { x: 0.8715, y: 1.2644 }, from: Color::rgb(124, 58, 237), to: Color::rgb(236, 72, 153) })
+                .background_gradient(Gradient::linear(Color::rgb(124, 58, 237), Color::rgb(236, 72, 153)).direction(UnitPoint { x: 0.1285, y: -0.2644 }, UnitPoint { x: 0.8715, y: 1.2644 }))
                 .corner_radius(17.0)
                 .shadow_color(8.0, Color::rgba(124, 58, 237, 89))
                 .shadow_offset(0.0, 3.0)

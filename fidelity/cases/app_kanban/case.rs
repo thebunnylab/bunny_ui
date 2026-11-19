@@ -1491,7 +1491,7 @@ pub fn view() -> impl View {
             .alignment(HorizontalAlignment::Leading)
             .padding_length(10.0)
             .frame_width_aligned(262.0, Alignment::TopLeading)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: -0.0339, y: 0.9701 }, end: UnitPoint { x: 1.0339, y: 0.0299 }, from: Color::rgb(233, 235, 241), to: Color::rgb(223, 226, 234) })
+            .background_gradient(Gradient::linear(Color::rgb(233, 235, 241), Color::rgb(223, 226, 234)).direction(UnitPoint { x: -0.0339, y: 0.9701 }, UnitPoint { x: 1.0339, y: 0.0299 }).stop(0.0253, Color::rgb(233, 235, 241)).stop(0.0253, Color::rgb(223, 226, 234)).stop(0.0505, Color::rgb(223, 226, 234)))
             .corner_radius(12.0)
             .clipped()
             .test_id("section.column-117"),

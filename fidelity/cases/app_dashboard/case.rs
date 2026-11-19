@@ -13,7 +13,7 @@ pub fn view() -> impl View {
             hstack!(
                 spacer()
                 .frame_aligned(26.0, 26.0, Alignment::TopLeading)
-                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.0 }, end: UnitPoint { x: 1.0, y: 1.0 }, from: Color::rgb(79, 70, 229), to: Color::rgb(236, 72, 153) })
+                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(236, 72, 153)).direction(UnitPoint { x: 0.0, y: 0.0 }, UnitPoint { x: 1.0, y: 1.0 }))
                 .corner_radius(8.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .padding_length(2.0)
@@ -48,10 +48,10 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .frame_aligned(16.0, 16.0, Alignment::TopLeading)
-                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) })
-                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) })
-                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) })
-                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(255, 255, 255), to: Color::rgb(255, 255, 255) })
+                    .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
+                    .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
+                    .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
+                    .background_gradient(Gradient::linear(Color::rgb(255, 255, 255), Color::rgb(255, 255, 255)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }))
                     .corner_radius(1.0)
                     .test_id("span.ico-8"),
                     text("Overview")
@@ -778,7 +778,7 @@ pub fn view() -> impl View {
                         hstack!(
                             spacer()
                             .frame_aligned(120.0, 120.0, Alignment::TopLeading)
-                            .background_gradient(Gradient::Radial { center: UnitPoint { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: Color::rgb(255, 255, 255), outer: Color::rgba(0, 0, 0, 0) })
+                            .background_gradient(Gradient::radial(Color::rgb(255, 255, 255), Color::rgba(255, 255, 255, 0)).stop(0.62, Color::rgb(255, 255, 255)).stop(0.63, Color::rgba(255, 255, 255, 0)))
                             .corner_radius(60.0)
                             .overlay(UnitPoint::TOP_LEADING, vstack!(
                                     text("€128k")
@@ -1170,7 +1170,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 6.0)
                             .frame_aligned(399.1953, 126.5, Alignment::TopLeading)
-                            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgb(229, 231, 235), to: Color::rgba(0, 0, 0, 0) })
+                            .background_gradient(Gradient::linear(Color::rgb(229, 231, 235), Color::rgba(229, 231, 235, 0)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }).stop(0.0079, Color::rgb(229, 231, 235)).stop(0.0079, Color::rgba(229, 231, 235, 0)).stop(0.25, Color::rgba(229, 231, 235, 0)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(203, 213, 225)))
                             .overlay(UnitPoint::TOP_LEADING, vstack!(
                                     text("Wednesday")
@@ -1385,7 +1385,7 @@ pub fn view() -> impl View {
                                 .test_id("td.num-190"),
                                 spacer()
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
-                                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(79, 70, 229), to: Color::rgb(6, 182, 212) })
+                                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(6, 182, 212)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                                 .test_id("i-193")
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(229, 231, 235))
@@ -1454,7 +1454,7 @@ pub fn view() -> impl View {
                                 .test_id("td.num-200"),
                                 spacer()
                                 .frame_aligned(36.3984, 6.0, Alignment::TopLeading)
-                                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(79, 70, 229), to: Color::rgb(6, 182, 212) })
+                                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(6, 182, 212)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                                 .test_id("i-203")
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(229, 231, 235))
@@ -1524,7 +1524,7 @@ pub fn view() -> impl View {
                                 .test_id("td.num-210"),
                                 spacer()
                                 .frame_aligned(83.1953, 6.0, Alignment::TopLeading)
-                                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(79, 70, 229), to: Color::rgb(6, 182, 212) })
+                                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(6, 182, 212)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                                 .test_id("i-213")
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(229, 231, 235))
@@ -1593,7 +1593,7 @@ pub fn view() -> impl View {
                                 .test_id("td.num-220"),
                                 spacer()
                                 .frame_aligned(12.4766, 6.0, Alignment::TopLeading)
-                                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(79, 70, 229), to: Color::rgb(6, 182, 212) })
+                                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(6, 182, 212)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                                 .test_id("i-223")
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(229, 231, 235))
@@ -1663,7 +1663,7 @@ pub fn view() -> impl View {
                                 .test_id("td.num-230"),
                                 spacer()
                                 .frame_aligned(64.4766, 6.0, Alignment::TopLeading)
-                                .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(79, 70, 229), to: Color::rgb(6, 182, 212) })
+                                .background_gradient(Gradient::linear(Color::rgb(79, 70, 229), Color::rgb(6, 182, 212)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                                 .test_id("i-233")
                                 .frame_aligned(104.0, 6.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(229, 231, 235))
