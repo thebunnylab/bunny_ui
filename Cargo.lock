@@ -101,6 +101,7 @@ dependencies = [
  "bunny-ui-macos",
  "bunny-ui-preview",
  "bunny-ui-preview-macros",
+ "bunny-ui-updater",
  "bunny-ui-web",
  "bunny-ui-windows",
 ]
@@ -224,6 +225,7 @@ dependencies = [
 name = "bunny-ui-updater"
 version = "0.5.0"
 dependencies = [
+ "bunny-ui-core",
  "bunny-ui-formats",
  "bunny-ui-release",
  "serde_json",

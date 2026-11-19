@@ -55,6 +55,18 @@ pub trait Fetch: Send + Sync {
     }
 }
 
+/// A shared transport is a transport: the service keeps one behind an
+/// `Arc` and hands it to each thread.
+impl<T: Fetch + ?Sized> Fetch for std::sync::Arc<T> {
+    fn get(&self, url: &str) -> Result<HttpReply, UpdateError> {
+        (**self).get(url)
+    }
+
+    fn download(&self, url: &str, to: &Path, received: &mut dyn FnMut(Transfer)) -> Result<u16, UpdateError> {
+        (**self).download(url, to, received)
+    }
+}
+
 /// Refuses a URL that is not `https`, `http` or `file`.
 ///
 /// A URL comes from a feed. A URL with no scheme, or one that starts

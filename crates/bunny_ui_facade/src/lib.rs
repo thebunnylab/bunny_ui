@@ -66,6 +66,11 @@ pub use bunny_ui_core::*;
 pub use bunny_ui_preview_macros::preview;
 pub use entry::{__private, AppConfig};
 
+/// The self-updater: the state a view reads, the click, the restart (see
+/// `docs/updater.md`). The `updater` feature, on the desktop.
+#[cfg(all(feature = "updater", any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub use bunny_ui_updater as updater;
+
 /// The shell of this target, whole.
 #[cfg(all(feature = "shell", target_os = "macos"))]
 pub use bunny_ui_macos as platform;

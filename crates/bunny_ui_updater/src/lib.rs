@@ -20,6 +20,10 @@
 //! - [`run_helper_if_asked`] runs the Windows update helper when this
 //!   launch is one. The app's start calls it first.
 //! - [`UpdateLog`] keeps the reason of each failure on this machine.
+//! - [`start`] runs the updater of an app on its UI thread: the checks on
+//!   a schedule, the install on [`click`], the restart. A view reads
+//!   [`state`], an [`UpdateState`]. `bunny_ui::app!` calls [`start`] when
+//!   the build has an updater configuration.
 //! - [`Fetch`] is the network. The `curl` feature (on by default) gives
 //!   [`CurlFetch`]. An app with its own HTTP client implements the trait.
 //!
@@ -39,17 +43,23 @@
 pub mod apply;
 mod client;
 mod config;
+mod cycle;
 #[cfg(feature = "curl")]
 mod curl;
 mod fetch;
 mod log;
+mod service;
 
 #[cfg(test)]
 mod client_tests;
 #[cfg(all(test, feature = "curl"))]
 mod curl_tests;
 #[cfg(test)]
+mod cycle_tests;
+#[cfg(test)]
 mod log_tests;
+#[cfg(test)]
+mod service_tests;
 
 pub use bunny_ui_formats::ed25519::VerifyingKey;
 pub use bunny_ui_release as release;
@@ -57,8 +67,15 @@ pub use bunny_ui_release::{InstallProgress, Installed, Offer, ReleaseAsset, Upda
 
 pub use apply::{ApplyStrategy, PlatformStrategy, relaunch, run_helper_if_asked};
 pub use client::{Updater, Verified, verify_file};
-pub use config::{Feed, UpdaterConfig, default_cache, parse_key};
+pub use config::{BuildSettings, Feed, UpdaterConfig, default_cache, parse_key};
 #[cfg(feature = "curl")]
 pub use curl::CurlFetch;
 pub use fetch::{Fetch, HttpReply, check_url};
+pub use cycle::{FIRST_CHECK_DELAY, POLL_INTERVAL, RETURN_RECHECK_AFTER, UpdateState, ask_on_return, next_check};
 pub use log::{Failure, LIMIT as LOG_LIMIT, UpdateLog};
+#[cfg(feature = "curl")]
+pub use service::start;
+pub use service::{
+    Schedule, check_now, click, current, install, is_running, restart, reveal_log, set_before_restart, start_with,
+    start_with_strategy, state,
+};

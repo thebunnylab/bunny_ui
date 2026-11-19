@@ -243,10 +243,24 @@ impl<F: Fetch> Updater<F> {
         asset: &ReleaseAsset,
         progress: &mut dyn FnMut(InstallProgress),
     ) -> Result<Installed, UpdateError> {
-        self.precheck()?;
+        self.update_with(&PlatformStrategy::for_config(&self.config), asset, progress)
+    }
+
+    /// [`Updater::update`] with a strategy of the caller's own.
+    ///
+    /// # Errors
+    ///
+    /// The first error of the precheck, the download or the install.
+    pub fn update_with(
+        &self,
+        strategy: &dyn ApplyStrategy,
+        asset: &ReleaseAsset,
+        progress: &mut dyn FnMut(InstallProgress),
+    ) -> Result<Installed, UpdateError> {
+        strategy.precheck()?;
         let verified = self.download(asset, progress)?;
         progress(InstallProgress::Applying);
-        self.install(&verified)
+        strategy.apply(&verified)
     }
 }
 

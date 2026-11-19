@@ -19,6 +19,9 @@ curl = []
 dalek = ["bunny-ui-formats/dalek"]
 
 [dependencies]
+# the state a view reads, the UI thread's tasks and the app's events;
+# `canvas` as every desktop shell has it
+bunny-ui-core = { workspace = true, features = ["canvas"] }
 bunny-ui-release = { workspace = true }
 bunny-ui-formats = { workspace = true }
 serde_json = { workspace = true }
