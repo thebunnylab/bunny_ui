@@ -6,9 +6,9 @@ case	pair	geometry	pixels_outside_text	pixels_in_text
 align	AxB	0	0	0
 align	AxC	0	0	0
 align	BxC	0	0	0
-card	AxB	0	8	0
+card	AxB	0	67724	0
 card	AxC	0	64387	466
-card	BxC	0	64395	466
+card	BxC	0	69032	466
 form	AxB	0	0	0
 form	AxC	0	538	658
 form	BxC	0	538	658
@@ -33,9 +33,9 @@ paragraph	BxC	0	0	4275
 rounded_border	AxB	0	709	0
 rounded_border	AxC	0	1792	0
 rounded_border	BxC	0	1801	0
-shadow	AxB	0	0	0
+shadow	AxB	0	36406	0
 shadow	AxC	0	35750	0
-shadow	BxC	0	35750	0
+shadow	BxC	0	25037	0
 stack_gap	AxB	0	0	0
 stack_gap	AxC	0	0	0
 stack_gap	BxC	0	0	0

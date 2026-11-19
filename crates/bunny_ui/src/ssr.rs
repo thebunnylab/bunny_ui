@@ -928,6 +928,39 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
     }
 }
 
+/// The house halo falls off as (1 − d/r)² from the edge and stops at
+/// its reach; one CSS blur is a Gaussian. Two blurred layers — a spread
+/// and a blur in reaches, and an exponent on the ink's opacity — follow
+/// the curve within 4/255 for the opacities a shadow wears, fitted
+/// against Chrome's own blur (σ ≈ 0.52 × the blur radius). The glue
+/// spells the same two.
+const HALO_LAYERS: [(f64, f64, f64); 2] = [(0.3262, 0.5124, 0.8489), (0.0738, 0.1164, 0.3444)];
+
+fn halo(radius: f64, ink: Color) -> impl Iterator<Item = String> {
+    let reach = radius.max(1.0);
+    let opacity = f64::from(ink.a) / 255.0;
+    HALO_LAYERS.iter().map(move |&(spread, blur, weight)| {
+        let alpha = 1.0 - (1.0 - opacity).powf(weight);
+        format!(
+            "0 0 {}px {}px rgba({}, {}, {}, {})",
+            decimal(blur * reach, 3),
+            decimal(spread * reach, 3),
+            ink.r,
+            ink.g,
+            ink.b,
+            decimal(alpha, 4),
+        )
+    })
+}
+
+/// A number rounded to `places` and written without trailing zeros — the
+/// glue's `Number(value.toFixed(places))`.
+fn decimal(value: f64, places: usize) -> String {
+    let text = format!("{value:.places$}");
+    let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.') } else { &text };
+    if text == "-0" { "0".to_string() } else { text.to_string() }
+}
+
 /// The ring a control the keyboard reached wears — the glue's sheet
 /// spells the same one.
 const FOCUS_RING: &str = "outline:2px solid Highlight;outline-offset:2px";
@@ -1112,7 +1145,7 @@ fn rule_text(
     // the halo and the glass rim share one property
     let mut shadows: Vec<String> = Vec::new();
     if let Some((radius, shadow)) = style.shadow {
-        shadows.push(format!("0 0 {} {}", px(radius), color(shadow)));
+        shadows.extend(halo(radius, shadow));
     }
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
@@ -1556,6 +1589,29 @@ mod tests {
         );
         let pushes = css.split(['{', ';']).filter(|declaration| declaration.starts_with("border:") && *declaration != "border:0");
         assert_eq!(pushes.count(), 0, "{css}");
+    }
+
+    /// The house halo falls off as (1 − d/r)² and stops at its reach;
+    /// one CSS blur is a Gaussian, lighter close in and longer far out.
+    /// The page stacks two blurred layers fitted to the curve, each a
+    /// spread and a blur in reaches and the ink's opacity raised to its
+    /// own power — the two the glue spells.
+    #[test]
+    fn a_served_shadow_follows_the_house_halo() {
+        #[derive(Clone, Copy)]
+        struct Lifted;
+        impl Component for Lifted {
+            fn body(self) -> impl View {
+                text("lifted").shadow_color(10.0, Color::rgba(0, 0, 0, 128))
+            }
+        }
+
+        let page = render(&Lifted, Size { width: 240.0, height: 120.0 });
+        assert!(
+            page.css.contains("box-shadow:0 0 5.124px 3.262px rgba(0, 0, 0, 0.4466),0 0 1.164px 0.738px rgba(0, 0, 0, 0.2134)"),
+            "{}",
+            page.css
+        );
     }
 
     /// A served field says what the mounted one says — the glue's op 7,

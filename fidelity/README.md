@@ -179,6 +179,13 @@ with itself.
   box's edge and lays nothing out around it; a field whose words stand
   12 px from the outer edge under a 1 px stroke is `padding-left: 11px`
   in CSS (`cases/form`).
+- A shadow is the one design the page cannot say on its own:
+  `.shadow(r)` is bunny's halo, (1 − d/r)² out to `r`, which no single
+  CSS blur draws, and the element lowering stacks two blurs fitted to
+  it. The page keeps the one blur a web developer would write, so a
+  case with a shadow (`shadow`, `card`) differs in A×B and A×C by
+  design; B×C, and its largest channel difference in the report, says
+  how closely the stack follows the halo.
 
 ### Writing the view
 

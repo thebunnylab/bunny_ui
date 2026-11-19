@@ -877,6 +877,31 @@ function rgba(packed) {
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
 }
 
+// The house halo falls off as (1 - d/r)² from the edge and stops at its
+// reach; one CSS blur is a Gaussian. Two blurred layers — a spread and a
+// blur in reaches, and an exponent on the ink's opacity — follow the
+// curve within 4/255 for the opacities a shadow wears, fitted against
+// Chrome's own blur (σ ≈ 0.52 × the blur radius). The serializer spells
+// the same two (ssr::halo).
+const HALO_LAYERS = [
+  [0.3262, 0.5124, 0.8489],
+  [0.0738, 0.1164, 0.3444],
+];
+
+function halo(radius, packed) {
+  const reach = Math.max(radius, 1);
+  const r = (packed >>> 24) & 0xff;
+  const g = (packed >>> 16) & 0xff;
+  const b = (packed >>> 8) & 0xff;
+  const opacity = (packed & 0xff) / 255;
+  const decimal = (value, places) => Number(value.toFixed(places));
+  return HALO_LAYERS.map(([spread, blur, weight]) => {
+    const alpha = 1 - Math.pow(1 - opacity, weight);
+    return `0 0 ${decimal(blur * reach, 3)}px ${decimal(spread * reach, 3)}px ` +
+      `rgba(${r}, ${g}, ${b}, ${decimal(alpha, 4)})`;
+  });
+}
+
 // The input's editing dance — shared by creation and hydration.
 function wireInput(input) {
   let composing = false;
@@ -1055,7 +1080,7 @@ function applyPatches(view, length) {
     if (mask & 16) style.radius = `${f32()}px`;
     if (mask & 32) {
       const radius = f32();
-      style.shadows.push(`0 0 ${radius}px ${rgba(u32())}`);
+      style.shadows.push(...halo(radius, u32()));
     }
     if (mask & 64) {
       const response = f32();
