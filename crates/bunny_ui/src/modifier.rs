@@ -87,6 +87,8 @@ pub enum Modifier {
     ShadowOffset(f64, f64),
     /// `.offset(x, y)` — the box drawn this far from its place.
     Offset(f64, f64),
+    /// `.rotation_effect(…)` — degrees clockwise, about a point of the box.
+    Rotation(f64, crate::layout::UnitPoint),
     /// `.border_style(…)` — how the border's line is drawn.
     BorderStyle(crate::shapes::BorderStyle),
     /// `.background_stripes(…)` — bands over the background.
@@ -331,6 +333,7 @@ impl Modifier {
             Modifier::Border { .. } => "border",
             Modifier::ShadowOffset { .. } => "shadow_offset",
             Modifier::Offset { .. } => "offset",
+            Modifier::Rotation { .. } => "rotation_effect",
             Modifier::BorderStyle { .. } => "border_style",
             Modifier::BackgroundStripes { .. } => "background_stripes",
             Modifier::QuarterTurn { .. } => "quarter_turn",
@@ -475,6 +478,7 @@ impl Modifier {
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::ShadowOffset(x, y) => format!(" [.shadow(x: {x}, y: {y})]"),
             Modifier::Offset(x, y) => format!(" [.offset(x: {x}, y: {y})]"),
+            Modifier::Rotation(degrees, anchor) => format!(" [.rotationEffect(.degrees({degrees}), anchor: ({}, {}))]", anchor.x, anchor.y),
             Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
             Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
             Modifier::BackgroundStripes(stripes) => format!(
@@ -1471,6 +1475,11 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { offset: Some((*x, *y)), ..VisualProps::default() },
+        ),
+        Modifier::Rotation(degrees, anchor) => wrap_styled(
+            out,
+            mark,
+            VisualProps { rotation: Some((*degrees, *anchor)), ..VisualProps::default() },
         ),
         Modifier::BorderStyle(style) => wrap_styled(
             out,

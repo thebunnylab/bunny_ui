@@ -1158,6 +1158,14 @@ fn rule_text(
     if let Some((x, y)) = style.offset {
         base.insert("translate", format!("{} {}", px(x), px(y)));
     }
+    // `.rotation_effect`: drawn turned about its pivot, the layout unmoved
+    if let Some((degrees, x, y)) = style.rotation {
+        // the f32 the wire carries, as the glue writes it
+        #[allow(clippy::cast_possible_truncation, reason = "the wire's own precision")]
+        let degrees = f64::from(degrees as f32);
+        base.insert("rotate", format!("{degrees}deg"));
+        base.insert("transform-origin", format!("{}% {}%", x * 100.0, y * 100.0));
+    }
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
         // the border, the halo — and the transform

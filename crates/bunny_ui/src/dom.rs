@@ -353,6 +353,10 @@ pub struct DomLook {
     /// How far the box is drawn from its place (`.offset`): CSS
     /// `translate`, which the box's neighbours never feel.
     pub offset: Option<(Px, Px)>,
+    /// The box drawn turned (`.rotation_effect`): degrees clockwise, and
+    /// the pivot as a fraction of the box — CSS `rotate` about a
+    /// `transform-origin`.
+    pub rotation: Option<(Px, Px, Px)>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -437,6 +441,7 @@ impl DomLook {
         shadow: None,
         shadow_offset: None,
         offset: None,
+        rotation: None,
         transition: None,
         focus_border: None,
         placeholder_color: None,
@@ -469,6 +474,7 @@ impl DomLook {
             shadow: props.shadow,
             shadow_offset: props.shadow_offset.filter(|_| props.shadow.is_some()),
             offset: props.offset,
+            rotation: props.rotation.map(|(degrees, anchor)| (degrees, anchor.x, anchor.y)),
             transition: None,
             focus_border: None,
             placeholder_color: None,
@@ -501,6 +507,7 @@ impl DomLook {
             || props.corner_radius.is_some()
             || props.shadow.is_some()
             || props.offset.is_some()
+            || props.rotation.is_some()
             || props.clip
             || props.hidden
             || props.passive
@@ -2451,6 +2458,9 @@ fn look_hash(node: &DomNode) -> u64 {
     }
     if let Some((x, y)) = style.offset {
         (2u8, x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some((degrees, x, y)) = style.rotation {
+        (3u8, degrees.to_bits(), x.to_bits(), y.to_bits()).hash(&mut hasher);
     }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
@@ -4441,8 +4451,10 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 ///
 /// 28 (2026-11-19): a look's record ends with a second mask, a byte:
 /// bit 0 the halo's offset (`.shadow_offset`, f32 x + f32 y), bit 1 the
-/// box's own offset (`.offset`, f32 x + f32 y, CSS `translate`) — the
-/// first mask's thirty-two bits were all taken.
+/// box's own offset (`.offset`, f32 x + f32 y, CSS `translate`), bit 2
+/// its turn (`.rotation_effect`, f32 degrees clockwise + f32 x + f32 y of
+/// the pivot as a fraction of the box, CSS `rotate` about a
+/// `transform-origin`) — the first mask's thirty-two bits were all taken.
 pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
@@ -5147,9 +5159,16 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         });
     }
     // the first mask is full: what came after rides a second one, a byte
-    let more = u8::from(style.shadow_offset.is_some()) | u8::from(style.offset.is_some()) << 1;
+    let more = u8::from(style.shadow_offset.is_some())
+        | u8::from(style.offset.is_some()) << 1
+        | u8::from(style.rotation.is_some()) << 2;
     out.push(more);
     for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
+        push_f32(out, x);
+        push_f32(out, y);
+    }
+    if let Some((degrees, x, y)) = style.rotation {
+        push_f32(out, degrees);
         push_f32(out, x);
         push_f32(out, y);
     }
@@ -8135,6 +8154,7 @@ mod tests {
             shadow: Some((4.0, Color::hex_a(0x0000_0040))),
             shadow_offset: None,
             offset: None,
+            rotation: None,
             transition: Some((0.4, 0.8)),
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),

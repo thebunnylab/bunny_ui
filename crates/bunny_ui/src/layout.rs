@@ -2770,6 +2770,11 @@ pub struct VisualProps {
     /// where the layout put it, as SwiftUI's `.offset`: paint and pointer
     /// move, the layout around it never hears of it.
     pub offset: Option<(Px, Px)>,
+    /// `.rotation_effect(…)` — the box and everything in it drawn turned
+    /// this many degrees, clockwise, about this point of the box, as
+    /// `SwiftUI`'s `.rotationEffect`: paint only, the layout never hears of
+    /// it. The pixel pipelines turn the subtree's picture as one sprite.
+    pub rotation: Option<(f64, UnitPoint)>,
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one. Paint
     /// only, like everything here: the measure never hears about it.
@@ -2861,6 +2866,11 @@ impl VisualProps {
             // is three
             offset: match (self.offset, outer.offset) {
                 (Some((x, y)), Some((outer_x, outer_y))) => Some((x + outer_x, y + outer_y)),
+                (inner, outer) => inner.or(outer),
+            },
+            // two turns about one point add up; the inner one names it
+            rotation: match (self.rotation, outer.rotation) {
+                (Some((degrees, anchor)), Some((outer_degrees, _))) => Some((degrees + outer_degrees, anchor)),
                 (inner, outer) => inner.or(outer),
             },
             opacity: self.opacity.or(outer.opacity),
@@ -4962,6 +4972,18 @@ pub struct HostPlacement {
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
+/// A turned subtree, open: where its commands, its named boxes and its
+/// texts begin, and the turn — degrees clockwise about a point of the box.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct TurnScope {
+    degrees: f64,
+    anchor: UnitPoint,
+    display: usize,
+    tests: usize,
+    texts: usize,
+}
+
 #[cfg(feature = "canvas")]
 #[derive(Clone, Copy)]
 struct BlurScope {
@@ -5239,6 +5261,31 @@ impl Placement {
 
     /// Replace framework paint with its composite and rebind dependent ranges.
     /// Native hosts are paint barriers: each side stays on its original layer.
+    #[cfg(feature = "canvas")]
+    /// Closes a turned subtree: its commands become one picture laid on
+    /// the scene turned about its pivot, and its named boxes and texts
+    /// report the box they cover once turned, as the page's
+    /// `getBoundingClientRect` does.
+    fn turn_from(&mut self, scope: TurnScope, frame: Rect, env: &LayoutEnv<'_>) {
+        let pivot = Point {
+            x: frame.size.width.mul_add(scope.anchor.x, frame.origin.x),
+            y: frame.size.height.mul_add(scope.anchor.y, frame.origin.y),
+        };
+        let map = crate::turn::about(scope.degrees, pivot);
+        for (_, rect) in &mut self.test_frames[scope.tests..] {
+            *rect = crate::turn::bounds_of(*rect, map);
+        }
+        for rect in &mut self.text_frames[scope.texts..] {
+            *rect = crate::turn::bounds_of(*rect, map);
+        }
+        let layer = DisplayList { commands: self.display.commands.split_off(scope.display) };
+        let slot = crate::image_engine::FeedKey::effect(self.effects);
+        self.effects += 1;
+        if let Some(sprite) = crate::turn::paint(&layer, map, env, slot) {
+            self.draw(sprite);
+        }
+    }
+
     #[cfg(feature = "canvas")]
     fn blur_from(&mut self, scope: BlurScope, viewport: Rect, env: &LayoutEnv<'_>) {
         let original = DisplayList {
@@ -9835,8 +9882,27 @@ impl LayoutNode {
                     .map(|radius| BlurScope { radius, display: fade_from, customs: out.customs.len(), hosts: out.hosts.len() });
                 #[cfg(not(feature = "canvas"))]
                 let blur: Option<()> = None;
+                // a turned box paints its subtree once, upright, and turns
+                // the picture: the same compositing boundary as a blur
+                #[cfg(feature = "canvas")]
+                let turn = props
+                    .rotation
+                    .filter(|(degrees, _)| degrees.rem_euclid(360.0).abs() > 1e-9)
+                    .filter(|_| out.dom.as_ref().is_none_or(crate::dom::DomCapture::in_canvas))
+                    .map(|(degrees, anchor)| TurnScope {
+                        degrees,
+                        anchor,
+                        display: fade_from,
+                        tests: out.test_frames.len(),
+                        texts: out.text_frames.len(),
+                    });
+                #[cfg(not(feature = "canvas"))]
+                let turn: Option<()> = None;
                 let old_thumbs = out.thumb_layers;
                 let old_keep = out.keep_unseen;
+                if turn.is_some() {
+                    out.compositing += 1;
+                }
                 if blur.is_some() {
                     out.compositing += 1;
                     out.thumb_layers = false;
@@ -10021,6 +10087,13 @@ impl LayoutNode {
                         let viewport = env.overlay_bounds.or(out.accessibility_viewport).unwrap_or(frame);
                         out.blur_from(scope, viewport, &env);
                     }
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = scope;
+                }
+                if let Some(scope) = turn {
+                    out.compositing -= 1;
+                    #[cfg(feature = "canvas")]
+                    out.turn_from(scope, frame, &env);
                     #[cfg(not(feature = "canvas"))]
                     let _ = scope;
                 }

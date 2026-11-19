@@ -1344,6 +1344,22 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Offset(x, y))
     }
 
+    /// `.rotationEffect(.degrees(12))` — the view drawn turned this far,
+    /// clockwise, about its centre, as `SwiftUI` turns it: paint and its
+    /// shadow turn, the layout around it keeps its place. A tilted card,
+    /// a disc on a turntable, a dragged item.
+    #[track_caller]
+    fn rotation_effect(self, angle: crate::angle::Angle) -> Modified<Self> {
+        Modified::new(self, Modifier::Rotation(whole_degrees(angle), crate::layout::UnitPoint::CENTER))
+    }
+
+    /// [`ViewExt::rotation_effect`] about another point of the view:
+    /// `UnitPoint::TOP_LEADING` swings it from its corner.
+    #[track_caller]
+    fn rotation_effect_at(self, angle: crate::angle::Angle, anchor: crate::layout::UnitPoint) -> Modified<Self> {
+        Modified::new(self, Modifier::Rotation(whole_degrees(angle), anchor))
+    }
+
     /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
     /// panels).
     #[track_caller]
@@ -1997,3 +2013,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 }
 
 impl<V: View<Arity = Single>> ViewExt for V {}
+
+/// An angle's degrees without the noise of the trip through radians:
+/// `Angle::degrees(-3.0)` reads back as -3, not -3.0000000000000004.
+fn whole_degrees(angle: crate::angle::Angle) -> f64 {
+    (angle.as_degrees() * 1e9).round() / 1e9
+}

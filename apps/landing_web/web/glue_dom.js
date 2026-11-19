@@ -685,6 +685,12 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.transition) decl.transition = style.transition;
   // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
   if (style.offset) decl.translate = `${style.offset[0]}px ${style.offset[1]}px`;
+  // `.rotation_effect`: drawn turned about its pivot, the layout unmoved
+  if (style.rotation) {
+    const [degrees, x, y] = style.rotation;
+    decl.rotate = `${degrees}deg`;
+    decl["transform-origin"] = `${x * 100}% ${y * 100}%`;
+  }
   // the ink the subtree INHERITS: the text below sets no color of its
   // own, so the hover and active rules flip the box at once
   if (style.ink) decl.color = style.ink;
@@ -1078,6 +1084,7 @@ function applyPatches(view, length) {
       scrollbar: null,
       halo: null,
       offset: null,
+      rotation: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -1213,6 +1220,7 @@ function applyPatches(view, length) {
     const more = u8();
     const shadowOffset = more & 1 ? [f32(), f32()] : [0, 0];
     if (more & 2) style.offset = [f32(), f32()];
+    if (more & 4) style.rotation = [f32(), f32(), f32()];
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };
