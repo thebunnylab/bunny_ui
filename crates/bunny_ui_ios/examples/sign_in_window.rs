@@ -20,8 +20,7 @@
 //! Passwords key does nothing, in Safari as here. With them, the key asks
 //! for the face (Features ▸ Face ID ▸ Matching Face, or `notifyutil -p
 //! com.apple.BiometricKit_Sim.pearl.match`). The account you pick fills
-//! the box that holds the keyboard: the address box takes the account's
-//! name and the password box its password, one pick each.
+//! the address and the password together, from either box.
 
 #![cfg_attr(not(target_os = "ios"), allow(dead_code, unused_imports))]
 
