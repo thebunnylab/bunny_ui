@@ -421,6 +421,34 @@ pub(super) fn measure_text(
     }
 }
 
+/// The narrowest a text gets without breaking a word — the CSS
+/// min-content width a flex line floors a shrinking text at: its widest
+/// word, in the faces it is drawn in. A text that truncates has none:
+/// it gives up characters instead.
+pub(super) fn min_content(
+    content: &str,
+    marks: Option<&TextMarks>,
+    truncation: Option<Truncation>,
+    env: &LayoutEnv<'_>,
+) -> Px {
+    if truncation.is_some() {
+        return 0.0;
+    }
+    let shape = Shape::of(content, marks, env);
+    let mut widest: Px = 0.0;
+    let mut word = None;
+    for (at, character) in content.char_indices().chain(std::iter::once((content.len(), ' '))) {
+        if character.is_whitespace() {
+            if let Some(start) = word.take() {
+                widest = widest.max(shape.width((start, at)));
+            }
+        } else if word.is_none() {
+            word = Some(at);
+        }
+    }
+    widest
+}
+
 /// The first baseline of a text, from its top: its first line's ascent.
 pub(super) fn first_baseline(content: &str, marks: Option<&TextMarks>, env: &LayoutEnv<'_>) -> Px {
     let shape = Shape::of(content, marks, env);

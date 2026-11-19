@@ -7193,6 +7193,43 @@ impl LayoutNode {
         }
     }
 
+    /// The narrowest this subtree gets without breaking a word — the
+    /// CSS min-content width a flex line floors a shrinking child at: a
+    /// text's widest word, a frame's own width, a row's floors and its
+    /// spacing side by side, a column's widest floor. What has no such
+    /// floor answers its natural width: it does not shrink.
+    pub(crate) fn min_content_width(&self, env: &LayoutEnv<'_>) -> Px {
+        match self {
+            Self::Text { content, highlights, truncation, .. } => {
+                paragraph::min_content(&content.get(), highlights.as_deref(), *truncation, env)
+            }
+            Self::Styled { props, child, .. } => {
+                let env = LayoutEnv {
+                    font: props.font.apply_over(env.font),
+                    line_height: props.line_height.or(env.line_height),
+                    ..*env
+                };
+                child.min_content_width(&env)
+            }
+            Self::Frame { width: Some(width), .. } => *width,
+            Self::FlexFrame { min_width, child, .. } => child.min_content_width(env).max(*min_width),
+            Self::Padding { edges, child } => child.min_content_width(env) + edges.leading + edges.trailing,
+            Self::Stack { axis, spacing, children, .. } => {
+                let floors = children.iter().filter(|child| child.placed_at().is_none()).map(|child| child.min_content_width(env));
+                match axis {
+                    Axis::Horizontal => floors
+                        .enumerate()
+                        .fold(0.0, |sum, (index, floor)| if index == 0 { floor } else { sum + *spacing + floor }),
+                    Axis::Vertical => floors.fold(0.0, Px::max),
+                }
+            }
+            _ => self.only_child().map_or_else(
+                || self.measure(Proposal { width: None, height: None }, env).0.width,
+                |child| child.min_content_width(env),
+            ),
+        }
+    }
+
     /// The FIRST baseline of this subtree, in the node's own
     /// coordinates — text answers with its ascent, wrappers forward
     /// (padding adds its top inset, styled swaps the font first, the
@@ -10502,6 +10539,14 @@ fn measure_stack(
         .map(|(index, _)| index)
         .collect();
 
+    // phase 1½: a row that does not fit shrinks what can shrink, as a
+    // flex line does — text wraps, a fixed frame does not
+    if axis == Axis::Horizontal
+        && let Some(total) = proposed_main
+    {
+        shrink_row(children, &flexible, &mut measured, total - spacing_total, proposal, env);
+    }
+
     // phase 2: only the flexibles re-measure — the waterfall. Offer equal
     // shares; a child that takes less than its offer is satisfied and its
     // leftover re-splits among the rest, until a round leaves nothing.
@@ -10686,6 +10731,65 @@ fn measure_stack(
         }
     };
     (size, Fit::Children(measured))
+}
+
+/// A row whose children's naturals pass its width shrinks them the way
+/// a CSS flex line does, so the page and the pixels agree: each child
+/// that is not flexible gives up width in proportion to its natural,
+/// never past its floor — what it measures offered nothing, the longest
+/// word of a text, a fixed frame's own width. A child that reaches its
+/// floor keeps it and the rest pay for it, round by round. Each shrunk
+/// child is measured again at the width it was left, and takes that
+/// width: a text wraps inside it. When the floors alone pass the width
+/// the row overflows at its floors.
+fn shrink_row(
+    children: &[LayoutNode],
+    flexible: &[usize],
+    measured: &mut [(Size, Fit)],
+    room: Px,
+    proposal: Proposal,
+    env: &LayoutEnv<'_>,
+) {
+    let in_line = |index: &usize| children[*index].placed_at().is_none() && !flexible.contains(index);
+    let lined: Vec<usize> = (0..children.len()).filter(in_line).collect();
+    let natural: Px = lined.iter().map(|&index| measured[index].0.width).sum();
+    if natural <= room + SETTLED {
+        return;
+    }
+    let offer = |width: Option<Px>| Proposal { width, height: proposal.height };
+    let floors: Vec<(usize, Px, Px)> = lined
+        .iter()
+        .map(|&index| {
+            let width = measured[index].0.width;
+            (index, width, children[index].min_content_width(env).min(width))
+        })
+        .collect();
+    let mut target: Vec<Option<Px>> = vec![None; children.len()];
+    let mut open: Vec<(usize, Px, Px)> = floors.iter().copied().filter(|(_, width, floor)| floor < width).collect();
+    let mut kept: Px = floors.iter().filter(|(_, width, floor)| floor >= width).map(|(_, width, _)| width).sum();
+    while !open.is_empty() {
+        let basis: Px = open.iter().map(|(_, width, _)| width).sum();
+        let deficit = room - kept - basis;
+        let mut floored = Vec::new();
+        for &(index, width, floor) in &open {
+            let wants = width + deficit * width / basis;
+            target[index] = Some(wants.max(floor));
+            if wants < floor {
+                floored.push(index);
+            }
+        }
+        if floored.is_empty() || deficit >= 0.0 {
+            break;
+        }
+        kept += open.iter().filter(|(index, _, _)| floored.contains(index)).map(|(_, _, floor)| floor).sum::<Px>();
+        open.retain(|(index, _, _)| !floored.contains(index));
+    }
+    for (index, width) in target.into_iter().enumerate() {
+        if let Some(width) = width.filter(|width| *width < measured[index].0.width - SETTLED) {
+            let (size, fit) = children[index].measure(offer(Some(width)), env);
+            measured[index] = (Size { width, ..size }, fit);
+        }
+    }
 }
 
 /// The flow's measure: every child at its own size, lines broken where
