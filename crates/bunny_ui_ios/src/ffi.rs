@@ -3,7 +3,7 @@
 //! This module is the shell's `unsafe` border on the phone. UIKit is
 //! called through `objc_msgSend` re-declared with the concrete signature
 //! of each message (the shared Apple half carries the vocabulary; every
-//! module declares its own aliases), and four classes are born at
+//! module declares its own aliases), and six classes are born at
 //! runtime via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyAppDelegate` (UIResponder) — the application delegate: the
@@ -20,7 +20,17 @@
 //!   traits (dark, the size class), which UIKit tells the controller;
 //! - `BunnyView` (UIView) — whose backing layer IS a `CAMetalLayer`
 //!   (`+layerClass`), which hears every touch, and which is the
-//!   responder the soft keyboard types into (`UIKeyInput`).
+//!   responder the soft keyboard types into. It adopts the whole of
+//!   `UITextInput`, not only `UIKeyInput`: the keyboard's input
+//!   assistant — the QuickType bar, the Passwords key, the one-time code
+//!   from Messages — attaches only to a responder that can say what the
+//!   focused field holds, where its caret stands and what is being
+//!   composed. It answers from a mirror of that field the shell syncs
+//!   after every frame ([`sync_text`]);
+//! - `BunnyTextPosition` (UITextPosition) and `BunnyTextRange`
+//!   (UITextRange) — an offset, and a pair of them, in UTF-16: the
+//!   objects the keyboard holds and hands back. Each carries its
+//!   offsets in instance variables, the one state these classes keep.
 //!
 //! UIKit counts from the top-left in points, like the layout: no flip
 //! happens anywhere here. Callbacks reach the Rust world through a
@@ -31,15 +41,17 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
-use std::sync::Once;
+use std::rc::Rc;
+use std::sync::{Arc, Once};
 
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
+use bunny_ui::text_input::{byte_to_utf16, utf16_to_byte};
 use bunny_ui_apple::ffi::{
-    CGPoint, CGRect, Id, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod,
-    class_addProtocol, modifiers_of, objc_allocateClassPair, objc_getProtocol,
-    objc_registerClassPair, object_getClass, sel, text_argument_to_string,
+    CGPoint, CGRect, Id, NS_NOT_FOUND, NSRange, NSRunLoopCommonModes, ObjcSuper, Sel,
+    class, class_addMethod, class_addProtocol, modifiers_of, objc_allocateClassPair,
+    objc_getProtocol, objc_registerClassPair, object_getClass, sel, text_argument_to_string,
 };
 use bunny_ui_apple::metal::MetalPresenter;
 
@@ -172,6 +184,17 @@ pub enum AppEvent {
     Text(String),
     /// The keyboard's backspace.
     DeleteBackward,
+    /// The keyboard's composition: the marked text and the selection
+    /// INSIDE it, in UTF-16 (`setMarkedText:selectedRange:`). An empty
+    /// text is a composition withdrawn.
+    Marked { text: String, location: u64, length: u64 },
+    /// The composition ends, committed as it stands (`unmarkText`).
+    Unmark,
+    /// The keyboard placed the selection — UTF-16 over the whole text
+    /// (`setSelectedTextRange:`; the space bar's trackpad).
+    Select { location: u64, length: u64 },
+    /// The keyboard replaces a range of the text (`replaceRange:withText:`).
+    Replace { location: u64, length: u64, text: String },
     /// A hardware key the keymap gate did not take, that types nothing
     /// — an arrow, a forward delete, an escape, a chord with command.
     Key(KeyStroke),
@@ -683,13 +706,21 @@ extern "C" fn bunny_yes(_this: Id, _sel: Sel) -> i8 {
 /// getter nil, and the keyboard then guesses — sentence capitals and
 /// autocorrection on a field that wanted neither. The traits say NO
 /// (the enum's `…No` is 1) and `autocapitalizationType` says none (0);
-/// `keyboardType` is the focused field's ([`want_keys`]).
+/// `keyboardType` is the focused field's ([`want_keys`]). The traits a
+/// view meets only once it adopts `UITextInput` — inline predictions,
+/// math completion, Writing Tools — say no as well: adopting it is for
+/// the input assistant's AutoFill, not for a keyboard that rewrites.
 extern "C" fn bunny_trait_no(_this: Id, _sel: Sel) -> i64 {
     1
 }
 
 extern "C" fn bunny_trait_zero(_this: Id, _sel: Sel) -> i64 {
     0
+}
+
+/// `writingToolsBehavior` — `UIWritingToolsBehaviorNone` is -1.
+extern "C" fn bunny_trait_none(_this: Id, _sel: Sel) -> i64 {
+    -1
 }
 
 extern "C" fn bunny_keyboard_type(_this: Id, _sel: Sel) -> i64 {
@@ -726,12 +757,12 @@ extern "C" fn bunny_reload_keys(this: Id, _sel: Sel) {
 extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, text: Id) {
     let text = unsafe { text_argument_to_string(text) };
     if !text.is_empty() {
-        dispatch(AppEvent::Text(text));
+        keyboard_edit(AppEvent::Text(text));
     }
 }
 
 extern "C" fn bunny_delete_backward(_this: Id, _sel: Sel) {
-    dispatch(AppEvent::DeleteBackward);
+    keyboard_edit(AppEvent::DeleteBackward);
 }
 
 extern "C" fn bunny_claim_keyboard(this: Id, _sel: Sel) {
@@ -744,6 +775,580 @@ extern "C" fn bunny_drop_keyboard(this: Id, _sel: Sel) {
     unsafe {
         let _ = msg_bool(this, sel("resignFirstResponder"));
     }
+}
+
+// MARK: - The document the keyboard reads (UITextInput)
+
+/// The focused field as the input system reads it — what `UITextInput`
+/// answers from on the spot. The shell re-syncs it after every frame it
+/// presents ([`sync_text`]); the keyboard's edits travel the other way,
+/// as events. Offsets are UTF-16 over the whole text, the kit's
+/// vocabulary; the caret is in the view's points, which are the layout's.
+#[derive(Clone)]
+pub struct Document {
+    /// The field's path: a focus that moved is a new document even when
+    /// the two texts read the same.
+    pub field: String,
+    /// The field's own text, shared — never copied for the mirror.
+    pub text: Arc<str>,
+    /// (location, length) of the selection; a caret has length 0.
+    pub selected: (u64, u64),
+    /// (location, length) of a live composition.
+    pub marked: Option<(u64, u64)>,
+    /// The caret, for a question the field's geometry cannot answer.
+    pub caret: CGRect,
+}
+
+/// The document and its text's length in UTF-16 — counted once per text,
+/// not once per frame.
+struct Mirror {
+    document: Document,
+    units: u64,
+}
+
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    /// Room for an instance variable on a class not yet registered —
+    /// how a position carries its offset.
+    fn class_addIvar(class: Id, name: *const c_char, size: usize, alignment: u8, types: *const c_char) -> i8;
+    fn class_getInstanceVariable(class: Id, name: *const c_char) -> Id;
+    fn ivar_getOffset(ivar: Id) -> isize;
+    /// ARC's weak reference, by hand: the cell is zeroed when the object
+    /// goes, which is what UIKit's `weak` on `inputDelegate` promises.
+    fn objc_storeWeak(location: *mut Id, object: Id) -> Id;
+    fn objc_loadWeak(location: *mut Id) -> Id;
+}
+
+#[allow(clashing_extern_declarations)]
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn msg_init_bytes(obj: Id, sel: Sel, bytes: *const u8, length: u64, encoding: u64) -> Id;
+}
+
+thread_local! {
+    static MIRROR: RefCell<Option<Rc<Mirror>>> = const { RefCell::new(None) };
+    /// The keyboard's own edit is being applied: what it changes is news
+    /// the keyboard already has, and is not announced back to it.
+    static KEYBOARD_EDITING: Cell<bool> = const { Cell::new(false) };
+    /// The input system's delegate, held weakly (`objc_storeWeak` writes
+    /// this very cell, which lives as long as the main thread).
+    static INPUT_DELEGATE: Cell<Id> = const { Cell::new(null_mut()) };
+    /// The string tokenizer the kit asks for words and lines — one, made
+    /// on the first question, for the one view.
+    static TOKENIZER: Cell<Id> = const { Cell::new(null_mut()) };
+    static TEXT_INDEX: RefCell<Option<IndexAt>> = const { RefCell::new(None) };
+    static TEXT_RECT: RefCell<Option<RectAt>> = const { RefCell::new(None) };
+    /// Where the offset of a `BunnyTextPosition`, and the two ends of a
+    /// `BunnyTextRange`, sit inside an instance — read at registration.
+    static POSITION_IVAR: Cell<isize> = const { Cell::new(0) };
+    static RANGE_IVARS: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
+}
+
+/// "Which offset sits under this point of the view?" — installed by the
+/// shell, capturing the runtime; `None` off the focused field.
+pub type IndexAt = Box<dyn Fn(f64, f64) -> Option<u64>>;
+
+/// "Where does the caret stand at this offset?" — in the view's points.
+pub type RectAt = Box<dyn Fn(u64) -> Option<CGRect>>;
+
+/// The shell installs the two questions the mirror cannot answer alone:
+/// the offset under a point and the caret at an offset.
+pub fn set_text_resolvers(index_at: IndexAt, rect_at: RectAt) {
+    TEXT_INDEX.with(|slot| *slot.borrow_mut() = Some(index_at));
+    TEXT_RECT.with(|slot| *slot.borrow_mut() = Some(rect_at));
+}
+
+/// The shell syncs the document after a frame (`None` = no field holds
+/// the keyboard). A change the keyboard did not make — a tap that moved
+/// the caret, the focus gone to another field, the app rewriting the
+/// text — is announced to the input system AROUND the swap: told only
+/// after, the keyboard would go on composing over a text that is no
+/// longer there, and offer what it read from the field before.
+pub fn sync_text(document: Option<Document>) {
+    let old = mirror();
+    let (text_moved, selection_moved) = match (old.as_deref(), document.as_ref()) {
+        (None, None) => (false, false),
+        (Some(old), Some(new)) => (
+            old.document.field != new.field
+                || !(Arc::ptr_eq(&old.document.text, &new.text) || old.document.text == new.text),
+            old.document.selected != new.selected || old.document.marked != new.marked,
+        ),
+        _ => (true, true),
+    };
+    let fresh = document.map(|document| {
+        let units = match old.as_deref() {
+            Some(old) if Arc::ptr_eq(&old.document.text, &document.text) => old.units,
+            _ => byte_to_utf16(&document.text, document.text.len()) as u64,
+        };
+        Rc::new(Mirror { document, units })
+    });
+    let announce = (text_moved || selection_moved) && !KEYBOARD_EDITING.with(Cell::get);
+    let delegate = if announce { input_delegate() } else { null_mut() };
+    let view = VIEW.with(Cell::get);
+    let (will, did) = if text_moved {
+        ("textWillChange:", "textDidChange:")
+    } else {
+        ("selectionWillChange:", "selectionDidChange:")
+    };
+    // no borrow is held across the calls: the delegate reads the
+    // document back, and may commit its composition, which queues
+    if !delegate.is_null() {
+        unsafe { msg_void_id(delegate, sel(will), view) };
+    }
+    MIRROR.with(|slot| *slot.borrow_mut() = fresh);
+    if !delegate.is_null() {
+        unsafe { msg_void_id(delegate, sel(did), view) };
+    }
+}
+
+fn mirror() -> Option<Rc<Mirror>> {
+    MIRROR.with(|slot| slot.borrow().clone())
+}
+
+/// The document's length in UTF-16 — 0 without a field.
+fn units() -> u64 {
+    mirror().map_or(0, |mirror| mirror.units)
+}
+
+fn input_delegate() -> Id {
+    INPUT_DELEGATE.with(|slot| unsafe { objc_loadWeak(slot.as_ptr()) })
+}
+
+/// An edit the keyboard asked for: the frame it draws syncs the
+/// keyboard's own news, which is not announced back to it.
+fn keyboard_edit(event: AppEvent) {
+    let was = KEYBOARD_EDITING.with(|flag| flag.replace(true));
+    dispatch(event);
+    KEYBOARD_EDITING.with(|flag| flag.set(was));
+}
+
+fn index_at(x: f64, y: f64) -> Option<u64> {
+    TEXT_INDEX.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
+}
+
+fn rect_at(offset: u64) -> Option<CGRect> {
+    TEXT_RECT.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(offset)))
+}
+
+const NO_RECT: CGRect = CGRect {
+    origin: CGPoint { x: 0.0, y: 0.0 },
+    size: CGSize { width: 0.0, height: 0.0 },
+};
+
+/// The `u64` an instance variable holds, by its offset in the instance.
+unsafe fn ivar(object: Id, offset: isize) -> *mut u64 {
+    unsafe { object.cast::<u8>().offset(offset).cast::<u64>() }
+}
+
+/// A `BunnyTextPosition` at `offset` — autoreleased: the kit keeps what
+/// it wants of it.
+unsafe fn position(offset: u64) -> Id {
+    unsafe {
+        let object = msg_id(msg_id(class("BunnyTextPosition"), sel("alloc")), sel("init"));
+        ivar(object, POSITION_IVAR.with(Cell::get)).write(offset);
+        msg_id(object, sel("autorelease"))
+    }
+}
+
+/// A `BunnyTextRange` over two offsets, in either order.
+unsafe fn range(from: u64, to: u64) -> Id {
+    unsafe {
+        let object = msg_id(msg_id(class("BunnyTextRange"), sel("alloc")), sel("init"));
+        let (start, end) = RANGE_IVARS.with(Cell::get);
+        ivar(object, start).write(from.min(to));
+        ivar(object, end).write(from.max(to));
+        msg_id(object, sel("autorelease"))
+    }
+}
+
+/// The offset a position the kit hands back holds — `None` for nil, and
+/// for an object this shell did not make: its memory is not ours to read.
+unsafe fn offset_of(position: Id) -> Option<u64> {
+    unsafe {
+        let ours = !position.is_null()
+            && msg_bool_id(position, sel("isKindOfClass:"), class("BunnyTextPosition")) != 0;
+        ours.then(|| ivar(position, POSITION_IVAR.with(Cell::get)).read())
+    }
+}
+
+/// The (start, end) of a range the kit hands back — `None` as above.
+unsafe fn span_of(range: Id) -> Option<(u64, u64)> {
+    unsafe {
+        let ours = !range.is_null()
+            && msg_bool_id(range, sel("isKindOfClass:"), class("BunnyTextRange")) != 0;
+        let (start, end) = RANGE_IVARS.with(Cell::get);
+        ours.then(|| (ivar(range, start).read(), ivar(range, end).read()))
+    }
+}
+
+/// An autoreleased `NSString` of this text — by its bytes, so a NUL in a
+/// field is text like any other, where a C string would stop at it.
+unsafe fn ns_text(text: &str) -> Id {
+    unsafe {
+        // NSUTF8StringEncoding
+        let string = msg_init_bytes(
+            msg_id(class("NSString"), sel("alloc")),
+            sel("initWithBytes:length:encoding:"),
+            text.as_ptr(),
+            text.len() as u64,
+            4,
+        );
+        msg_id(string, sel("autorelease"))
+    }
+}
+
+/// Where a direction points along the text. The kit passes a
+/// `UITextLayoutDirection` (right 2, left 3, up 4, down 5) and, in a few
+/// questions, a `UITextStorageDirection` (forward 0, backward 1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Toward {
+    Start,
+    End,
+    Up,
+    Down,
+}
+
+impl Toward {
+    fn of(direction: i64) -> Self {
+        match direction {
+            1 | 3 => Self::Start,
+            4 => Self::Up,
+            5 => Self::Down,
+            _ => Self::End,
+        }
+    }
+
+    fn back(self) -> Self {
+        match self {
+            Self::Start => Self::End,
+            Self::End => Self::Start,
+            Self::Up => Self::Down,
+            Self::Down => Self::Up,
+        }
+    }
+
+    /// Toward the text's end — right, down, forward.
+    fn ahead(self) -> bool {
+        matches!(self, Self::End | Self::Down)
+    }
+}
+
+/// `steps` characters along the text from the UTF-16 offset `from` — a
+/// surrogate pair is one step, never two halves. `None` past either end.
+fn step_chars(text: &str, from: u64, steps: u64, ahead: bool) -> Option<u64> {
+    let byte = utf16_to_byte(text, from as usize);
+    let at = byte_to_utf16(text, byte) as u64;
+    let walk = |chars: &mut dyn Iterator<Item = char>| {
+        let mut units = 0;
+        for _ in 0..steps {
+            units += chars.next()?.len_utf16() as u64;
+        }
+        Some(units)
+    };
+    if ahead {
+        walk(&mut text[byte..].chars()).map(|units| at + units)
+    } else {
+        walk(&mut text[..byte].chars().rev()).map(|units| at - units)
+    }
+}
+
+/// `lines` rows up or down from an offset, through the field's own
+/// geometry: the caret's rect there, a row's height over or under it,
+/// the offset under that point. Off the field's first row it is the
+/// start, off its last the end — where an arrow key takes a caret.
+fn step_lines(from: u64, lines: u64, up: bool, units: u64) -> u64 {
+    let edge = if up { 0 } else { units };
+    let mut at = from;
+    for _ in 0..lines {
+        let Some(caret) = rect_at(at) else { return edge };
+        let height = caret.size.height.max(1.0);
+        let y = if up { caret.origin.y - height / 2.0 } else { caret.origin.y + height * 1.5 };
+        match index_at(caret.origin.x, y) {
+            Some(next) if next != at => at = next,
+            _ => return edge,
+        }
+    }
+    at
+}
+
+// The questions (the kit's reads)
+
+/// `textInRange:` — clamped to the text that exists; nil without a field.
+extern "C" fn bunny_text_in_range(_this: Id, _sel: Sel, range: Id) -> Id {
+    let (Some(mirror), Some((start, end))) = (mirror(), unsafe { span_of(range) }) else {
+        return null_mut();
+    };
+    let text = &mirror.document.text;
+    let from = utf16_to_byte(text, start as usize);
+    let to = utf16_to_byte(text, end as usize).max(from);
+    unsafe { ns_text(&text[from..to]) }
+}
+
+extern "C" fn bunny_selected_text_range(_this: Id, _sel: Sel) -> Id {
+    mirror().map_or(null_mut(), |mirror| {
+        let (location, length) = mirror.document.selected;
+        unsafe { range(location, location + length) }
+    })
+}
+
+/// nil when nothing is being composed — what tells the keyboard there is
+/// no composition of its own to carry on.
+extern "C" fn bunny_marked_text_range(_this: Id, _sel: Sel) -> Id {
+    mirror()
+        .and_then(|mirror| mirror.document.marked)
+        .map_or(null_mut(), |(location, length)| unsafe { range(location, location + length) })
+}
+
+/// `markedTextStyle` — none: the field draws its composition its own way.
+extern "C" fn bunny_marked_text_style(_this: Id, _sel: Sel) -> Id {
+    null_mut()
+}
+
+extern "C" fn bunny_beginning_of_document(_this: Id, _sel: Sel) -> Id {
+    unsafe { position(0) }
+}
+
+extern "C" fn bunny_end_of_document(_this: Id, _sel: Sel) -> Id {
+    unsafe { position(units()) }
+}
+
+extern "C" fn bunny_range_between(_this: Id, _sel: Sel, from: Id, to: Id) -> Id {
+    match unsafe { (offset_of(from), offset_of(to)) } {
+        (Some(from), Some(to)) => unsafe { range(from, to) },
+        _ => null_mut(),
+    }
+}
+
+/// `positionFromPosition:offset:` — nil before the start or past the end,
+/// as the kit asks.
+extern "C" fn bunny_position_offset(_this: Id, _sel: Sel, from: Id, offset: i64) -> Id {
+    unsafe { offset_of(from) }
+        .and_then(|from| from.checked_add_signed(offset))
+        .filter(|to| *to <= units())
+        .map_or(null_mut(), |to| unsafe { position(to) })
+}
+
+/// `positionFromPosition:inDirection:offset:` — along the text by whole
+/// characters, across it by rows.
+extern "C" fn bunny_position_toward(_this: Id, _sel: Sel, from: Id, direction: i64, offset: i64) -> Id {
+    let (Some(mirror), Some(from)) = (mirror(), unsafe { offset_of(from) }) else {
+        return null_mut();
+    };
+    let from = from.min(mirror.units);
+    let toward = if offset < 0 { Toward::of(direction).back() } else { Toward::of(direction) };
+    let steps = offset.unsigned_abs();
+    let to = match toward {
+        Toward::Start | Toward::End => step_chars(&mirror.document.text, from, steps, toward.ahead()),
+        Toward::Up | Toward::Down => Some(step_lines(from, steps, toward == Toward::Up, mirror.units)),
+    };
+    to.map_or(null_mut(), |to| unsafe { position(to) })
+}
+
+/// `comparePosition:toPosition:` — `NSComparisonResult`: -1 when the
+/// first stands before the second.
+extern "C" fn bunny_compare_positions(_this: Id, _sel: Sel, first: Id, second: Id) -> i64 {
+    match unsafe { (offset_of(first), offset_of(second)) } {
+        (Some(first), Some(second)) => first.cmp(&second) as i64,
+        _ => 0,
+    }
+}
+
+extern "C" fn bunny_offset_between(_this: Id, _sel: Sel, from: Id, to: Id) -> i64 {
+    match unsafe { (offset_of(from), offset_of(to)) } {
+        (Some(from), Some(to)) => to as i64 - from as i64,
+        _ => 0,
+    }
+}
+
+extern "C" fn bunny_input_delegate(_this: Id, _sel: Sel) -> Id {
+    input_delegate()
+}
+
+extern "C" fn bunny_set_input_delegate(_this: Id, _sel: Sel, delegate: Id) {
+    INPUT_DELEGATE.with(|slot| unsafe { objc_storeWeak(slot.as_ptr(), delegate) });
+}
+
+/// `tokenizer` — UIKit's own string tokenizer over this view, made on the
+/// first question and kept for the life of the view, which is the app's.
+extern "C" fn bunny_tokenizer(this: Id, _sel: Sel) -> Id {
+    TOKENIZER.with(|slot| {
+        if slot.get().is_null() {
+            let tokenizer = unsafe {
+                msg_id_id(
+                    msg_id(class("UITextInputStringTokenizer"), sel("alloc")),
+                    sel("initWithTextInput:"),
+                    this,
+                )
+            };
+            slot.set(tokenizer);
+        }
+        slot.get()
+    })
+}
+
+extern "C" fn bunny_farthest_in_range(_this: Id, _sel: Sel, range: Id, direction: i64) -> Id {
+    unsafe { span_of(range) }.map_or(null_mut(), |(start, end)| unsafe {
+        position(if Toward::of(direction).ahead() { end } else { start })
+    })
+}
+
+/// `characterRangeByExtendingPosition:inDirection:` — the one character
+/// on that side of the position.
+extern "C" fn bunny_extend_position(_this: Id, _sel: Sel, at: Id, direction: i64) -> Id {
+    let (Some(mirror), Some(at)) = (mirror(), unsafe { offset_of(at) }) else {
+        return null_mut();
+    };
+    let at = at.min(mirror.units);
+    let other = step_chars(&mirror.document.text, at, 1, Toward::of(direction).ahead()).unwrap_or(at);
+    unsafe { range(at, other) }
+}
+
+/// `NSWritingDirectionNatural`: the field lays bidirectional text out
+/// itself, run by run.
+extern "C" fn bunny_writing_direction(_this: Id, _sel: Sel, _at: Id, _direction: i64) -> i64 {
+    -1
+}
+
+/// `setBaseWritingDirection:forRange:` — the field's direction is its
+/// text's, and nothing the keyboard can set.
+extern "C" fn bunny_set_writing_direction(_this: Id, _sel: Sel, _direction: i64, _range: Id) {}
+
+/// `firstRectForRange:` — where the keyboard's own panels look: a range on
+/// one row runs from its start's caret to its end's; one that wraps
+/// answers its first row's start.
+extern "C" fn bunny_first_rect(_this: Id, _sel: Sel, range: Id) -> CGRect {
+    let Some((start, end)) = (unsafe { span_of(range) }) else {
+        return NO_RECT;
+    };
+    let Some(first) = rect_at(start).or_else(|| mirror().map(|mirror| mirror.document.caret)) else {
+        return NO_RECT;
+    };
+    match rect_at(end) {
+        Some(last)
+            if end > start
+                && (last.origin.y - first.origin.y).abs() < 0.5
+                && last.origin.x > first.origin.x =>
+        {
+            CGRect {
+                origin: first.origin,
+                size: CGSize { width: last.origin.x - first.origin.x, height: first.size.height },
+            }
+        }
+        _ => first,
+    }
+}
+
+extern "C" fn bunny_caret_rect(_this: Id, _sel: Sel, at: Id) -> CGRect {
+    unsafe { offset_of(at) }
+        .and_then(rect_at)
+        .or_else(|| mirror().map(|mirror| mirror.document.caret))
+        .unwrap_or(NO_RECT)
+}
+
+/// `selectionRectsForRange:` — none: the field paints its own selection,
+/// and the kit is handed nothing to draw over it.
+extern "C" fn bunny_selection_rects(_this: Id, _sel: Sel, _range: Id) -> Id {
+    unsafe { msg_id(class("NSArray"), sel("array")) }
+}
+
+/// `closestPositionToPoint:` — nil off the field.
+extern "C" fn bunny_closest_position(_this: Id, _sel: Sel, point: CGPoint) -> Id {
+    index_at(point.x, point.y).map_or(null_mut(), |at| unsafe { position(at) })
+}
+
+extern "C" fn bunny_closest_position_within(_this: Id, _sel: Sel, point: CGPoint, range: Id) -> Id {
+    match (index_at(point.x, point.y), unsafe { span_of(range) }) {
+        (Some(at), Some((start, end))) => unsafe { position(at.clamp(start, end)) },
+        _ => null_mut(),
+    }
+}
+
+extern "C" fn bunny_character_range_at(_this: Id, _sel: Sel, point: CGPoint) -> Id {
+    let (Some(mirror), Some(at)) = (mirror(), index_at(point.x, point.y)) else {
+        return null_mut();
+    };
+    let next = step_chars(&mirror.document.text, at, 1, true).unwrap_or(at);
+    unsafe { range(at, next) }
+}
+
+extern "C" fn bunny_text_input_view(this: Id, _sel: Sel) -> Id {
+    this
+}
+
+// The keyboard's edits (they travel as events, like typing)
+
+/// `setSelectedTextRange:` — the kit hands back the selection it just
+/// read as often as it moves one: an unmoved selection is no edit, and
+/// must not commit a composition.
+extern "C" fn bunny_set_selected_text_range(_this: Id, _sel: Sel, range: Id) {
+    let Some((start, end)) = (unsafe { span_of(range) }) else {
+        return;
+    };
+    let unmoved = mirror().is_some_and(|mirror| {
+        let (location, length) = mirror.document.selected;
+        (location, location + length) == (start, end)
+    });
+    if !unmoved {
+        keyboard_edit(AppEvent::Select { location: start, length: end - start });
+    }
+}
+
+/// `setMarkedText:selectedRange:` — the composition, with the selection
+/// INSIDE it; a range the kit leaves unsaid (`NSNotFound`) or overlong is
+/// the composition's end.
+extern "C" fn bunny_set_marked_text(_this: Id, _sel: Sel, text: Id, selected: NSRange) {
+    let text = unsafe { text_argument_to_string(text) };
+    let units = text.encode_utf16().count() as u64;
+    let location = if selected.location == NS_NOT_FOUND { units } else { selected.location.min(units) };
+    let length = selected.length.min(units - location);
+    keyboard_edit(AppEvent::Marked { text, location, length });
+}
+
+extern "C" fn bunny_unmark_text(_this: Id, _sel: Sel) {
+    keyboard_edit(AppEvent::Unmark);
+}
+
+extern "C" fn bunny_set_marked_text_style(_this: Id, _sel: Sel, _style: Id) {}
+
+extern "C" fn bunny_replace_range(_this: Id, _sel: Sel, range: Id, text: Id) {
+    let Some((start, end)) = (unsafe { span_of(range) }) else {
+        return;
+    };
+    let text = unsafe { text_argument_to_string(text) };
+    keyboard_edit(AppEvent::Replace { location: start, length: end - start, text });
+}
+
+// The position and the range themselves
+
+extern "C" fn bunny_range_start(this: Id, _sel: Sel) -> Id {
+    unsafe { span_of(this) }.map_or(null_mut(), |(start, _)| unsafe { position(start) })
+}
+
+extern "C" fn bunny_range_end(this: Id, _sel: Sel) -> Id {
+    unsafe { span_of(this) }.map_or(null_mut(), |(_, end)| unsafe { position(end) })
+}
+
+extern "C" fn bunny_range_empty(this: Id, _sel: Sel) -> i8 {
+    i8::from(unsafe { span_of(this) }.is_none_or(|(start, end)| start == end))
+}
+
+/// Two positions are equal when they stand at the same offset — the kit
+/// compares what it read twice.
+extern "C" fn bunny_position_equal(this: Id, _sel: Sel, other: Id) -> i8 {
+    i8::from(unsafe { offset_of(other).is_some() && offset_of(this) == offset_of(other) })
+}
+
+extern "C" fn bunny_position_hash(this: Id, _sel: Sel) -> u64 {
+    unsafe { offset_of(this) }.unwrap_or(0)
+}
+
+extern "C" fn bunny_range_equal(this: Id, _sel: Sel, other: Id) -> i8 {
+    i8::from(unsafe { span_of(other).is_some() && span_of(this) == span_of(other) })
+}
+
+extern "C" fn bunny_range_hash(this: Id, _sel: Sel) -> u64 {
+    unsafe { span_of(this) }.map_or(0, |(start, end)| start.rotate_left(32) ^ end)
 }
 
 /// The HID usages that type nothing and therefore never reach
@@ -1095,6 +1700,31 @@ unsafe fn register_classes() {
         let class_ = CString::new("#@:").expect("type encoding");
         let int = CString::new("q@:").expect("type encoding");
 
+        // the keyboard's positions and ranges: offsets in UTF-16, kept in
+        // instance variables (added before the class is registered, read
+        // back by where they landed once it is)
+        let position = objc_allocateClassPair(class("UITextPosition"), c"BunnyTextPosition".as_ptr(), 0);
+        class_addIvar(position, c"bunnyOffset".as_ptr(), 8, 3, c"Q".as_ptr());
+        class_addMethod(position, sel("isEqual:"), bunny_position_equal as *const c_void, c"c@:@".as_ptr());
+        class_addMethod(position, sel("hash"), bunny_position_hash as *const c_void, c"Q@:".as_ptr());
+        objc_registerClassPair(position);
+        let at = |class: Id, name: &CStr| ivar_getOffset(class_getInstanceVariable(class, name.as_ptr()));
+        POSITION_IVAR.with(|slot| slot.set(at(position, c"bunnyOffset")));
+        let range = objc_allocateClassPair(class("UITextRange"), c"BunnyTextRange".as_ptr(), 0);
+        class_addIvar(range, c"bunnyStart".as_ptr(), 8, 3, c"Q".as_ptr());
+        class_addIvar(range, c"bunnyEnd".as_ptr(), 8, 3, c"Q".as_ptr());
+        for (name, imp, types) in [
+            ("start", bunny_range_start as *const c_void, c"@@:"),
+            ("end", bunny_range_end as *const c_void, c"@@:"),
+            ("isEmpty", bunny_range_empty as *const c_void, c"c@:"),
+            ("isEqual:", bunny_range_equal as *const c_void, c"c@:@"),
+            ("hash", bunny_range_hash as *const c_void, c"Q@:"),
+        ] {
+            class_addMethod(range, sel(name), imp, types.as_ptr());
+        }
+        objc_registerClassPair(range);
+        RANGE_IVARS.with(|slot| slot.set((at(range, c"bunnyStart"), at(range, c"bunnyEnd"))));
+
         // the view: a CAMetalLayer for a skin, ears for every finger,
         // and the responder the keyboard types into
         let view = objc_allocateClassPair(
@@ -1138,14 +1768,77 @@ unsafe fn register_classes() {
             "smartQuotesType",
             "smartDashesType",
             "smartInsertDeleteType",
+            "inlinePredictionType",
+            "mathExpressionCompletionType",
         ] {
             class_addMethod(view, sel(name), bunny_trait_no as *const c_void, int.as_ptr());
         }
         for name in ["autocapitalizationType", "returnKeyType", "keyboardAppearance"] {
             class_addMethod(view, sel(name), bunny_trait_zero as *const c_void, int.as_ptr());
         }
+        class_addMethod(view, sel("writingToolsBehavior"), bunny_trait_none as *const c_void, int.as_ptr());
         class_addMethod(view, sel("keyboardType"), bunny_keyboard_type as *const c_void, int.as_ptr());
-        for protocol in ["UIKeyInput", "UITextInputTraits"] {
+        // the whole of UITextInput: every question answered from the
+        // mirror ([`sync_text`]), every edit sent as an event
+        for (name, imp, types) in [
+            ("textInRange:", bunny_text_in_range as *const c_void, c"@@:@"),
+            ("replaceRange:withText:", bunny_replace_range as *const c_void, c"v@:@@"),
+            ("selectedTextRange", bunny_selected_text_range as *const c_void, c"@@:"),
+            ("setSelectedTextRange:", bunny_set_selected_text_range as *const c_void, c"v@:@"),
+            ("markedTextRange", bunny_marked_text_range as *const c_void, c"@@:"),
+            ("markedTextStyle", bunny_marked_text_style as *const c_void, c"@@:"),
+            ("setMarkedTextStyle:", bunny_set_marked_text_style as *const c_void, c"v@:@"),
+            ("setMarkedText:selectedRange:", bunny_set_marked_text as *const c_void, c"v@:@{_NSRange=QQ}"),
+            ("unmarkText", bunny_unmark_text as *const c_void, c"v@:"),
+            ("beginningOfDocument", bunny_beginning_of_document as *const c_void, c"@@:"),
+            ("endOfDocument", bunny_end_of_document as *const c_void, c"@@:"),
+            ("textRangeFromPosition:toPosition:", bunny_range_between as *const c_void, c"@@:@@"),
+            ("positionFromPosition:offset:", bunny_position_offset as *const c_void, c"@@:@q"),
+            (
+                "positionFromPosition:inDirection:offset:",
+                bunny_position_toward as *const c_void,
+                c"@@:@qq",
+            ),
+            ("comparePosition:toPosition:", bunny_compare_positions as *const c_void, c"q@:@@"),
+            ("offsetFromPosition:toPosition:", bunny_offset_between as *const c_void, c"q@:@@"),
+            ("inputDelegate", bunny_input_delegate as *const c_void, c"@@:"),
+            ("setInputDelegate:", bunny_set_input_delegate as *const c_void, c"v@:@"),
+            ("tokenizer", bunny_tokenizer as *const c_void, c"@@:"),
+            (
+                "positionWithinRange:farthestInDirection:",
+                bunny_farthest_in_range as *const c_void,
+                c"@@:@q",
+            ),
+            (
+                "characterRangeByExtendingPosition:inDirection:",
+                bunny_extend_position as *const c_void,
+                c"@@:@q",
+            ),
+            (
+                "baseWritingDirectionForPosition:inDirection:",
+                bunny_writing_direction as *const c_void,
+                c"q@:@q",
+            ),
+            ("setBaseWritingDirection:forRange:", bunny_set_writing_direction as *const c_void, c"v@:q@"),
+            ("firstRectForRange:", bunny_first_rect as *const c_void, c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@"),
+            (
+                "caretRectForPosition:",
+                bunny_caret_rect as *const c_void,
+                c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@",
+            ),
+            ("selectionRectsForRange:", bunny_selection_rects as *const c_void, c"@@:@"),
+            ("closestPositionToPoint:", bunny_closest_position as *const c_void, c"@@:{CGPoint=dd}"),
+            (
+                "closestPositionToPoint:withinRange:",
+                bunny_closest_position_within as *const c_void,
+                c"@@:{CGPoint=dd}@",
+            ),
+            ("characterRangeAtPoint:", bunny_character_range_at as *const c_void, c"@@:{CGPoint=dd}"),
+            ("textInputView", bunny_text_input_view as *const c_void, c"@@:"),
+        ] {
+            class_addMethod(view, sel(name), imp, types.as_ptr());
+        }
+        for protocol in ["UIKeyInput", "UITextInputTraits", "UITextInput"] {
             let name = CString::new(protocol).expect("protocol name");
             let protocol = objc_getProtocol(name.as_ptr());
             if !protocol.is_null() {
