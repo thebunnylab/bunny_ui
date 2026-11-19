@@ -109,6 +109,10 @@ name = "tone"
 required-features = ["shell"]
 
 [[example]]
+name = "updater"
+required-features = ["shell", "updater"]
+
+[[example]]
 name = "preview"
 required-features = ["shell", "preview"]
 

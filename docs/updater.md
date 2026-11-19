@@ -12,8 +12,7 @@ The proofs:*
   verified that server's real signature with the std-only Ed25519.*
 
 *The Linux and Windows file work runs in CI on their runners. A whole
-app that updates itself under `bunny build` is not proven yet. The
-ready-made update control is not here yet.*
+app that updates itself under `bunny build` is not proven yet.*
 
 An app on the desktop asks a feed whether a newer build is there. When
 the person wants it, the updater downloads it, checks that its bytes
@@ -74,6 +73,38 @@ the updater says so, and the app goes read-only until it updates.
 
 ## In the app
 
+The ready-made control is a pill. Put it where the app shows status: a
+toolbar, a title bar, the corner of the window.
+
+```rust
+use bunny_ui::prelude::*;
+use bunny_ui::updater::ui::{UpdateBannerExt, update_pill};
+
+fn toolbar() -> impl View {
+    hstack!(text("My app"), spacer(), update_pill())
+}
+
+// or, for a window with no toolbar: the pill over its top trailing corner
+fn home() -> impl View {
+    content().update_banner()
+}
+```
+
+- **Nothing to say:** the pill takes no room. That covers no updater in
+  the build, and a build that is up to date.
+- **Its words** follow the locale of the view, in the sixteen languages
+  of the framework's own words. A long message ends in an ellipsis on
+  one line.
+- **During a download,** the pill's own ground fills with the share that
+  arrived, so the pill keeps its size and no bar crosses the words.
+- **The colors** come from the theme: the words in the accent when a
+  click does the next step, in the secondary ink when it does not.
+- **A click** does the next step (`bunny_ui::updater::click`).
+- **`cargo run -p bunny-ui --features updater --example updater`** shows
+  each state.
+
+An app with a control of its own reads the state:
+
 ```rust
 use bunny_ui::prelude::*;
 use bunny_ui::updater::UpdateState;
@@ -88,6 +119,9 @@ fn update_button() -> Option<impl View> {
     Some(button(text(label), bunny_ui::updater::click))
 }
 ```
+
+`bunny_ui::updater::ui::model::reading` gives the pill's words, ink and
+fill for any state, for a control that wants the same words.
 
 - `bunny_ui::updater::state()` is the `State<UpdateState>` a view reads.
   It is `None` when the build has no updater.
