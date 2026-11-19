@@ -377,6 +377,7 @@ pub fn font_spec(font: &wire::Font, strings: &[String]) -> Result<FontSpec, Miss
         },
         family,
         tracking: font.tracking,
+        monospaced_digits: false,
     })
 }
 
@@ -883,7 +884,7 @@ pub fn turned_as_pictures(display: DisplayList, text: &dyn TextEngine, scale: us
                 return Some(command.clone());
             };
             let slice = content.get(range.0..range.1)?;
-            let upright = text.raster_line(slice, font, *color, scale)?;
+            let upright = bunny_ui_core::figures::raster_line(text, slice, font, *color, scale)?;
             let turned = bunny_ui_core::raster::turn_raster(&upright, *turn);
             let (x, y) = bunny_ui_core::raster::turned_corner(
                 *pivot,

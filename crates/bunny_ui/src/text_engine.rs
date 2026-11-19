@@ -173,6 +173,9 @@ pub struct FontSpec {
     /// `.tracking`, the CSS `letter-spacing`. Already resolved: an em
     /// became points against this spec's own size.
     pub tracking: Px,
+    /// The figures take one advance each — `SwiftUI`'s
+    /// `.monospacedDigit()`, the CSS `tabular-nums` ([`crate::figures`]).
+    pub monospaced_digits: bool,
 }
 
 impl FontSpec {
@@ -183,6 +186,7 @@ impl FontSpec {
         slant: Slant::Upright,
         family: Family::SYSTEM,
         tracking: 0.0,
+        monospaced_digits: false,
     };
 
     /// The API text styles, in desktop metrics.
@@ -206,6 +210,7 @@ impl FontSpec {
             slant: Slant::Upright,
             family: Family::SYSTEM,
             tracking: 0.0,
+            monospaced_digits: false,
         }
     }
 
@@ -225,6 +230,7 @@ impl FontSpec {
             family: self.family,
             slant: self.slant,
             tracking_milli: (self.tracking * 1000.0).round() as i32,
+            monospaced_digits: self.monospaced_digits,
         }
     }
 }
@@ -244,6 +250,8 @@ pub struct FontKey {
     /// two widths and two rasters. Signed: tracking closes a line as
     /// often as it opens one.
     tracking_milli: i32,
+    /// Figures laid one advance apart are another width and raster.
+    monospaced_digits: bool,
 }
 
 /// A partial font patch for inheritance: `.font(…)` sets all three
@@ -259,6 +267,7 @@ pub struct FontPatch {
     /// Unresolved on purpose: an em only becomes points once the size
     /// it rides on is known, which is here and not at the call site.
     pub tracking: Option<Tracking>,
+    pub monospaced_digits: Option<bool>,
 }
 
 impl FontPatch {
@@ -274,6 +283,7 @@ impl FontPatch {
             slant: self.slant.or(outer.slant),
             family: self.family.or(outer.family),
             tracking: self.tracking.or(outer.tracking),
+            monospaced_digits: self.monospaced_digits.or(outer.monospaced_digits),
         }
     }
 
@@ -293,6 +303,7 @@ impl FontPatch {
                 Some(Tracking::Em(em)) => em * size,
                 None => base.tracking,
             },
+            monospaced_digits: self.monospaced_digits.unwrap_or(base.monospaced_digits),
         }
     }
 }
@@ -1014,7 +1025,13 @@ impl MeasureCache {
             entry.used.set(self.frame.get());
             return entry.value.clone();
         }
-        let geometry = engine.line_geometry(text, font).map(std::rc::Rc::new);
+        // figures laid by cells are not where the engine's whole line
+        // put them: the caret falls back on the measured prefixes
+        let geometry = if crate::figures::laid_by_cells(engine, text, font) {
+            None
+        } else {
+            engine.line_geometry(text, font).map(std::rc::Rc::new)
+        };
         self.geometry.borrow_mut().entry(key).or_default().insert(
             text.to_owned(),
             CachedGeometry {
@@ -1045,7 +1062,7 @@ impl MeasureCache {
             return *metrics;
         }
         crate::stats::note_measure(false);
-        let measured = engine.measure_line(text, font);
+        let measured = crate::figures::measure_line(engine, text, font);
         self.lines
             .borrow_mut()
             .entry(font_key)

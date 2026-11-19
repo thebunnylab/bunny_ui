@@ -67,6 +67,7 @@ mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod figures;
 pub mod font_file;
 pub mod form;
 pub mod glass;

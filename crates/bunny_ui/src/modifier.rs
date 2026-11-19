@@ -123,6 +123,8 @@ pub enum Modifier {
         over: Option<crate::layout::DragOverAction>,
     },
     Monospaced,
+    /// `.monospacedDigit()` — the figures take one advance each.
+    MonospacedDigit,
     /// `.font_family(…)` — the face itself, by name. Only the family
     /// travels: a size, a weight and a lean around it all survive.
     FontFamily(crate::text_engine::Family),
@@ -365,6 +367,7 @@ impl Modifier {
             Modifier::OnDrag { .. } => "on_drag",
             Modifier::OnDrop { .. } => "on_drop",
             Modifier::Monospaced => "monospaced",
+            Modifier::MonospacedDigit => "monospaced_digit",
             Modifier::FontFamily { .. } => "font_family",
             Modifier::FontSize { .. } => "font_size",
             Modifier::LineHeight { .. } => "line_height",
@@ -543,6 +546,7 @@ impl Modifier {
             Modifier::OnDrag(_) => " [.onDrag()]".into(),
             Modifier::OnDrop { .. } => " [.onDrop()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::MonospacedDigit => " [.monospacedDigit()]".into(),
             Modifier::FontFamily(family) => {
                 format!(" [.font_family({:?})]", family.name().unwrap_or_default())
             }
@@ -1657,6 +1661,14 @@ pub(crate) fn apply(
             mark,
             VisualProps {
                 font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::MonospacedDigit => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { monospaced_digits: Some(true), ..FontPatch::default() },
                 ..VisualProps::default()
             },
         ),

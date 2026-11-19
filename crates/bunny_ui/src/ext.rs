@@ -895,6 +895,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Monospaced)
     }
 
+    /// `.monospacedDigit()` — the figures of the text below take one
+    /// advance each, the letters keep theirs: a column of numbers lines
+    /// up, a clock that ticks keeps its width. It inherits like the
+    /// font, and only this travels: the size, the weight and the face
+    /// around it survive. The page writes `font-variant-numeric:
+    /// tabular-nums`.
+    #[track_caller]
+    fn monospaced_digit(self) -> Modified<Self> {
+        Modified::new(self, Modifier::MonospacedDigit)
+    }
+
     /// `.font_family("Menlo")` — the face by name, for a scene that
     /// lets the reader choose one. It inherits like every other font
     /// modifier and it names ONLY the family: a `.bold()` or a

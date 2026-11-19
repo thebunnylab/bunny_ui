@@ -1320,6 +1320,9 @@ fn rule_text(
             if text.font.tracking != 0.0 {
                 base.insert("letter-spacing", format!("{}px", text.font.tracking));
             }
+            if text.font.monospaced_digits {
+                base.insert("font-variant-numeric", "tabular-nums".into());
+            }
         }
         // after the font shorthand, which resets it — the served page
         // steps its lines the way the engine measured them

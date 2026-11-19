@@ -1811,13 +1811,13 @@ fn paint(
             ),
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let slice = &content[range.0..range.1];
-                if let Some(raster) = text.raster_line(slice, font, *color, scale) {
+                if let Some(raster) = crate::figures::raster_line(text, slice, font, *color, scale) {
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
             DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
                 let slice = &content[range.0..range.1];
-                if let Some(raster) = text.raster_line(slice, font, *color, scale) {
+                if let Some(raster) = crate::figures::raster_line(text, slice, font, *color, scale) {
                     bitmap.composite_turned(*pivot, *turn, scale, &raster);
                 }
             }
@@ -2354,13 +2354,13 @@ impl Surface {
                     }
                     DrawCommand::TextLine { origin, content, range, color, font } => {
                         let slice = &content[range.0..range.1];
-                        if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
+                        if let Some(raster) = crate::figures::raster_line(text, slice, font, *color, self.scale) {
                             self.bitmap.composite_text(origin.x, origin.y, self.scale, &raster);
                         }
                     }
                     DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
                         let slice = &content[range.0..range.1];
-                        if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
+                        if let Some(raster) = crate::figures::raster_line(text, slice, font, *color, self.scale) {
                             self.bitmap.composite_turned(*pivot, *turn, self.scale, &raster);
                         }
                     }

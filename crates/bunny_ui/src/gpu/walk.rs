@@ -840,7 +840,7 @@ impl RunAtlas {
         };
         let warm = self.entries.get(&hash).is_some_and(|bucket| bucket.iter().any(same));
         if !warm {
-            let Some(upright) = engine.raster_line(slice, font, color, scale) else {
+            let Some(upright) = crate::figures::raster_line(engine, slice, font, color, scale) else {
                 return Ok(None);
             };
             if !ground.ensure_shared(self.size) {

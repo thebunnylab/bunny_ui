@@ -2635,6 +2635,9 @@ fn look_hash(node: &DomNode) -> u64 {
             (face.slant as u8).hash(&mut hasher);
             face.family.name().as_deref().hash(&mut hasher);
             face.tracking.to_bits().hash(&mut hasher);
+            if face.monospaced_digits {
+                1u8.hash(&mut hasher);
+            }
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -2648,6 +2651,9 @@ fn look_hash(node: &DomNode) -> u64 {
         (text.font.slant as u8).hash(&mut hasher);
         text.font.family.name().as_deref().hash(&mut hasher);
         text.font.tracking.to_bits().hash(&mut hasher);
+        if text.font.monospaced_digits {
+            1u8.hash(&mut hasher);
+        }
         hash_f32(text.line_height, &mut hasher);
         text.text_align.map(|align| align as u8).hash(&mut hasher);
         text.truncation.map(|mode| mode as u8).hash(&mut hasher);
@@ -4600,9 +4606,10 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
 ///
-/// The text look's record ends with a u8, the most lines the text shows
-/// (`.line_limit`, 0 for none); the glue clamps the element to them
-/// (`-webkit-line-clamp`).
+/// The text look's record ends with two bytes: the most lines the text
+/// shows (`.line_limit`, 0 for none; the glue clamps the element to them,
+/// `-webkit-line-clamp`), then the figures' byte — bit 0, one advance
+/// each (`.monospaced_digit()`, CSS `tabular-nums`).
 pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
@@ -5485,6 +5492,8 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
     out.push(text.inherits_face as u8);
     // the most lines it shows, 0 for none
     out.push(text.line_limit);
+    // bit 0: the figures take one advance each (`tabular-nums`)
+    out.push(u8::from(text.font.monospaced_digits));
 }
 
 /// The kind's byte on the wire, shared by the create op and the rule.
@@ -8632,8 +8641,9 @@ mod tests {
         };
         let (free, two) = (limited(0), limited(2));
         assert_eq!(free.len(), two.len());
-        assert_eq!(free.last(), Some(&0), "{free:?}");
-        assert_eq!(two.last(), Some(&2), "{two:?}");
+        // the figures' byte follows it
+        assert_eq!(free[free.len() - 2], 0, "{free:?}");
+        assert_eq!(two[two.len() - 2], 2, "{two:?}");
         assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("const lineLimit = u8();"), "glue_dom.js reads it");
     }
 
@@ -8659,6 +8669,22 @@ mod tests {
             look_hash(&node)
         };
         assert_ne!(node(look), node(DomLook::NONE));
+    }
+
+    /// The text look's record ends with the figures' byte: bit 0, one
+    /// advance each.
+    #[test]
+    fn the_figures_ride_the_text_look() {
+        let record = |monospaced_digits| {
+            let mut out = Vec::new();
+            let font = FontSpec { monospaced_digits, ..FontSpec::DEFAULT };
+            encode_text_look(&mut out, &DomText { font, ..face_only(FontSpec::DEFAULT) });
+            out
+        };
+        let (plain, tabular) = (record(false), record(true));
+        assert_eq!((plain.last(), tabular.last()), (Some(&0), Some(&1)));
+        assert_eq!(plain[..plain.len() - 1], tabular[..tabular.len() - 1]);
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("tabular-nums"), "glue_dom.js writes it");
     }
 
     #[test]

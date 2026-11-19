@@ -804,6 +804,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
       // the shorthand leaves the spacing alone; the face's own advance
       // rides beside it
       if (face.tracking) decl["letter-spacing"] = `${face.tracking}px`;
+      // after the shorthand, which resets it
+      if (face.tabular) decl["font-variant-numeric"] = "tabular-nums";
     }
     // AFTER the font shorthand, which resets line-height: 0 means the
     // face's own box
@@ -1374,9 +1376,12 @@ function applyPatches(view, length) {
     const inheritsFace = u8();
     // the most lines it shows, 0 for none
     const lineLimit = u8();
+    // bit 0: the figures take one advance each
+    const figures = u8();
     return {
       font: cssFont(size, weight, mono, italic, family),
       inheritsFace,
+      tabular: figures & 1,
       lineHeight,
       tracking,
       align,
