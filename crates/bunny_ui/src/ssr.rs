@@ -476,9 +476,13 @@ impl Tree {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
+                // a pinned size is a floor too: a flex line never
+                // shrinks a box below its minimum, whichever its axis
                 for (name, value) in [
                     ("width", width),
+                    ("min-width", width),
                     ("height", height),
+                    ("min-height", height),
                     ("max-width", max_width),
                     ("max-height", max_height),
                 ] {
@@ -840,8 +844,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "column"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::FlexRow => (
@@ -850,8 +852,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "row"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::Layers | CreateKind::Grid => (
@@ -859,8 +859,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
             &[
                 ("display", "grid"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::Popover => (
@@ -876,8 +874,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
             "div",
             &[
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
                 ("white-space", "pre-wrap"),
                 ("cursor", "default"),
             ],
@@ -907,12 +903,12 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
         // fill flag)
         CreateKind::Rectangle => (
             "div",
-            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+            &[("box-sizing", "border-box"),
               ("background", "currentColor")],
         ),
         CreateKind::Ellipse => (
             "div",
-            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+            &[("box-sizing", "border-box"),
               ("background", "currentColor"), ("border-radius", "50%")],
         ),
         CreateKind::Group | CreateKind::Box => (
@@ -921,8 +917,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "column"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
     }
@@ -1081,6 +1075,8 @@ fn rule_text(
         base.insert("flex", "1 1 auto".into());
         base.insert("min-width", "0".into());
         base.insert("min-height", "0".into());
+        // in a grid cell the grow means nothing: the box stretches across
+        base.insert("justify-self", "stretch".into());
         // a resizable picture takes its frame across as well (the glue's
         // `lookRules` says why)
         if matches!(kind, CreateKind::Image) {
@@ -1614,6 +1610,52 @@ mod tests {
         );
     }
 
+    /// A frame pins what it names: a child that fills the width stops at
+    /// the frame, and the box around the frame — its background — hugs
+    /// the frame instead of stretching to whatever holds it.
+    #[test]
+    fn a_box_around_an_exact_frame_hugs_the_frame() {
+        #[derive(Clone, Copy)]
+        struct Column;
+        impl Component for Column {
+            fn body(self) -> impl View {
+                vstack!(text("wide").frame_max(f64::INFINITY, f64::MAX, Alignment::Leading))
+                    .frame_width_aligned(300.0, Alignment::Leading)
+                    .background_color(Color::rgb(1, 2, 3))
+            }
+        }
+
+        let page = render(&Column, Size { width: 400.0, height: 120.0 });
+        let painted = page.css.lines().find(|rule| rule.contains("background-color:rgba(1, 2, 3, 1)")).expect("the background's rule");
+        assert!(!painted.contains("align-self:stretch"), "{}", page.css);
+    }
+
+    /// A layer meets its box at its point: the cell places it by the
+    /// point — the box is the cell's own size and stays put — and a
+    /// layer that takes the width stretches across the cell.
+    #[test]
+    fn an_overlay_is_placed_by_its_point() {
+        #[derive(Clone, Copy)]
+        struct Badged;
+        impl Component for Badged {
+            fn body(self) -> impl View {
+                vstack!(
+                    rectangle().frame(120.0, 60.0).overlay(UnitPoint::TOP_TRAILING, rectangle().frame(16.0, 16.0)),
+                    rectangle()
+                        .frame(120.0, 40.0)
+                        .overlay(UnitPoint::BOTTOM, spacer().frame_height(3.0).background_color(Color::rgb(4, 5, 6))),
+                )
+            }
+        }
+
+        let page = render(&Badged, Size { width: 400.0, height: 200.0 });
+        let cells: Vec<&str> = page.css.lines().filter(|rule| rule.contains("display:grid")).collect();
+        assert!(cells.iter().any(|cell| cell.contains("align-items:flex-start") && cell.contains("justify-items:flex-end")), "{}", page.css);
+        assert!(cells.iter().any(|cell| cell.contains("align-items:flex-end") && cell.contains("justify-items:center")), "{}", page.css);
+        let band = page.css.lines().find(|rule| rule.contains("background-color:rgba(4, 5, 6, 1)")).expect("the band's rule");
+        assert!(band.contains("justify-self:stretch"), "{}", page.css);
+    }
+
     /// A served field says what the mounted one says — the glue's op 7,
     /// mirrored: a secret is a password box, what it holds is the
     /// autofill's token, its name is `aria-label`, and a field that said
@@ -1927,8 +1969,10 @@ mod tests {
 
         let page = render(&Placed, Size { width: 200.0, height: 200.0 });
         for served in [
-            // the flow's wrapper: a pinned box, at the wire's precision
-            "style=\"height:60.70000076293945px;width:120.30000305175781px\"",
+            // the flow's wrapper: a pinned box, at the wire's precision,
+            // and a floor of the same size the flex line cannot shrink
+            "style=\"height:60.70000076293945px;min-height:60.70000076293945px;\
+             min-width:120.30000305175781px;width:120.30000305175781px\"",
             // the interior: the engine's own numbers
             "style=\"height:16px;left:0;position:absolute;top:0;\
              transform:translate(36.15px, 6.550000000000001px);width:48px\"",

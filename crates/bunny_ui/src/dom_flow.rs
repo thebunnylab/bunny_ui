@@ -477,6 +477,18 @@ fn align_code(align: CrossAlign) -> u8 {
     }
 }
 
+/// The edge a [`crate::layout::UnitPoint`] coordinate names. A cell
+/// aligns by edges, so a point between them goes to the nearest.
+fn unit_align(at: f64) -> CrossAlign {
+    if at <= 0.25 {
+        CrossAlign::Start
+    } else if at >= 0.75 {
+        CrossAlign::End
+    } else {
+        CrossAlign::Center
+    }
+}
+
 /// [`align_code`] with the vertical edge a node names in the high nibble
 /// ([`crate::dom::DomLayout::align`]). The middle row centres: a frame
 /// taller than its child holds the child in its middle, as the pixel
@@ -792,6 +804,7 @@ impl Walk<'_> {
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    Self::stamp_cell(child, &mut container.children[opened..]);
                     if let Some(at) = child.placed_at() {
                         stamp_position(&mut container.children[opened..], at, true, child, None);
                     }
@@ -865,6 +878,14 @@ impl Walk<'_> {
                 self.unbounded = outer_unbounded;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                // a frame pins what it names: the hunger inside stops at
+                // the axes it pins, or the box around it (a background,
+                // a border) stretches to the holder past the frame
+                let open_hunger = (width.is_none() && child.is_flexible(Axis::Horizontal, None))
+                    || (height.is_none() && child.is_flexible(Axis::Vertical, None));
+                if !open_hunger && let Some(layout) = container.layout.as_mut() {
+                    layout.stretch = false;
+                }
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
@@ -1430,16 +1451,23 @@ impl Walk<'_> {
                     owner.style.set_group_owner(Some(key));
                 }
             }
-            LayoutNode::Overlay { behind, layer, child, .. } => {
+            LayoutNode::Overlay { at, behind, layer, child } => {
                 // one grid cell, both in it — the browser stacks them
-                // in document order
+                // in document order. The cell is the box's own size, so
+                // placing both by the layer's point moves the layer
+                // alone: a point of the layer meets the same point of
+                // the box
                 let cell = placed(out, node(DomKind::Layers));
+                cell.layout.as_mut().expect("flow node").align =
+                    Some(align_both(unit_align(at.x), unit_align(at.y)));
                 self.overlay_depth += 1;
                 let mut over = Vec::new();
                 self.lower_into(layer, &mut over);
                 self.overlay_depth -= 1;
+                Self::stamp_cell(layer, &mut over);
                 let mut under = Vec::new();
                 self.lower_into(child, &mut under);
+                Self::stamp_cell(child, &mut under);
                 if *behind {
                     cell.children.extend(over);
                     cell.children.extend(under);
@@ -1796,6 +1824,22 @@ impl Walk<'_> {
                 if let Some(layout) = node.layout.as_mut() {
                     layout.fill = true;
                 }
+            }
+        }
+    }
+
+    /// A grid cell places what it holds by the cell's alignment, and a
+    /// flex line's grow means nothing there: a layer that takes what
+    /// it is offered stretches across the cell on that axis instead —
+    /// `fill` is `justify-self: stretch` too, the horizontal one, and
+    /// `stretch` the vertical.
+    fn stamp_cell(child: &LayoutNode, lowered: &mut [DomNode]) {
+        let across = child.is_flexible(Axis::Horizontal, None);
+        let down = child.is_flexible(Axis::Vertical, None);
+        for node in lowered {
+            if let Some(layout) = node.layout.as_mut() {
+                layout.fill |= across;
+                layout.stretch |= down;
             }
         }
     }

@@ -535,11 +535,11 @@ const KIND_BASE = [
   // 0 group, 1 box: a wrapper is a COLUMN, not a block — the engine
   // proposes its box to the child, and only a flex line can hand the
   // offer down (width by the stretch default, height by the fill flag)
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:column;box-sizing:border-box",
+  "display:flex;flex-direction:column;box-sizing:border-box",
   // 2 text: the browser breaks the lines in this mode — pre-wrap keeps
   // the engine's explicit newlines and wraps the rest
-  "box-sizing:border-box;min-width:0;min-height:0;white-space:pre-wrap;cursor:default",
+  "box-sizing:border-box;white-space:pre-wrap;cursor:default",
   // 3 field: the padding mirrors the engine's FIELD_PAD; every color
   // and border arrives through the look — the theme owns the chrome
   "box-sizing:border-box;padding:5px 8px;outline:none",
@@ -554,10 +554,10 @@ const KIND_BASE = [
   "pointer-events:none",
   // 9 flex column, 10 flex row: FLOW containers, the browser lays
   // their children out
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
-  "display:flex;flex-direction:row;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:column;box-sizing:border-box",
+  "display:flex;flex-direction:row;box-sizing:border-box",
   // 11 layers: one grid cell, everyone in it
-  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  "display:grid;box-sizing:border-box",
   // 12 popover: absolute under the root; the glue positions it from
   // the anchor's real box once the placement round lands
   "position:absolute;left:0;top:0;box-sizing:border-box",
@@ -568,10 +568,10 @@ const KIND_BASE = [
   // 15 video: the video host's stream, the box underneath owns the clicks
   "display:block;pointer-events:none;box-sizing:border-box;min-width:0;min-height:0",
   // 16 grid: sparse cells in equal-width tracks
-  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  "display:grid;box-sizing:border-box",
   // 17 rectangle, 18 ellipse: independent axes, inherited hover/press ink
-  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor",
-  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor;border-radius:50%",
+  "box-sizing:border-box;background:currentColor",
+  "box-sizing:border-box;background:currentColor;border-radius:50%",
 ];
 
 // The rules of one look: the base, then one per state. The twin of the
@@ -649,6 +649,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl.flex = "1 1 auto";
     decl["min-width"] = "0";
     decl["min-height"] = "0";
+    // in a grid cell the grow means nothing: the box stretches across
+    decl["justify-self"] = "stretch";
     // a resizable picture takes its frame across as well: a width left
     // to the ratio spills a contained picture past its frame and crops
     // a covering one from one side
@@ -1730,10 +1732,12 @@ function applyPatches(view, length) {
       if (el) {
         const style = el.style;
         const dressed = style.length !== 0;
-        if (width !== null) style.width = `${width}px`;
-        else if (dressed) style.width = "";
-        if (height !== null) style.height = `${height}px`;
-        else if (dressed) style.height = "";
+        // a pinned size is a floor too: a flex line never shrinks a box
+        // below its minimum, whichever its axis
+        if (width !== null) style.width = style.minWidth = `${width}px`;
+        else if (dressed) style.width = style.minWidth = "";
+        if (height !== null) style.height = style.minHeight = `${height}px`;
+        else if (dressed) style.height = style.minHeight = "";
         if (maxWidth !== null) style.maxWidth = `${maxWidth}px`;
         else if (dressed) style.maxWidth = "";
         if (maxHeight !== null) style.maxHeight = `${maxHeight}px`;
