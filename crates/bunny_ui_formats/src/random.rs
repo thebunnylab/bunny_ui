@@ -28,15 +28,21 @@ fn system_fill(out: &mut [u8]) -> io::Result<()> {
 
 #[cfg(windows)]
 fn system_fill(out: &mut [u8]) -> io::Result<()> {
+    // `powershell.exe` is Windows PowerShell 5.1 on .NET Framework, which
+    // has no static `RandomNumberGenerator.GetBytes(int)` (that came with
+    // .NET 6). `Create().GetBytes(byte[])` is on every version.
     let script = format!(
-        "[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes({}))",
+        "$bytes = New-Object byte[] {}; \
+         [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes); \
+         [Convert]::ToBase64String($bytes)",
         out.len()
     );
     let run = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()?;
     if !run.status.success() {
-        return Err(io::Error::other("powershell did not give random bytes"));
+        let why = String::from_utf8_lossy(&run.stderr);
+        return Err(io::Error::other(format!("powershell did not give random bytes: {}", why.trim())));
     }
     let text = String::from_utf8_lossy(&run.stdout);
     let bytes = crate::base64::decode(text.trim())
