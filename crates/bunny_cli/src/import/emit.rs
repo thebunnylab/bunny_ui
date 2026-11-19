@@ -368,8 +368,10 @@ impl Writer<'_> {
             Flow::Column { .. } if grows => fill_height,
             Flow::Block | Flow::Row { .. } | Flow::Column { .. } => Size::Hug,
         });
-        if node.size("min-width") != "auto" && node.size("min-width") != "0px" && !matches!(width, Size::Exact(_)) {
-            self.gap(node, "min-width", node.size("min-width").to_owned());
+        // a box that hugs keeps its floor (`frame_min`); one that fills
+        // has none to keep yet
+        if node.size("min-width") != "auto" && node.size("min-width") != "0px" && matches!(width, Size::Fill(_)) {
+            self.gap(node, "min-width", format!("{} on a box that fills", node.size("min-width")));
         }
         // a box that hugs its content is as wide as the browser resolved
         // it: a child that fills it takes that width
@@ -382,6 +384,24 @@ impl Writer<'_> {
             other => other,
         };
         (width, height)
+    }
+
+    /// The floors of a box that hugs its content (`min-width`,
+    /// `min-height`), at the border edge its frame wraps; zero where it
+    /// has none or does not hug.
+    fn floors(&self, node: &Node, width: Size, height: Size) -> (f64, f64) {
+        let content_box = node.css("box-sizing") == "content-box";
+        let floor = |property: &str, hugs: bool, insets: f64, room: Option<f64>| {
+            let value = node.size(property);
+            let length = css::px(value).or_else(|| css::percent(value).and_then(|share| room.map(|room| share * room))).unwrap_or(0.0);
+            if hugs && length > 0.0 { length + if content_box { insets } else { 0.0 } } else { 0.0 }
+        };
+        let across = node.px("padding-left") + node.px("padding-right") + node.px("border-left-width") + node.px("border-right-width");
+        let down = node.px("padding-top") + node.px("padding-bottom") + node.px("border-top-width") + node.px("border-bottom-width");
+        (
+            floor("min-width", matches!(width, Size::Hug), across, Some(self.container_width)),
+            floor("min-height", matches!(height, Size::Hug), down, None),
+        )
     }
 
     /// Where the box's content sits in it when the box is bigger.
@@ -433,6 +453,10 @@ impl Writer<'_> {
         }
         let (horizontal, vertical) = Self::content_alignment(node);
         view.push_str(&frame(width, height, alignment(horizontal, vertical)));
+        let (floor_w, floor_h) = self.floors(node, width, height);
+        if floor_w > 0.0 || floor_h > 0.0 {
+            let _ = write!(view, "\n.frame_min({}, {}, {})", num(floor_w), num(floor_h), alignment(horizontal, vertical));
+        }
         self.paint(node, &mut view);
         self.layers(node, &mut view);
         if node.kind == Kind::Element && !node.id.is_empty() {
