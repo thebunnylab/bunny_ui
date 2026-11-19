@@ -361,8 +361,15 @@ impl Writer<'_> {
             Flow::Column { stretch: true } if !pinned => fill_width,
             Flow::Block | Flow::Row { .. } | Flow::Column { .. } => Size::Hug,
         });
+        // a ratio decides the axis its box leaves open: the page resolved
+        // it, and a picture that fills its box must be told
+        let ratio = !matches!(node.css("aspect-ratio"), "" | "auto");
+        let width = match width {
+            Size::Hug if ratio => Size::Exact(node.rect.w),
+            other => other,
+        };
         let baseline = node.css("align-self") == "baseline";
-        let height = axis(&height_spec, node.rect.h).unwrap_or(match flow {
+        let height = axis(&height_spec, node.rect.h).or_else(|| ratio.then_some(Size::Exact(node.rect.h))).unwrap_or(match flow {
             Flow::Root | Flow::Cell | Flow::Layer => Size::Exact(node.rect.h),
             Flow::Row { stretch: true } if !pinned && !baseline => fill_height,
             Flow::Column { .. } if grows => fill_height,

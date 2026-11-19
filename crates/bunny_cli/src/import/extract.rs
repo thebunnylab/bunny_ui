@@ -26,7 +26,7 @@ pub const SCRIPT: &str = r"(() => {
     'color', 'font-size', 'font-weight', 'font-style', 'font-family', 'font-variant', 'line-height', 'letter-spacing',
     'text-align', 'text-transform', 'text-decoration-line', 'text-decoration-color', 'text-decoration-style',
     'text-shadow', 'white-space', 'text-overflow', '-webkit-line-clamp', 'writing-mode', 'direction', 'vertical-align',
-    'object-fit', 'object-position', 'column-count', 'appearance', 'box-sizing', 'content', 'list-style-type', 'shape-outside',
+    'object-fit', 'object-position', 'column-count', 'appearance', 'box-sizing', 'aspect-ratio', 'content', 'list-style-type', 'shape-outside',
     'background-blend-mode', '-webkit-text-fill-color', 'accent-color', 'cursor'];
   const SIZES = ['width', 'height', 'min-width', 'max-width', 'min-height', 'max-height', 'flex-basis',
     'margin-top', 'margin-right', 'margin-bottom', 'margin-left'];
