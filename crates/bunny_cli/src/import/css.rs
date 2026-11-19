@@ -151,11 +151,34 @@ pub fn shadows(value: &str) -> Vec<Shadow> {
         .collect()
 }
 
-/// A color stop: the color, and where on the line, 0–1, when named.
+/// A color stop: the color, and where on the gradient line, when named.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Stop {
     pub color: Rgba,
-    pub at: Option<f64>,
+    pub at: Option<Place>,
+}
+
+/// Where a stop stands: a fraction of the gradient line, or a length
+/// along it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Place {
+    Fraction(f64),
+    Px(f64),
+}
+
+impl Place {
+    fn of(value: &str) -> Option<Self> {
+        percent(value).map(Self::Fraction).or_else(|| px(value).map(Self::Px))
+    }
+
+    /// The fraction of a line `length` px long.
+    #[must_use]
+    pub fn fraction(self, length: f64) -> f64 {
+        match self {
+            Self::Fraction(fraction) => fraction,
+            Self::Px(px) => px / length.max(1e-9),
+        }
+    }
 }
 
 /// One layer of a computed `background-image`.
@@ -229,15 +252,18 @@ fn direction(value: &str) -> Option<f64> {
     Some(x.atan2(-y).to_degrees())
 }
 
+/// The stops of a gradient; a stop that names two places (`red 20%
+/// 40%`) is two stops of one color.
 fn stops(parts: &[&str]) -> Vec<Stop> {
     parts
         .iter()
         .filter_map(|part| {
             let words = words(part);
             let color = color(words.first()?)?;
-            let at = words.get(1).and_then(|at| percent(at));
-            Some(Stop { color, at })
+            let places: Vec<Place> = words[1..].iter().filter_map(|word| Place::of(word)).collect();
+            Some(if places.is_empty() { vec![Stop { color, at: None }] } else { places.into_iter().map(|at| Stop { color, at: Some(at) }).collect() })
         })
+        .flatten()
         .collect()
 }
 
@@ -328,6 +354,9 @@ mod tests {
         }
         assert_eq!(layers[1], Image::Url("/assets/a.png".to_owned()));
         assert!(matches!(images("linear-gradient(to right, rgb(0, 0, 0), rgb(1, 1, 1))")[0], Image::Linear { degrees, .. } if (degrees - 90.0).abs() < 1e-9));
+        let Image::Linear { stops, .. } = &images("linear-gradient(rgb(0, 0, 0), rgb(255, 0, 0) 20% 40%, rgb(1, 1, 1) 30px)")[0] else { panic!("a line") };
+        let places: Vec<Option<Place>> = stops.iter().map(|stop| stop.at).collect();
+        assert_eq!(places, [None, Some(Place::Fraction(0.2)), Some(Place::Fraction(0.4)), Some(Place::Px(30.0))]);
     }
 
     #[test]

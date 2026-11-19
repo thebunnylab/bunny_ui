@@ -15,6 +15,9 @@ use std::path::{Component, Path, PathBuf};
 use super::css::{self, Image, Rgba};
 use super::extract::{Kind, Node, Page, Rect};
 
+/// How many stops a bunny ramp holds between its ends (`Stops::MOST`).
+const MOST_STOPS: usize = 6;
+
 /// Where the module goes and what it starts with.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -532,44 +535,39 @@ impl Writer<'_> {
                 if *repeating {
                     self.gap(node, "repeating-linear-gradient", "drawn once");
                 }
-                if stops.len() > 2 {
-                    self.gap(node, "gradient: stops", format!("{} stops drawn as the first and the last", stops.len()));
-                }
-                let (Some(first), Some(last)) = (stops.first(), stops.last()) else { return };
                 // the CSS gradient line runs through the centre, as long as
                 // the box's corners need
                 let radians = degrees.to_radians();
                 let (dx, dy) = (radians.sin(), -radians.cos());
                 let (w, h) = (node.rect.w.max(1.0), node.rect.h.max(1.0));
                 let length = (w * dx).abs() + (h * dy).abs();
+                let Some(ramp) = ramp(stops, length) else { return };
                 let (sx, sy) = (0.5 - dx * length / 2.0 / w, 0.5 - dy * length / 2.0 / h);
                 let (ex, ey) = (0.5 + dx * length / 2.0 / w, 0.5 + dy * length / 2.0 / h);
-                let _ = write!(view, 
-                    "\n.background_gradient(Gradient::Linear {{ start: UnitPoint {{ x: {}, y: {} }}, end: UnitPoint {{ x: {}, y: {} }}, from: {}, to: {} }})",
+                let _ = write!(
+                    view,
+                    "\n.background_gradient(Gradient::linear({}, {}).direction(UnitPoint {{ x: {}, y: {} }}, UnitPoint {{ x: {}, y: {} }}){})",
+                    ramp.from.code(),
+                    ramp.to.code(),
                     num(sx),
                     num(sy),
                     num(ex),
                     num(ey),
-                    first.color.code(),
-                    last.color.code()
+                    ramp.stops_code()
                 );
+                self.crowded(node, &ramp);
             }
             Image::Radial { shape, stops, repeating } => {
                 if *repeating {
                     self.gap(node, "repeating-radial-gradient", "drawn once");
                 }
-                if stops.len() > 2 {
-                    self.gap(node, "gradient: stops", format!("{} stops drawn as the first and the last", stops.len()));
-                }
-                let (Some(first), Some(last)) = (stops.first(), stops.last()) else { return };
                 if !shape.is_empty() && shape != "circle" && !shape.starts_with("circle at center") {
                     self.gap(node, "radial-gradient: shape", shape.clone());
                 }
-                let _ = write!(view, 
-                    "\n.background_gradient(Gradient::Radial {{ center: UnitPoint {{ x: 0.5, y: 0.5 }}, start: 0.0, end: None, aspect: 1.0, inner: {}, outer: {} }})",
-                    first.color.code(),
-                    last.color.code()
-                );
+                // the rings reach the farthest corner from the centre
+                let Some(ramp) = ramp(stops, (node.rect.w / 2.0).hypot(node.rect.h / 2.0)) else { return };
+                let _ = write!(view, "\n.background_gradient(Gradient::radial({}, {}){})", ramp.from.code(), ramp.to.code(), ramp.stops_code());
+                self.crowded(node, &ramp);
             }
             Image::Conic => self.gap(node, "conic-gradient", "not drawn"),
             Image::Url(url) => match self.picture(url) {
@@ -578,6 +576,14 @@ impl Writer<'_> {
                 }
                 None => self.gap(node, "background-image: url", url.clone()),
             },
+        }
+    }
+
+    /// A ramp with more stops than bunny holds keeps the ones that shape
+    /// it most.
+    fn crowded(&mut self, node: &Node, ramp: &Ramp) {
+        if ramp.stops.len() > MOST_STOPS {
+            self.gap(node, "gradient: stops", format!("{} stops between the ends; the {MOST_STOPS} that shape it most are kept", ramp.stops.len()));
         }
     }
 
@@ -1348,6 +1354,113 @@ fn rotation(node: &Node) -> Option<String> {
     })
 }
 
+/// A CSS ramp as bunny holds it: the colors at the two ends of the
+/// box's gradient line and the stops between them.
+struct Ramp {
+    from: Rgba,
+    to: Rgba,
+    stops: Vec<(f64, Rgba)>,
+}
+
+impl Ramp {
+    fn stops_code(&self) -> String {
+        self.stops.iter().fold(String::new(), |mut out, (location, color)| {
+            let _ = write!(out, ".stop({}, {})", num(*location), color.code());
+            out
+        })
+    }
+}
+
+/// The ramp of `stops` on a line `length` px long, each place resolved as
+/// CSS resolves it: the first at the start and the last at the end when
+/// unnamed, the unnamed between share out the room of their neighbours,
+/// and a place behind an earlier one stands at it. What lies past the
+/// box's line is cut off at its ends.
+fn ramp(stops: &[css::Stop], length: f64) -> Option<Ramp> {
+    let count = stops.len();
+    let mut places: Vec<Option<f64>> = stops.iter().map(|stop| stop.at.map(|at| at.fraction(length))).collect();
+    *places.first_mut()? = places[0].or(Some(0.0));
+    if count > 1 {
+        places[count - 1] = places[count - 1].or(Some(1.0));
+    }
+    let mut most = f64::NEG_INFINITY;
+    for place in places.iter_mut().flatten() {
+        most = most.max(*place);
+        *place = most;
+    }
+    let mut index = 1;
+    while index < count {
+        if places[index].is_some() {
+            index += 1;
+            continue;
+        }
+        let after = (index..count).find(|at| places[*at].is_some()).unwrap_or(count - 1);
+        let (low, high) = (places[index - 1].unwrap_or(0.0), places[after].unwrap_or(1.0));
+        #[allow(clippy::cast_precision_loss, reason = "a handful of stops")]
+        let room = (after - index + 1) as f64;
+        for (step, at) in (index..after).enumerate() {
+            #[allow(clippy::cast_precision_loss, reason = "a handful of stops")]
+            let share = (step + 1) as f64 / room;
+            places[at] = Some((high - low).mul_add(share, low));
+        }
+        index = after + 1;
+    }
+    let points: Vec<(f64, Rgba)> = places.into_iter().map(|place| place.unwrap_or(0.0)).zip(stops.iter().map(|stop| stop.color)).collect();
+    // the color at `place`, seen from after it (where two stops share a
+    // place, the later) or from before it (the earlier)
+    let color_at = |place: f64, from_after: bool| {
+        let next = points.iter().position(|(at, _)| if from_after { *at > place } else { *at >= place });
+        match next {
+            None => points[points.len() - 1].1,
+            Some(0) => points[0].1,
+            Some(next) => {
+                let ((low, below), (high, above)) = (points[next - 1], points[next]);
+                if high - low <= 0.0 { above } else { lerp(below, above, (place - low) / (high - low)) }
+            }
+        }
+    };
+    let line: Vec<(f64, Rgba)> = std::iter::once((0.0, color_at(0.0, true)))
+        .chain(points.iter().copied().filter(|(at, _)| *at > 0.0 && *at < 1.0))
+        .chain(std::iter::once((1.0, color_at(1.0, false))))
+        .collect();
+    // CSS mixes with the alpha premultiplied, so a color with none takes
+    // the hue of its neighbour on each side; bunny mixes straight, and
+    // fades a ramp to its own color with no alpha (`Color::fade`)
+    let faded = |color: Rgba| Rgba { a: 0.0, ..color };
+    let mut out: Vec<(f64, Rgba)> = Vec::new();
+    for (index, (at, color)) in line.iter().copied().enumerate() {
+        if color.a > 0.0 {
+            out.push((at, color));
+            continue;
+        }
+        let before = line[..index].iter().rev().find(|(_, color)| color.a > 0.0).map(|(_, color)| faded(*color));
+        let after = line[index + 1..].iter().find(|(_, color)| color.a > 0.0).map(|(_, color)| faded(*color));
+        match (before, after) {
+            (Some(before), Some(after)) if index != 0 && index != line.len() - 1 => {
+                out.push((at, before));
+                if after != before {
+                    out.push((at, after));
+                }
+            }
+            (_, Some(after)) if index == 0 => out.push((at, after)),
+            (Some(near), _) | (None, Some(near)) => out.push((at, near)),
+            (None, None) => out.push((at, color)),
+        }
+    }
+    let (from, to) = (out[0].1, out[out.len() - 1].1);
+    Some(Ramp { from, to, stops: out[1..out.len() - 1].to_vec() })
+}
+
+/// Straight interpolation, as bunny mixes a ramp.
+fn lerp(from: Rgba, to: Rgba, t: f64) -> Rgba {
+    let channel = |a: u8, b: u8| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "between two bytes")]
+        let mixed = (f64::from(b) - f64::from(a)).mul_add(t, f64::from(a)).round() as u8;
+        mixed
+    };
+    Rgba { r: channel(from.r, to.r), g: channel(from.g, to.g), b: channel(from.b, to.b), a: (to.a - from.a).mul_add(t, from.a) }
+}
+
 /// The view with `.offset(x, y)` around it, its name inside: the
 /// offset moves the frame the named view is placed in, so the view is
 /// found where it is drawn, on both roads.
@@ -1552,6 +1665,33 @@ mod tests {
         assert_eq!(turned(40.0, quarter, "0px 0px").as_deref(), Some("\n.rotation_effect_at(Angle::degrees(90.0), UnitPoint { x: 0.0, y: 0.0 })"));
         assert_eq!(turned(0.0, quarter, "20px 10px").as_deref(), Some("\n.rotation_effect(Angle::degrees(90.0))"), "a pseudo-element");
         assert_eq!(turned(40.0, "matrix(1, 0, 0, 1, 5, 0)", "20px 10px"), None, "a translation alone");
+    }
+
+    /// A CSS ramp resolves its places as CSS does and is cut at the ends
+    /// of the box's line.
+    #[test]
+    fn a_ramp_places_its_stops_as_css_does() {
+        let ink = |r: u8| Rgba { r, g: 0, b: 0, a: 1.0 };
+        let stop = |r: u8, at: Option<css::Place>| css::Stop { color: ink(r), at };
+        let reds = |ramp: &Ramp| ramp.stops.iter().map(|(at, color)| ((at * 1000.0).round() / 1000.0, color.r)).collect::<Vec<_>>();
+        // unnamed places share the room evenly
+        let even = ramp(&[stop(0, None), stop(100, None), stop(200, None)], 100.0).expect("a ramp");
+        assert_eq!((even.from.r, even.to.r, reds(&even)), (0, 200, vec![(0.5, 100)]));
+        // a place in px is a fraction of the line; one behind an earlier
+        // place stands at it, a hard edge
+        let edge = ramp(&[stop(0, None), stop(100, Some(css::Place::Px(25.0))), stop(200, Some(css::Place::Fraction(0.1))), stop(250, None)], 100.0)
+            .expect("a ramp");
+        assert_eq!(reds(&edge), [(0.25, 100), (0.25, 200)]);
+        // what lies past the line is cut off at its ends
+        let wide = ramp(&[stop(0, Some(css::Place::Fraction(-1.0))), stop(200, Some(css::Place::Fraction(2.0)))], 100.0).expect("a ramp");
+        assert_eq!((wide.from.r, wide.to.r, wide.stops.len()), (67, 133, 0));
+        assert_eq!(edge.stops_code(), ".stop(0.25, Color::rgb(100, 0, 0)).stop(0.25, Color::rgb(200, 0, 0))");
+        // a color with no alpha takes its neighbours' hues, faded
+        let clear = Rgba { r: 0, g: 0, b: 0, a: 0.0 };
+        let scrim = ramp(&[stop(10, None), css::Stop { color: clear, at: Some(css::Place::Fraction(0.4)) }, stop(90, None)], 100.0).expect("a ramp");
+        assert_eq!(scrim.stops.iter().map(|(at, color)| (*at, color.r, color.a)).collect::<Vec<_>>(), [(0.4, 10, 0.0), (0.4, 90, 0.0)]);
+        let glow = ramp(&[stop(30, None), css::Stop { color: clear, at: None }], 100.0).expect("a ramp");
+        assert_eq!((glow.to.r, glow.to.a), (30, 0.0));
     }
 
     #[test]
