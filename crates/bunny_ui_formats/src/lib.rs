@@ -7,8 +7,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod base64;
 pub mod deflate;
 pub mod inflate;
+pub mod random;
 pub mod sha;
+pub mod sha512;
 pub mod tar;
 pub mod zip;
