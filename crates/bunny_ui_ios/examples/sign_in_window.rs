@@ -11,6 +11,17 @@
 //! the Passwords key, and the typed characters stay bullets; the line
 //! under the boxes says what the system answered (an unsigned example is
 //! associated with no domain, so it is refused by name).
+//!
+//! To see a fill, the Simulator needs what a phone already has: a saved
+//! password (the Passwords app, `+`) and an enrolled face (Features ▸
+//! Face ID ▸ Enrolled). Without Simulator.app, run `xcrun simctl spawn
+//! booted notifyutil -s com.apple.BiometricKit.enrollmentChanged 1`, then
+//! the same command with `-p` in place of `-s 1`. Without both, the
+//! Passwords key does nothing, in Safari as here. With them, the key asks
+//! for the face (Features ▸ Face ID ▸ Matching Face, or `notifyutil -p
+//! com.apple.BiometricKit_Sim.pearl.match`). The account you pick fills
+//! the box that holds the keyboard: the address box takes the account's
+//! name and the password box its password, one pick each.
 
 #![cfg_attr(not(target_os = "ios"), allow(dead_code, unused_imports))]
 

@@ -74,6 +74,22 @@ the account, the password and the one-time code there. The keyboard
 deletes by selecting the cluster before the caret and then deleting the
 selection, so each backspace is its own step of a field's undo.
 
+A field that takes the keyboard from another meets the input system as
+a new responder. The keyboard moves between the view and a second door
+inside it, an empty view that answers the keyboard the same way, and
+only the door that holds the keyboard says what its field holds.
+AutoFill keeps the group of boxes it found for a responder for as long
+as that responder holds the keyboard. With one door, a pick in the
+address box after the password box held the keyboard typed the password
+into the address box.
+
+A pick from Passwords fills the box that holds the keyboard, and only
+that box. The address box takes the account's name and the password box
+its password, so a sign-in takes two picks where a form of UIKit text
+fields takes one. The system pairs a name box with a password box only
+across separate text views, and every box of the scene answers through
+the one view.
+
 ## What the shell answers
 
 | | iOS |
@@ -103,4 +119,8 @@ count comes from `UITouch.tapCount`, so a double tap is the platform's
 word. A rubber band past a scroll region's edge is not drawn. The
 countries example's root wears `.ignores_safe_area()`, as the app it
 ports does, so its list starts under the clock — that is the app's
-choice, faithfully kept.
+choice, faithfully kept. On a fresh Simulator the Passwords key does
+nothing, in Safari as in a Bunny UI app: the picker asks for the owner's
+face before it opens, and a Simulator has no face enrolled and no
+password saved until someone gives it both. The sign-in example
+(`examples/sign_in_window.rs`) says how.
