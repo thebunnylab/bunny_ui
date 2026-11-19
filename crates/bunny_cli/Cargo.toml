@@ -20,9 +20,12 @@ path = "src/lib.rs"
 name = "bunny"
 path = "src/main.rs"
 
-# The one dependency: the wire a preview host speaks and the scan that
-# lists a crate's previews — in-house, std only, the same workspace and
-# the same version. `bunny preview` reads frames and lists previews
-# through it rather than carrying a second copy of a frozen codec.
+# The dependencies are in-house, std only, the same workspace and the
+# same version. `bunny-ui-preview` is the wire a preview host speaks and
+# the scan that lists a crate's previews: `bunny preview` reads frames
+# and lists previews through it rather than carrying a second copy of a
+# frozen codec. `bunny-ui-formats` is the digests and the archives the
+# updater reads back, so both sides use one copy.
 [dependencies]
 bunny-ui-preview = { workspace = true }
+bunny-ui-formats = { workspace = true }

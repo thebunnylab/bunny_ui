@@ -29,7 +29,7 @@ pub fn write(out: &mut impl Write, files: &[(String, Vec<u8>)]) -> std::io::Resu
     for (name, bytes) in files {
         let crc = crc32(bytes);
         let size = u32::try_from(bytes.len()).map_err(|_| std::io::Error::other(format!("{name} is too big for a zip")))?;
-        let deflated = super::deflate::deflate(bytes);
+        let deflated = crate::deflate::deflate(bytes);
         let (method, data): (u16, &[u8]) = if deflated.len() < bytes.len() { (8, &deflated) } else { (0, bytes) };
         let packed = data.len() as u32;
         let name_len = name.len() as u16;
