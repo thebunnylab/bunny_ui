@@ -2998,6 +2998,12 @@ pub struct VisualProps {
     pub opacity: Option<f64>,
     /// Foreground blur in logical pixels. A compositing boundary: styles never fold across it.
     pub blur: Option<Px>,
+    /// `.grayscale(…)`, `.saturation(…)`, `.contrast(…)`,
+    /// `.hue_rotation(…)`, `.color_invert()` — the colors of everything
+    /// the box and its subtree paint go through these, in order. Nothing
+    /// set further out folds in: a ground laid around a filtered view
+    /// keeps its color, as in `SwiftUI`.
+    pub filters: crate::color_filter::ColorFilters,
     /// The same fade under hover and pressed, so a mark can appear
     /// under the pointer without the scene changing what it CONTAINS
     /// (the LAW: hover swaps paint, never content).
@@ -3090,6 +3096,8 @@ impl VisualProps {
             },
             opacity: self.opacity.or(outer.opacity),
             blur: self.blur.or(outer.blur),
+            // the inner ones first; a chain too long for one stays nested
+            filters: self.filters.then(outer.filters).unwrap_or(self.filters),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
             hidden: self.hidden || outer.hidden,
@@ -5211,6 +5219,16 @@ struct TurnScope {
     texts: usize,
 }
 
+/// A filtered subtree, open: where its commands and its custom boxes
+/// begin, and the filters its colors go through.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct FilterScope {
+    filters: crate::color_filter::ColorFilters,
+    display: usize,
+    customs: usize,
+}
+
 #[cfg(feature = "canvas")]
 #[derive(Clone, Copy)]
 struct BlurScope {
@@ -5525,6 +5543,23 @@ impl Placement {
         self.effects += 1;
         if let Some(sprite) = crate::turn::paint(&layer, map, env, slot) {
             self.draw(sprite);
+        }
+    }
+
+    /// Closes a filtered subtree: its commands become one picture, its
+    /// colors through the filters, laid where they were. A custom box
+    /// inside paints in that picture now.
+    #[cfg(feature = "canvas")]
+    fn filter_from(&mut self, scope: FilterScope, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
+        let layer = DisplayList { commands: self.display.commands.split_off(scope.display) };
+        let slot = crate::image_engine::FeedKey::effect(self.effects);
+        self.effects += 1;
+        if let Some(sprite) = crate::color_filter::paint(&layer, &scope.filters, env, slot) {
+            self.draw(sprite);
+        }
+        for custom in &mut self.customs[scope.customs..] {
+            custom.slice = (scope.display, self.display.len());
         }
     }
 
@@ -10208,9 +10243,21 @@ impl LayoutNode {
                     });
                 #[cfg(not(feature = "canvas"))]
                 let turn: Option<()> = None;
+                // a filtered box paints its subtree once and filters the
+                // picture's colors: the same boundary again
+                #[cfg(feature = "canvas")]
+                let filtered = Some(props.filters)
+                    .filter(|filters| !filters.is_identity())
+                    .filter(|_| out.dom.as_ref().is_none_or(crate::dom::DomCapture::in_canvas))
+                    .map(|filters| FilterScope { filters, display: fade_from, customs: out.customs.len() });
+                #[cfg(not(feature = "canvas"))]
+                let filtered: Option<()> = None;
                 let old_thumbs = out.thumb_layers;
                 let old_keep = out.keep_unseen;
                 if turn.is_some() {
+                    out.compositing += 1;
+                }
+                if filtered.is_some() {
                     out.compositing += 1;
                 }
                 if blur.is_some() {
@@ -10408,6 +10455,15 @@ impl LayoutNode {
                     if let Some(opacity) = opacity.filter(|value| *value < 1.0) {
                         out.display.fade_from(fade_from, opacity.max(0.0));
                     }
+                }
+                // the colors are filtered before a blur spreads them, as
+                // the page's `filter` list writes them
+                if let Some(scope) = filtered {
+                    out.compositing -= 1;
+                    #[cfg(feature = "canvas")]
+                    out.filter_from(scope, &env);
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = scope;
                 }
                 if let Some(scope) = blur {
                     out.compositing -= 1;

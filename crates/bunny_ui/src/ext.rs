@@ -1400,6 +1400,43 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Rotation(whole_degrees(angle), anchor))
     }
 
+    /// `.grayscale(1)` — the colors of everything the view paints drained
+    /// toward their gray, from 0 (as they are) to 1 (gray): an archived
+    /// card, a locked tile. Chained color filters apply in the order
+    /// written, as a CSS `filter` list does; a ground laid around the
+    /// view later keeps its color.
+    #[track_caller]
+    fn grayscale(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Grayscale(amount)))
+    }
+
+    /// `.saturation(1.4)` — the colors richer past 1, grayer below it, gray
+    /// at 0.
+    #[track_caller]
+    fn saturation(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Saturation(amount)))
+    }
+
+    /// `.contrast(1.3)` — the colors pushed away from the middle gray past
+    /// 1, toward it below; a negative amount inverts them too.
+    #[track_caller]
+    fn contrast(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Contrast(amount)))
+    }
+
+    /// `.hueRotation(.degrees(90))` — every hue turned this far round the
+    /// color circle, its lightness kept.
+    #[track_caller]
+    fn hue_rotation(self, angle: crate::angle::Angle) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::HueRotation(whole_degrees(angle))))
+    }
+
+    /// `.colorInvert()` — every color turned into its opposite.
+    #[track_caller]
+    fn color_invert(self) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Invert))
+    }
+
     /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
     /// panels).
     #[track_caller]

@@ -94,6 +94,9 @@ pub enum Modifier {
     Offset(f64, f64),
     /// `.rotation_effect(…)` — degrees clockwise, about a point of the box.
     Rotation(f64, crate::layout::UnitPoint),
+    /// `.grayscale(…)`, `.saturation(…)`, `.contrast(…)`,
+    /// `.hue_rotation(…)`, `.color_invert()`.
+    ColorFilter(crate::color_filter::ColorFilter),
     /// `.border_style(…)` — how the border's line is drawn.
     BorderStyle(crate::shapes::BorderStyle),
     /// `.background_stripes(…)` — bands over the background.
@@ -344,6 +347,13 @@ impl Modifier {
             Modifier::ShadowOffset { .. } => "shadow_offset",
             Modifier::Offset { .. } => "offset",
             Modifier::Rotation { .. } => "rotation_effect",
+            Modifier::ColorFilter(filter) => match filter {
+                crate::color_filter::ColorFilter::Grayscale(_) => "grayscale",
+                crate::color_filter::ColorFilter::Saturation(_) => "saturation",
+                crate::color_filter::ColorFilter::Contrast(_) => "contrast",
+                crate::color_filter::ColorFilter::HueRotation(_) => "hue_rotation",
+                crate::color_filter::ColorFilter::Invert => "color_invert",
+            },
             Modifier::BorderStyle { .. } => "border_style",
             Modifier::BackgroundStripes { .. } => "background_stripes",
             Modifier::QuarterTurn { .. } => "quarter_turn",
@@ -501,6 +511,13 @@ impl Modifier {
             Modifier::ShadowOffset(x, y) => format!(" [.shadow(x: {x}, y: {y})]"),
             Modifier::Offset(x, y) => format!(" [.offset(x: {x}, y: {y})]"),
             Modifier::Rotation(degrees, anchor) => format!(" [.rotationEffect(.degrees({degrees}), anchor: ({}, {}))]", anchor.x, anchor.y),
+            Modifier::ColorFilter(filter) => match filter {
+                crate::color_filter::ColorFilter::Grayscale(amount) => format!(" [.grayscale({amount})]"),
+                crate::color_filter::ColorFilter::Saturation(amount) => format!(" [.saturation({amount})]"),
+                crate::color_filter::ColorFilter::Contrast(amount) => format!(" [.contrast({amount})]"),
+                crate::color_filter::ColorFilter::HueRotation(degrees) => format!(" [.hueRotation(.degrees({degrees}))]"),
+                crate::color_filter::ColorFilter::Invert => " [.colorInvert()]".into(),
+            },
             Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
             Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
             Modifier::BackgroundStripes(stripes) => format!(
@@ -707,7 +724,7 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
         // wrapper, where no style reached it to merge: the new one
         // nests, as it did. One that merges merges where it stands
         LayoutNode::Styled { props, hints, action: None, .. }
-            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() => {
+            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() && filters_fold(props, &delta) => {
             VisualProps::restyle(props, delta);
         }
         node => wrap_in_place(node, |other| LayoutNode::Styled {
@@ -717,6 +734,16 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
             action: None,
         }),
     }
+}
+
+/// May `delta`, set outside a style, fold into it? A filter takes in
+/// everything the style paints, so it folds into any; once filtered, a
+/// style takes in only more filters, while they fit — what is set
+/// further out lies outside the filter.
+fn filters_fold(props: &VisualProps, delta: &VisualProps) -> bool {
+    props.filters.is_empty()
+        || (VisualProps { filters: crate::color_filter::ColorFilters::NONE, ..*delta } == VisualProps::default()
+            && props.filters.then(delta.filters).is_some())
 }
 
 /// Makes what the base left the target of `path`. A stack, a text or a
@@ -1521,6 +1548,12 @@ pub(crate) fn apply(
             mark,
             VisualProps { rotation: Some((*degrees, *anchor)), ..VisualProps::default() },
         ),
+        Modifier::ColorFilter(filter) => {
+            if let Some(filter) = filter.normalized() {
+                let filters = crate::color_filter::ColorFilters::one(filter);
+                wrap_styled(out, mark, VisualProps { filters, ..VisualProps::default() });
+            }
+        }
         Modifier::BorderStyle(style) => wrap_styled(
             out,
             mark,

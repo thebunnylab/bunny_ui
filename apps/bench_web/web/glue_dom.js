@@ -772,7 +772,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // `.hidden()`: the box keeps its place in the flow and shows nothing —
   // visibility, never display, or the sibling would move up
   if (style.hidden) decl.visibility = "hidden";
-  if (style.blur !== null) decl.filter = `blur(${style.blur}px)`;
+  // the color filters in their order, then the blur
+  const filters = style.blur !== null ? [...style.filters, `blur(${style.blur}px)`] : style.filters;
+  if (filters.length !== 0) decl.filter = filters.join(" ");
   // the turn rides `rotate` and `translate`, which compose with the
   // `transform` that positions the element instead of replacing it
   if (style.turn !== null) {
@@ -1140,6 +1142,20 @@ function applyPatches(view, length) {
     for (let n = u8(); n > 0; n--) stops.push([f32(), rgba(u32())]);
     return stops;
   };
+  // the color filters, in the order they apply: a kind and an amount
+  // each. A negative contrast is an inversion and the contrast it keeps,
+  // which CSS reads as one and refuses to write
+  const readFilters = () => {
+    const filters = [];
+    for (let n = u8(); n > 0; n--) {
+      const kind = u8();
+      const amount = f32();
+      if (kind === 2 && amount < 0) filters.push(`invert(1) contrast(${-amount})`);
+      else if (kind === 3) filters.push(`hue-rotate(${amount}deg)`);
+      else filters.push(`${["grayscale", "saturate", "contrast", "", "invert"][kind]}(${amount})`);
+    }
+    return filters;
+  };
   const readStyle = () => {
     // the mask carries twenty-five bits, so it crosses as a u32
     const mask = u32();
@@ -1168,6 +1184,7 @@ function applyPatches(view, length) {
       hidden: false,
       filter: null,
       blur: null,
+      filters: [],
       turn: null,
       scrollbar: null,
       halo: null,
@@ -1297,6 +1314,7 @@ function applyPatches(view, length) {
     if (more & 32) style.ownInk = true;
     // the box's floor, zero for none
     if (more & 64) style.floor = [f32(), f32()];
+    if (more & 128) style.filters = readFilters();
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };

@@ -5707,6 +5707,37 @@ mod tests {
         assert_close(&gpu.read_rgba(), &cpu, 2, "gradient text");
     }
 
+    /// A filtered subtree is a picture of it with its colors changed
+    /// texel by texel: the GPU lays the same bytes the raster does.
+    #[test]
+    fn color_filters_paint_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::angle::Angle;
+        let root = vstack((
+            hstack((
+                empty().frame(40.0, 40.0).background_color(Color::hex(0xEF4444)).corner_radius(10.0),
+                text("Filters").font_size(20.0).foreground_color(Color::hex(0x3B82F6)),
+            ))
+            .grayscale(0.6)
+            .contrast(1.3),
+            empty().frame(120.0, 30.0).background_color(Color::hex(0x22C55E)).hue_rotation(Angle::degrees(90.0)).saturation(1.4),
+            text("inverted").font_size(18.0).color_invert(),
+        ));
+        // the picture is made at the scale the layout runs at, the
+        // device's, as a window's runtime does
+        let runtime = Runtime::new();
+        runtime.set_device_scale(2.0);
+        let display = runtime.display_frame(&root, Size { width: 160.0, height: 120.0 });
+        let sprites = display.iter().filter(|command| matches!(command, bunny_ui::layout::DrawCommand::Sprite { .. })).count();
+        assert_eq!(sprites, 3, "each filtered view is one picture");
+        let cpu = rasterize_with(&display, 320, 240, 2, Color::CANVAS, &PixelFont, &RawImages::default()).to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(320, 240).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_close(&gpu.read_rgba(), &cpu, 2, "color filters");
+    }
+
     #[test]
     fn the_elliptical_wash_ramps_the_same_on_both_backends() {
         if !device_present() {

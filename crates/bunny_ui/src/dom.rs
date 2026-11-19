@@ -394,6 +394,10 @@ pub struct DomLook {
     pub opacity: Option<f64>,
     /// Foreground CSS filter, independent of the backdrop material.
     pub blur: Option<Px>,
+    /// The color filters (`.grayscale`, `.saturation`, `.contrast`,
+    /// `.hue_rotation`, `.color_invert`), in order: the CSS `filter` list,
+    /// before the blur.
+    pub filters: crate::color_filter::ColorFilters,
     pub hover_opacity: Option<f64>,
     pub pressed_opacity: Option<f64>,
     /// `.group_hovered()` — the ancestor whose `:hover` drives this
@@ -463,6 +467,7 @@ impl DomLook {
         hidden: false,
         opacity: None,
         blur: None,
+        filters: crate::color_filter::ColorFilters::NONE,
         hover_opacity: None,
         pressed_opacity: None,
         group: None,
@@ -499,6 +504,7 @@ impl DomLook {
             hidden: props.hidden,
             opacity: props.opacity,
             blur: props.blur,
+            filters: props.filters,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
             group: None,
@@ -531,6 +537,7 @@ impl DomLook {
             || props.passive
             || props.opacity.is_some()
             || props.blur.is_some()
+            || !props.filters.is_empty()
             || props.opacity_hovered.is_some()
             || props.opacity_pressed.is_some()
             || props.glass.is_some();
@@ -2566,6 +2573,12 @@ fn look_hash(node: &DomNode) -> u64 {
     if let Some((width, height)) = style.floor {
         (6u8, width.to_bits(), height.to_bits()).hash(&mut hasher);
     }
+    if !style.filters.is_empty() {
+        7u8.hash(&mut hasher);
+        for (kind, amount) in style.filters.iter().map(crate::color_filter::ColorFilter::wire) {
+            (kind, amount.to_bits()).hash(&mut hasher);
+        }
+    }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
@@ -4576,7 +4589,13 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// record as bit 13 of the first mask carries it, then its stops as bit
 /// 3's), bit 5 a box inside such a ramp that paints its text in its own
 /// ink again, bit 6 the box's floor (f32 min width + f32 min height, zero
-/// for none) — the first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// for none), bit 7 its color filters (`.grayscale`, `.saturation`,
+/// `.contrast`, `.hue_rotation`, `.color_invert`: u8 count, then per
+/// filter, in the order they apply, u8 kind — 0 grayscale, 1 saturate, 2
+/// contrast, 3 hue-rotate, 4 invert — + f32 amount, degrees for the hue;
+/// the CSS `filter` list, before the blur, a negative contrast written
+/// `invert(1) contrast(-amount)`) — the first mask's thirty-two bits were
+/// all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
 /// its first child alone, or by its last — `grid-template: auto 0fr /
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
@@ -5273,7 +5292,8 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         | u8::from(stops.is_some()) << 3
         | u8::from(style.ink_gradient.is_some()) << 4
         | u8::from(style.own_ink) << 5
-        | u8::from(style.floor.is_some()) << 6;
+        | u8::from(style.floor.is_some()) << 6
+        | u8::from(!style.filters.is_empty()) << 7;
     out.push(more);
     for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
         push_f32(out, x);
@@ -5294,6 +5314,14 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if let Some((width, height)) = style.floor {
         push_f32(out, width);
         push_f32(out, height);
+    }
+    if !style.filters.is_empty() {
+        #[allow(clippy::cast_possible_truncation, reason = "at most ColorFilters::MOST")]
+        out.push(style.filters.len() as u8);
+        for (kind, amount) in style.filters.iter().map(crate::color_filter::ColorFilter::wire) {
+            out.push(kind);
+            push_f32(out, amount);
+        }
     }
 }
 
@@ -8193,7 +8221,7 @@ mod tests {
     #[test]
     fn whether_props_paint_is_asked_prop_by_prop() {
         let ink = Color::hex(0x123456);
-        let each: [fn(&mut VisualProps); 14] = [
+        let each: [fn(&mut VisualProps); 15] = [
             |props| props.background = Some(Color::hex(0x123456)),
             |props| {
                 props.gradient = Some(crate::layout::Gradient::Linear {
@@ -8216,6 +8244,7 @@ mod tests {
             |props| props.opacity_hovered = Some(0.5),
             |props| props.opacity_pressed = Some(0.5),
             |props| props.glass = Some(crate::layout::Glass::regular()),
+            |props| props.filters = crate::color_filter::ColorFilters::one(crate::color_filter::ColorFilter::Invert),
         ];
         // an ink alone paints nothing a style records: the text takes it
         let bare = VisualProps { foreground: Some(ink), ..VisualProps::default() };
@@ -8332,6 +8361,7 @@ mod tests {
             hidden: false,
             opacity: Some(0.5),
             blur: None,
+            filters: crate::color_filter::ColorFilters::NONE,
             hover_opacity: Some(0.75),
             pressed_opacity: Some(0.25),
             group: Some(7),
@@ -8605,6 +8635,30 @@ mod tests {
         assert_eq!(free.last(), Some(&0), "{free:?}");
         assert_eq!(two.last(), Some(&2), "{two:?}");
         assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("const lineLimit = u8();"), "glue_dom.js reads it");
+    }
+
+    /// A box's color filters ride the second mask (bit 7): a count, then
+    /// a kind and an amount each, in the order they apply. A look with
+    /// none keeps the hash it had.
+    #[test]
+    fn color_filters_ride_the_second_mask() {
+        use crate::color_filter::{ColorFilter, ColorFilters};
+        let filters = ColorFilters::one(ColorFilter::Grayscale(1.0)).then(ColorFilters::one(ColorFilter::HueRotation(90.0)));
+        let look = DomLook { filters: filters.expect("two fit"), ..DomLook::NONE };
+        let mut out = Vec::new();
+        encode_style(&mut out, &look);
+        let mut tail = vec![1 << 7, 2, 0];
+        tail.extend_from_slice(&1f32.to_le_bytes());
+        tail.push(3);
+        tail.extend_from_slice(&90f32.to_le_bytes());
+        assert!(out.ends_with(&tail), "{out:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 128"), "glue_dom.js reads them");
+        let node = |look: DomLook| {
+            let mut node = flow_row("a");
+            node.style = DomStyle::new(None, look, DomMarks::default());
+            look_hash(&node)
+        };
+        assert_ne!(node(look), node(DomLook::NONE));
     }
 
     #[test]

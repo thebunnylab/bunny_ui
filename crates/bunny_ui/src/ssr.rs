@@ -1275,12 +1275,17 @@ fn rule_text(
     if style.pass_through {
         base.insert("pointer-events", "none".into());
     }
+    // the color filters in their order, then the blur
+    let mut filters: Vec<String> = style.filters.iter().map(css_filter).collect();
+    if let Some(blur) = style.blur {
+        filters.push(format!("blur({blur}px)"));
+    }
+    if !filters.is_empty() {
+        base.insert("filter", filters.join(" "));
+    }
     // liquid glass, the half a browser owns: one native filter over
     // what is behind the element, and the rim as two inset shadows
     // along the lit diagonals
-    if let Some(blur) = style.blur {
-        base.insert("filter", format!("blur({blur}px)"));
-    }
     if let Some(glass) = style.glass {
         let filter = format!(
             "blur({}px) saturate({}) brightness({})",
@@ -1458,6 +1463,23 @@ fn css_font(font: &crate::text_engine::FontSpec) -> String {
         _ => "",
     };
     format!("{lean}{weight} {}px {family}", font.size)
+}
+
+/// The glue's color filter, mirrored: its CSS function at the f32 the
+/// wire carries. A negative contrast is an inversion and the contrast
+/// it keeps, which CSS reads as one and refuses to write.
+fn css_filter(filter: crate::color_filter::ColorFilter) -> String {
+    use crate::color_filter::ColorFilter;
+    #[allow(clippy::cast_possible_truncation, reason = "the wire's own precision")]
+    let amount = f64::from(filter.wire().1 as f32);
+    match filter {
+        ColorFilter::Grayscale(_) => format!("grayscale({amount})"),
+        ColorFilter::Saturation(_) => format!("saturate({amount})"),
+        ColorFilter::Contrast(_) if amount < 0.0 => format!("invert(1) contrast({})", -amount),
+        ColorFilter::Contrast(_) => format!("contrast({amount})"),
+        ColorFilter::HueRotation(_) => format!("hue-rotate({amount}deg)"),
+        ColorFilter::Invert => "invert(1)".into(),
+    }
 }
 
 /// The glue's gradient lowering, mirrored: a proportional centre or

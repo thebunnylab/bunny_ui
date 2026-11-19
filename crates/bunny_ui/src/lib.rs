@@ -49,6 +49,7 @@ pub mod anim;
 pub mod beat;
 pub mod bind;
 mod blur;
+pub mod color_filter;
 #[cfg(feature = "canvas")]
 mod ink;
 #[cfg(feature = "canvas")]
