@@ -18,7 +18,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{Info, Log, Options, Signing};
+use super::{Info, Log, Options, Shipped, Signing};
 use crate::cargo::{self, Target};
 use crate::error::{self, Error, Result};
 use crate::ids;
@@ -86,8 +86,10 @@ fn targets(options: &Options) -> Vec<&'static str> {
     if options.universal { vec!["aarch64-apple-darwin", "x86_64-apple-darwin"] } else { vec![host_target()] }
 }
 
-/// Builds the bundle and the disk image into `out`.
-pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<()> {
+/// Builds the bundle and the disk image into `out`. The disk image,
+/// notarized and stapled, is what the updater downloads; with `--no-dmg`
+/// there is none.
+pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, info: &mut Info) -> Result<Option<Shipped>> {
     check(project, options)?;
     let id = project.require_id()?;
     let bin = project.require_bin()?;
@@ -214,7 +216,12 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
             term::warn("signed ad hoc: the app runs on this Mac, and Gatekeeper refuses it on others (a Developer ID signs it for them)")
         ),
     }
-    Ok(())
+    Ok(dmg.map(|path| Shipped { path, format: "dmg", targets: targets.iter().map(|target| updater_target(target)).collect() }))
+}
+
+/// The release contract's name of a Rust target of the Mac.
+fn updater_target(target: &str) -> &'static str {
+    if target.starts_with("aarch64") { "darwin-aarch64" } else { "darwin-x86_64" }
 }
 
 fn host_target() -> &'static str {

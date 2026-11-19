@@ -207,11 +207,12 @@ pub fn check(platforms: &[Platform]) -> Vec<Section> {
 }
 
 /// The app `doctor` runs in, when it runs in one: whether its platform
-/// folders follow this `bunny`'s templates.
+/// folders follow this `bunny`'s templates, and whether the updater's
+/// public keys are good and in git.
 fn app_section() -> Option<Section> {
     use crate::templates::{PLATFORMS, STAMP, Stamp};
     let cwd = std::env::current_dir().ok()?;
-    let project = crate::project::Project::discover(&cwd, None).ok()?;
+    let project = crate::project::Project::locate(&cwd, None).ok()?;
     let mut section =
         Section { key: "app", title: format!("This app ({})", project.name), checks: Vec::new(), missing_targets: Vec::new() };
     for set in PLATFORMS {
@@ -234,7 +235,48 @@ fn app_section() -> Option<Section> {
             ),
         });
     }
+    if let Some(config) = &project.updater {
+        section.checks.extend(updater_checks(config, &project.dir, &|path| tracked(&project.dir, path)));
+    }
     (!section.checks.is_empty()).then_some(section)
+}
+
+/// Each public key of the updater: readable, a valid key, and in git. A
+/// key pair made again after a release signs updates that no app out
+/// there verifies, so the `.pub` the apps carry belongs in git.
+/// `tracked` answers whether git tracks a file, or `None` when there is
+/// no git to ask.
+pub fn updater_checks(config: &crate::updater::Config, dir: &std::path::Path, tracked: &dyn Fn(&std::path::Path) -> Option<bool>) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for (written, path) in config.pubkeys.iter().zip(&config.pubkey_paths) {
+        let read = std::fs::read_to_string(path).map_err(|error| error.to_string());
+        if let Err(why) = read.and_then(|text| crate::updater::public_key(&text).map(|_| ())) {
+            checks.push(Check::fail(format!("Updater key {written}: {why}"), &["bunny signer generate"]));
+            continue;
+        }
+        let relative = path.strip_prefix(dir).unwrap_or(path);
+        checks.push(match tracked(relative) {
+            Some(true) => Check::ok(format!("Updater key {written} is in git")),
+            Some(false) => Check::warn(
+                format!("Updater key {written} is not in git: a key pair made again after a release signs updates that no app verifies"),
+                &[&format!("git add {written} && git commit")],
+            ),
+            None => Check::ok(format!("Updater key {written}")),
+        });
+    }
+    checks
+}
+
+/// Whether git tracks `path` in the repository of `dir` — `false` when
+/// `dir` is in no repository. `None`: there is no git to ask.
+fn tracked(dir: &std::path::Path, path: &std::path::Path) -> Option<bool> {
+    let timeout = std::time::Duration::from_secs(10);
+    let inside = process::run_in("git", &["rev-parse", "--is-inside-work-tree"], Some(dir), &[], timeout).ok()?;
+    if !inside.ok() {
+        return Some(false);
+    }
+    let args = [std::ffi::OsStr::new("ls-files"), std::ffi::OsStr::new("--error-unmatch"), std::ffi::OsStr::new("--"), path.as_os_str()];
+    Some(process::run_in("git", &args, Some(dir), &[], timeout).ok()?.ok())
 }
 
 /// One platform's checks.

@@ -6,6 +6,7 @@
 pub mod android;
 pub mod linux;
 pub mod macos;
+pub mod release;
 pub mod web;
 pub mod windows;
 
@@ -50,6 +51,18 @@ pub enum Signing {
     Identity(String),
     /// Nobody: the app stays as the linker left it.
     Unsigned,
+}
+
+/// The package the updater downloads, as a desktop build made it: what
+/// a release build signs and lists in `latest.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shipped {
+    pub path: PathBuf,
+    /// The release contract's format: `dmg`, `zip`, `tar.gz`.
+    pub format: &'static str,
+    /// The platforms it serves: `darwin-aarch64`, and with
+    /// `--universal`, `darwin-x86_64` too.
+    pub targets: Vec<&'static str>,
 }
 
 /// Every command a build ran and what each answered: `build.log`, the

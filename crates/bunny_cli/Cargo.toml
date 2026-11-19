@@ -29,3 +29,10 @@ path = "src/main.rs"
 [dependencies]
 bunny-ui-preview = { workspace = true }
 bunny-ui-formats = { workspace = true }
+
+# The tests alone: `bunny-ui-release` and serde_json read back the
+# latest.json the CLI writes by hand, to the same bytes. The binary
+# itself stays on std.
+[dev-dependencies]
+bunny-ui-release = { workspace = true }
+serde_json = { workspace = true }
