@@ -994,7 +994,18 @@ fn rule_text(
         base.insert("position", "relative".into());
         base.insert("isolation", "isolate".into());
     }
-    if let Some(gap) = layout.gap {
+    // a negative spacing overlaps the items, as SwiftUI's does; CSS has
+    // no negative gap, so each item after the first is pulled back by a
+    // negative margin along the line instead
+    let overlap = layout
+        .gap
+        .filter(|gap| *gap < 0.0 && layout.wrap.is_none())
+        .and_then(|gap| match kind {
+            CreateKind::FlexRow => Some(("margin-inline-start", gap)),
+            CreateKind::FlexColumn => Some(("margin-block-start", gap)),
+            _ => None,
+        });
+    if let Some(gap) = layout.gap.filter(|_| overlap.is_none()) {
         base.insert(
             if matches!(kind, CreateKind::Grid) {
                 "column-gap"
@@ -1105,6 +1116,9 @@ fn rule_text(
     // would give each layer a row of its own
     if matches!(kind, CreateKind::Layers) {
         states.push(format!("{selector}>*{{grid-area:1/1}}"));
+    }
+    if let Some((side, gap)) = overlap {
+        states.push(format!("{selector}>*+*{{{side}:{}}}", px(gap)));
     }
     // a follower hangs its states off the GROUP's pointer: the same
     // rules, hung off the group's selector; a box without one listens

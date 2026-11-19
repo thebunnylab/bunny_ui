@@ -91,3 +91,24 @@ fn offsets_add_up() {
     runtime.display_frame(&rectangle().frame(10.0, 10.0).test_id("moved").offset(1.0, 2.0).offset(3.0, 4.0), SIZE);
     assert_eq!(frame(&runtime, "moved").origin, Point { x: 4.0, y: 6.0 });
 }
+
+/// A negative spacing overlaps the items — an avatar stack, each face
+/// over the one before — and CSS has no negative gap: the page pulls
+/// each item after the first back by a margin along the line.
+#[test]
+fn the_page_writes_a_negative_spacing_as_margins() {
+    let runtime = Runtime::new();
+    let faces = hstack!(
+        rectangle().frame(30.0, 30.0).test_id("first"),
+        rectangle().frame(30.0, 30.0).test_id("second"),
+        rectangle().frame(30.0, 30.0).test_id("third"),
+    )
+    .spacing(-9.0);
+    runtime.display_frame(&faces, SIZE);
+    assert_eq!(frame(&runtime, "third").origin.x, 42.0);
+    let page = bunny_ui::ssr::render(&faces, SIZE);
+    assert!(page.css.contains(">*+*{margin-inline-start:-9px}"), "{}", page.css);
+    assert!(!page.css.contains("gap:-9px"), "{}", page.css);
+    let column = bunny_ui::ssr::render(&vstack!(text("a"), text("b")).spacing(-4.0), SIZE);
+    assert!(column.css.contains(">*+*{margin-block-start:-4px}"), "{}", column.css);
+}
