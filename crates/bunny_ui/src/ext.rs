@@ -308,6 +308,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::FrameHeight(height))
     }
 
+    /// `.frame(height: 48, alignment: .top)` — the vertical twin of
+    /// [`ViewExt::frame_width_aligned`]: the box is exact on that axis and
+    /// the content sits on the named edge in it, where
+    /// [`ViewExt::frame_height`] centres it.
+    #[track_caller]
+    fn frame_height_aligned(self, height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified::new(self, Modifier::FrameHeightAligned(height, alignment))
+    }
+
     /// `.frame(maxWidth: .infinity, maxHeight: 60, alignment: .leading)`
     #[track_caller]
     fn frame_max(self, max_width: f64, max_height: f64, alignment: Alignment) -> Modified<Self> {

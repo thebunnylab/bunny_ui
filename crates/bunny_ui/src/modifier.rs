@@ -42,6 +42,9 @@ pub enum Modifier {
     FrameWH(f64, f64, Alignment),
     FrameWidth(f64, Alignment),
     FrameHeight(f64),
+    /// `.frame(height:alignment:)` — exact on the vertical axis, the
+    /// child placed on the named edge inside it.
+    FrameHeightAligned(f64, Alignment),
     Tracking(Tracking),
     FrameMax(f64, f64, Alignment),
     FrameFlex(f64, f64, Alignment),
@@ -295,6 +298,7 @@ impl Modifier {
             Modifier::FrameWH { .. } => "frame",
             Modifier::FrameWidth { .. } => "frame_width",
             Modifier::FrameHeight { .. } => "frame_height",
+            Modifier::FrameHeightAligned { .. } => "frame_height_aligned",
             Modifier::Tracking { .. } => "tracking",
             Modifier::FrameMax { .. } => "frame_max",
             Modifier::FrameFlex { .. } => "frame_flex",
@@ -418,6 +422,7 @@ impl Modifier {
                 format!(" [.frame(width: {width}, alignment: {alignment})]")
             }
             Modifier::FrameHeight(height) => format!(" [.frame(height: {height})]"),
+            Modifier::FrameHeightAligned(height, alignment) => format!(" [.frame(height: {height}, alignment: {alignment})]"),
             Modifier::Tracking(Tracking::Points(points)) => format!(" [.tracking({points})]"),
             Modifier::Tracking(Tracking::Em(em)) => format!(" [.tracking({em}em)]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
@@ -1354,6 +1359,12 @@ pub(crate) fn apply(
                 vertical: crate::layout::CrossAlign::Center,
                 child: Box::new(node),
             });
+        }
+        Modifier::FrameHeightAligned(height, alignment) => {
+            let height = Some(*height);
+            let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::Frame { width: None, height, align, vertical, child: Box::new(node) });
         }
         Modifier::FrameMax(max_width, max_height, alignment) => {
             let (max_width, max_height) = (*max_width, *max_height);

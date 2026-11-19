@@ -267,7 +267,7 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        AlertSpec, BackgroundBlend, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction,
+        AlertSpec, BackgroundBlend, Color, Corners, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction,
         Glass, Gradient,
         OverlaySurface, Point, Proposal, Px, Rect, Rendering, ScrollIndicators, Side, Size,
         Truncation, UnitPoint, VisualProps,
