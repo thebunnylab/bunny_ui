@@ -52,13 +52,27 @@ inset when it rises, so the scene stands above the keys. A view wearing
 `.ignores_safe_area()` reclaims the bands its frame touches; the root
 reclaims the whole window. The keyboard follows the focus: a field that
 takes it makes the view the first responder, and the view types through
-`UIKeyInput` with the traits answered by hand (no autocorrection, no
-sentence capitals, unless the app asks). `keyboardType` is the field's
-own (`TextField::keyboard_type`): an address gets the `@`, a code the
-number pad, and a keyboard already up is laid out again
-(`reloadInputViews`) when the focus moves to a field of another kind. A
-hardware keyboard is asked of the keymap first; a letter arrives once,
-through the keyboard's road.
+`UITextInput` with the traits answered by hand (no autocorrection, no
+sentence capitals, no inline predictions, unless the app asks).
+`keyboardType` is the field's own (`TextField::keyboard_type`): an
+address gets the `@`, a code the number pad, and a keyboard already up
+is laid out again (`reloadInputViews`) when the focus moves to a field
+of another kind. A hardware keyboard is asked of the keymap first; a
+letter arrives once, through the keyboard's road.
+
+The keyboard reads the focused field from a mirror the shell syncs after
+every frame — its text, the selection, a composition, the caret — and
+its edits come back as events: typing, a composition marked in the field
+until it is committed, the selection the space bar's trackpad moves. A
+change the keyboard did not make (a tap that moved the caret, the focus
+gone to another field) is announced to it around the swap, so it drops a
+composition that no longer stands. Answering the whole protocol is what
+puts the QuickType bar over the keys: what the field holds
+(`TextField::autocomplete`) and whether it hides it (`.secret`) reach the
+system as `textContentType` and `isSecureTextEntry`, and Passwords offers
+the account, the password and the one-time code there. The keyboard
+deletes by selecting the cluster before the caret and then deleting the
+selection, so each backspace is its own step of a field's undo.
 
 ## What the shell answers
 
@@ -73,7 +87,8 @@ through the keyboard's road.
 | hosts | a webview rides the shared tenant, under the same sandwich the desktops keep |
 | synthetic input into a page | not claimed — the phone has no event constructor a page trusts |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |
-| an IME mirror | not yet: a composition arrives committed |
+| an IME mirror | `UITextInput`, answered from the focused field: a composition is marked in place, and the QuickType bar carries Passwords' AutoFill |
+| selection handles, the loupe | none: the field paints its own selection, and UIKit is handed nothing to draw |
 | notifications | UserNotifications through the shared half, the Mac's own road: the system asks once, a post before the answer waits for it, and a tap — on the banner or on a button — comes back as `AppEvent::NotificationActivated`, while running or as the launch |
 | a url handed over | `application:openURL:options:` → `AppEvent::Reopened` |
 | background, foreground | `AppEvent::WillSleep` / `DidWake`, and the loop clocks rest |
