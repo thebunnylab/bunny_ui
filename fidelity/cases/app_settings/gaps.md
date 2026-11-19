@@ -1,10 +1,9 @@
 # Import gaps — apps/settings.html
 
-100 views named; 39 gaps in 14 features.
+100 views named; 29 gaps in 13 features.
 
 | feature | count | where | what |
 |---|---|---|---|
-| `background-clip: text` | 10 | kbd-80, kbd-81, kbd-83, kbd-84, … | gradient text drawn in the text's own ink |
 | `width: %` | 9 | input-16, input-22, input-58, input.bad-19, … | 100% written as 398.0 points |
 | `min-width` | 7 | kbd-80, kbd-81, kbd-83, kbd-84, … | 18px |
 | `input type=radio` | 3 | input-46, input-48, input-50 | drawn as an empty box |

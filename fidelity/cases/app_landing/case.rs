@@ -28,8 +28,8 @@ pub fn view() -> impl View {
             text("Lumen")
             .font_size(24.0)
             .font_weight(Weight::Black)
-            .foreground_color(Color::rgba(0, 0, 0, 0))
             .tracking(-0.48)
+            .foreground_gradient(Gradient::linear(Color::rgb(109, 40, 217), Color::rgb(245, 158, 11)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }).stop(0.6, Color::rgb(236, 72, 153)))
             .test_id("span.logo-3"),
             hstack!(
                 text("Product")
