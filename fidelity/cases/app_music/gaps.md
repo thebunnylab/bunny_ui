@@ -21,4 +21,4 @@
 | `radial-gradient: shape` | 1 | span.play-30 | circle at 30% 25% |
 | `repeating-radial-gradient` | 1 | div.vinyl-12 | drawn once |
 | `text-shadow` | 1 | span.title-16 | rgba(0, 0, 0, 0.55) 0px 2px 10px, rgba(255, 255, 255, 0.4) 0px 0px 1px |
-| `width: %` | 1 | div.fill-21 | 38% written as 121.98 points |
+| `width: %` | 1 | div.fill-21 | 38% written as 121.9766 points |

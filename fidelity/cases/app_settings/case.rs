@@ -36,7 +36,7 @@ pub fn view() -> impl View {
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-6")
             .padding_edge(Edge::Top, -6.0)
-            .padding_edge(Edge::Trailing, 492.68),
+            .padding_edge(Edge::Trailing, 492.6797),
             hstack!(
                 vstack!(
                     text("Photo")
@@ -116,7 +116,7 @@ pub fn view() -> impl View {
                         .padding_length(1.5)
                         .frame_height_aligned(44.0, Alignment::Center)
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::Center)
-                        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.22, y: 2.7 }, end: UnitPoint { x: 0.78, y: -1.7 }, from: Color::rgb(250, 250, 252), to: Color::rgb(255, 255, 255) })
+                        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.218, y: 2.7045 }, end: UnitPoint { x: 0.782, y: -1.7045 }, from: Color::rgb(250, 250, 252), to: Color::rgb(255, 255, 255) })
                         .corner_radius(8.0)
                         .border(Color::rgb(174, 174, 178), 1.5)
                         .border_style(BorderStyle::Dashed)
@@ -228,7 +228,7 @@ pub fn view() -> impl View {
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-26")
             .padding_edge(Edge::Top, -6.0)
-            .padding_edge(Edge::Trailing, 462.04),
+            .padding_edge(Edge::Trailing, 462.0391),
             hstack!(
                 vstack!(
                     text("Email digests")
@@ -430,7 +430,7 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Leading, 9.0)
                     .frame_aligned(398.0, 22.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.24, y: 5.27 }, end: UnitPoint { x: 0.76, y: -4.27 }, from: Color::rgba(0, 0, 0, 0), to: Color::rgb(110, 110, 115) })
+                    .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.2362, y: 5.2727 }, end: UnitPoint { x: 0.7638, y: -4.2727 }, from: Color::rgba(0, 0, 0, 0), to: Color::rgb(110, 110, 115) })
                     .corner_radius(6.0)
                     .border(Color::rgb(199, 199, 204), 1.0)
                     .test_id("select-53")
@@ -466,7 +466,7 @@ pub fn view() -> impl View {
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-55")
             .padding_edge(Edge::Top, -6.0)
-            .padding_edge(Edge::Trailing, 465.29),
+            .padding_edge(Edge::Trailing, 465.2891),
             hstack!(
                 vstack!(
                     text("Text size")
@@ -558,7 +558,7 @@ pub fn view() -> impl View {
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-66")
             .padding_edge(Edge::Top, -6.0)
-            .padding_edge(Edge::Trailing, 452.95),
+            .padding_edge(Edge::Trailing, 452.9531),
             hstack!(
                 vstack!(
                     text("Bio")
@@ -606,13 +606,13 @@ pub fn view() -> impl View {
                         .corner_radius(5.0)
                         .clipped()
                         .test_id("progress-72")
-                        .padding_edge(Edge::Top, 4.4),
+                        .padding_edge(Edge::Top, 4.3984),
                         text("9.6 GB of 16 GB used")
                         .font_size(11.0)
                         .foreground_color(Color::rgb(142, 142, 147))
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.hint-73")
-                        .padding_edge(Edge::Top, 2.1),
+                        .padding_edge(Edge::Top, 2.1016),
                     )
                     .alignment(HorizontalAlignment::Leading)
                     .frame_aligned(398.0, 30.0, Alignment::TopLeading)
@@ -842,7 +842,7 @@ pub fn view() -> impl View {
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-90")
             .padding_edge(Edge::Top, -6.0)
-            .padding_edge(Edge::Trailing, 406.11),
+            .padding_edge(Edge::Trailing, 406.1094),
             hstack!(
                 spacer()
                 .frame_aligned(34.0, 20.0, Alignment::TopLeading)
@@ -916,7 +916,7 @@ pub fn view() -> impl View {
                 .foreground_color(Color::rgb(110, 110, 115))
                 .frame_width_aligned(221.25, Alignment::TopLeading)
                 .test_id("p-100")
-                .padding_edge(Edge::Top, 15.5),
+                .padding_edge(Edge::Top, 1.0),
             )
             .alignment(HorizontalAlignment::Leading)
             .test_id("div-98"),

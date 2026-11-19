@@ -177,9 +177,11 @@ const fn weight(weight: u16) -> &'static str {
     }
 }
 
-/// A number as Rust writes an `f64`: `12.0`, `0.5`, two decimals at most.
+/// A number as Rust writes an `f64`: `12.0`, `0.5`, four decimals at most
+/// — a grid of equal tracks adds each one's rounding up across the row,
+/// and the browser keeps its geometry in sixty-fourths.
 fn num(value: f64) -> String {
-    let rounded = (value * 100.0).round() / 100.0;
+    let rounded = (value * 10_000.0).round() / 10_000.0;
     let rounded = if rounded == 0.0 { 0.0 } else { rounded };
     let text = format!("{rounded}");
     if text.contains('.') || text.contains('e') || text.contains("inf") { text } else { format!("{text}.0") }
@@ -783,10 +785,19 @@ impl Writer<'_> {
         let content_left = node.rect.x + node.px("padding-left") + node.px("border-left-width");
         let content_right = node.rect.right() - node.px("padding-right") - node.px("border-right-width");
         let mut previous_bottom = content_top;
-        let flush = |writer: &mut Self, line: &mut Vec<&Node>, views: &mut Vec<String>| {
+        let flush = |writer: &mut Self, line: &mut Vec<&Node>, views: &mut Vec<String>, previous_bottom: &mut f64| {
             if line.iter().all(|item| item.kind == Kind::Space) {
                 line.clear();
                 return;
+            }
+            // the next block stands under the line's lowest words
+            let bottom = line
+                .iter()
+                .filter(|item| matches!(item.kind, Kind::Text | Kind::Element) && item.rect.h > 0.0)
+                .map(|item| item.rect.bottom())
+                .fold(f64::NEG_INFINITY, f64::max);
+            if bottom.is_finite() {
+                *previous_bottom = previous_bottom.max(bottom);
             }
             if let Some(paragraph) = writer.paragraph(node, line) {
                 let edge = match Self::content_alignment(node).0 {
@@ -807,10 +818,13 @@ impl Writer<'_> {
                 line.push(child);
                 continue;
             }
-            flush(self, &mut line, &mut views);
+            let after_line = line.iter().any(|item| item.kind != Kind::Space);
+            flush(self, &mut line, &mut views, &mut previous_bottom);
             let Some(mut view) = self.block_child(child) else { continue };
             let rect = child_rect(node, child);
-            let top = rect.y - previous_bottom;
+            // under a line of words the gap is the block's own margin: the
+            // words' boxes are shorter than the line they stand in
+            let top = if after_line { child.px("margin-top") } else { rect.y - previous_bottom };
             if top.abs() > 0.25 && child.kind == Kind::Element {
                 let _ = write!(view, "\n.padding_edge(Edge::Top, {})", num(top));
             }
@@ -827,7 +841,7 @@ impl Writer<'_> {
             }
             views.push(view);
         }
-        flush(self, &mut line, &mut views);
+        flush(self, &mut line, &mut views, &mut previous_bottom);
         if views.len() == 1 {
             return views.pop().unwrap_or_default();
         }
@@ -1062,6 +1076,11 @@ impl Writer<'_> {
             if matches!(child.kind, Kind::Element | Kind::Before | Kind::After) {
                 view.push_str(&margins(child, overlap.is_some() && index > 0, row));
             }
+            // an item that names its own place across the line: a box the
+            // line's cross size, the item on that edge in it
+            if child.kind == Kind::Element {
+                view.push_str(&self.self_alignment(node, child, row));
+            }
             // an `auto` margin takes the line's free room: a spacer
             let (before, after) = if row { ("margin-left", "margin-right") } else { ("margin-top", "margin-bottom") };
             let auto = |side: &str| child.kind == Kind::Element && child.sizes.get(side).is_some_and(|value| value == "auto");
@@ -1115,6 +1134,41 @@ impl Writer<'_> {
             }
         }
         code
+    }
+
+    /// `align-self`: an item placed on its own edge across the line — an
+    /// outgoing bubble on the right of a column. The item takes the line's
+    /// cross size in a frame and sits on that edge inside it.
+    fn self_alignment(&self, line: &Node, child: &Node, row: bool) -> String {
+        let edge = match child.css("align-self") {
+            "flex-end" | "end" | "self-end" => Edge::End,
+            "center" => Edge::Center,
+            "flex-start" | "start" | "self-start" => Edge::Start,
+            _ => return String::new(),
+        };
+        let line_edge = match line.css("align-items") {
+            "flex-end" | "end" => Edge::End,
+            "center" => Edge::Center,
+            _ => Edge::Start,
+        };
+        if edge == line_edge {
+            return String::new();
+        }
+        if row {
+            let align = alignment(Edge::Start, edge);
+            if self.hug.1 {
+                format!("\n.frame_height_aligned({}, {align})", num(content_height(line)))
+            } else {
+                format!("\n.frame_max(f64::MAX, f64::INFINITY, {align})")
+            }
+        } else {
+            let align = alignment(edge, Edge::Start);
+            if self.hug.0 {
+                format!("\n.frame_width_aligned({}, {align})", num(content_width(line)))
+            } else {
+                format!("\n.frame_max(f64::INFINITY, f64::MAX, {align})")
+            }
+        }
     }
 
     /// A grid, a table, anything laid out by tracks: the boxes the browser
@@ -1370,6 +1424,11 @@ fn content_width(node: &Node) -> f64 {
     node.rect.w - node.px("padding-left") - node.px("padding-right") - node.px("border-left-width") - node.px("border-right-width")
 }
 
+/// The height of a box's content: inside its padding and its border.
+fn content_height(node: &Node) -> f64 {
+    node.rect.h - node.px("padding-top") - node.px("padding-bottom") - node.px("border-top-width") - node.px("border-bottom-width")
+}
+
 /// An empty box: nothing to draw inside, so a hugging axis is the size
 /// the browser gave its content.
 fn empty(node: &Node, width: Size, height: Size) -> String {
@@ -1429,7 +1488,7 @@ mod tests {
     #[test]
     fn numbers_read_as_rust_floats() {
         assert_eq!(num(12.0), "12.0");
-        assert_eq!(num(0.333), "0.33");
+        assert_eq!(num(0.333_33), "0.3333");
         assert_eq!(num(-0.001), "0.0");
     }
 

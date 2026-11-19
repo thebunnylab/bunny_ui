@@ -9,7 +9,7 @@
 | `content: counter/attr` | 3 | div.feat-34, div.feat-38, div.feat-42 | counter(feat, decimal-leading-zero) |
 | `clip-path` | 2 | div.hero-bg-1, div.ico-39::after | polygon(0px 0px, 100% 0px, 100% 78%, 0px 100%) |
 | `gradient: stops` | 2 | hr-86, div.newsletter-82 | 3 stops drawn as the first and the last |
-| `transform: scale` | 2 | span.hl-14::before, div.card-62 | 1.0 1.02 |
+| `transform: scale` | 2 | span.hl-14::before, div.card-62 | 1.0 1.0154 |
 | `transform: skew` | 2 | div.banner-26, span.hl-14::before | matrix(1, -0.0349208, 0, 1, 0, 0) |
 | `background-clip: text` | 1 | span.logo-3 | gradient text drawn in the text's own ink |
 | `column-count` | 1 | div.article-50 | 2 |

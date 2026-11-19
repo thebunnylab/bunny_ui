@@ -121,7 +121,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 14.0)
             .padding_edge(Edge::Bottom, 6.0)
             .padding_edge(Edge::Leading, 12.0)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.18, y: -0.69 }, end: UnitPoint { x: 0.82, y: 1.69 }, from: Color::rgb(90, 200, 250), to: Color::rgb(88, 86, 214) })
+            .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.1832, y: -0.6854 }, end: UnitPoint { x: 0.8168, y: 1.6854 }, from: Color::rgb(90, 200, 250), to: Color::rgb(88, 86, 214) })
             .corner_radius(8.0)
             .shadow_color(6.0, Color::rgba(52, 120, 246, 102))
             .shadow_offset(0.0, 2.0)
@@ -164,7 +164,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-20"),
                         hstack!(
                             text("26")
@@ -172,8 +172,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-27"),
                         hstack!(
@@ -182,8 +182,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-34"),
                         hstack!(
                             text("9")
@@ -191,8 +191,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-41"),
                         hstack!(
                             text("16")
@@ -200,8 +200,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-48"),
                         hstack!(
                             text("23")
@@ -209,8 +209,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-55"),
                         hstack!(
                             text("30")
@@ -218,8 +218,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-62"),
                     )
                     .alignment(HorizontalAlignment::Leading),
@@ -230,7 +230,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-21"),
                         hstack!(
                             text("27")
@@ -238,8 +238,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-28"),
                         hstack!(
@@ -248,8 +248,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-35"),
                         hstack!(
                             text("10")
@@ -257,8 +257,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-42"),
                         hstack!(
                             text("17")
@@ -266,8 +266,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-49"),
                         hstack!(
                             text("24")
@@ -275,8 +275,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-56"),
                         hstack!(
                             text("1")
@@ -284,8 +284,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-63"),
                     )
@@ -297,7 +297,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-22"),
                         hstack!(
                             text("28")
@@ -305,8 +305,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-29"),
                         hstack!(
@@ -315,8 +315,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-36"),
                         hstack!(
                             text("11")
@@ -324,8 +324,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-43"),
                         hstack!(
                             text("18")
@@ -333,8 +333,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-50"),
                         hstack!(
                             text("25")
@@ -342,8 +342,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-57"),
                         hstack!(
                             text("2")
@@ -351,8 +351,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-64"),
                     )
@@ -364,7 +364,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-23"),
                         hstack!(
                             text("29")
@@ -372,8 +372,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-30"),
                         hstack!(
@@ -382,8 +382,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-37"),
                         hstack!(
                             text("12")
@@ -391,8 +391,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-44"),
                         hstack!(
                             text("19")
@@ -402,9 +402,9 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
                         .background_color(Color::rgb(255, 59, 48))
-                        .corner_radius(10.79)
+                        .corner_radius(10.7852)
                         .test_id("span.m-51"),
                         hstack!(
                             text("26")
@@ -412,8 +412,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-58"),
                         hstack!(
                             text("3")
@@ -421,8 +421,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-65"),
                     )
@@ -434,7 +434,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-24"),
                         hstack!(
                             text("30")
@@ -442,8 +442,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-31"),
                         hstack!(
@@ -452,8 +452,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-38"),
                         hstack!(
                             text("13")
@@ -461,8 +461,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-45"),
                         hstack!(
                             text("20")
@@ -470,8 +470,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-52"),
                         hstack!(
                             text("27")
@@ -479,8 +479,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-59"),
                         hstack!(
                             text("4")
@@ -488,8 +488,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-66"),
                     )
@@ -501,7 +501,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-25"),
                         hstack!(
                             text("31")
@@ -509,8 +509,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-32"),
                         hstack!(
@@ -519,8 +519,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-39"),
                         hstack!(
                             text("14")
@@ -528,8 +528,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-46"),
                         hstack!(
                             text("21")
@@ -537,8 +537,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-53"),
                         hstack!(
                             text("28")
@@ -546,8 +546,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-60"),
                         hstack!(
                             text("5")
@@ -555,8 +555,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-67"),
                     )
@@ -568,7 +568,7 @@ pub fn view() -> impl View {
                         .foreground_color(Color::rgb(142, 142, 147))
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 2.0)
-                        .frame_aligned(21.57, 13.0, Alignment::Top)
+                        .frame_aligned(21.5703, 13.0, Alignment::Top)
                         .test_id("span.w-26"),
                         hstack!(
                             text("1")
@@ -576,8 +576,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-33"),
                         hstack!(
                             text("8")
@@ -585,8 +585,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-40"),
                         hstack!(
                             text("15")
@@ -594,8 +594,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-47"),
                         hstack!(
                             text("22")
@@ -603,8 +603,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-54"),
                         hstack!(
                             text("29")
@@ -612,8 +612,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .test_id("span.m-61"),
                         hstack!(
                             text("6")
@@ -621,8 +621,8 @@ pub fn view() -> impl View {
                             .multiline_text_alignment(TextAlignment::Center),
                         )
                         .alignment(VerticalAlignment::Center)
-                        .frame_aligned(21.57, 21.57, Alignment::Center)
-                        .corner_radius(10.79)
+                        .frame_aligned(21.5703, 21.5703, Alignment::Center)
+                        .corner_radius(10.7852)
                         .opacity(0.35)
                         .test_id("span.m-68"),
                     )
@@ -859,7 +859,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.42, 23.0, Alignment::Top)
+                        .frame_aligned(63.4219, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-95"),
                         text("TUE")
@@ -870,7 +870,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.43, 23.0, Alignment::Top)
+                        .frame_aligned(63.4297, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-96"),
                         text("WED")
@@ -881,7 +881,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.43, 23.0, Alignment::Top)
+                        .frame_aligned(63.4297, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-97"),
                         text("THU")
@@ -892,7 +892,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.43, 23.0, Alignment::Top)
+                        .frame_aligned(63.4297, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-98"),
                         text("FRI")
@@ -903,7 +903,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.43, 23.0, Alignment::Top)
+                        .frame_aligned(63.4297, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-99"),
                         text("SAT")
@@ -914,7 +914,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.43, 23.0, Alignment::Top)
+                        .frame_aligned(63.4297, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-100"),
                         text("SUN")
@@ -925,7 +925,7 @@ pub fn view() -> impl View {
                         .line_height(22.0)
                         .multiline_text_alignment(TextAlignment::Center)
                         .padding_edge(Edge::Bottom, 1.0)
-                        .frame_aligned(63.42, 23.0, Alignment::Top)
+                        .frame_aligned(63.4219, 23.0, Alignment::Top)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(229, 229, 234)))
                         .test_id("span-101"),
                     )
@@ -1029,7 +1029,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1046,7 +1046,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1062,7 +1062,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1078,7 +1078,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1094,7 +1094,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1134,7 +1134,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1153,7 +1153,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1201,7 +1201,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1217,7 +1217,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1278,7 +1278,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1348,7 +1348,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1395,7 +1395,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1415,7 +1415,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1432,7 +1432,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1448,7 +1448,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1464,7 +1464,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1511,7 +1511,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1527,7 +1527,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1578,7 +1578,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1640,7 +1640,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1680,7 +1680,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1745,7 +1745,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1761,7 +1761,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1777,7 +1777,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1797,7 +1797,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1814,7 +1814,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1861,7 +1861,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1877,7 +1877,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1893,7 +1893,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1909,7 +1909,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
                             .clipped()
@@ -1929,7 +1929,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -1947,7 +1947,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -1964,7 +1964,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2012,7 +2012,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2053,7 +2053,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2070,7 +2070,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.43, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4297, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2091,7 +2091,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2108,7 +2108,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2125,7 +2125,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2142,7 +2142,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2159,7 +2159,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2176,7 +2176,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 4.0)
                             .padding_edge(Edge::Bottom, 1.0)
                             .padding_edge(Edge::Leading, 3.0)
-                            .frame_aligned(63.42, 90.0, Alignment::TopLeading)
+                            .frame_aligned(63.4219, 90.0, Alignment::TopLeading)
                             .background_color(Color::rgb(248, 248, 251))
                             .overlay(UnitPoint::TRAILING, spacer().frame_width(1.0).background_color(Color::rgb(236, 236, 240)))
                             .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.0).background_color(Color::rgb(236, 236, 240)))
@@ -2197,13 +2197,13 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(122.86, 16.0, Alignment::TopLeading)
+                            .frame_aligned(122.8594, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(218, 218, 246))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(88, 86, 214)))
                             .clipped()
                             .test_id("div.bar-248")
-                            .padding_edge(Edge::Leading, 126.85),
+                            .padding_edge(Edge::Leading, 126.8516),
                             text("Design sprint")
                             .font_size(9.0)
                             .font_weight(Weight::Bold)
@@ -2212,13 +2212,13 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(249.72, 16.0, Alignment::TopLeading)
+                            .frame_aligned(249.7188, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(210, 225, 253))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(52, 120, 246)))
                             .clipped()
                             .test_id("div.bar-243")
-                            .padding_edge(Edge::Leading, 63.42)
+                            .padding_edge(Edge::Leading, 63.4219)
                             .padding_edge(Edge::Top, 74.0),
                             text("Conference — Lisbon")
                             .font_size(9.0)
@@ -2228,13 +2228,13 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(186.29, 16.0, Alignment::TopLeading)
+                            .frame_aligned(186.2891, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(237, 217, 248))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(175, 82, 222)))
                             .clipped()
                             .test_id("div.bar-244")
-                            .padding_edge(Edge::Leading, 190.28)
+                            .padding_edge(Edge::Leading, 190.2813)
                             .padding_edge(Edge::Top, 2.0),
                             text("Launch week")
                             .font_size(9.0)
@@ -2244,7 +2244,7 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(313.14, 16.0, Alignment::TopLeading)
+                            .frame_aligned(313.1406, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(210, 243, 218))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(52, 199, 89)))
@@ -2259,13 +2259,13 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(186.28, 16.0, Alignment::TopLeading)
+                            .frame_aligned(186.2813, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(255, 232, 199))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(255, 149, 0)))
                             .clipped()
                             .test_id("div.bar-246")
-                            .padding_edge(Edge::Leading, 253.71)
+                            .padding_edge(Edge::Leading, 253.7109)
                             .padding_edge(Edge::Top, 2.0),
                             text("Holiday break")
                             .font_size(9.0)
@@ -2275,13 +2275,13 @@ pub fn view() -> impl View {
                             .truncation_mode(Truncation::End)
                             .padding_edge(Edge::Trailing, 6.0)
                             .padding_edge(Edge::Leading, 9.0)
-                            .frame_aligned(186.29, 16.0, Alignment::TopLeading)
+                            .frame_aligned(186.2891, 16.0, Alignment::TopLeading)
                             .background_color(Color::rgb(255, 212, 209))
                             .corner_radius(4.0)
                             .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(255, 59, 48)))
                             .clipped()
                             .test_id("div.bar-247")
-                            .padding_edge(Edge::Leading, 126.85)
+                            .padding_edge(Edge::Leading, 126.8516)
                             .padding_edge(Edge::Top, 56.0),
                         )
                         .alignment(HorizontalAlignment::Leading)
@@ -2518,7 +2518,7 @@ pub fn view() -> impl View {
                         .corner_radius(4.0)
                         .offset(-2.0, -3.0))
                     .test_id("div.now-274")
-                    .offset(-4.0, 106.66))
+                    .offset(-4.0, 106.6641))
                 .test_id("div.tl-253")
                 .padding_edge(Edge::Top, 8.0)
                 .padding_edge(Edge::Leading, 26.0),
@@ -2537,8 +2537,7 @@ pub fn view() -> impl View {
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
                         spacer().frame(0.0, 12.0)
                         .test_id("br-279")
-                        .padding_edge(Edge::Top, 1.0)
-                        .padding_edge(Edge::Leading, 112.49),
+                        .padding_edge(Edge::Leading, 112.4922),
                         text("in 20 min • Room 4")
                         .font_size(10.0)
                         .foreground_color(Color::rgb(110, 110, 115))

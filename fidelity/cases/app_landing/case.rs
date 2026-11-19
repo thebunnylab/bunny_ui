@@ -22,7 +22,7 @@ pub fn view() -> impl View {
     .clipped()
     .overlay(UnitPoint::TOP_LEADING, spacer()
         .frame_aligned(1024.0, 330.0, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.06, y: -0.3 }, end: UnitPoint { x: 0.94, y: 1.3 }, from: Color::rgb(237, 233, 254), to: Color::rgb(252, 231, 243) })
+        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0552, y: -0.2968 }, end: UnitPoint { x: 0.9448, y: 1.2968 }, from: Color::rgb(237, 233, 254), to: Color::rgb(252, 231, 243) })
         .test_id("div.hero-bg-1"))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             text("Lumen")
@@ -112,12 +112,11 @@ pub fn view() -> impl View {
                 .padding_edge(Edge::Trailing, 6.0)
                 .padding_edge(Edge::Leading, 6.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
-                    .frame_aligned(100.48, 42.3, Alignment::TopLeading)
+                    .frame_aligned(100.484, 42.2969, Alignment::TopLeading)
                     .background_color(Color::rgb(109, 40, 217))
                     .corner_radius(3.0)
                     .offset(0.0, 4.0))
-                .test_id("span.hl-14")
-                .padding_edge(Edge::Top, 48.3),
+                .test_id("span.hl-14"),
                 text("to use.")
                 .font_size(46.0)
                 .font_weight(Weight::Black)
@@ -175,7 +174,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Top, 14.0),
         )
         .alignment(HorizontalAlignment::Leading)
-        .frame_aligned(470.0, 203.19, Alignment::TopLeading)
+        .frame_aligned(470.0, 203.1875, Alignment::TopLeading)
         .test_id("section.hero-12")
         .offset(40.0, 64.0))
     .overlay(UnitPoint::TOP_LEADING, image(picture_cover_0())
@@ -186,7 +185,7 @@ pub fn view() -> impl View {
         .corner_radius(14.0)
         .clipped()
         .test_id("img-21")
-        .padding_edge(Edge::Leading, 12.34)
+        .padding_edge(Edge::Leading, 12.3441)
         .frame_aligned(440.0, 220.0, Alignment::TopLeading)
         .overlay(UnitPoint::TOP_LEADING, vstack!(
                 vstack!(
@@ -299,7 +298,7 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 107, 115))
                     .line_height(16.2)
-                    .frame_aligned(228.0, 32.39, Alignment::TopLeading)
+                    .frame_aligned(228.0, 32.3906, Alignment::TopLeading)
                     .test_id("p-37")
                     .padding_edge(Edge::Top, 2.0),
                 )
@@ -311,14 +310,14 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 14.0)
             .padding_edge(Edge::Bottom, 12.0)
             .padding_edge(Edge::Leading, 14.0)
-            .frame_aligned(304.0, 76.39, Alignment::TopLeading)
+            .frame_aligned(304.0, 76.3906, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
             .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
-                .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .offset(266.48, 8.0))
+                .frame_aligned(25.5234, 26.0, Alignment::TopLeading)
+                .offset(266.477, 8.0))
             .test_id("div.feat-34"),
             hstack!(
                 spacer()
@@ -340,7 +339,7 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 107, 115))
                     .line_height(16.2)
-                    .frame_aligned(228.0, 32.39, Alignment::TopLeading)
+                    .frame_aligned(228.0, 32.3906, Alignment::TopLeading)
                     .test_id("p-41")
                     .padding_edge(Edge::Top, 2.0),
                 )
@@ -352,14 +351,14 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 14.0)
             .padding_edge(Edge::Bottom, 12.0)
             .padding_edge(Edge::Leading, 14.0)
-            .frame_aligned(304.0, 76.39, Alignment::TopLeading)
+            .frame_aligned(304.0, 76.3906, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
             .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
-                .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .offset(266.48, 8.0))
+                .frame_aligned(25.5234, 26.0, Alignment::TopLeading)
+                .offset(266.477, 8.0))
             .test_id("div.feat-38")
             .padding_edge(Edge::Leading, 16.0),
             hstack!(
@@ -382,7 +381,7 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 107, 115))
                     .line_height(16.2)
-                    .frame_aligned(228.0, 32.39, Alignment::TopLeading)
+                    .frame_aligned(228.0, 32.3906, Alignment::TopLeading)
                     .test_id("p-45")
                     .padding_edge(Edge::Top, 2.0),
                 )
@@ -394,19 +393,19 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 14.0)
             .padding_edge(Edge::Bottom, 12.0)
             .padding_edge(Edge::Leading, 14.0)
-            .frame_aligned(304.0, 76.39, Alignment::TopLeading)
+            .frame_aligned(304.0, 76.3906, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
             .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
-                .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .offset(266.48, 8.0))
+                .frame_aligned(25.5234, 26.0, Alignment::TopLeading)
+                .offset(266.477, 8.0))
             .test_id("div.feat-42")
             .padding_edge(Edge::Leading, 16.0),
         )
         .alignment(VerticalAlignment::Top)
-        .frame_aligned(944.0, 76.39, Alignment::TopLeading)
+        .frame_aligned(944.0, 76.3906, Alignment::TopLeading)
         .test_id("section.features-33")
         .offset(40.0, 384.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
@@ -435,7 +434,7 @@ pub fn view() -> impl View {
             .alignment(VerticalAlignment::Center)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
             .test_id("footer-47")
-            .padding_edge(Edge::Top, 60.59),
+            .padding_edge(Edge::Top, 6.0),
         )
         .alignment(HorizontalAlignment::Leading)
         .padding_edge(Edge::Top, 14.0)
@@ -451,7 +450,7 @@ pub fn view() -> impl View {
             .font_weight(Weight::Black)
             .foreground_color(Color::rgb(196, 181, 253))
             .line_height(110.0)
-            .frame_aligned(40.81, 110.0, Alignment::TopLeading)
+            .frame_aligned(40.8125, 110.0, Alignment::TopLeading)
             .offset(12.0, -14.0))
         .test_id("blockquote-46")
         .offset(40.0, 478.0))
@@ -547,7 +546,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 17.0)
             .padding_edge(Edge::Bottom, 11.0)
             .padding_edge(Edge::Leading, 17.0)
-            .frame_aligned(282.66, 150.0, Alignment::TopLeading)
+            .frame_aligned(282.6641, 150.0, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(14.0)
             .border(Color::rgb(229, 225, 245), 1.0)
@@ -562,8 +561,8 @@ pub fn view() -> impl View {
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("h4-64")
                 .padding_edge(Edge::Top, -3.15)
-                .padding_edge(Edge::Leading, -6.0)
-                .padding_edge(Edge::Trailing, -6.0),
+                .padding_edge(Edge::Leading, -5.9986)
+                .padding_edge(Edge::Trailing, -5.9987),
                 rich_text([
                     run("€29"),
                     run(" / seat").weight(Weight::Regular).font_size(12.0).foreground_color(Color::rgb(107, 107, 115)),
@@ -573,8 +572,8 @@ pub fn view() -> impl View {
                 .tracking(-0.84)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("div.price-65")
-                .padding_edge(Edge::Leading, -6.0)
-                .padding_edge(Edge::Trailing, -6.0),
+                .padding_edge(Edge::Leading, -5.9986)
+                .padding_edge(Edge::Trailing, -5.9987),
                 vstack!(
                     text("Unlimited projects")
                     .font_size(12.0)
@@ -620,8 +619,8 @@ pub fn view() -> impl View {
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("ul-67")
                 .padding_edge(Edge::Top, 4.2)
-                .padding_edge(Edge::Leading, -6.0)
-                .padding_edge(Edge::Trailing, -6.0),
+                .padding_edge(Edge::Leading, -5.9986)
+                .padding_edge(Edge::Trailing, -5.9987),
             )
             .alignment(HorizontalAlignment::Leading)
             .padding_edge(Edge::Top, 12.0)
@@ -646,9 +645,9 @@ pub fn view() -> impl View {
                 .frame_aligned(110.0, 18.0, Alignment::Top)
                 .background_color(Color::rgb(236, 72, 153))
                 .test_id("span.ribbon-63")
-                .offset(206.55, 13.5))
+                .offset(206.5486, 13.5))
             .test_id("div.card-62")
-            .padding_edge(Edge::Leading, 27.83),
+            .padding_edge(Edge::Leading, 27.832),
             vstack!(
                 text("SCALE")
                 .font_size(13.0)
@@ -717,13 +716,13 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 17.0)
             .padding_edge(Edge::Bottom, 11.0)
             .padding_edge(Edge::Leading, 17.0)
-            .frame_aligned(282.66, 150.0, Alignment::TopLeading)
+            .frame_aligned(282.6641, 150.0, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(14.0)
             .border(Color::rgb(229, 225, 245), 1.0)
             .clipped()
             .test_id("div.card-71")
-            .padding_edge(Edge::Leading, 27.83),
+            .padding_edge(Edge::Leading, 27.832),
         )
         .alignment(VerticalAlignment::Top)
         .padding_edge(Edge::Trailing, 20.0)
@@ -767,7 +766,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Trailing, 15.0)
         .padding_edge(Edge::Bottom, 9.0)
         .padding_edge(Edge::Leading, 15.0)
-        .frame_aligned(560.0, 73.79, Alignment::TopLeading)
+        .frame_aligned(560.0, 73.7891, Alignment::TopLeading)
         .background_color(Color::rgb(255, 255, 255))
         .corner_radius(10.0)
         .border(Color::rgb(229, 225, 245), 1.0)
@@ -799,7 +798,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Bottom, 10.0)
         .padding_edge(Edge::Leading, 14.0)
         .frame_aligned(360.0, 76.0, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.2, y: 1.93 }, end: UnitPoint { x: 0.8, y: -0.93 }, from: Color::rgb(109, 40, 217), to: Color::rgb(124, 58, 237) })
+        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.1972, y: 1.9342 }, end: UnitPoint { x: 0.8028, y: -0.9342 }, from: Color::rgb(109, 40, 217), to: Color::rgb(124, 58, 237) })
         .corner_radius(10.0)
         .test_id("div.newsletter-82")
         .offset(624.0, 784.0))

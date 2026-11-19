@@ -168,7 +168,7 @@ pub fn view() -> impl View {
                 .test_id("div.track-20")
                 .offset(0.0, 5.0))
             .overlay(UnitPoint::TOP_LEADING, spacer()
-                .frame_aligned(121.98, 4.0, Alignment::TopLeading)
+                .frame_aligned(121.9766, 4.0, Alignment::TopLeading)
                 .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(255, 179, 71), to: Color::rgb(92, 123, 255) })
                 .corner_radius(2.0)
                 .shadow_color(8.0, Color::rgba(255, 94, 126, 153))
@@ -179,7 +179,7 @@ pub fn view() -> impl View {
                 .background_color(Color::rgb(255, 255, 255))
                 .corner_radius(7.0)
                 .test_id("div.knob-22")
-                .offset(114.98, 0.0))
+                .offset(114.9766, 0.0))
             .test_id("div.prog-19")
             .padding_edge(Edge::Top, 16.0),
             hstack!(
@@ -330,7 +330,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Bottom, 16.5)
         .padding_edge(Edge::Leading, 18.5)
         .frame_aligned(358.0, 500.0, Alignment::TopLeading)
-        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.22, y: -0.06 }, end: UnitPoint { x: 0.78, y: 1.06 }, from: Color::rgba(255, 255, 255, 56), to: Color::rgba(255, 255, 255, 18) })
+        .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.2171, y: -0.0566 }, end: UnitPoint { x: 0.7829, y: 1.0566 }, from: Color::rgba(255, 255, 255, 56), to: Color::rgba(255, 255, 255, 18) })
         .corner_radius(28.0)
         .border(Color::rgba(255, 255, 255, 89), 0.5)
         .shadow_color(50.0, Color::rgba(0, 0, 0, 89))
@@ -388,15 +388,15 @@ pub fn view() -> impl View {
                         .test_id("div.a-46"),
                     )
                     .alignment(HorizontalAlignment::Leading)
-                    .frame_aligned(219.09, 29.59, Alignment::TopLeading)
+                    .frame_aligned(219.0938, 29.5938, Alignment::TopLeading)
                     .test_id("div-44")
                     .padding_edge(Edge::Leading, 10.0)
-                    .padding_edge(Edge::Top, 5.2),
+                    .padding_edge(Edge::Top, 5.2031),
                     text("3:42")
                     .font_size(12.0)
                     .foreground_color(Color::rgb(255, 255, 255))
                     .multiline_text_alignment(TextAlignment::Trailing)
-                    .frame_aligned(23.91, 14.5, Alignment::TopTrailing)
+                    .frame_aligned(23.9063, 14.5, Alignment::TopTrailing)
                     .opacity(0.75)
                     .test_id("span.d-47")
                     .padding_edge(Edge::Leading, 10.0)
@@ -441,7 +441,7 @@ pub fn view() -> impl View {
                         .padding_edge(Edge::Trailing, 6.0)
                         .padding_edge(Edge::Bottom, 1.0)
                         .padding_edge(Edge::Leading, 6.0)
-                        .frame_max(219.09, f64::MAX, Alignment::TopLeading)
+                        .frame_max(219.0938, f64::MAX, Alignment::TopLeading)
                         .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(255, 207, 92), to: Color::rgb(255, 94, 126) })
                         .corner_radius(6.0)
                         .clipped()
@@ -450,15 +450,15 @@ pub fn view() -> impl View {
                         .padding_edge(Edge::Trailing, 61.5),
                     )
                     .alignment(HorizontalAlignment::Leading)
-                    .frame_aligned(219.09, 33.59, Alignment::TopLeading)
+                    .frame_aligned(219.0938, 33.5938, Alignment::TopLeading)
                     .test_id("div-50")
                     .padding_edge(Edge::Leading, 10.0)
-                    .padding_edge(Edge::Top, 3.2),
+                    .padding_edge(Edge::Top, 3.2031),
                     text("4:05")
                     .font_size(12.0)
                     .foreground_color(Color::rgb(255, 255, 255))
                     .multiline_text_alignment(TextAlignment::Trailing)
-                    .frame_aligned(23.91, 14.5, Alignment::TopTrailing)
+                    .frame_aligned(23.9063, 14.5, Alignment::TopTrailing)
                     .opacity(0.75)
                     .test_id("span.d-53")
                     .padding_edge(Edge::Leading, 10.0)
@@ -502,15 +502,15 @@ pub fn view() -> impl View {
                         .test_id("div.a-58"),
                     )
                     .alignment(HorizontalAlignment::Leading)
-                    .frame_aligned(219.09, 29.59, Alignment::TopLeading)
+                    .frame_aligned(219.0938, 29.5938, Alignment::TopLeading)
                     .test_id("div-56")
                     .padding_edge(Edge::Leading, 10.0)
-                    .padding_edge(Edge::Top, 5.2),
+                    .padding_edge(Edge::Top, 5.2031),
                     text("6:18")
                     .font_size(12.0)
                     .foreground_color(Color::rgb(255, 255, 255))
                     .multiline_text_alignment(TextAlignment::Trailing)
-                    .frame_aligned(23.91, 14.5, Alignment::TopTrailing)
+                    .frame_aligned(23.9063, 14.5, Alignment::TopTrailing)
                     .opacity(0.75)
                     .test_id("span.d-59")
                     .padding_edge(Edge::Leading, 10.0)
@@ -554,15 +554,15 @@ pub fn view() -> impl View {
                         .test_id("div.a-64"),
                     )
                     .alignment(HorizontalAlignment::Leading)
-                    .frame_aligned(219.09, 29.59, Alignment::TopLeading)
+                    .frame_aligned(219.0938, 29.5938, Alignment::TopLeading)
                     .test_id("div-62")
                     .padding_edge(Edge::Leading, 10.0)
-                    .padding_edge(Edge::Top, 5.2),
+                    .padding_edge(Edge::Top, 5.2031),
                     text("2:59")
                     .font_size(12.0)
                     .foreground_color(Color::rgb(255, 255, 255))
                     .multiline_text_alignment(TextAlignment::Trailing)
-                    .frame_aligned(23.91, 14.5, Alignment::TopTrailing)
+                    .frame_aligned(23.9063, 14.5, Alignment::TopTrailing)
                     .opacity(0.75)
                     .test_id("span.d-65")
                     .padding_edge(Edge::Leading, 10.0)

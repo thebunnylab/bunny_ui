@@ -4,7 +4,7 @@
 
 | feature | count | where | what |
 |---|---|---|---|
-| `width: %` | 10 | img-51, img-53, img-55, img-57, … | 100% written as 108.66 points |
+| `width: %` | 10 | img-51, img-53, img-55, img-57, … | 100% written as 108.6641 points |
 | `font-variant` | 6 | b-32, b-35, b-38, span-4, … | tabular-nums |
 | `filter: hue-rotate` | 2 | img-53, img-65 | hue-rotate(90deg) |
 | `filter: sepia` | 2 | img-51, img-63 | sepia(0.6) |

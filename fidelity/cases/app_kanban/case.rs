@@ -251,7 +251,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-26"),
                     text("Users who leave the app for longer than five minutes are logged out in the middle of the second step and lose every field they entered so far.")
@@ -376,7 +376,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-38"),
                     text("Illustrations and copy for the three empty inbox states.")
@@ -500,7 +500,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-50")
                     .padding_edge(Edge::Trailing, 11.0)
@@ -663,7 +663,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-64"),
                     text("Switch from offset to cursor pagination so the feed stays fast for accounts with more than ten thousand events and avoids duplicate rows.")
@@ -797,7 +797,7 @@ pub fn view() -> impl View {
                         .padding_edge(Edge::Trailing, 7.0)
                         .padding_edge(Edge::Bottom, 1.0)
                         .padding_edge(Edge::Leading, 7.0)
-                        .frame_height_aligned(16.96, Alignment::TopLeading)
+                        .frame_height_aligned(16.9636, Alignment::TopLeading)
                         .background_color(Color::rgb(252, 231, 243))
                         .corner_radius(8.0)
                         .test_id("span.tag-77"),
@@ -812,7 +812,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-78"),
                     text("Add exponential backoff and surface a clear message after the third attempt fails.")
@@ -824,11 +824,11 @@ pub fn view() -> impl View {
                     .test_id("p.desc-79"),
                     rectangle()
                     .foreground_color(Color::rgb(52, 120, 246))
-                    .frame(86.39, 16.3)
-                    .frame_width_aligned(215.97, Alignment::Leading)
+                    .frame(86.3863, 16.2977)
+                    .frame_width_aligned(215.9657, Alignment::Leading)
                     .background_color(Color::rgb(229, 229, 234))
-                    .corner_radius(8.15)
-                    .frame_aligned(215.97, 16.3, Alignment::TopLeading)
+                    .corner_radius(8.1489)
+                    .frame_aligned(215.9657, 16.2977, Alignment::TopLeading)
                     .background_color(Color::rgb(229, 231, 235))
                     .corner_radius(3.0)
                     .clipped()
@@ -872,9 +872,9 @@ pub fn view() -> impl View {
                             .aspect_ratio(ContentMode::Fill)
                             .clipped()
                             .padding_length(1.5)
-                            .frame_aligned(21.02, 21.02, Alignment::TopLeading)
+                            .frame_aligned(21.0193, 21.0193, Alignment::TopLeading)
                             .background_color(Color::rgb(255, 255, 255))
-                            .corner_radius(10.51)
+                            .corner_radius(10.5096)
                             .border(Color::rgb(255, 255, 255), 1.5)
                             .clipped()
                             .test_id("img-85"),
@@ -900,7 +900,7 @@ pub fn view() -> impl View {
                 .shadow_color(1.0, Color::rgba(37, 99, 235, 36))
                 .shadow_offset(10.0, 14.0)
                 .test_id("article.card-75")
-                .offset(5.78, -4.31)
+                .offset(5.7824, -4.3085)
                 .padding_edge(Edge::Bottom, 2.0),
                 text("Add card")
                 .font_size(12.0)
@@ -1007,7 +1007,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-96"),
                     text("Rewrite the setup steps, add the new lint rules, and describe the release branch flow.")
@@ -1131,7 +1131,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-108"),
                     text("Check every text and surface token pair against the contrast thresholds.")
@@ -1313,7 +1313,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-125"),
                     text("Deprecated since March and no longer called by any released client version.")
@@ -1400,7 +1400,7 @@ pub fn view() -> impl View {
                     .font_size(13.5)
                     .font_weight(Weight::Bold)
                     .tracking(-0.1)
-                    .line_height(16.88)
+                    .line_height(16.875)
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .test_id("h4-133"),
                     text("All services now ship logs to the new provider.")
@@ -1468,7 +1468,7 @@ pub fn view() -> impl View {
             .alignment(HorizontalAlignment::Leading)
             .padding_length(10.0)
             .frame_width_aligned(262.0, Alignment::TopLeading)
-            .background_gradient(Gradient::Linear { start: UnitPoint { x: -0.03, y: 0.97 }, end: UnitPoint { x: 1.03, y: 0.03 }, from: Color::rgb(233, 235, 241), to: Color::rgb(223, 226, 234) })
+            .background_gradient(Gradient::Linear { start: UnitPoint { x: -0.0339, y: 0.9701 }, end: UnitPoint { x: 1.0339, y: 0.0299 }, from: Color::rgb(233, 235, 241), to: Color::rgb(223, 226, 234) })
             .corner_radius(12.0)
             .clipped()
             .test_id("section.column-117"),
