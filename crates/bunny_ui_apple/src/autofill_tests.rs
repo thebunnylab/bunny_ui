@@ -1,7 +1,7 @@
 use bunny_ui::autofill::SavedPasswordError;
 use bunny_ui::text_input::Autocomplete;
 
-use super::{Kit, content_type_name, outcome_of_error};
+use super::{Kit, authentication_services, content_type_name, outcome_of_error};
 
 /// Every value a field can say has a constant in both kits, and the two
 /// names differ only by the kit's prefix — one table, never two that
@@ -46,4 +46,21 @@ fn the_system_errors_map_to_their_outcomes() {
             SavedPasswordError::Failed { code, reason: String::from("why") },
         );
     }
+}
+
+/// Whether the runtime has a class by this name registered yet.
+fn registered(name: &std::ffi::CStr) -> bool {
+    !unsafe { crate::ffi::objc_getClass(name.as_ptr()) }.is_null()
+}
+
+/// Linking the Apple half loads neither AuthenticationServices nor the
+/// ScreenCaptureKit it drags in; the first request does. The only test
+/// that loads it, so the "before" holds whatever runs beside it.
+#[test]
+fn the_framework_loads_on_the_first_request_never_at_launch() {
+    assert!(!registered(c"ASAuthorizationPasswordProvider"), "AuthenticationServices was loaded at launch");
+    assert!(!registered(c"SCShareableContent"), "ScreenCaptureKit was loaded at launch");
+    assert!(authentication_services(), "this system has AuthenticationServices");
+    assert!(registered(c"ASAuthorizationPasswordProvider"), "the provider resolves once loaded");
+    assert!(authentication_services(), "a second request finds it loaded");
 }
