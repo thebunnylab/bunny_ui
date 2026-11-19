@@ -83,6 +83,10 @@ pub fn run(matches: &Matches) -> Result<()> {
         (None, None) => String::from("my-app"),
     };
     println!("{}", snippet(&portable(relative), product.as_deref(), &id));
+    if !project.as_ref().is_some_and(|project| project.updater_feature) {
+        println!("\n{}\n", term::bold("And turn the updater on in the app's bunny-ui dependency:"));
+        println!("bunny-ui = {{ version = \"…\", features = [\"updater\"] }}");
+    }
     println!(
         "\n{}",
         term::dim(&format!(

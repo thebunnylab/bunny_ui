@@ -65,6 +65,7 @@ fn the_release_signs_the_package_and_lists_it() {
         id: None,
         build: 1,
         updater: Some(config.clone()),
+        updater_feature: true,
     };
     let release = Release { config, key: key.clone(), channel: String::from("stable") };
     let shipped = Shipped { path: package.clone(), format: "tar.gz", targets: vec!["linux-x86_64"] };

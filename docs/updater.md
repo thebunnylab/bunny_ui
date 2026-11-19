@@ -11,8 +11,14 @@ The proofs:*
 - *A check and a 285 MB download against a release server in production
   verified that server's real signature with the std-only Ed25519.*
 
+*- On a Mac, `cargo test -p bunny-cli --test self_update -- --ignored`
+  runs a whole update. `bunny new` makes an app, `bunny build macos` signs
+  1.0.0 and 1.1.0, and 1.0.0 finds 1.1.0 on a feed of files. It installs
+  it over its own bundle and restarts as 1.1.0, with the bundle's
+  signature still valid.*
+
 *The Linux and Windows file work runs in CI on their runners. A whole
-app that updates itself under `bunny build` is not proven yet.*
+update on Linux and on Windows is not proven yet.*
 
 An app on the desktop asks a feed whether a newer build is there. When
 the person wants it, the updater downloads it, checks that its bytes
@@ -177,6 +183,11 @@ refused before the download, with advice for the user.
   `min_supported` come through TLS and the server. A bad feed cannot make
   the app install bytes that you did not sign. But it can offer an old
   signed build, or retire a build that is good.
+- **Turn on the feature.** `[package.metadata.bunny.updater]` alone gives
+  an app with no updater. `bunny build` and `bunny signer generate` warn
+  when the `bunny-ui` dependency has no `updater` feature.
+- **macOS 27 warns about `hdiutil attach`** on stderr. It still mounts
+  the image.
 - **No rollback on macOS and Linux.** A failure before the Linux binary's
   rename leaves the old binary with new support files, which it can run.
 - **The failure is in the log, not on screen.** Each failure adds one
