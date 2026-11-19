@@ -167,7 +167,7 @@ pub fn view() -> impl View {
         .test_id("img-21")
         .frame_aligned(440.0, 220.0, Alignment::TopLeading)
         .overlay(UnitPoint::TOP_LEADING, vstack!(
-                vstack!(
+                hstack!(
                     spacer()
                     .padding_edge(Edge::Trailing, 5.0)
                     .padding_edge(Edge::Bottom, 8.0)
@@ -182,9 +182,12 @@ pub fn view() -> impl View {
                     .font_size(24.0)
                     .font_weight(Weight::Bold)
                     .tracking(-0.48)
-                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                    .monospaced_digit()
+                    .padding_edge(Edge::Leading, 4.0),
                 )
-                .alignment(HorizontalAlignment::Leading)
+                .spacing(0.0)
+                .alignment(VerticalAlignment::Top)
+                .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("b-23"),
                 rich_text([run("uptime across 12k teams").font_size(11.0).foreground_color(Color::rgb(107, 107, 115))])

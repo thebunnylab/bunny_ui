@@ -1182,7 +1182,7 @@ pub fn view() -> impl View {
                                 .test_id("b-137")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 120, 246))
@@ -1194,9 +1194,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1261,7 +1263,7 @@ pub fn view() -> impl View {
                                     .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(52, 120, 246)))
                                     .clipped()
                                     .test_id("span.chip-179"),
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(255, 149, 0))
@@ -1273,9 +1275,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1323,7 +1327,7 @@ pub fn view() -> impl View {
                                     .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(175, 82, 222)))
                                     .clipped()
                                     .test_id("span.chip-204"),
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 120, 246))
@@ -1335,9 +1339,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1380,7 +1386,7 @@ pub fn view() -> impl View {
                                 .test_id("b-228")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 120, 246))
@@ -1392,9 +1398,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1501,7 +1509,7 @@ pub fn view() -> impl View {
                                 .test_id("b-209")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 199, 89))
@@ -1513,9 +1521,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1570,7 +1580,7 @@ pub fn view() -> impl View {
                                 .test_id("b-124")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(255, 149, 0))
@@ -1582,9 +1592,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1633,7 +1645,7 @@ pub fn view() -> impl View {
                                     .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(52, 199, 89)))
                                     .clipped()
                                     .test_id("span.chip-146"),
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(255, 149, 0))
@@ -1645,9 +1657,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1740,7 +1754,7 @@ pub fn view() -> impl View {
                                     .overlay(UnitPoint::LEADING, spacer().frame_width(3.0).background_color(Color::rgb(255, 59, 48)))
                                     .clipped()
                                     .test_id("span.chip-187"),
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 120, 246))
@@ -1752,9 +1766,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -1861,7 +1877,7 @@ pub fn view() -> impl View {
                                 .test_id("b-166")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 199, 89))
@@ -1873,9 +1889,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -2019,7 +2037,7 @@ pub fn view() -> impl View {
                                 .test_id("b-193")
                                 .padding_edge(Edge::Top, 2.5),
                                 vstack!(
-                                    vstack!(
+                                    hstack!(
                                         spacer()
                                         .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                                         .background_color(Color::rgb(52, 199, 89))
@@ -2031,9 +2049,11 @@ pub fn view() -> impl View {
                                         .foreground_color(Color::rgb(58, 58, 60))
                                         .line_height(15.0)
                                         .truncation_mode(Truncation::End)
-                                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
+                                        .padding_edge(Edge::Leading, 3.0),
                                     )
-                                    .alignment(HorizontalAlignment::Leading)
+                                    .spacing(0.0)
+                                    .alignment(VerticalAlignment::Top)
+                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                                     .padding_edge(Edge::Trailing, 3.0)
                                     .frame_height_aligned(15.0, Alignment::TopLeading)
                                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -2575,7 +2595,7 @@ pub fn view() -> impl View {
                     .resizable()
                     .aspect_ratio(ContentMode::Fill)
                     .clipped()
-                    .frame_width_aligned(163.0, Alignment::TopLeading)
+                    .frame_aligned(163.0, 50.9375, Alignment::TopLeading)
                     .clipped()
                     .test_id("img-276"),
                     vstack!(

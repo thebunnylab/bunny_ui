@@ -413,6 +413,7 @@ pub fn view() -> impl View {
                         .font_size(26.0)
                         .font_weight(Weight::ExtraBold)
                         .tracking(-0.8)
+                        .monospaced_digit()
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-43")
                         .padding_edge(Edge::Top, 2.0),
@@ -499,6 +500,7 @@ pub fn view() -> impl View {
                         .font_size(26.0)
                         .font_weight(Weight::ExtraBold)
                         .tracking(-0.8)
+                        .monospaced_digit()
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-55")
                         .padding_edge(Edge::Top, 2.0),
@@ -586,6 +588,7 @@ pub fn view() -> impl View {
                         .font_size(26.0)
                         .font_weight(Weight::ExtraBold)
                         .tracking(-0.8)
+                        .monospaced_digit()
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-67")
                         .padding_edge(Edge::Top, 2.0),
@@ -673,6 +676,7 @@ pub fn view() -> impl View {
                         .font_size(26.0)
                         .font_weight(Weight::ExtraBold)
                         .tracking(-0.8)
+                        .monospaced_digit()
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-79")
                         .padding_edge(Edge::Top, 2.0),
@@ -785,6 +789,7 @@ pub fn view() -> impl View {
                                     .font_size(20.0)
                                     .font_weight(Weight::Bold)
                                     .tracking(-0.5)
+                                    .monospaced_digit()
                                     .test_id("b-98"),
                                     text("total")
                                     .font_size(10.0)
@@ -806,6 +811,7 @@ pub fn view() -> impl View {
                                     text("38%")
                                     .font_size(12.0)
                                     .foreground_color(Color::rgb(107, 114, 128))
+                                    .monospaced_digit()
                                     .test_id("em-102"),
                                 )
                                 .spacing(8.0)
@@ -822,6 +828,7 @@ pub fn view() -> impl View {
                                     text("24%")
                                     .font_size(12.0)
                                     .foreground_color(Color::rgb(107, 114, 128))
+                                    .monospaced_digit()
                                     .test_id("em-104"),
                                 )
                                 .spacing(8.0)
@@ -838,6 +845,7 @@ pub fn view() -> impl View {
                                     text("22%")
                                     .font_size(12.0)
                                     .foreground_color(Color::rgb(107, 114, 128))
+                                    .monospaced_digit()
                                     .test_id("em-106"),
                                 )
                                 .spacing(8.0)
@@ -854,6 +862,7 @@ pub fn view() -> impl View {
                                     text("16%")
                                     .font_size(12.0)
                                     .foreground_color(Color::rgb(107, 114, 128))
+                                    .monospaced_digit()
                                     .test_id("em-108"),
                                 )
                                 .spacing(8.0)

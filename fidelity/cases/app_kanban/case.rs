@@ -169,6 +169,7 @@ pub fn view() -> impl View {
                     .font_size(11.0)
                     .font_weight(Weight::ExtraBold)
                     .foreground_color(Color::rgb(75, 85, 99))
+                    .monospaced_digit()
                     .padding_edge(Edge::Top, 1.0)
                     .padding_edge(Edge::Trailing, 8.0)
                     .padding_edge(Edge::Bottom, 1.0)
@@ -261,8 +262,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-27"),
@@ -389,8 +390,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-39"),
@@ -610,6 +611,7 @@ pub fn view() -> impl View {
                     .font_size(11.0)
                     .font_weight(Weight::ExtraBold)
                     .foreground_color(Color::rgb(75, 85, 99))
+                    .monospaced_digit()
                     .padding_edge(Edge::Top, 1.0)
                     .padding_edge(Edge::Trailing, 8.0)
                     .padding_edge(Edge::Bottom, 1.0)
@@ -678,8 +680,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-65"),
@@ -830,8 +832,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-79"),
@@ -960,6 +962,7 @@ pub fn view() -> impl View {
                     .font_size(11.0)
                     .font_weight(Weight::ExtraBold)
                     .foreground_color(Color::rgb(75, 85, 99))
+                    .monospaced_digit()
                     .padding_edge(Edge::Top, 1.0)
                     .padding_edge(Edge::Trailing, 8.0)
                     .padding_edge(Edge::Bottom, 1.0)
@@ -1028,8 +1031,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-97"),
@@ -1155,8 +1158,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-109"),
@@ -1283,6 +1286,7 @@ pub fn view() -> impl View {
                     .font_size(11.0)
                     .font_weight(Weight::ExtraBold)
                     .foreground_color(Color::rgb(75, 85, 99))
+                    .monospaced_digit()
                     .padding_edge(Edge::Top, 1.0)
                     .padding_edge(Edge::Trailing, 8.0)
                     .padding_edge(Edge::Bottom, 1.0)
@@ -1339,8 +1343,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-126"),
@@ -1394,6 +1398,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(245, 158, 11)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
                 .shadow_offset(0.0, 1.0)
+                .grayscale(1.0)
                 .opacity(0.6)
                 .test_id("article.card-122"),
                 vstack!(
@@ -1428,8 +1433,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .line_limit(2)
                     .frame_height_aligned(32.3906, Alignment::TopLeading)
-                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-134"),
@@ -1483,6 +1488,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(34, 197, 94)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
                 .shadow_offset(0.0, 1.0)
+                .grayscale(1.0)
                 .opacity(0.6)
                 .test_id("article.card-130")
                 .padding_edge(Edge::Bottom, 2.0),

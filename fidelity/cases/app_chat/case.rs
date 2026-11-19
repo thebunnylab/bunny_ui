@@ -145,6 +145,7 @@ pub fn view() -> impl View {
                 .frame_width_aligned(250.5, Alignment::Leading),
                 text("9:41")
                 .font_size(10.0)
+                .monospaced_digit()
                 .line_height(13.0)
                 .multiline_text_alignment(TextAlignment::Trailing)
                 .frame_width_aligned(250.5, Alignment::TopTrailing)
@@ -175,6 +176,7 @@ pub fn view() -> impl View {
                 text("9:42")
                 .font_size(10.0)
                 .foreground_color(Color::rgb(255, 255, 255))
+                .monospaced_digit()
                 .line_height(13.0)
                 .multiline_text_alignment(TextAlignment::Trailing)
                 .frame_width_aligned(172.3125, Alignment::TopTrailing)
@@ -214,6 +216,7 @@ pub fn view() -> impl View {
                 .frame_width_aligned(250.5, Alignment::Leading),
                 text("9:43")
                 .font_size(10.0)
+                .monospaced_digit()
                 .line_height(13.0)
                 .multiline_text_alignment(TextAlignment::Trailing)
                 .frame_width_aligned(250.5, Alignment::TopTrailing)
@@ -239,7 +242,7 @@ pub fn view() -> impl View {
             .resizable()
             .aspect_ratio(ContentMode::Fill)
             .clipped()
-            .frame_width_aligned(266.5, Alignment::TopLeading)
+            .frame_aligned(266.5, 199.875, Alignment::TopLeading)
             .clipped()
             .test_id("img-27")
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
@@ -303,6 +306,7 @@ pub fn view() -> impl View {
                 text("9:45")
                 .font_size(10.0)
                 .foreground_color(Color::rgb(255, 255, 255))
+                .monospaced_digit()
                 .line_height(13.0)
                 .multiline_text_alignment(TextAlignment::Trailing)
                 .frame_width_aligned(225.5938, Alignment::TopTrailing)
@@ -341,6 +345,7 @@ pub fn view() -> impl View {
                 .frame_width_aligned(191.8125, Alignment::Leading),
                 text("9:47")
                 .font_size(10.0)
+                .monospaced_digit()
                 .line_height(13.0)
                 .frame_width_aligned(191.8125, Alignment::TopLeading)
                 .opacity(0.55)
