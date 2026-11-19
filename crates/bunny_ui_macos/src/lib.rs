@@ -2398,6 +2398,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         if matches!(
             event,
             AppEvent::Key { .. }
+                | AppEvent::Physical(_)
                 | AppEvent::ImeInsert { .. }
                 | AppEvent::ImeMark { .. }
                 | AppEvent::ImeUnmark
@@ -2589,6 +2590,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // the front returns: a frozen loop resumes mid-phase
             runtime.set_loops_paused(false);
             sync_frame_driver(runtime, &handler_pacer, window_id);
+        }
+        AppEvent::Physical(key) => {
+            // the box holding the keyboard reads the key of the board; the
+            // stroke and the text that follow are what change the scene
+            if runtime.physical_key(key) {
+                soon(runtime, root, trace::Origin::Input);
+            }
         }
         AppEvent::Modifiers(held) => {
             // a release confirms, closes, opens — whatever the sink did,

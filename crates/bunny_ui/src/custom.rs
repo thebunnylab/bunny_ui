@@ -1240,6 +1240,50 @@ pub enum WheelPhase {
     Ended,
 }
 
+/// Whether a key went down or came up.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KeyPhase {
+    /// Down — and down again while it is held, with `repeat` set.
+    Down,
+    Up,
+}
+
+/// One key of the board going down or coming up, as the platform saw
+/// it: what a stroke cannot say — WHICH key it was, a modifier pressed
+/// on its own, a release, a repeat.
+///
+/// It rides beside the stroke and the text, never instead of them: the
+/// keymap still hears the stroke and the input method still makes the
+/// text, so composition and dead keys keep working.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PhysicalKey {
+    pub phase: KeyPhase,
+    /// The key's place on the board in the W3C UI Events `code`
+    /// vocabulary — `KeyA`, `Digit1`, `ShiftLeft`, `Numpad0` — the names
+    /// of a US board's positions, whatever the layout prints on them.
+    /// Empty for a key that vocabulary has no name for.
+    pub code: &'static str,
+    /// What the key types under shift and option, command and control
+    /// set aside: `a`, `A`, `¢`. `None` for a key that types nothing (an
+    /// arrow, a modifier) and for a dead key.
+    pub character: Option<char>,
+    /// A dead key: it types nothing yet and marks the next one — the
+    /// acute and then `e` make `é`.
+    pub dead: bool,
+    /// The platform's own repeat of a key held down.
+    pub repeat: bool,
+    /// What the hand holds once this key moved: a shift going down
+    /// holds shift, and one coming up no longer does.
+    pub modifiers: crate::action::Modifiers,
+    /// The input method took the key: it composes, and what it makes
+    /// arrives as marked text or text after this.
+    pub composing: bool,
+    /// The app used the stroke before the platform's text road had it:
+    /// a key binding, or the box's own answer to the
+    /// [`ElementEvent::Key`] that came first.
+    pub taken: bool,
+}
+
 /// One event for the app's box, in LOCAL coordinates: the origin is the
 /// box's own top-left corner.
 ///
@@ -1326,6 +1370,13 @@ pub enum ElementEvent {
     /// is the only way to know that shift and the bracket key made a
     /// `{` — the layout knows, and no table in an app does.
     Key(crate::action::Stroke),
+    /// A key of the board went down or came up while the box holds the
+    /// keyboard — every one, modifiers alone included, where the shell
+    /// can tell (the mac today). A press arrives once the stroke's road
+    /// is decided: after the box's own [`ElementEvent::Key`] for it, and
+    /// before the text or the marked text it made. The answer changes
+    /// nothing.
+    Physical(PhysicalKey),
     /// Text to insert: typing, a paste, or the commit of a
     /// composition. The framework opens no clipboard — the shell reads
     /// it and the text arrives here.

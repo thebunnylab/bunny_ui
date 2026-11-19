@@ -2724,6 +2724,21 @@ impl Runtime {
         }
     }
 
+    /// A key of the board went down or came up: the app's box that holds
+    /// the keyboard hears it, and nobody else — the keymap reads strokes,
+    /// and a field reads text. Whether the box answered it handled.
+    pub fn physical_key(&self, key: crate::custom::PhysicalKey) -> bool {
+        self.enter_scene();
+        let Some(placement) = self.focused_custom() else {
+            return false;
+        };
+        let response = self.deliver(&placement, crate::custom::ElementEvent::Physical(key));
+        if response.handled {
+            self.dirty_island_of(&placement.path);
+        }
+        response.handled
+    }
+
     /// One keystroke offered to whoever holds the keyboard BEFORE the
     /// keymap: an editor owns its arrows, its Enter and its Tab while
     /// it has focus, and a field of many lines owns the `⌘↵` its

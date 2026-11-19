@@ -61,12 +61,15 @@ mod window_ops;
 pub use window_ops::{focus_window, set_application_icon, set_window_parent, set_window_title};
 #[path = "fullscreen_ops.rs"]
 mod fullscreen_ops;
+#[path = "physical_keys.rs"]
+mod physical_keys;
 pub use fullscreen_ops::{forget_fullscreen, set_window_fullscreen, window_fullscreen};
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
 
 use bunny_ui::action::ActionId;
+use bunny_ui::custom::{KeyPhase, PhysicalKey};
 use bunny_ui::menu::Pick;
 use bunny_ui::window::WindowBackground;
 
@@ -299,6 +302,10 @@ pub enum AppEvent {
     /// now. A modifier going down or coming UP types nothing and makes
     /// no stroke; this is the only report of a release.
     Modifiers(bunny_ui::action::Modifiers),
+    /// A key of the board went down or came up — every one, the
+    /// modifiers alone included. A press arrives once its road is
+    /// decided: after the gate, before the text it makes.
+    Physical(bunny_ui::custom::PhysicalKey),
     /// RAW key — only arrives here when the focused field is NOT in the
     /// path (no focus, or cmd held): shortcuts and function keys. With
     /// focus, the event enters the input system (`interpretKeyEvents:`)
@@ -862,8 +869,53 @@ unsafe fn register_file_drag(view: Id) {
 /// it to the key window's first responder, which is this view whenever
 /// the scene holds the keyboard.
 extern "C" fn bunny_flags_changed(_this: Id, _sel: Sel, event: Id) {
-    let held = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    let (flags, key_code) = unsafe { (msg_u64(event, sel("modifierFlags")), msg_u16(event, sel("keyCode"))) };
+    let held = modifiers_of(flags);
+    if let Some(down) = physical_keys::modifier_down(key_code, flags) {
+        let phase = if down { KeyPhase::Down } else { KeyPhase::Up };
+        dispatch(AppEvent::Physical(PhysicalKey {
+            phase,
+            code: physical_keys::code(key_code),
+            character: None,
+            dead: false,
+            repeat: false,
+            modifiers: held,
+            composing: false,
+            taken: false,
+        }));
+    }
     dispatch(AppEvent::Modifiers(held));
+}
+
+/// `keyUp:` — a key of the board came up.
+extern "C" fn bunny_key_up(_this: Id, _sel: Sel, event: Id) {
+    let key = unsafe { physical_key(event, KeyPhase::Up, false, false) };
+    dispatch(AppEvent::Physical(key));
+}
+
+/// The key `event` pressed or released, as a box reads it: its place on
+/// the board, what it types under shift and option, and whether it
+/// repeats. Only for `keyDown:` and `keyUp:` events — AppKit refuses
+/// their characters to any other.
+unsafe fn physical_key(event: Id, phase: KeyPhase, composing: bool, taken: bool) -> PhysicalKey {
+    unsafe {
+        let key_code = msg_u16(event, sel("keyCode"));
+        let flags = msg_u64(event, sel("modifierFlags"));
+        let modifiers = modifiers_of(flags);
+        let chord = modifiers.command || modifiers.control;
+        let dead = !chord && text_argument_to_string(msg_id(event, sel("characters"))).is_empty();
+        let character = if dead { None } else { typed_character(event, flags & physical_keys::TYPING_FLAGS) };
+        PhysicalKey {
+            phase,
+            code: physical_keys::code(key_code),
+            character,
+            dead,
+            repeat: msg_bool(event, sel("isARepeat")).get(),
+            modifiers,
+            composing,
+            taken,
+        }
+    }
 }
 
 extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
@@ -1107,9 +1159,42 @@ fn ime_mirror() -> Option<ImeMirror> {
     IME.with(|ime| ime.borrow().clone())
 }
 
+thread_local! {
+    /// What the input system says while it reads one key: held, so the
+    /// key itself is told first — see [`interpret_holding`].
+    static HELD_IME: RefCell<Option<Vec<AppEvent>>> = const { RefCell::new(None) };
+}
+
+/// The input system's word: held while it reads a key, dispatched at
+/// once otherwise (a candidate picked with the mouse).
+fn ime_dispatch(event: AppEvent) {
+    let event = HELD_IME.with(|held| match held.borrow_mut().as_mut() {
+        Some(events) => {
+            events.push(event);
+            None
+        }
+        None => Some(event),
+    });
+    if let Some(event) = event {
+        dispatch(event);
+    }
+}
+
+/// Hands `event` to the input system and gives back what it said about
+/// it, in order — text, marked text, commands — undelivered, so the key
+/// goes first and knows whether the input method took it.
+unsafe fn interpret_holding(this: Id, event: Id) -> Vec<AppEvent> {
+    HELD_IME.with(|held| *held.borrow_mut() = Some(Vec::new()));
+    unsafe {
+        let array = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), event);
+        msg_void_id(this, sel("interpretKeyEvents:"), array);
+    }
+    HELD_IME.with(|held| held.borrow_mut().take()).unwrap_or_default()
+}
+
 extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, string: Id, _replacement: NSRange) {
     let text = unsafe { text_argument_to_string(string) };
-    dispatch(AppEvent::ImeInsert { text });
+    ime_dispatch(AppEvent::ImeInsert { text });
 }
 
 extern "C" fn bunny_set_marked_text(
@@ -1120,11 +1205,11 @@ extern "C" fn bunny_set_marked_text(
     _replacement: NSRange,
 ) {
     let text = unsafe { text_argument_to_string(string) };
-    dispatch(AppEvent::ImeMark { text, location: selected.location, length: selected.length });
+    ime_dispatch(AppEvent::ImeMark { text, location: selected.location, length: selected.length });
 }
 
 extern "C" fn bunny_unmark_text(_this: Id, _sel: Sel) {
-    dispatch(AppEvent::ImeUnmark);
+    ime_dispatch(AppEvent::ImeUnmark);
 }
 
 extern "C" fn bunny_has_marked_text(_this: Id, _sel: Sel) -> ObjcBool {
@@ -1240,7 +1325,7 @@ extern "C" fn bunny_do_command(_this: Id, _sel: Sel, command: Sel) {
         }
         std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
     };
-    dispatch(AppEvent::Command { selector });
+    ime_dispatch(AppEvent::Command { selector });
 }
 
 /// The key's characters with NO modifier applied — AppKit reads the
@@ -1362,6 +1447,7 @@ extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> Ob
             chars_bare: bare_characters(event),
         };
         if gate_consumed(&stroke) {
+            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, true)));
             return ObjcBool::YES; // the keymap dispatched — the event dies here
         }
         key_equivalent_super(this, event)
@@ -1393,16 +1479,24 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             return;
         }
         if !composing && first_offer(event) && gate_consumed(&stroke) {
+            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, true)));
             return; // the keymap dispatched — the event dies here
         }
 
         // focused field without cmd: the event enters the input system —
-        // IME composition comes back via insertText/setMarkedText/doCommand
+        // IME composition comes back via insertText/setMarkedText/doCommand,
+        // told after the key itself, which then knows if the IME took it
         if INTERPRET.with(|flag| flag.get()) && !stroke.command {
-            let array = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), event);
-            msg_void_id(this, sel("interpretKeyEvents:"), array);
+            let said = interpret_holding(this, event);
+            let composed = composing
+                || said.iter().any(|said| matches!(said, AppEvent::ImeMark { .. } | AppEvent::ImeUnmark));
+            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, composed, false)));
+            for said in said {
+                dispatch(said);
+            }
             return;
         }
+        dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, false)));
         dispatch(AppEvent::Key {
             code,
             shift: stroke.shift,
@@ -2297,6 +2391,7 @@ unsafe fn register_classes() {
             bunny_flags_changed as *const c_void,
             types.as_ptr(),
         );
+        class_addMethod(view, sel("keyUp:"), bunny_key_up as *const c_void, types.as_ptr());
         // the chord road that survives a hosted page holding the
         // first responder — see bunny_perform_key_equivalent
         let key_equivalent_types = objc_bool::OBJECT;

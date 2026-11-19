@@ -363,3 +363,68 @@ fn a_lone_modifier_never_reaches_the_focused_box() {
     assert!(!runtime.offer_key(KeyPattern::key(Key::Shift)), "unbound, the platform's own road goes on");
     assert_eq!(bench.heard.borrow().as_str(), "", "and the box heard nothing");
 }
+
+/// A box that writes down the keys of the board it hears.
+struct Board {
+    heard: Rc<RefCell<Vec<crate::custom::PhysicalKey>>>,
+}
+
+impl CustomElement for Board {
+    fn accepts_keys(&self) -> bool {
+        true
+    }
+
+    fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+    fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+        if let ElementEvent::Physical(key) = event {
+            self.heard.borrow_mut().push(*key);
+            return Response::handled();
+        }
+        Response::ignored()
+    }
+}
+
+#[derive(Clone)]
+struct Keyboard {
+    heard: Rc<RefCell<Vec<crate::custom::PhysicalKey>>>,
+}
+
+impl Component for Keyboard {
+    fn body(self) -> impl View {
+        vstack!(custom(Board { heard: Rc::clone(&self.heard) }).id("board"))
+    }
+}
+
+fn shift_left(phase: crate::custom::KeyPhase) -> crate::custom::PhysicalKey {
+    crate::custom::PhysicalKey {
+        phase,
+        code: "ShiftLeft",
+        character: None,
+        dead: false,
+        repeat: false,
+        modifiers: Modifiers::from(phase == crate::custom::KeyPhase::Down),
+        composing: false,
+        taken: false,
+    }
+}
+
+#[test]
+fn a_key_of_the_board_reaches_the_box_holding_the_keyboard_alone() {
+    let keyboard = Keyboard { heard: Rc::default() };
+    let runtime = Runtime::new();
+    runtime.render_stable(&keyboard);
+    assert!(
+        !runtime.physical_key(shift_left(crate::custom::KeyPhase::Down)),
+        "with nothing focused nobody hears it"
+    );
+    focus_the_box(&runtime, &keyboard);
+    assert!(runtime.physical_key(shift_left(crate::custom::KeyPhase::Down)));
+    assert!(runtime.physical_key(shift_left(crate::custom::KeyPhase::Up)));
+    let heard = keyboard.heard.borrow();
+    assert_eq!(heard.len(), 2);
+    assert_eq!(heard[0].phase, crate::custom::KeyPhase::Down);
+    assert!(heard[0].modifiers.shift);
+    assert_eq!(heard[1].phase, crate::custom::KeyPhase::Up);
+    assert!(!heard[1].modifiers.shift);
+}
