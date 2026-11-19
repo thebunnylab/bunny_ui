@@ -221,6 +221,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bunny-ui-updater"
+version = "0.5.0"
+dependencies = [
+ "bunny-ui-formats",
+ "bunny-ui-release",
+ "serde_json",
+]
+
+[[package]]
 name = "bunny-ui-vulkan"
 version = "0.5.0"
 dependencies = [
