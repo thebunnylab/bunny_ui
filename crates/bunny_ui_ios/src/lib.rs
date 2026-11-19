@@ -814,7 +814,16 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         if trace && !matches!(event, AppEvent::Blink | AppEvent::Frame { .. }) {
-            eprintln!("bunny_ui ios: {event:?}");
+            // what the keyboard writes into a box that hides it — a pick
+            // from Passwords lands here whole — is named, never printed
+            match &event {
+                AppEvent::Text(text) | AppEvent::Marked { text, .. } | AppEvent::Replace { text, .. }
+                    if runtime.focus_is_secret() =>
+                {
+                    eprintln!("bunny_ui ios: {} chars into a secret box", text.chars().count());
+                }
+                _ => eprintln!("bunny_ui ios: {event:?}"),
+            }
         }
         match event {
             AppEvent::Redraw => blit(runtime, root),
