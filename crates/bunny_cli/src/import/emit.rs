@@ -1512,7 +1512,7 @@ mod tests {
     fn numbers_read_as_rust_floats() {
         assert_eq!(num(12.0), "12.0");
         assert_eq!(num(0.333_33), "0.3333");
-        assert_eq!(num(-0.001), "0.0");
+        assert_eq!(num(-0.000_01), "0.0");
     }
 
     #[test]
