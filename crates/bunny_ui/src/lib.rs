@@ -49,6 +49,10 @@ pub mod anim;
 pub mod beat;
 pub mod bind;
 mod blur;
+#[cfg(feature = "canvas")]
+mod ink;
+#[cfg(feature = "canvas")]
+mod picture;
 pub mod turn;
 pub mod calendar;
 pub mod catalog;

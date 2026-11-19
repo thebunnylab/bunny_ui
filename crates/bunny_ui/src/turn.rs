@@ -8,8 +8,8 @@
 
 #[cfg(feature = "canvas")]
 use crate::{
-    image_engine::{FeedKey, ImageSource, RawImages},
-    layout::{Affine, Color, DisplayList, DrawCommand, LayoutEnv, Point, Rect, Size},
+    image_engine::FeedKey,
+    layout::{Affine, DisplayList, DrawCommand, LayoutEnv},
 };
 
 /// The map that turns the plane `degrees` clockwise about `pivot` (the
@@ -51,55 +51,13 @@ pub fn bounds_of(rect: crate::layout::Rect, map: crate::layout::Affine) -> crate
     }
 }
 
-/// A picture past this many texels a side would hold a screen's worth
-/// many times over.
-#[cfg(feature = "canvas")]
-const MOST: f64 = 8192.0;
-
 /// The picture of `layer`, upright, on `slot`, laid on the scene by `map`.
 /// The picture keeps a transparent texel around its ink, so the turned
 /// edge fades instead of stepping.
 #[cfg(feature = "canvas")]
 pub(crate) fn paint(layer: &DisplayList, map: Affine, env: &LayoutEnv<'_>, slot: FeedKey) -> Option<DrawCommand> {
-    let ink = crate::raster::list_bounds(layer, env.text)?;
-    let scale = env.scale.max(1.0).ceil();
-    let margin = 1.0 / scale;
-    let left = ((ink.origin.x - margin) * scale).floor() / scale;
-    let top = ((ink.origin.y - margin) * scale).floor() / scale;
-    let right = ink.origin.x + ink.size.width + margin;
-    let bottom = ink.origin.y + ink.size.height + margin;
-    if ![left, top, right, bottom].iter().all(|value| value.is_finite()) {
-        return None;
-    }
-    let width = ((right - left) * scale).ceil().clamp(0.0, MOST);
-    let height = ((bottom - top) * scale).ceil().clamp(0.0, MOST);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=8192 first")]
-    let (width, height, factor) = (width as usize, height as usize, scale as usize);
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let shifted = layer.translated_slice((0, layer.len()), -left, -top);
-    let bitmap = crate::raster::rasterize_with(&shifted, width, height, factor, Color::rgba(0, 0, 0, 0), env.text, env.images);
-    // the raster's transparent canvas is premultiplied; a picture crosses
-    // every backend as straight alpha
-    let rgba: Vec<u8> = bitmap
-        .pixels()
-        .iter()
-        .flat_map(|pixel| {
-            let [red, green, blue, alpha] = pixel.to_be_bytes();
-            if alpha == 0 {
-                return [0; 4];
-            }
-            let straight = |channel: u8| u8::try_from((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).unwrap_or(u8::MAX);
-            [straight(red), straight(green), straight(blue), alpha]
-        })
-        .collect();
-    #[allow(clippy::cast_possible_truncation, reason = "at most 8192")]
-    let size = (width as u32, height as u32);
-    let generation = ImageSource::from_bytes(RawImages::encode(size.0, size.1, &rgba)).key();
-    #[allow(clippy::cast_precision_loss, reason = "at most 8192")]
-    let rect = Rect { origin: Point { x: left, y: top }, size: Size { width: width as f64 / scale, height: height as f64 / scale } };
-    Some(DrawCommand::Sprite { rect, source: ImageSource::feed(slot, generation, size, rgba), transform: map, opacity: 1.0 })
+    let texel = 1.0 / env.scale.max(1.0).ceil();
+    Some(crate::picture::raster(layer, env, texel)?.sprite(slot, map))
 }
 
 #[cfg(test)]

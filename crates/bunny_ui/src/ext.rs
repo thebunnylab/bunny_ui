@@ -676,6 +676,21 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::ForegroundColor(color))
     }
 
+    /// `.foregroundStyle(LinearGradient(…))` — the text below paints with
+    /// the ramp, laid across this view's box: a headline from violet to
+    /// pink, its letters cut out of one gradient. A foreground color set
+    /// further in wins, as in `SwiftUI`.
+    ///
+    /// ```ignore
+    /// text("Ship calmer")
+    ///     .font_size(48.0)
+    ///     .foreground_gradient(Gradient::linear(VIOLET, PINK).direction(UnitPoint::LEADING, UnitPoint::TRAILING))
+    /// ```
+    #[track_caller]
+    fn foreground_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
+        Modified::new(self, Modifier::ForegroundGradient(Box::new(gradient)))
+    }
+
     /// `.border(Color.gray, width: 1)` — a frame inward from the edge.
     #[track_caller]
     fn border(self, color: Color, width: f64) -> Modified<Self> {

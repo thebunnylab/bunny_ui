@@ -2900,6 +2900,10 @@ pub struct VisualProps {
     pub glass: Option<Glass>,
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
+    /// `.foreground_gradient(…)` — the text below paints with this ramp,
+    /// laid across this box, as `SwiftUI`'s `.foregroundStyle(gradient)`.
+    /// A foreground color set further in wins, as in `SwiftUI`.
+    pub foreground_gradient: Option<Gradient>,
     pub border: Option<(Color, Px)>,
     /// How the border's line is drawn — `None` is the solid ring.
     pub border_style: Option<crate::shapes::BorderStyle>,
@@ -3029,6 +3033,13 @@ impl VisualProps {
             },
             clip: self.clip || outer.clip,
             foreground: self.foreground.or(outer.foreground),
+            // the ink nearer the view wins: a color set inside drops a
+            // ramp set outside
+            foreground_gradient: if self.foreground.is_some() {
+                self.foreground_gradient
+            } else {
+                self.foreground_gradient.or(outer.foreground_gradient)
+            },
             border: self.border.or(outer.border),
             border_style: self.border_style.or(outer.border_style),
             stripes: self.stripes.or(outer.stripes),
@@ -5154,6 +5165,17 @@ pub struct HostPlacement {
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
+/// A line of text a ramp inks: where it stands in the display list, the
+/// ramp, and how opaque the line was drawn — what a fade does to it
+/// later scales the ink.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy, Debug)]
+struct Inked {
+    index: usize,
+    ramp: GradientPaint,
+    alpha: u8,
+}
+
 /// A turned subtree, open: where its commands, its named boxes and its
 /// texts begin, and the turn — degrees clockwise about a point of the box.
 #[cfg(feature = "canvas")]
@@ -5229,6 +5251,15 @@ pub struct Placement {
     panes: Vec<usize>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
+    /// Stack of the open foreground ramps, each with the depth of the
+    /// foreground stack it was opened at: a ramp inks the text drawn
+    /// while no color has been set since.
+    ramps: Vec<(usize, GradientPaint)>,
+    /// The lines a ramp inks, in paint order: each turns into its
+    /// picture when its ramp closes, or sooner, when a picture of the
+    /// subtree around it is taken first.
+    #[cfg(feature = "canvas")]
+    inked: Vec<Inked>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
     /// `Styled` picks its background by it.
     pointer: Vec<(bool, bool)>,
@@ -5438,17 +5469,23 @@ impl Placement {
             crate::stats::note_unseen();
             return;
         }
+        #[cfg(feature = "canvas")]
+        if let Some((depth, ramp)) = self.ramps.last()
+            && *depth == self.foreground.len()
+            && let DrawCommand::TextLine { color, .. } | DrawCommand::TurnedText { color, .. } = &command
+        {
+            self.inked.push(Inked { index: self.display.len(), ramp: *ramp, alpha: color.a });
+        }
         self.display.push(command);
     }
 
-    /// Replace framework paint with its composite and rebind dependent ranges.
-    /// Native hosts are paint barriers: each side stays on its original layer.
     #[cfg(feature = "canvas")]
     /// Closes a turned subtree: its commands become one picture laid on
     /// the scene turned about its pivot, and its named boxes and texts
     /// report the box they cover once turned, as the page's
     /// `getBoundingClientRect` does.
     fn turn_from(&mut self, scope: TurnScope, frame: Rect, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
         let pivot = Point {
             x: frame.size.width.mul_add(scope.anchor.x, frame.origin.x),
             y: frame.size.height.mul_add(scope.anchor.y, frame.origin.y),
@@ -5468,8 +5505,41 @@ impl Placement {
         }
     }
 
+    /// Turns the lines a ramp inks, from the `mark`-th on, into their
+    /// pictures, in place.
+    #[cfg(feature = "canvas")]
+    fn ink_from(&mut self, mark: usize, env: &LayoutEnv<'_>) {
+        for inked in self.inked.split_off(mark.min(self.inked.len())) {
+            let Some(command) = self.display.commands.get(inked.index) else { continue };
+            let alpha = match command {
+                DrawCommand::TextLine { color, .. } | DrawCommand::TurnedText { color, .. } if inked.alpha > 0 => {
+                    f64::from(color.a) / f64::from(inked.alpha)
+                }
+                _ => continue,
+            };
+            let slot = crate::image_engine::FeedKey::effect(self.effects);
+            self.effects += 1;
+            // a line with no ink (white space) has no picture, and paints
+            // nothing as it is
+            if let Some(picture) = crate::ink::paint(command, &inked.ramp, alpha, env, slot) {
+                self.display.commands[inked.index] = picture;
+            }
+        }
+    }
+
+    /// Inks the lines at or past `display` before a picture of the
+    /// subtree there is taken.
+    #[cfg(feature = "canvas")]
+    fn ink_since(&mut self, display: usize, env: &LayoutEnv<'_>) {
+        let mark = self.inked.partition_point(|inked| inked.index < display);
+        self.ink_from(mark, env);
+    }
+
+    /// Replace framework paint with its composite and rebind dependent ranges.
+    /// Native hosts are paint barriers: each side stays on its original layer.
     #[cfg(feature = "canvas")]
     fn blur_from(&mut self, scope: BlurScope, viewport: Rect, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
         let original = DisplayList {
             commands: self.display.commands.split_off(scope.display),
         };
@@ -8322,6 +8392,8 @@ impl LayoutNode {
                 }
                 let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
+                // under a ramp, a color set nearer the text wins
+                let own_ink = out.ramps.last().is_some_and(|(depth, _)| *depth < out.foreground.len());
                 if let Some(dom) = out.dom.as_mut() {
                     // the WHOLE content, unwrapped: the browser re-breaks
                     // lines inside the same box with the same measures
@@ -8341,6 +8413,9 @@ impl LayoutNode {
                         }),
                         frame,
                     );
+                    if own_ink {
+                        dom.own_ink();
+                    }
                 }
                 paragraph::place_text(
                     &content,
@@ -10217,6 +10292,20 @@ impl LayoutNode {
                     let color = animated(crate::anim::Channel::Foreground, color);
                     out.foreground.push(color);
                 }
+                // a ramp inks the text below, laid across this box; the
+                // page clips it to the text itself
+                let ramp = props
+                    .foreground_gradient
+                    .map(|gradient| {
+                        // its anchors are named from the leading side
+                        let gradient = if env.rtl() { gradient.flipped() } else { gradient };
+                        out.ramps.push((out.foreground.len(), gradient.resolve(frame)));
+                        #[cfg(feature = "canvas")]
+                        let mark = out.inked.len();
+                        #[cfg(not(feature = "canvas"))]
+                        let mark = 0;
+                        mark
+                    });
                 // the background IS the shape, so it paints before the
                 // cut; the border paints after, over the cut child — a
                 // ring blended once, never twice
@@ -10232,6 +10321,13 @@ impl LayoutNode {
                 }
                 if ink.is_some() {
                     out.foreground.pop();
+                }
+                if let Some(mark) = ramp {
+                    out.ramps.pop();
+                    #[cfg(feature = "canvas")]
+                    out.ink_from(mark, &env);
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = mark;
                 }
                 if let Some((color, width)) = props.border {
                     let color = animated(crate::anim::Channel::Border, color);

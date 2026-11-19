@@ -357,6 +357,13 @@ pub struct DomLook {
     /// the pivot as a fraction of the box — CSS `rotate` about a
     /// `transform-origin`.
     pub rotation: Option<(Px, Px, Px)>,
+    /// The ramp the text below paints with (`.foreground_gradient`): the
+    /// box's background, cut to the text (`background-clip: text`).
+    pub ink_gradient: Option<crate::layout::Gradient>,
+    /// A text inside a ramp whose ink was set nearer to it: it paints its
+    /// color again (`-webkit-text-fill-color: currentcolor`), as the
+    /// nearer ink wins in `SwiftUI`.
+    pub own_ink: bool,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -442,6 +449,8 @@ impl DomLook {
         shadow_offset: None,
         offset: None,
         rotation: None,
+        ink_gradient: None,
+        own_ink: false,
         transition: None,
         focus_border: None,
         placeholder_color: None,
@@ -475,6 +484,8 @@ impl DomLook {
             shadow_offset: props.shadow_offset.filter(|_| props.shadow.is_some()),
             offset: props.offset,
             rotation: props.rotation.map(|(degrees, anchor)| (degrees, anchor.x, anchor.y)),
+            ink_gradient: props.foreground_gradient,
+            own_ink: false,
             transition: None,
             focus_border: None,
             placeholder_color: None,
@@ -508,6 +519,7 @@ impl DomLook {
             || props.shadow.is_some()
             || props.offset.is_some()
             || props.rotation.is_some()
+            || props.foreground_gradient.is_some()
             || props.clip
             || props.hidden
             || props.passive
@@ -1024,10 +1036,12 @@ impl DomCapture {
         if states || inheriting {
             look.color = Some(ink);
         }
+
         node.style = DomStyle::new(interactive, look, DomMarks { tooltip, group_owner: None });
         if states {
             self.ink_scopes.push(self.stack.len());
         }
+
     }
 
     /// The ink the open node hands down: the BASE color, never the
@@ -1096,6 +1110,18 @@ impl DomCapture {
         }
         self.open(kind, frame, frame.origin);
         self.close();
+    }
+
+    /// The leaf just placed paints its text in its own ink, inside a
+    /// ramp that would cut the text out of it otherwise: a color set
+    /// nearer the text wins, as in `SwiftUI`.
+    pub(crate) fn own_ink(&mut self) {
+        if self.island > 0 {
+            return;
+        }
+        if let Some(leaf) = self.stack.last_mut().and_then(|(_, parent)| parent.children.last_mut()) {
+            leaf.style.look_mut().own_ink = true;
+        }
     }
 
     /// A childless element that carries its own look (the field's
@@ -2517,6 +2543,16 @@ fn look_hash(node: &DomNode) -> u64 {
     }
     if let Some((degrees, x, y)) = style.rotation {
         (3u8, degrees.to_bits(), x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some(gradient) = &style.ink_gradient {
+        4u8.hash(&mut hasher);
+        let mut ramp = Vec::new();
+        encode_ramp(&mut ramp, gradient);
+        encode_stops(&mut ramp, gradient.stops());
+        ramp.hash(&mut hasher);
+    }
+    if style.own_ink {
+        5u8.hash(&mut hasher);
     }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
@@ -4517,8 +4553,11 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// its turn (`.rotation_effect`, f32 degrees clockwise + f32 x + f32 y of
 /// the pivot as a fraction of the box, CSS `rotate` about a
 /// `transform-origin`), bit 3 the colors its ramp passes through (u8
-/// count, then per stop f32 location along the ramp + u32 rgba) — the
-/// first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// count, then per stop f32 location along the ramp + u32 rgba), bit 4
+/// the ramp its text paints with (`.foreground_gradient`: the ramp's
+/// record as bit 13 of the first mask carries it, then its stops as bit
+/// 3's), bit 5 a box inside such a ramp that paints its text in its own
+/// ink again — the first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
 /// its first child alone, or by its last — `grid-template: auto 0fr /
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
@@ -5146,30 +5185,8 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if let Some(color) = style.pressed_color {
         push_u32(out, pack_color(color));
     }
-    if let Some(gradient) = style.gradient {
-        match gradient {
-            crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. } => {
-                out.push(0);
-                push_f32(out, center.x);
-                push_f32(out, center.y);
-                push_f32(out, start);
-                // no reach given = the box's own farthest corner, which
-                // CSS spells `farthest-corner`
-                push_f32(out, end.unwrap_or(-1.0));
-                push_f32(out, aspect);
-                push_u32(out, pack_color(inner));
-                push_u32(out, pack_color(outer));
-            }
-            crate::layout::Gradient::Linear { start, end, from, to, .. } => {
-                out.push(1);
-                push_f32(out, start.x);
-                push_f32(out, start.y);
-                push_f32(out, end.x);
-                push_f32(out, end.y);
-                push_u32(out, pack_color(from));
-                push_u32(out, pack_color(to));
-            }
-        }
+    if let Some(gradient) = &style.gradient {
+        encode_ramp(out, gradient);
     }
     if let Some(opacity) = style.opacity {
         push_f32(out, opacity);
@@ -5230,7 +5247,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     let more = u8::from(style.shadow_offset.is_some())
         | u8::from(style.offset.is_some()) << 1
         | u8::from(style.rotation.is_some()) << 2
-        | u8::from(stops.is_some()) << 3;
+        | u8::from(stops.is_some()) << 3
+        | u8::from(style.ink_gradient.is_some()) << 4
+        | u8::from(style.own_ink) << 5;
     out.push(more);
     for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
         push_f32(out, x);
@@ -5242,12 +5261,51 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         push_f32(out, y);
     }
     if let Some(stops) = stops {
-        #[allow(clippy::cast_possible_truncation, reason = "at most Stops::MOST")]
-        out.push(stops.len() as u8);
-        for (location, color) in stops.iter() {
-            push_f32(out, location);
-            push_u32(out, pack_color(color));
+        encode_stops(out, stops);
+    }
+    if let Some(gradient) = &style.ink_gradient {
+        encode_ramp(out, gradient);
+        encode_stops(out, gradient.stops());
+    }
+}
+
+/// A ramp's shape and its two ends: u8 kind (0 the rings, 1 the line),
+/// then the rings' centre, inner radius, reach (-1 for the farthest
+/// corner) and aspect, or the line's two ends, then the two colors.
+fn encode_ramp(out: &mut Vec<u8>, gradient: &crate::layout::Gradient) {
+    match *gradient {
+        crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. } => {
+            out.push(0);
+            push_f32(out, center.x);
+            push_f32(out, center.y);
+            push_f32(out, start);
+            // no reach given = the box's own farthest corner, which
+            // CSS spells `farthest-corner`
+            push_f32(out, end.unwrap_or(-1.0));
+            push_f32(out, aspect);
+            push_u32(out, pack_color(inner));
+            push_u32(out, pack_color(outer));
         }
+        crate::layout::Gradient::Linear { start, end, from, to, .. } => {
+            out.push(1);
+            push_f32(out, start.x);
+            push_f32(out, start.y);
+            push_f32(out, end.x);
+            push_f32(out, end.y);
+            push_u32(out, pack_color(from));
+            push_u32(out, pack_color(to));
+        }
+    }
+}
+
+/// The colors between a ramp's ends: u8 count, then per stop f32
+/// location + u32 rgba.
+fn encode_stops(out: &mut Vec<u8>, stops: &crate::layout::Stops) {
+    #[allow(clippy::cast_possible_truncation, reason = "at most Stops::MOST")]
+    out.push(stops.len() as u8);
+    for (location, color) in stops.iter() {
+        push_f32(out, location);
+        push_u32(out, pack_color(color));
     }
 }
 
@@ -8234,6 +8292,8 @@ mod tests {
             shadow_offset: None,
             offset: None,
             rotation: None,
+            ink_gradient: None,
+            own_ink: false,
             transition: Some((0.4, 0.8)),
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
@@ -8461,6 +8521,25 @@ mod tests {
         assert_eq!(striped.len(), plain.len() + 1 + 8);
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
         assert!(glue.contains("more & 8"), "glue_dom.js reads the stops");
+    }
+
+    /// The ramp a text paints with rides the second mask (bit 4) — the
+    /// ramp's record, then its stops — and a box that paints its text in
+    /// its own ink again sets bit 5 alone.
+    #[test]
+    fn a_text_ramp_rides_the_second_mask() {
+        let ramp = crate::layout::Gradient::linear(Color::BLACK, Color::WHITE);
+        let mut out = Vec::new();
+        encode_style(&mut out, &DomLook { ink_gradient: Some(ramp), ..DomLook::NONE });
+        let mut tail = vec![1 << 4];
+        encode_ramp(&mut tail, &ramp);
+        tail.push(0);
+        assert!(out.ends_with(&tail), "{out:?}");
+        let mut own = Vec::new();
+        encode_style(&mut own, &DomLook { own_ink: true, ..DomLook::NONE });
+        assert_eq!(own.last(), Some(&(1 << 5)));
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("more & 16") && glue.contains("more & 32"), "glue_dom.js reads both");
     }
 
     #[test]

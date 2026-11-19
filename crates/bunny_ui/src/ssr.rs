@@ -1224,6 +1224,19 @@ fn rule_text(
     if let Some(gradient) = &style.gradient {
         base.insert("background-image", css_gradient(gradient));
     }
+    // the ramp the text paints with: the top layer, cut to the text;
+    // what the box paints under it keeps its own box
+    if let Some(ink) = &style.ink_gradient {
+        let under = base.remove("background-image").unwrap_or_else(|| "none".into());
+        base.insert("background-image", format!("{}, {under}", css_gradient(ink)));
+        base.insert("-webkit-background-clip", "text, border-box".into());
+        base.insert("background-clip", "text, border-box".into());
+        base.insert("-webkit-text-fill-color", "transparent".into());
+    }
+    // inside a ramp, a box with its own ink paints its text in it again
+    if style.own_ink {
+        base.insert("-webkit-text-fill-color", "currentcolor".into());
+    }
     if style.clip {
         base.insert("overflow", "hidden".into());
     }

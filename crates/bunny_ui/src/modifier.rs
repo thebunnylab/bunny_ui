@@ -83,6 +83,8 @@ pub enum Modifier {
     /// Whether the background lies over what is under it or replaces it.
     BackgroundBlend(crate::layout::BackgroundBlend),
     ForegroundColor(Color),
+    /// Boxed: a ramp carries its stops inline.
+    ForegroundGradient(Box<crate::layout::Gradient>),
     Border(Color, f64),
     /// `.shadow_offset(x, y)` — where the halo sits from the box.
     ShadowOffset(f64, f64),
@@ -331,6 +333,7 @@ impl Modifier {
             Modifier::BackgroundGradient { .. } => "background_gradient",
             Modifier::BackgroundBlend { .. } => "background_blend",
             Modifier::ForegroundColor { .. } => "foreground_color",
+            Modifier::ForegroundGradient { .. } => "foreground_gradient",
             Modifier::Border { .. } => "border",
             Modifier::ShadowOffset { .. } => "shadow_offset",
             Modifier::Offset { .. } => "offset",
@@ -476,6 +479,14 @@ impl Modifier {
                 }
             },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
+            Modifier::ForegroundGradient(gradient) => match **gradient {
+                crate::layout::Gradient::Radial { inner, outer, .. } => {
+                    format!(" [.foregroundStyle(RadialGradient({inner} → {outer}))]")
+                }
+                crate::layout::Gradient::Linear { from, to, .. } => {
+                    format!(" [.foregroundStyle(LinearGradient({from} → {to}))]")
+                }
+            },
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::ShadowOffset(x, y) => format!(" [.shadow(x: {x}, y: {y})]"),
             Modifier::Offset(x, y) => format!(" [.offset(x: {x}, y: {y})]"),
@@ -1461,6 +1472,11 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { foreground: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::ForegroundGradient(gradient) => wrap_styled(
+            out,
+            mark,
+            VisualProps { foreground_gradient: Some(**gradient), ..VisualProps::default() },
         ),
         Modifier::Border(color, width) => wrap_styled(
             out,

@@ -149,6 +149,8 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         changed: ChangedIndex::new(env.changed),
         ink: Vec::new(),
         ink_scopes: Vec::new(),
+        inks_set: 0,
+        ramps: Vec::new(),
         font: FontSpec::DEFAULT,
         declared: FontSpec::DEFAULT,
         line_height: None,
@@ -276,6 +278,12 @@ struct Walk<'a> {
     /// Depths where a hover/pressed ink opened: inside one, text
     /// inherits instead of painting its own color.
     ink_scopes: Vec<usize>,
+    /// How many colors are set by the styles open around here, and, for
+    /// each open ramp the text paints with, how many were when it
+    /// opened: a text under a ramp with more colors set since paints in
+    /// its own ink, as the nearer ink wins in `SwiftUI`.
+    inks_set: usize,
+    ramps: Vec<usize>,
     font: FontSpec,
     /// The face declared by the nearest element above that declares
     /// one — the root's default until a box changes it. A text with
@@ -1009,7 +1017,10 @@ impl Walk<'_> {
                     && !DomLook::paints(props)
                 {
                     self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
+                    let sets = usize::from(props.foreground.is_some());
+                    self.inks_set += sets;
                     self.lower_into(child, out);
+                    self.inks_set -= sets;
                     self.ink.pop();
                     self.font = outer_font;
                     self.line_height = outer_line_height;
@@ -1045,6 +1056,7 @@ impl Walk<'_> {
                 // the scene, as the engine's does
                 if self.direction.is_rtl() {
                     look.gradient = look.gradient.map(crate::layout::Gradient::flipped);
+                    look.ink_gradient = look.ink_gradient.map(crate::layout::Gradient::flipped);
                 }
                 let marks = DomMarks { tooltip: self.pending_tooltip.take(), group_owner: None };
                 // the tint is the half of the material an ELEMENT owns:
@@ -1073,6 +1085,12 @@ impl Walk<'_> {
                 if states {
                     self.ink_scopes.push(self.ink.len());
                 }
+                // a ramp wins over a color set beside it
+                let sets = usize::from(props.foreground.is_some() && props.foreground_gradient.is_none());
+                self.inks_set += sets;
+                if props.foreground_gradient.is_some() {
+                    self.ramps.push(self.inks_set);
+                }
                 // a box that changes the face declares it for its
                 // subtree, once; the texts under it with that face
                 // inherit it and name none of their own
@@ -1083,6 +1101,10 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut boxed.children);
                 self.declared = outer_declared;
+                if props.foreground_gradient.is_some() {
+                    self.ramps.pop();
+                }
+                self.inks_set -= sets;
                 if states {
                     self.ink_scopes.pop();
                 }
@@ -1110,6 +1132,10 @@ impl Walk<'_> {
                     truncation: *truncation,
                     inherits_face: self.font == self.declared,
                 })));
+                // under a ramp, a color set nearer the text wins
+                if self.ramps.last().is_some_and(|at| self.inks_set > *at) {
+                    text.style.look_mut().own_ink = true;
+                }
                 text.style.interactive = self.pending_interactive.take();
                 text.style.set_tooltip(self.pending_tooltip.take());
                 text.binding = binding.map(crate::dom::NodeBinding::Text);
@@ -2428,6 +2454,8 @@ mod tests {
             changed: ChangedIndex::new(env.changed),
             ink: Vec::new(),
             ink_scopes: Vec::new(),
+            inks_set: 0,
+            ramps: Vec::new(),
             font: FontSpec::DEFAULT,
             declared: FontSpec::DEFAULT,
             line_height: None,

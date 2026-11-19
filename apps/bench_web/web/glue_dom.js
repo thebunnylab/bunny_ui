@@ -721,6 +721,17 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.background) decl["background-color"] = style.background;
   // background-image sits OVER the flat background
   if (style.image) decl["background-image"] = style.image;
+  if (style.inkImage) {
+    // the ramp the text paints with: the top layer, cut to the text;
+    // what the box paints under it keeps its own box
+    decl["background-image"] = `${style.inkImage}, ${style.image || "none"}`;
+    const clips = ["text", ...Array(Math.max(style.imageLayers, 1)).fill("border-box")].join(", ");
+    decl["-webkit-background-clip"] = clips;
+    decl["background-clip"] = clips;
+    decl["-webkit-text-fill-color"] = "transparent";
+  }
+  // inside a ramp, a box with its own ink paints its text in it again
+  if (style.ownInk) decl["-webkit-text-fill-color"] = "currentcolor";
   // a line drawn inward over the box and its children: an outline
   // pulled in by its own width paints a CSS border's pixels and lays
   // nothing out, where a border would push the content in
@@ -1103,6 +1114,18 @@ function applyPatches(view, length) {
 
   // the three records a look is made of, decoded with no element in
   // hand: a look is defined once (op 21), then worn by class (op 22)
+  // a ramp's shape and its two ends, and the colors between them
+  const readRamp = () => {
+    const kind = u8();
+    const [a, b, c, d] = [f32(), f32(), f32(), f32()];
+    const aspect = kind === 0 ? f32() : 1;
+    return { kind, a, b, c, d, aspect, near: rgba(u32()), far: rgba(u32()) };
+  };
+  const readStops = () => {
+    const stops = [];
+    for (let n = u8(); n > 0; n--) stops.push([f32(), rgba(u32())]);
+    return stops;
+  };
   const readStyle = () => {
     // the mask carries twenty-five bits, so it crosses as a u32
     const mask = u32();
@@ -1172,12 +1195,7 @@ function applyPatches(view, length) {
     if (mask & 4096) style.pressedInk = rgba(u32());
     // a ramp: the geometry is the engine's, the pixels are the
     // browser's. The colors between its ends come with the second mask
-    if (mask & 8192) {
-      const kind = u8();
-      const [a, b, c, d] = [f32(), f32(), f32(), f32()];
-      const aspect = kind === 0 ? f32() : 1;
-      style.ramp = { kind, a, b, c, d, aspect, near: rgba(u32()), far: rgba(u32()) };
-    }
+    if (mask & 8192) style.ramp = readRamp();
     if (mask & 16384) style.clip = true;
     if (mask & 32768) text(u16());
     if (mask & 65536) style.fade = f32();
@@ -1254,11 +1272,15 @@ function applyPatches(view, length) {
     const shadowOffset = more & 1 ? [f32(), f32()] : [0, 0];
     if (more & 2) style.offset = [f32(), f32()];
     if (more & 4) style.rotation = [f32(), f32(), f32()];
-    const stops = [];
-    if (more & 8) for (let n = u8(); n > 0; n--) stops.push([f32(), rgba(u32())]);
+    const stops = more & 8 ? readStops() : [];
     // the bands lie over the ramp
     const layers = [style.bands, style.ramp && rampImage(style.ramp, stops)].filter(Boolean);
     if (layers.length !== 0) style.image = layers.join(", ");
+    style.imageLayers = layers.length;
+    // the ramp the text paints with, and a box inside one that paints
+    // its text in its own ink again
+    if (more & 16) style.inkImage = rampImage(readRamp(), readStops());
+    if (more & 32) style.ownInk = true;
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };

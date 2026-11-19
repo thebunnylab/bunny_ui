@@ -5680,6 +5680,33 @@ mod tests {
         assert_close(&gpu, &cpu, 2, "stops");
     }
 
+    /// Text under a ramp is a picture of its letters tinted by the ramp:
+    /// the GPU lays the same bytes the raster does.
+    #[test]
+    fn gradient_text_inks_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::{Gradient, UnitPoint};
+        let root = text("Ship calmer")
+            .font_size(28.0)
+            .foreground_gradient(
+                Gradient::linear(Color::hex(0x6D28D9), Color::hex(0xF59E0B))
+                    .direction(UnitPoint::LEADING, UnitPoint::TRAILING)
+                    .stop(0.6, Color::hex(0xEC4899)),
+            )
+            .frame(200.0, 48.0);
+        // the picture is made at the scale the layout runs at, the
+        // device's, as a window's runtime does
+        let runtime = Runtime::new();
+        runtime.set_device_scale(2.0);
+        let display = runtime.display_frame(&root, Size { width: 200.0, height: 48.0 });
+        let cpu = rasterize_with(&display, 400, 96, 2, Color::CANVAS, &PixelFont, &RawImages::default()).to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(400, 96).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_close(&gpu.read_rgba(), &cpu, 2, "gradient text");
+    }
+
     #[test]
     fn the_elliptical_wash_ramps_the_same_on_both_backends() {
         if !device_present() {
