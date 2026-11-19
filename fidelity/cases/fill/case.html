@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Filling the width</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { width: 300px; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; background: #f2f2f7; }
+      .full { align-self: stretch; display: flex; padding: 8px; background: #e8f0fe; }
+      .full.end { justify-content: flex-end; }
+      .capped { align-self: stretch; max-width: 200px; height: 20px; background: #3478f6; }
+      .share { align-self: stretch; display: flex; gap: 8px; }
+      .share > div { flex: 1 1 0; height: 24px; }
+      .share > .b { max-width: 60px; background: #af52de; }
+      .share > .a { background: #34c759; }
+      .short { width: 80px; height: 20px; background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column" data-fid="column">
+        <div class="full" data-fid="full"><span data-fid="full-text">Full width</span></div>
+        <div class="full end" data-fid="end"><span data-fid="end-text">Trailing</span></div>
+        <div class="capped" data-fid="capped"></div>
+        <div class="share" data-fid="share">
+          <div class="a" data-fid="share-a"></div>
+          <div class="b" data-fid="share-b"></div>
+        </div>
+        <div class="short" data-fid="short"></div>
+      </div>
+    </div>
+  </body>
+</html>

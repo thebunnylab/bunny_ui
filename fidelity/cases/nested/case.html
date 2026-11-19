@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=340" />
+    <title>Nested stacks</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 340px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 16px; }
+      .header { width: 360px; padding: 12px; display: flex; align-items: center; justify-content: space-between; background: #f2f2f7; }
+      .heading { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+      .title { font-size: 18px; font-weight: 600; }
+      .subtitle { font-size: 13px; color: #8e8e93; }
+      .action { width: 64px; height: 28px; background: #3478f6; }
+      .split { display: flex; align-items: flex-start; gap: 12px; }
+      .sidebar { display: flex; flex-direction: column; gap: 6px; padding: 10px; background: #e8f0fe; }
+      .nav { width: 60px; height: 20px; }
+      .main { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+      .centered { width: 300px; display: flex; flex-direction: column; align-items: center; gap: 6px; background: #f2f2f7; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+      .purple { background: #af52de; }
+      .gray { background: #8e8e93; }
+      .light { background: #c7c7cc; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="header" data-fid="header">
+          <div class="heading" data-fid="heading">
+            <span class="title" data-fid="title">Inbox</span>
+            <span class="subtitle" data-fid="subtitle">3 unread</span>
+          </div>
+          <div class="action" data-fid="action"></div>
+        </div>
+        <div class="split" data-fid="split">
+          <div class="sidebar" data-fid="sidebar">
+            <div class="nav blue" data-fid="nav-a"></div>
+            <div class="nav green" data-fid="nav-b"></div>
+            <div class="nav orange" data-fid="nav-c"></div>
+          </div>
+          <div class="main" data-fid="main">
+            <div class="purple" style="width: 200px; height: 40px" data-fid="hero"></div>
+            <div class="gray" style="width: 140px; height: 20px" data-fid="line-a"></div>
+            <div class="light" style="width: 170px; height: 20px" data-fid="line-b"></div>
+          </div>
+        </div>
+        <div class="centered" data-fid="centered">
+          <div class="blue" style="width: 120px; height: 20px" data-fid="c-wide"></div>
+          <div class="green" style="width: 60px; height: 20px" data-fid="c-narrow"></div>
+          <span data-fid="c-caption">Centered caption</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

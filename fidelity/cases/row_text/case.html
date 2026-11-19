@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Text in rows</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 16px; }
+      .setting { width: 320px; padding: 12px; display: flex; justify-content: space-between; align-items: center; background: #f2f2f7; }
+      .muted { color: #8e8e93; }
+      .message { width: 320px; padding: 12px; display: flex; align-items: flex-start; gap: 12px; background: #f2f2f7; }
+      .avatar { flex: none; width: 40px; height: 40px; background: #3478f6; }
+      .body { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+      .name { font-weight: 600; }
+      .text { font-size: 14px; color: #8e8e93; }
+      .titled { width: 220px; display: flex; align-items: center; gap: 8px; background: #e8f0fe; }
+      .clip { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tag { flex: none; width: 40px; height: 20px; background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="setting" data-fid="setting">
+          <span data-fid="setting-name">Wi-Fi</span>
+          <span class="muted" data-fid="setting-value">Home</span>
+        </div>
+        <div class="message" data-fid="message">
+          <div class="avatar" data-fid="avatar"></div>
+          <div class="body" data-fid="body">
+            <span class="name" data-fid="name">Ana Souza</span>
+            <span class="text" data-fid="text">The cabin is booked for Saturday; bring boots, the trail is still wet.</span>
+          </div>
+        </div>
+        <div class="titled" data-fid="titled">
+          <span class="clip" data-fid="clipped">A very long title that will not fit</span>
+          <div class="tag" data-fid="tag"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

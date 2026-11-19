@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Fixed boxes wider than their row</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 40px; }
+      .track { width: 240px; display: flex; gap: 8px; background: #f2f2f7; }
+      .track.middle { justify-content: center; }
+      .fixed { flex: none; height: 24px; }
+      .w100 { width: 100px; }
+      .w160 { width: 160px; }
+      .grow { flex: 1 1 0; min-width: 0; height: 24px; background: #34c759; }
+      .stack { width: 120px; height: 60px; display: flex; flex-direction: column; align-items: center; gap: 4px; background: #f2f2f7; }
+      .tall { flex: none; width: 80px; height: 30px; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="track" data-fid="start">
+          <div class="fixed w100 blue" data-fid="start-a"></div>
+          <div class="fixed w100 green" data-fid="start-b"></div>
+          <div class="fixed w100 orange" data-fid="start-c"></div>
+        </div>
+        <div class="track middle" data-fid="middle">
+          <div class="fixed w100 blue" data-fid="middle-a"></div>
+          <div class="fixed w100 green" data-fid="middle-b"></div>
+          <div class="fixed w100 orange" data-fid="middle-c"></div>
+        </div>
+        <div class="track" data-fid="squeeze">
+          <div class="fixed w160 blue" data-fid="wide-a"></div>
+          <div class="grow" data-fid="squeezed"></div>
+          <div class="fixed w100 orange" data-fid="wide-b"></div>
+        </div>
+        <div class="stack" data-fid="column">
+          <div class="tall blue" data-fid="tall-a"></div>
+          <div class="tall green" data-fid="tall-b"></div>
+          <div class="tall orange" data-fid="tall-c"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
