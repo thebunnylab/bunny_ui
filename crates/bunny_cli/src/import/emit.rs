@@ -154,7 +154,12 @@ impl TextStyle {
             size: node.px("font-size"),
             weight: node.css("font-weight").parse().unwrap_or(400),
             italic: node.css("font-style") != "normal" && !node.css("font-style").is_empty(),
-            color: css::color(node.css("color")),
+            // the ink the letters are painted in: their fill, which is the
+            // color unless the page set it apart; a fill with no alpha
+            // shows what the box cuts out with them, a ramp
+            color: css::color(node.css("-webkit-text-fill-color"))
+                .or_else(|| css::color(node.css("color")))
+                .filter(|fill| fill.a > 0.0),
             family: node.css("font-family").split(',').next().unwrap_or("").trim().trim_matches('"').to_owned(),
             tracking: node.px("letter-spacing"),
             line_height: css::px(node.css("line-height")),
@@ -462,14 +467,36 @@ impl Writer<'_> {
         let ground = css::color(node.css("background-color")).filter(|ground| !ground.invisible());
         let images = css::images(node.css("background-image"));
         let rect = node.rect;
-        if let Some(ground) = ground {
-            let _ = write!(view, "\n.background_color({})", ground.code());
-        }
-        if node.css("background-clip") == "text" || node.css("-webkit-text-fill-color").contains("0)") {
-            self.gap(node, "background-clip: text", "gradient text drawn in the text's own ink");
+        if node.css("background-clip") == "text" {
+            // the box's ground cut to its text: the letters' ink
+            match images.first() {
+                Some(Image::Url(url)) => self.gap(node, "background-clip: text", format!("a picture cut to the text: {url}")),
+                Some(layer) => {
+                    if let Some(ramp) = self.ramp_code(node, layer) {
+                        let _ = write!(view, "\n.foreground_gradient({ramp})");
+                    }
+                }
+                None => {
+                    if let Some(ground) = ground {
+                        let _ = write!(view, "\n.foreground_color({})", ground.code());
+                    }
+                }
+            }
         } else {
+            if let Some(ground) = ground {
+                let _ = write!(view, "\n.background_color({})", ground.code());
+            }
             for layer in images.iter().rev() {
-                self.background_image(node, layer, view);
+                if let Image::Url(url) = layer {
+                    match self.picture(url) {
+                        Some(picture) => {
+                            let _ = write!(view, "\n.background(UnitPoint::CENTER, image({picture}()).resizable().aspect_ratio(ContentMode::Fill).clipped())");
+                        }
+                        None => self.gap(node, "background-image: url", url.clone()),
+                    }
+                } else if let Some(ramp) = self.ramp_code(node, layer) {
+                    let _ = write!(view, "\n.background_gradient({ramp})");
+                }
             }
         }
         if images.len() > 1 {
@@ -529,7 +556,8 @@ impl Writer<'_> {
         }
     }
 
-    fn background_image(&mut self, node: &Node, layer: &Image, view: &mut String) {
+    /// A gradient layer as bunny writes it (a picture is no ramp).
+    fn ramp_code(&mut self, node: &Node, layer: &Image) -> Option<String> {
         match layer {
             Image::Linear { degrees, stops, repeating } => {
                 if *repeating {
@@ -541,12 +569,12 @@ impl Writer<'_> {
                 let (dx, dy) = (radians.sin(), -radians.cos());
                 let (w, h) = (node.rect.w.max(1.0), node.rect.h.max(1.0));
                 let length = (w * dx).abs() + (h * dy).abs();
-                let Some(ramp) = ramp(stops, length) else { return };
+                let ramp = ramp(stops, length)?;
                 let (sx, sy) = (0.5 - dx * length / 2.0 / w, 0.5 - dy * length / 2.0 / h);
                 let (ex, ey) = (0.5 + dx * length / 2.0 / w, 0.5 + dy * length / 2.0 / h);
-                let _ = write!(
-                    view,
-                    "\n.background_gradient(Gradient::linear({}, {}).direction(UnitPoint {{ x: {}, y: {} }}, UnitPoint {{ x: {}, y: {} }}){})",
+                self.crowded(node, &ramp);
+                Some(format!(
+                    "Gradient::linear({}, {}).direction(UnitPoint {{ x: {}, y: {} }}, UnitPoint {{ x: {}, y: {} }}){}",
                     ramp.from.code(),
                     ramp.to.code(),
                     num(sx),
@@ -554,8 +582,7 @@ impl Writer<'_> {
                     num(ex),
                     num(ey),
                     ramp.stops_code()
-                );
-                self.crowded(node, &ramp);
+                ))
             }
             Image::Radial { shape, stops, repeating } => {
                 if *repeating {
@@ -565,17 +592,15 @@ impl Writer<'_> {
                     self.gap(node, "radial-gradient: shape", shape.clone());
                 }
                 // the rings reach the farthest corner from the centre
-                let Some(ramp) = ramp(stops, (node.rect.w / 2.0).hypot(node.rect.h / 2.0)) else { return };
-                let _ = write!(view, "\n.background_gradient(Gradient::radial({}, {}){})", ramp.from.code(), ramp.to.code(), ramp.stops_code());
+                let ramp = ramp(stops, (node.rect.w / 2.0).hypot(node.rect.h / 2.0))?;
                 self.crowded(node, &ramp);
+                Some(format!("Gradient::radial({}, {}){}", ramp.from.code(), ramp.to.code(), ramp.stops_code()))
             }
-            Image::Conic => self.gap(node, "conic-gradient", "not drawn"),
-            Image::Url(url) => match self.picture(url) {
-                Some(picture) => {
-                    let _ = write!(view, "\n.background(UnitPoint::CENTER, image({picture}()).resizable().aspect_ratio(ContentMode::Fill).clipped())");
-                }
-                None => self.gap(node, "background-image: url", url.clone()),
-            },
+            Image::Conic => {
+                self.gap(node, "conic-gradient", "not drawn");
+                None
+            }
+            Image::Url(_) => None,
         }
     }
 
