@@ -431,8 +431,12 @@ impl Writer<'_> {
             let _ = write!(view, "\n.test_id({})", quote(&node.id));
             self.named.insert(node.id.clone());
         }
-        // moved off its place — a translation, a relative position — after
-        // its name, so the name is found where the box is drawn
+        // turned and moved off its place — a transform, a relative
+        // position — after its name, so the name is found where the box
+        // is drawn
+        if let Some(turn) = rotation(node) {
+            view.push_str(&turn);
+        }
         let (mut dx, mut dy) = css::transform(node.css("transform")).ok().flatten().map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f));
         // a box drawn under its clip at a scrolled position: its content
         // moved by the scroll (bunny's clip does not scroll)
@@ -642,32 +646,16 @@ impl Writer<'_> {
         match css::transform(node.css("transform")) {
             Ok(None) => {}
             Ok(Some(matrix)) => {
-                let degrees = matrix.degrees();
                 let (sx, sy) = matrix.scale();
-                if degrees.abs() > 0.01 {
-                    let quarter = (degrees / 90.0).round();
-                    if (degrees - quarter * 90.0).abs() < 0.01 && quarter.rem_euclid(4.0) != 0.0 {
-                        let quarters = quarter.rem_euclid(4.0);
-                        let turn = if (quarters - 1.0).abs() < 0.5 {
-                            "QuarterTurn::Clockwise"
-                        } else if (quarters - 2.0).abs() < 0.5 {
-                            "QuarterTurn::Half"
-                        } else {
-                            "QuarterTurn::Counterclockwise"
-                        };
-                        let _ = write!(view, "\n.quarter_turn({turn})");
-                    } else {
-                        self.gap(node, "transform: rotate", format!("{}deg", num(degrees)));
-                    }
-                }
                 if (sx - 1.0).abs() > 0.001 || (sy - 1.0).abs() > 0.001 {
                     self.gap(node, "transform: scale", format!("{} {}", num(sx), num(sy)));
                 }
                 if matrix.shear().abs() > 0.001 {
                     self.gap(node, "transform: skew", node.css("transform").to_owned());
                 }
-                // a translation is the box's `.offset`, written after its
-                // name (`Writer::dressed`)
+                // a turn and a translation are the box's
+                // `.rotation_effect` and `.offset`, written after its name
+                // (`Writer::dressed`)
             }
             Err(text) => self.gap(node, "transform: 3d", text),
         }
@@ -1341,6 +1329,25 @@ impl Writer<'_> {
     }
 }
 
+/// A CSS transform's turn: `SwiftUI`'s rotation effect about the
+/// transform's origin, which turns the picture and never the layout.
+fn rotation(node: &Node) -> Option<String> {
+    let degrees = css::transform(node.css("transform")).ok().flatten()?.degrees();
+    if degrees.abs() <= 0.01 {
+        return None;
+    }
+    let origin: Vec<f64> = node.css("transform-origin").split_whitespace().filter_map(css::px).collect();
+    // a pseudo-element's box is not reported; its computed size stands in
+    let extent = |reported: f64, property: &str| if reported > 0.0 { Some(reported) } else { css::px(node.size(property)).filter(|side| *side > 0.0) };
+    let size = extent(node.rect.w, "width").zip(extent(node.rect.h, "height"));
+    Some(match (origin.as_slice(), size) {
+        ([x, y, ..], Some((w, h))) if ((x / w) - 0.5).abs() > 1e-3 || ((y / h) - 0.5).abs() > 1e-3 => {
+            format!("\n.rotation_effect_at(Angle::degrees({}), UnitPoint {{ x: {}, y: {} }})", num(degrees), num(x / w), num(y / h))
+        }
+        _ => format!("\n.rotation_effect(Angle::degrees({}))", num(degrees)),
+    })
+}
+
 /// The view with `.offset(x, y)` around it, its name inside: the
 /// offset moves the frame the named view is placed in, so the view is
 /// found where it is drawn, on both roads.
@@ -1525,6 +1532,26 @@ mod tests {
     #[test]
     fn a_picture_path_is_written_from_the_module() {
         assert_eq!(relative(Path::new("/a/fidelity/cases/app"), Path::new("/a/fidelity/assets/x.png")), "../../assets/x.png");
+    }
+
+    /// A CSS turn is the view's rotation effect, about the transform's
+    /// origin as a fraction of the box — a pseudo-element's computed size
+    /// when the page reports no box for it.
+    #[test]
+    fn a_turn_is_a_rotation_effect_about_its_origin() {
+        let turned = |w: f64, transform: &str, origin: &str| {
+            let mut node = Node { rect: Rect { x: 0.0, y: 0.0, w, h: 20.0 }, ..Node::default() };
+            node.style.insert("transform".to_owned(), transform.to_owned());
+            node.style.insert("transform-origin".to_owned(), origin.to_owned());
+            node.sizes.insert("width".to_owned(), "40px".to_owned());
+            node.sizes.insert("height".to_owned(), "20px".to_owned());
+            rotation(&node)
+        };
+        let quarter = "matrix(0, 1, -1, 0, 0, 0)";
+        assert_eq!(turned(40.0, quarter, "20px 10px").as_deref(), Some("\n.rotation_effect(Angle::degrees(90.0))"));
+        assert_eq!(turned(40.0, quarter, "0px 0px").as_deref(), Some("\n.rotation_effect_at(Angle::degrees(90.0), UnitPoint { x: 0.0, y: 0.0 })"));
+        assert_eq!(turned(0.0, quarter, "20px 10px").as_deref(), Some("\n.rotation_effect(Angle::degrees(90.0))"), "a pseudo-element");
+        assert_eq!(turned(40.0, "matrix(1, 0, 0, 1, 5, 0)", "20px 10px"), None, "a translation alone");
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub const SCRIPT: &str = r"(() => {
     'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
     'border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius',
     'background-color', 'background-image', 'background-size', 'background-position', 'background-repeat', 'background-clip',
-    'box-shadow', 'opacity', 'overflow-x', 'overflow-y', 'transform', 'filter', 'backdrop-filter', 'mix-blend-mode',
+    'box-shadow', 'opacity', 'overflow-x', 'overflow-y', 'transform', 'transform-origin', 'filter', 'backdrop-filter', 'mix-blend-mode',
     'clip-path', 'mask-image', 'outline-width', 'outline-style', 'outline-color', 'outline-offset',
     'color', 'font-size', 'font-weight', 'font-style', 'font-family', 'font-variant', 'line-height', 'letter-spacing',
     'text-align', 'text-transform', 'text-decoration-line', 'text-decoration-color', 'text-decoration-style',
@@ -61,15 +61,25 @@ pub const SCRIPT: &str = r"(() => {
     const sizes = { width: cs.width, height: cs.height };
     return { kind: which === '::before' ? 'before' : 'after', style: styleOf(cs), sizes };
   };
+  // a transform turns, scales and moves the picture, never the layout:
+  // every box is read with the transforms off, the boxes inside a turned
+  // one included, and the view's `.rotation_effect` and `.offset` put
+  // them back
+  const turns = new Map();
+  for (const el of [document.body, ...document.body.querySelectorAll('*')]) {
+    const transform = getComputedStyle(el).transform;
+    if (transform !== 'none') turns.set(el, transform);
+  }
+  const flat = document.createElement('style');
+  flat.textContent = '*{transform:none!important}';
+  document.head.appendChild(flat);
   const walk = (el) => {
     const cs = getComputedStyle(el);
     if (cs.display === 'none') return null;
     const tag = el.tagName.toLowerCase();
     const node = { kind: 'element', tag, id: slug(el), rect: box(el.getBoundingClientRect()), style: styleOf(cs),
       sizes: sizesOf(el), attrs: {}, children: [] };
-    // a transformed box reports its transformed bounds; its layout size
-    // is the box before the transform
-    if (cs.transform !== 'none' && el.offsetWidth !== undefined) node.layout = [el.offsetWidth, el.offsetHeight];
+    if (turns.has(el)) node.style.transform = turns.get(el);
     for (const a of ['src', 'alt', 'type', 'value', 'placeholder', 'href', 'dir', 'checked', 'disabled', 'min', 'max', 'low', 'high', 'open', 'colspan', 'rowspan'])
       if (el.hasAttribute(a)) node.attrs[a] = el.getAttribute(a) || 'true';
     // a scrolled box: where its content stands at load (a snap, a
@@ -100,6 +110,7 @@ pub const SCRIPT: &str = r"(() => {
     return node;
   };
   const root = walk(document.body);
+  flat.remove();
   return JSON.stringify({ root, html: '<!doctype html>\n' + document.documentElement.outerHTML, width: innerWidth, height: innerHeight });
 })()";
 
@@ -233,17 +244,6 @@ fn node(value: &Value) -> Node {
     let at = |index: usize| rect.get(index).and_then(as_f64).unwrap_or(0.0);
     let mut rect = Rect { x: at(0), y: at(1), w: at(2), h: at(3) };
     let style = strings(value.get("style"));
-    // a transformed box: its layout size, centred where the transform
-    // left it (the default origin is the centre), less the translation —
-    // the box the layout gave it, which the view's `.offset` moves again
-    if let [w, h] = value.get("layout").map(Value::as_array).unwrap_or_default() {
-        let (w, h) = (as_f64(w).unwrap_or(rect.w), as_f64(h).unwrap_or(rect.h));
-        let (e, f) = style
-            .get("transform")
-            .and_then(|transform| super::css::transform(transform).ok().flatten())
-            .map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f));
-        rect = Rect { x: rect.x + (rect.w - w) / 2.0 - e, y: rect.y + (rect.h - h) / 2.0 - f, w, h };
-    }
     // a box moved by `position: relative` stands, in the layout, where it
     // would have been
     if style.get("position").is_some_and(|position| position == "relative") {
