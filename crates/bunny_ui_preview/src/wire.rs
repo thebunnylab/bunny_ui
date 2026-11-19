@@ -30,7 +30,10 @@
 //! one keeps tag 6 and its bytes, and a tool that predates the tag reads a
 //! frame that draws one as malformed. A pane of glass faded under an
 //! opacity grew the draws once more (`Draw` tag 10, its opacity after
-//! the `Backdrop` bytes): a whole pane keeps tag 2 and its bytes.
+//! the `Backdrop` bytes): a whole pane keeps tag 2 and its bytes. A ramp
+//! with colors between its ends grew the gradients the same way
+//! (`GradientPaint` and `Gradient` tags 2 and 3, their stops after the
+//! two-color bytes): a two-color ramp keeps tags 0 and 1 and its bytes.
 
 use std::fmt;
 
@@ -179,18 +182,71 @@ pub struct Edges {
 }
 
 /// A gradient resolved to a rectangle — what a `Draw::Gradient` paints.
+/// One with stops between its ends travels as a tag of its own (2 for
+/// the rings, 3 for the line), so a two-color ramp is the bytes it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GradientPaint {
-    Radial { center: Point, start: f64, end: f64, aspect: f64, inner: Color, outer: Color },
-    Linear { start: Point, end: Point, from: Color, to: Color },
+    Radial { center: Point, start: f64, end: f64, aspect: f64, inner: Color, outer: Color, stops: Stops },
+    Linear { start: Point, end: Point, from: Color, to: Color, stops: Stops },
 }
 
 /// A gradient as an app wrote it, in unit coordinates — what a vector
-/// icon's ink may hold.
+/// icon's ink may hold. Its stops travel as [`GradientPaint`]'s do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gradient {
-    Radial { center: Point, start: f64, end: Option<f64>, aspect: f64, inner: Color, outer: Color },
-    Linear { start: Point, end: Point, from: Color, to: Color },
+    Radial { center: Point, start: f64, end: Option<f64>, aspect: f64, inner: Color, outer: Color, stops: Stops },
+    Linear { start: Point, end: Point, from: Color, to: Color, stops: Stops },
+}
+
+/// The colors a ramp passes through between its two ends, each at its
+/// location along the ramp (0 its start, 1 its end), in order — at most
+/// [`Stops::MOST`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stops {
+    len: u8,
+    stops: [(f32, Color); Stops::MOST],
+}
+
+impl Stops {
+    pub const MOST: usize = 6;
+    pub const NONE: Stops = Stops { len: 0, stops: [(0.0, Color { r: 0, g: 0, b: 0, a: 0 }); Stops::MOST] };
+
+    /// The stop after the others; one past [`Stops::MOST`] is refused.
+    pub fn push(&mut self, location: f32, color: Color) -> bool {
+        let Some(slot) = self.stops.get_mut(usize::from(self.len)) else { return false };
+        *slot = (location, color);
+        self.len += 1;
+        true
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (f32, Color)> + '_ {
+        self.stops[..usize::from(self.len)].iter().copied()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn put(&self, out: &mut Vec<u8>) {
+        out.u8(self.len);
+        for (location, color) in self.iter() {
+            out.f32(location);
+            color.put(out);
+        }
+    }
+
+    fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        let count = c.u8()?;
+        let mut stops = Stops::NONE;
+        for _ in 0..count {
+            let (location, color) = (c.f32()?, Color::get(c)?);
+            if !stops.push(location, color) {
+                return Err(Malformed::BadTag { what: "Stops", tag: count });
+            }
+        }
+        Ok(stops)
+    }
 }
 
 /// The liquid-glass pane's parameters.
@@ -1221,35 +1277,48 @@ impl Wire for Edges {
 impl Wire for GradientPaint {
     fn put(&self, out: &mut Vec<u8>) {
         match self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                out.u8(0);
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                out.u8(if stops.is_empty() { 0 } else { 2 });
                 center.put(out);
                 out.f64(*start);
                 out.f64(*end);
                 out.f64(*aspect);
                 inner.put(out);
                 outer.put(out);
+                if !stops.is_empty() {
+                    stops.put(out);
+                }
             }
-            GradientPaint::Linear { start, end, from, to } => {
-                out.u8(1);
+            GradientPaint::Linear { start, end, from, to, stops } => {
+                out.u8(if stops.is_empty() { 1 } else { 3 });
                 start.put(out);
                 end.put(out);
                 from.put(out);
                 to.put(out);
+                if !stops.is_empty() {
+                    stops.put(out);
+                }
             }
         }
     }
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         match c.u8()? {
-            0 => Ok(GradientPaint::Radial {
+            tag @ (0 | 2) => Ok(GradientPaint::Radial {
                 center: Point::get(c)?,
                 start: c.f64()?,
                 end: c.f64()?,
                 aspect: c.f64()?,
                 inner: Color::get(c)?,
                 outer: Color::get(c)?,
+                stops: if tag == 2 { Stops::get(c)? } else { Stops::NONE },
             }),
-            1 => Ok(GradientPaint::Linear { start: Point::get(c)?, end: Point::get(c)?, from: Color::get(c)?, to: Color::get(c)? }),
+            tag @ (1 | 3) => Ok(GradientPaint::Linear {
+                start: Point::get(c)?,
+                end: Point::get(c)?,
+                from: Color::get(c)?,
+                to: Color::get(c)?,
+                stops: if tag == 3 { Stops::get(c)? } else { Stops::NONE },
+            }),
             tag => Err(Malformed::BadTag { what: "GradientPaint", tag }),
         }
     }
@@ -1258,35 +1327,48 @@ impl Wire for GradientPaint {
 impl Wire for Gradient {
     fn put(&self, out: &mut Vec<u8>) {
         match self {
-            Gradient::Radial { center, start, end, aspect, inner, outer } => {
-                out.u8(0);
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => {
+                out.u8(if stops.is_empty() { 0 } else { 2 });
                 center.put(out);
                 out.f64(*start);
                 out.option(end.as_ref(), |out, end| out.f64(*end));
                 out.f64(*aspect);
                 inner.put(out);
                 outer.put(out);
+                if !stops.is_empty() {
+                    stops.put(out);
+                }
             }
-            Gradient::Linear { start, end, from, to } => {
-                out.u8(1);
+            Gradient::Linear { start, end, from, to, stops } => {
+                out.u8(if stops.is_empty() { 1 } else { 3 });
                 start.put(out);
                 end.put(out);
                 from.put(out);
                 to.put(out);
+                if !stops.is_empty() {
+                    stops.put(out);
+                }
             }
         }
     }
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         match c.u8()? {
-            0 => Ok(Gradient::Radial {
+            tag @ (0 | 2) => Ok(Gradient::Radial {
                 center: Point::get(c)?,
                 start: c.f64()?,
                 end: c.option(|c| c.f64())?,
                 aspect: c.f64()?,
                 inner: Color::get(c)?,
                 outer: Color::get(c)?,
+                stops: if tag == 2 { Stops::get(c)? } else { Stops::NONE },
             }),
-            1 => Ok(Gradient::Linear { start: Point::get(c)?, end: Point::get(c)?, from: Color::get(c)?, to: Color::get(c)? }),
+            tag @ (1 | 3) => Ok(Gradient::Linear {
+                start: Point::get(c)?,
+                end: Point::get(c)?,
+                from: Color::get(c)?,
+                to: Color::get(c)?,
+                stops: if tag == 3 { Stops::get(c)? } else { Stops::NONE },
+            }),
             tag => Err(Malformed::BadTag { what: "Gradient", tag }),
         }
     }
@@ -2423,6 +2505,33 @@ mod tests {
         let mut big = Reader::new();
         big.feed(&[0xff, 0xff, 0xff, 0xff, 1]);
         assert!(matches!(big.pull(), Err(Malformed::Oversized { .. })));
+    }
+
+    /// A ramp with colors between its ends travels under tags of its
+    /// own, its stops after the two-color bytes; a two-color ramp keeps
+    /// its tags and its bytes.
+    #[test]
+    fn a_ramp_with_stops_grows_the_tags_and_a_plain_one_keeps_its_bytes() {
+        let ink = |r: u8| Color { r, g: 0, b: 0, a: 255 };
+        let plain = GradientPaint::Linear { start: Point { x: 0.0, y: 0.0 }, end: Point { x: 0.0, y: 10.0 }, from: ink(1), to: ink(2), stops: Stops::NONE };
+        let mut stops = Stops::NONE;
+        assert!(stops.push(0.25, ink(3)) && stops.push(0.75, ink(4)));
+        let striped = GradientPaint::Linear { start: Point { x: 0.0, y: 0.0 }, end: Point { x: 0.0, y: 10.0 }, from: ink(1), to: ink(2), stops };
+        let (mut two, mut four) = (Vec::new(), Vec::new());
+        plain.put(&mut two);
+        striped.put(&mut four);
+        assert_eq!(two[0], 1, "a plain line keeps tag 1");
+        assert_eq!(four[0], 3);
+        assert_eq!(four[1..two.len()], two[1..], "the stops follow the two-color bytes");
+        assert_eq!(four.len(), two.len() + 1 + 2 * (4 + 4));
+        let read = |bytes: &[u8]| GradientPaint::get(&mut Cursor { bytes, at: 0, kind: kind::FRAME });
+        assert_eq!(read(&four), Ok(striped));
+        assert_eq!(read(&two), Ok(plain));
+        let rings = Gradient::Radial { center: Point { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: ink(1), outer: ink(2), stops };
+        let mut out = Vec::new();
+        rings.put(&mut out);
+        assert_eq!(out[0], 2);
+        assert_eq!(Gradient::get(&mut Cursor { bytes: &out, at: 0, kind: kind::FRAME }), Ok(rings));
     }
 
     #[test]

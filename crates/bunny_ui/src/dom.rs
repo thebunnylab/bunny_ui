@@ -2537,19 +2537,25 @@ fn look_hash(node: &DomNode) -> u64 {
     style.group.hash(&mut hasher);
     style.pass_through.hash(&mut hasher);
     match &style.gradient {
-        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer }) => {
+        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. }) => {
             1u8.hash(&mut hasher);
             [center.x.to_bits(), center.y.to_bits(), start.to_bits(), end.unwrap_or(-1.0).to_bits(), aspect.to_bits()].hash(&mut hasher);
             hash_color(Some(*inner), &mut hasher);
             hash_color(Some(*outer), &mut hasher);
         }
-        Some(crate::layout::Gradient::Linear { start, end, from, to }) => {
+        Some(crate::layout::Gradient::Linear { start, end, from, to, .. }) => {
             2u8.hash(&mut hasher);
             [start.x.to_bits(), start.y.to_bits(), end.x.to_bits(), end.y.to_bits()].hash(&mut hasher);
             hash_color(Some(*from), &mut hasher);
             hash_color(Some(*to), &mut hasher);
         }
         None => 0u8.hash(&mut hasher),
+    }
+    // only a ramp with stops between its ends adds to the hash: a
+    // two-color look keeps the rule it had
+    for (location, color) in style.gradient.iter().flat_map(|gradient| gradient.stops().iter()) {
+        location.to_bits().hash(&mut hasher);
+        hash_color(Some(color), &mut hasher);
     }
     match &style.glass {
         Some(glass) => {
@@ -4510,8 +4516,9 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// box's own offset (`.offset`, f32 x + f32 y, CSS `translate`), bit 2
 /// its turn (`.rotation_effect`, f32 degrees clockwise + f32 x + f32 y of
 /// the pivot as a fraction of the box, CSS `rotate` about a
-/// `transform-origin`) — the first mask's thirty-two bits were all taken.
-/// A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// `transform-origin`), bit 3 the colors its ramp passes through (u8
+/// count, then per stop f32 location along the ramp + u32 rgba) — the
+/// first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
 /// its first child alone, or by its last — `grid-template: auto 0fr /
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
@@ -5141,7 +5148,7 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     }
     if let Some(gradient) = style.gradient {
         match gradient {
-            crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer } => {
+            crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. } => {
                 out.push(0);
                 push_f32(out, center.x);
                 push_f32(out, center.y);
@@ -5153,7 +5160,7 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
                 push_u32(out, pack_color(inner));
                 push_u32(out, pack_color(outer));
             }
-            crate::layout::Gradient::Linear { start, end, from, to } => {
+            crate::layout::Gradient::Linear { start, end, from, to, .. } => {
                 out.push(1);
                 push_f32(out, start.x);
                 push_f32(out, start.y);
@@ -5219,9 +5226,11 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         });
     }
     // the first mask is full: what came after rides a second one, a byte
+    let stops = style.gradient.as_ref().map(crate::layout::Gradient::stops).filter(|stops| !stops.is_empty());
     let more = u8::from(style.shadow_offset.is_some())
         | u8::from(style.offset.is_some()) << 1
-        | u8::from(style.rotation.is_some()) << 2;
+        | u8::from(style.rotation.is_some()) << 2
+        | u8::from(stops.is_some()) << 3;
     out.push(more);
     for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
         push_f32(out, x);
@@ -5231,6 +5240,14 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         push_f32(out, degrees);
         push_f32(out, x);
         push_f32(out, y);
+    }
+    if let Some(stops) = stops {
+        #[allow(clippy::cast_possible_truncation, reason = "at most Stops::MOST")]
+        out.push(stops.len() as u8);
+        for (location, color) in stops.iter() {
+            push_f32(out, location);
+            push_u32(out, pack_color(color));
+        }
     }
 }
 
@@ -8096,6 +8113,7 @@ mod tests {
                     end: crate::layout::UnitPoint { x: 1.0, y: 1.0 },
                     from: Color::BLACK,
                     to: Color::WHITE,
+                    stops: crate::layout::Stops::NONE,
                 })
             },
             |props| props.background_hovered = Some(Color::BLACK),
@@ -8200,6 +8218,7 @@ mod tests {
                 end: crate::layout::UnitPoint { x: 1.0, y: 0.5 },
                 from: Color::BLACK,
                 to: Color::WHITE,
+                stops: crate::layout::Stops::NONE,
             }),
             hover_background: Some(Color::hex(0x223344)),
             pressed_background: Some(Color::hex(0x334455)),
@@ -8420,6 +8439,28 @@ mod tests {
             assert!(glue.contains(bit), "glue_dom.js reads {bit}");
         }
         assert!(glue.contains("stroke-dasharray"), "glue_dom.js hands a dashed pen its rhythm");
+    }
+
+    /// A ramp's stops ride the second mask (bit 3): their count, then
+    /// each stop's location and color. A two-color ramp sets no bit, and
+    /// its look keeps the hash it had.
+    #[test]
+    fn a_ramps_stops_ride_the_second_mask() {
+        let ramp = crate::layout::Gradient::linear(Color::BLACK, Color::WHITE);
+        let look = |gradient| DomLook { gradient: Some(gradient), ..DomLook::NONE };
+        let mut plain = Vec::new();
+        encode_style(&mut plain, &look(ramp));
+        assert_eq!(plain.last(), Some(&0), "a two-color ramp leaves the second mask empty");
+        let green = Color::rgb(0, 255, 0);
+        let mut striped = Vec::new();
+        encode_style(&mut striped, &look(ramp.stop(0.5, green)));
+        let mut tail = vec![1 << 3, 1];
+        tail.extend_from_slice(&0.5f32.to_le_bytes());
+        tail.extend_from_slice(&pack_color(green).to_le_bytes());
+        assert!(striped.ends_with(&tail), "{striped:?}");
+        assert_eq!(striped.len(), plain.len() + 1 + 8);
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("more & 8"), "glue_dom.js reads the stops");
     }
 
     #[test]

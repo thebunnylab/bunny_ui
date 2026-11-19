@@ -153,15 +153,38 @@ impl From<wire::Edges> for layout::Edges {
     }
 }
 
+fn wire_stops(stops: &layout::Stops) -> wire::Stops {
+    let mut out = wire::Stops::NONE;
+    for (location, color) in stops.iter() {
+        #[allow(clippy::cast_possible_truncation, reason = "the stops are f32 on both sides")]
+        out.push(location as f32, color.into());
+    }
+    out
+}
+
+fn layout_stops(stops: &wire::Stops, from: layout::Color, to: layout::Color) -> layout::Stops {
+    stops.iter().fold(layout::Stops::NONE, |out, (location, color)| out.with(f64::from(location), color.into(), from, to))
+}
+
 impl From<layout::GradientPaint> for wire::GradientPaint {
     fn from(g: layout::GradientPaint) -> Self {
         match g {
-            layout::GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                wire::GradientPaint::Radial { center: center.into(), start, end, aspect, inner: inner.into(), outer: outer.into() }
-            }
-            layout::GradientPaint::Linear { start, end, from, to } => {
-                wire::GradientPaint::Linear { start: start.into(), end: end.into(), from: from.into(), to: to.into() }
-            }
+            layout::GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => wire::GradientPaint::Radial {
+                center: center.into(),
+                start,
+                end,
+                aspect,
+                inner: inner.into(),
+                outer: outer.into(),
+                stops: wire_stops(&stops),
+            },
+            layout::GradientPaint::Linear { start, end, from, to, stops } => wire::GradientPaint::Linear {
+                start: start.into(),
+                end: end.into(),
+                from: from.into(),
+                to: to.into(),
+                stops: wire_stops(&stops),
+            },
         }
     }
 }
@@ -169,12 +192,22 @@ impl From<layout::GradientPaint> for wire::GradientPaint {
 impl From<wire::GradientPaint> for layout::GradientPaint {
     fn from(g: wire::GradientPaint) -> Self {
         match g {
-            wire::GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                layout::GradientPaint::Radial { center: center.into(), start, end, aspect, inner: inner.into(), outer: outer.into() }
-            }
-            wire::GradientPaint::Linear { start, end, from, to } => {
-                layout::GradientPaint::Linear { start: start.into(), end: end.into(), from: from.into(), to: to.into() }
-            }
+            wire::GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => layout::GradientPaint::Radial {
+                center: center.into(),
+                start,
+                end,
+                aspect,
+                inner: inner.into(),
+                outer: outer.into(),
+                stops: layout_stops(&stops, inner.into(), outer.into()),
+            },
+            wire::GradientPaint::Linear { start, end, from, to, stops } => layout::GradientPaint::Linear {
+                start: start.into(),
+                end: end.into(),
+                from: from.into(),
+                to: to.into(),
+                stops: layout_stops(&stops, from.into(), to.into()),
+            },
         }
     }
 }
@@ -182,12 +215,22 @@ impl From<wire::GradientPaint> for layout::GradientPaint {
 impl From<layout::Gradient> for wire::Gradient {
     fn from(g: layout::Gradient) -> Self {
         match g {
-            layout::Gradient::Radial { center, start, end, aspect, inner, outer } => {
-                wire::Gradient::Radial { center: center.into(), start, end, aspect, inner: inner.into(), outer: outer.into() }
-            }
-            layout::Gradient::Linear { start, end, from, to } => {
-                wire::Gradient::Linear { start: start.into(), end: end.into(), from: from.into(), to: to.into() }
-            }
+            layout::Gradient::Radial { center, start, end, aspect, inner, outer, stops } => wire::Gradient::Radial {
+                center: center.into(),
+                start,
+                end,
+                aspect,
+                inner: inner.into(),
+                outer: outer.into(),
+                stops: wire_stops(&stops),
+            },
+            layout::Gradient::Linear { start, end, from, to, stops } => wire::Gradient::Linear {
+                start: start.into(),
+                end: end.into(),
+                from: from.into(),
+                to: to.into(),
+                stops: wire_stops(&stops),
+            },
         }
     }
 }
@@ -195,12 +238,22 @@ impl From<layout::Gradient> for wire::Gradient {
 impl From<wire::Gradient> for layout::Gradient {
     fn from(g: wire::Gradient) -> Self {
         match g {
-            wire::Gradient::Radial { center, start, end, aspect, inner, outer } => {
-                layout::Gradient::Radial { center: center.into(), start, end, aspect, inner: inner.into(), outer: outer.into() }
-            }
-            wire::Gradient::Linear { start, end, from, to } => {
-                layout::Gradient::Linear { start: start.into(), end: end.into(), from: from.into(), to: to.into() }
-            }
+            wire::Gradient::Radial { center, start, end, aspect, inner, outer, stops } => layout::Gradient::Radial {
+                center: center.into(),
+                start,
+                end,
+                aspect,
+                inner: inner.into(),
+                outer: outer.into(),
+                stops: layout_stops(&stops, inner.into(), outer.into()),
+            },
+            wire::Gradient::Linear { start, end, from, to, stops } => layout::Gradient::Linear {
+                start: start.into(),
+                end: end.into(),
+                from: from.into(),
+                to: to.into(),
+                stops: layout_stops(&stops, from.into(), to.into()),
+            },
         }
     }
 }
@@ -630,7 +683,7 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
             ResourceKind::Vector {
             verbs: verbs.iter().map(|verb| verb_to_wire(*verb)).collect(),
             paint: paint_to_wire(paint),
-            ink: match *ink {
+            ink: match **ink {
                 icon::Ink::Solid(color) => wire::Ink::Solid(color.into()),
                 icon::Ink::Ramp(gradient) => wire::Ink::Ramp(gradient.into()),
             },
@@ -705,10 +758,10 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             key,
             verbs: verbs.iter().map(|verb| verb_from_wire(*verb)).collect(),
             paint: paint_from_wire(*paint),
-            ink: match *ink {
+            ink: Rc::new(match *ink {
                 wire::Ink::Solid(color) => icon::Ink::Solid(color.into()),
                 wire::Ink::Ramp(gradient) => icon::Ink::Ramp(gradient.into()),
-            },
+            }),
             box_size: *box_size,
         },
         ResourceKind::Symbol { name, color, forced } => ImageSource::Symbol {

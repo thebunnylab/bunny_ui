@@ -78,7 +78,8 @@ pub enum Modifier {
 
     // MARK: - Visuals (pure data → `Styled` in the scene)
     BackgroundColor(Color),
-    BackgroundGradient(crate::layout::Gradient),
+    /// Boxed: a ramp carries its stops inline.
+    BackgroundGradient(Box<crate::layout::Gradient>),
     /// Whether the background lies over what is under it or replaces it.
     BackgroundBlend(crate::layout::BackgroundBlend),
     ForegroundColor(Color),
@@ -466,7 +467,7 @@ impl Modifier {
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
             Modifier::BackgroundBlend(blend) => format!(" [.backgroundBlend({blend:?})]"),
-            Modifier::BackgroundGradient(gradient) => match gradient {
+            Modifier::BackgroundGradient(gradient) => match **gradient {
                 crate::layout::Gradient::Radial { inner, outer, .. } => {
                     format!(" [.background(RadialGradient({inner} → {outer}))]")
                 }
@@ -1434,7 +1435,7 @@ pub(crate) fn apply(
         Modifier::BackgroundGradient(gradient) => wrap_styled(
             out,
             mark,
-            VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
+            VisualProps { gradient: Some(**gradient), ..VisualProps::default() },
         ),
         Modifier::BackgroundBlend(blend) => wrap_styled(
             out,

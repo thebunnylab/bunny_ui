@@ -574,6 +574,40 @@ const KIND_BASE = [
   "box-sizing:border-box;background:currentColor;border-radius:50%",
 ];
 
+// A ramp's CSS: the engine's geometry, each color between the ends at
+// its place along the ramp. The twin of the serializer's `css_gradient`.
+function rampImage({ kind, a, b, c, d, aspect, near, far }, stops) {
+  const between = (at) => stops.map(([location, color]) => `, ${color} ${at(location)}`).join("");
+  if (kind === 0 && aspect !== 1 && d > 0) {
+    // the ellipse: X radius on the wire, Y is X times the aspect
+    const inner = c / d;
+    return (
+      `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
+      `${a * 100}% ${b * 100}%, ${near} ${(inner * 100).toFixed(2)}%` +
+      between((t) => `${((inner + t * (1 - inner)) * 100).toFixed(2)}%`) +
+      `, ${far} 100%)`
+    );
+  }
+  if (kind === 0) {
+    const reach = d < 0 ? "farthest-corner" : `${d}px`;
+    const stop = d < 0 ? "100%" : `${d}px`;
+    const inside =
+      d < 0
+        ? between((t) => `calc(${((1 - t) * c).toFixed(2)}px + ${(t * 100).toFixed(2)}%)`)
+        : between((t) => `${(c + t * (d - c)).toFixed(2)}px`);
+    return `radial-gradient(circle ${reach} at ${a * 100}% ${b * 100}%, ${near} ${c}px${inside}, ${far} ${stop})`;
+  }
+  // CSS runs its line through the centre: the angle carries the
+  // direction (0deg points up, clockwise)
+  const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
+  if (stops.length === 0) return `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
+  return (
+    `linear-gradient(${degrees.toFixed(2)}deg, ${near} 0%` +
+    between((t) => `${(t * 100).toFixed(2)}%`) +
+    `, ${far} 100%)`
+  );
+}
+
 // The rules of one look: the base, then one per state. The twin of the
 // serializer's `rule_text` — a served page must agree with a mounted one.
 function lookRules(selector, kind, flags, style, layout, face) {
@@ -1136,31 +1170,13 @@ function applyPatches(view, length) {
     if (mask & 1024) style.ink = rgba(u32());
     if (mask & 2048) style.hoverInk = rgba(u32());
     if (mask & 4096) style.pressedInk = rgba(u32());
-    // a two-stop ramp: the geometry is the engine's, the pixels are
-    // the browser's
+    // a ramp: the geometry is the engine's, the pixels are the
+    // browser's. The colors between its ends come with the second mask
     if (mask & 8192) {
       const kind = u8();
       const [a, b, c, d] = [f32(), f32(), f32(), f32()];
       const aspect = kind === 0 ? f32() : 1;
-      const near = rgba(u32());
-      const far = rgba(u32());
-      if (kind === 0 && aspect !== 1 && d > 0) {
-        // the ellipse: X radius on the wire, Y is X times the aspect
-        style.image =
-          `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
-          `${a * 100}% ${b * 100}%, ${near} ${((c / d) * 100).toFixed(2)}%, ${far} 100%)`;
-      } else if (kind === 0) {
-        const reach = d < 0 ? "farthest-corner" : `${d}px`;
-        const stop = d < 0 ? "100%" : `${d}px`;
-        style.image =
-          `radial-gradient(circle ${reach} at ` +
-          `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`;
-      } else {
-        // CSS runs its line through the centre: the angle carries the
-        // direction (0deg points up, clockwise)
-        const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
-        style.image = `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
-      }
+      style.ramp = { kind, a, b, c, d, aspect, near: rgba(u32()), far: rgba(u32()) };
     }
     if (mask & 16384) style.clip = true;
     if (mask & 32768) text(u16());
@@ -1224,7 +1240,7 @@ function applyPatches(view, length) {
       const bands =
         `repeating-linear-gradient(${angle}deg, ${ink} 0 ${width}px, ` +
         `transparent ${width}px ${period}px)`;
-      style.image = style.image ? `${bands}, ${style.image}` : bands;
+      style.bands = bands;
     }
     // bit 30: a quarter turn — about the box's own corner where the
     // engine placed the children (0–2), the flow's writing-mode where
@@ -1238,6 +1254,11 @@ function applyPatches(view, length) {
     const shadowOffset = more & 1 ? [f32(), f32()] : [0, 0];
     if (more & 2) style.offset = [f32(), f32()];
     if (more & 4) style.rotation = [f32(), f32(), f32()];
+    const stops = [];
+    if (more & 8) for (let n = u8(); n > 0; n--) stops.push([f32(), rgba(u32())]);
+    // the bands lie over the ramp
+    const layers = [style.bands, style.ramp && rampImage(style.ramp, stops)].filter(Boolean);
+    if (layers.length !== 0) style.image = layers.join(", ");
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };

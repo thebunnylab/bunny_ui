@@ -1432,8 +1432,16 @@ fn css_font(font: &crate::text_engine::FontSpec) -> String {
 /// The glue's gradient lowering, mirrored: a proportional centre or
 /// line, a reach that spells farthest-corner when the box decides it.
 fn css_gradient(gradient: &crate::layout::Gradient) -> String {
+    // the colors between the two ends, each at the place `at` names for
+    // its location along the ramp
+    let between = |at: &dyn Fn(f64) -> String| -> String {
+        gradient.stops().iter().fold(String::new(), |mut out, (location, ink)| {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!(", {} {}", color(ink), at(location)));
+            out
+        })
+    };
     match gradient {
-        crate::layout::Gradient::Radial { center, start, end, inner, outer, aspect } => {
+        crate::layout::Gradient::Radial { center, start, end, inner, outer, aspect, stops } => {
             let reach = match end {
                 Some(radius) => px(*radius),
                 None => "farthest-corner".to_string(),
@@ -1445,30 +1453,51 @@ fn css_gradient(gradient: &crate::layout::Gradient) -> String {
             match end {
                 // the ellipse: the X radius is on the wire and the Y
                 // radius is that times the aspect
-                Some(radius) if *aspect != 1.0 && *radius > 0.0 => format!(
-                    "radial-gradient(ellipse {} {} at {}% {}%, {} {:.2}%, {} 100%)",
-                    px(*radius),
-                    px(radius * aspect),
-                    center.x * 100.0,
-                    center.y * 100.0,
-                    color(*inner),
-                    (start / radius) * 100.0,
-                    color(*outer),
-                ),
-                _ => format!(
-                    "radial-gradient(circle {reach} at {}% {}%, {} {}, {} {stop})",
-                    center.x * 100.0,
-                    center.y * 100.0,
-                    color(*inner),
-                    px(*start),
-                    color(*outer),
-                ),
+                Some(radius) if *aspect != 1.0 && *radius > 0.0 => {
+                    let near = start / radius;
+                    format!(
+                        "radial-gradient(ellipse {} {} at {}% {}%, {} {:.2}%{}, {} 100%)",
+                        px(*radius),
+                        px(radius * aspect),
+                        center.x * 100.0,
+                        center.y * 100.0,
+                        color(*inner),
+                        near * 100.0,
+                        between(&|location| format!("{:.2}%", (near + location * (1.0 - near)) * 100.0)),
+                        color(*outer),
+                    )
+                }
+                _ => {
+                    let inside = match end {
+                        Some(radius) if !stops.is_empty() => {
+                            between(&|location| format!("{:.2}px", (radius - start).mul_add(location, *start)))
+                        }
+                        _ => between(&|location| format!("calc({:.2}px + {:.2}%)", (1.0 - location) * start, location * 100.0)),
+                    };
+                    format!(
+                        "radial-gradient(circle {reach} at {}% {}%, {} {}{inside}, {} {stop})",
+                        center.x * 100.0,
+                        center.y * 100.0,
+                        color(*inner),
+                        px(*start),
+                        color(*outer),
+                    )
+                }
             }
         }
-        crate::layout::Gradient::Linear { start, end, from, to } => {
+        crate::layout::Gradient::Linear { start, end, from, to, stops } => {
             let degrees =
                 ((end.x - start.x).atan2(-(end.y - start.y))).to_degrees();
-            format!("linear-gradient({degrees:.2}deg, {}, {})", color(*from), color(*to))
+            if stops.is_empty() {
+                format!("linear-gradient({degrees:.2}deg, {}, {})", color(*from), color(*to))
+            } else {
+                format!(
+                    "linear-gradient({degrees:.2}deg, {} 0%{}, {} 100%)",
+                    color(*from),
+                    between(&|location| format!("{:.2}%", location * 100.0)),
+                    color(*to)
+                )
+            }
         }
     }
 }

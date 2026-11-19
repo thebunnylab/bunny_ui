@@ -511,10 +511,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// )
     /// // a bar with a sheen
     /// .background_gradient(Gradient::linear(TOP_INK, BOTTOM_INK))
+    /// // a ramp through a third color, half way down
+    /// .background_gradient(Gradient::linear(RED, BLUE).stop(0.5, GREEN))
     /// ```
     #[track_caller]
     fn background_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
-        Modified::new(self, Modifier::BackgroundGradient(gradient))
+        Modified::new(self, Modifier::BackgroundGradient(Box::new(gradient)))
     }
 
     /// How this view's background meets what is already painted under

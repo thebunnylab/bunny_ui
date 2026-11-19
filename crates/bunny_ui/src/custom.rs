@@ -697,11 +697,11 @@ impl<'a> Painter<'a> {
                 DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
                     rect: self.shift(rect),
                     paint: match paint {
-                        crate::layout::GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                            crate::layout::GradientPaint::Radial { center: self.at(center), start, end, aspect, inner, outer }
+                        crate::layout::GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                            crate::layout::GradientPaint::Radial { center: self.at(center), start, end, aspect, inner, outer, stops }
                         }
-                        crate::layout::GradientPaint::Linear { start, end, from, to } => {
-                            crate::layout::GradientPaint::Linear { start: self.at(start), end: self.at(end), from, to }
+                        crate::layout::GradientPaint::Linear { start, end, from, to, stops } => {
+                            crate::layout::GradientPaint::Linear { start: self.at(start), end: self.at(end), from, to, stops }
                         }
                     },
                     corner_radius,

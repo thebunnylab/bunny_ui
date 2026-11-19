@@ -48,7 +48,9 @@ float clip_cov(vec2 p) {
 
 void main() {
     vec2 p = gl_FragCoord.xy;
-    float kind = v_params.z;
+    // a piece of a longer ramp carries its stretch in the kind's tens
+    float band = floor(v_params.z / 10.0);
+    float kind = v_params.z - band * 10.0;
     float coverage;
     if (kind == 0.0) {
         coverage = rect_cov(p, v_rect, v_radii);
@@ -70,21 +72,27 @@ void main() {
         coverage = (dist > 0.0 && dist < reach) ? strength * strength : 0.0;
     } else {
         coverage = rect_cov(p, v_rect, v_radii);
-        float t;
+        float raw;
         if (kind == 3.0) {
             float dist = length(p - v_point2);
-            t = clamp((dist - v_params.y) / (v_params.w - v_params.y), 0.0, 1.0);
+            raw = (dist - v_params.y) / (v_params.w - v_params.y);
         } else if (kind == 5.0) {
             coverage = rect_cov(p, v_rect, vec4(0.0));
             vec2 away = p - v_point2;
             float dist = length(vec2(away.x, away.y / v_params.x));
-            t = clamp((dist - v_params.y) / (v_params.w - v_params.y), 0.0, 1.0);
+            raw = (dist - v_params.y) / (v_params.w - v_params.y);
         } else {
             vec2 origin = vec2(v_params.y, v_params.w);
             vec2 axis = v_point2 - origin;
             float length2 = dot(axis, axis);
-            t = length2 > 0.0 ? clamp(dot(p - origin, axis) / length2, 0.0, 1.0) : 1.0;
+            raw = length2 > 0.0 ? dot(p - origin, axis) / length2 : 1.0;
         }
+        // a piece paints its own stretch of the ramp alone: from its
+        // start, short of its end — the next piece owns that line
+        if (((band == 1.0 || band == 3.0) && raw < 0.0) || (band >= 2.0 && raw >= 1.0)) {
+            coverage = 0.0;
+        }
+        float t = clamp(raw, 0.0, 1.0);
         vec4 mixed = floor(mix(v_color, v_color2, t) * 255.0 + 0.5) / 255.0;
         out_color = vec4(mixed.rgb, mixed.a * coverage * clip_cov(p));
         return;

@@ -49,12 +49,12 @@ fn frame() -> Frame {
             Draw::FillRect { rect: rect(0.0, 0.0, 320.0, 200.0), color: color(250, 250, 252, 255), corners: corners(0.0) },
             Draw::Gradient {
                 rect: rect(10.0, 10.0, 100.0, 50.0),
-                paint: GradientPaint::Linear { start: Point { x: 10.0, y: 10.0 }, end: Point { x: 110.0, y: 60.0 }, from: color(1, 2, 3, 255), to: color(4, 5, 6, 255) },
+                paint: GradientPaint::Linear { start: Point { x: 10.0, y: 10.0 }, end: Point { x: 110.0, y: 60.0 }, from: color(1, 2, 3, 255), to: color(4, 5, 6, 255), stops: Stops::NONE },
                 corners: corners(4.0),
             },
             Draw::Gradient {
                 rect: rect(10.0, 70.0, 100.0, 50.0),
-                paint: GradientPaint::Radial { center: Point { x: 60.0, y: 95.0 }, start: 0.0, end: 50.0, aspect: 1.0, inner: color(7, 7, 7, 255), outer: color(8, 8, 8, 0) },
+                paint: GradientPaint::Radial { center: Point { x: 60.0, y: 95.0 }, start: 0.0, end: 50.0, aspect: 1.0, inner: color(7, 7, 7, 255), outer: color(8, 8, 8, 0), stops: Stops::NONE },
                 corners: corners(0.0),
             },
             Draw::Backdrop {
@@ -130,7 +130,7 @@ fn every_message() -> Vec<Message> {
             kind: ResourceKind::Vector {
                 verbs: vec![Verb::Move(0.0, 0.0), Verb::Line(1.0, 0.0), Verb::Quad(1.0, 1.0, 0.0, 1.0), Verb::Cubic(0.0, 0.5, 0.5, 0.0, 0.0, 0.0), Verb::Close],
                 paint: Paint::Stroke { width: 1.5 },
-                ink: Ink::Ramp(Gradient::Radial { center: Point { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: color(1, 1, 1, 255), outer: color(2, 2, 2, 255) }),
+                ink: Ink::Ramp(Gradient::Radial { center: Point { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: color(1, 1, 1, 255), outer: color(2, 2, 2, 255), stops: Stops::NONE }),
                 box_size: (24.0, 24.0),
             },
         })),

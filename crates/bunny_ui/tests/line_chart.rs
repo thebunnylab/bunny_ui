@@ -383,7 +383,7 @@ fn themes_repaint_existing_plots_and_explicit_ink_remains_stable() {
                 DrawCommand::Image {
                     source: ImageSource::Path { ink, .. },
                     ..
-                } => Some(*ink),
+                } => Some(**ink),
                 _ => None,
             })
             .unwrap()

@@ -2096,13 +2096,14 @@ impl UnitPoint {
     }
 }
 
-/// A two-stop paint ramp behind a view — the glow of a hero panel, the
-/// sheen of a bar.
+/// A paint ramp behind a view — the glow of a hero panel, the sheen of a
+/// bar.
 ///
 /// Declared in the box's own proportions (a [`UnitPoint`] centre, a
 /// direction) so it survives a resize, and resolved to px once the
-/// frame is known. Deliberately TWO stops: what a UI paints is a ramp,
-/// and two colors keep every backend's wire format fixed.
+/// frame is known. It runs from one color to another, through the
+/// [`Stops`] between them: `Gradient::linear(red, blue).stop(0.5,
+/// green)` is `SwiftUI`'s `Gradient(stops:)` with three.
 ///
 /// A ramp that fades out must fade to the SAME color with no alpha
 /// ([`Color::fade`]): interpolation is straight, so fading to a
@@ -2122,9 +2123,147 @@ pub enum Gradient {
         aspect: f64,
         inner: Color,
         outer: Color,
+        stops: Stops,
     },
     /// A ramp along the line from `start` to `end`.
-    Linear { start: UnitPoint, end: UnitPoint, from: Color, to: Color },
+    Linear { start: UnitPoint, end: UnitPoint, from: Color, to: Color, stops: Stops },
+}
+
+/// The colors a ramp passes through between its two ends — `SwiftUI`'s
+/// `Gradient.Stop`s other than the first and the last — each at its
+/// location along the ramp, 0 its start and 1 its end, in order.
+///
+/// A ramp holds [`Stops::MOST`] of them, inline, so a gradient stays a
+/// plain value that every backend paints with the colors it already
+/// mixes two at a time. One more drops the stop whose loss changes the
+/// ramp least.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Stops {
+    count: u8,
+    locations: [f32; Stops::MOST],
+    colors: [Color; Stops::MOST],
+}
+
+impl Default for Stops {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Stops {
+    /// How many stops a ramp holds between its ends: a rainbow's seven
+    /// colors fit, with one to spare.
+    pub const MOST: usize = 6;
+    /// A ramp straight from one end to the other.
+    pub const NONE: Stops = Stops {
+        count: 0,
+        locations: [0.0; Stops::MOST],
+        colors: [Color { r: 0, g: 0, b: 0, a: 0 }; Stops::MOST],
+    };
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Each stop's location and color, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (f64, Color)> + '_ {
+        self.locations[..self.len()].iter().zip(&self.colors[..self.len()]).map(|(at, color)| (f64::from(*at), *color))
+    }
+
+    /// One more stop between `from` and `to`, after any stop already at
+    /// its location (two stops at one place draw a hard edge).
+    #[must_use]
+    pub fn with(self, location: f64, color: Color, from: Color, to: Color) -> Stops {
+        #[allow(clippy::cast_possible_truncation, reason = "a fraction of the ramp")]
+        let location = location.clamp(0.0, 1.0) as f32;
+        let mut stops: Vec<(f32, Color)> = self.locations[..self.len()].iter().copied().zip(self.colors[..self.len()].iter().copied()).collect();
+        let at = stops.iter().position(|(other, _)| *other > location).unwrap_or(stops.len());
+        stops.insert(at, (location, color));
+        while stops.len() > Self::MOST {
+            // the stop the ramp misses least: its color closest to what
+            // its neighbours would mix at its place without it
+            let miss = |index: usize| {
+                let (before, after) = (
+                    if index == 0 { (0.0, from) } else { stops[index - 1] },
+                    stops.get(index + 1).copied().unwrap_or((1.0, to)),
+                );
+                let (location, color) = stops[index];
+                let span = after.0 - before.0;
+                let mixed = if span > 0.0 { mix(before.1, after.1, f64::from((location - before.0) / span)) } else { color };
+                [mixed.r.abs_diff(color.r), mixed.g.abs_diff(color.g), mixed.b.abs_diff(color.b), mixed.a.abs_diff(color.a)].into_iter().max().unwrap_or(0)
+            };
+            let least = (0..stops.len()).min_by_key(|index| miss(*index)).unwrap_or(0);
+            stops.remove(least);
+        }
+        let mut out = Self::NONE;
+        #[allow(clippy::cast_possible_truncation, reason = "at most MOST")]
+        let count = stops.len() as u8;
+        out.count = count;
+        for (index, (location, color)) in stops.into_iter().enumerate() {
+            out.locations[index] = location;
+            out.colors[index] = color;
+        }
+        out
+    }
+}
+
+/// One two-color piece of a ramp, which paints its own stretch alone.
+///
+/// It mixes `from` into `to` between their locations: a painter that
+/// mixes two colors at a time paints the whole ramp piece by piece.
+/// Each piece owns its start and not its end, as
+/// [`GradientPaint::at`] reads them; the first owns everything before
+/// it and the last everything after.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RampPiece {
+    pub from: (f64, Color),
+    pub to: (f64, Color),
+    /// Paints nothing before its start.
+    pub cuts_below: bool,
+    /// Paints nothing at its end and past it.
+    pub cuts_above: bool,
+}
+
+/// The pieces of the ramp `from` → `stops` → `to`; a stretch of no
+/// length (a hard edge) is no piece.
+#[must_use]
+pub fn ramp_pieces(from: Color, to: Color, stops: &Stops) -> Vec<RampPiece> {
+    let points: Vec<(f64, Color)> = std::iter::once((0.0, from)).chain(stops.iter()).chain(std::iter::once((1.0, to))).collect();
+    let mut pieces: Vec<RampPiece> = points
+        .windows(2)
+        .filter(|pair| pair[1].0 > pair[0].0)
+        .map(|pair| RampPiece { from: pair[0], to: pair[1], cuts_below: true, cuts_above: true })
+        .collect();
+    if pieces.is_empty() {
+        // every stop at one place: the last color, everywhere
+        pieces.push(RampPiece { from: (0.0, to), to: (1.0, to), cuts_below: false, cuts_above: false });
+    }
+    if let Some(first) = pieces.first_mut() {
+        first.cuts_below = false;
+    }
+    if let Some(last) = pieces.last_mut() {
+        last.cuts_above = false;
+    }
+    pieces
+}
+
+/// The color at `t` (in 0…1) of the ramp `from` → `stops` → `to`.
+fn ramp(from: Color, to: Color, stops: &Stops, t: f64) -> Color {
+    let mut lower = (0.0, from);
+    for (location, color) in stops.iter().chain(std::iter::once((1.0, to))) {
+        if t < location {
+            let span = location - lower.0;
+            return if span > 0.0 { mix(lower.1, color, (t - lower.0) / span) } else { color };
+        }
+        lower = (location, color);
+    }
+    to
 }
 
 impl Gradient {
@@ -2133,16 +2272,17 @@ impl Gradient {
     /// wash named from its leading corner. The colours stay.
     pub fn flipped(self) -> Gradient {
         match self {
-            Gradient::Radial { center, start, end, aspect, inner, outer } => Gradient::Radial {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => Gradient::Radial {
                 center: center.flipped(),
                 start,
                 end,
                 aspect,
                 inner,
                 outer,
+                stops,
             },
-            Gradient::Linear { start, end, from, to } => {
-                Gradient::Linear { start: start.flipped(), end: end.flipped(), from, to }
+            Gradient::Linear { start, end, from, to, stops } => {
+                Gradient::Linear { start: start.flipped(), end: end.flipped(), from, to, stops }
             }
         }
     }
@@ -2156,19 +2296,50 @@ impl Gradient {
             aspect: 1.0,
             inner,
             outer,
+            stops: Stops::NONE,
         }
     }
 
     /// A ramp from the top edge to the bottom one.
     pub fn linear(from: Color, to: Color) -> Gradient {
-        Gradient::Linear { start: UnitPoint::TOP, end: UnitPoint::BOTTOM, from, to }
+        Gradient::Linear { start: UnitPoint::TOP, end: UnitPoint::BOTTOM, from, to, stops: Stops::NONE }
+    }
+
+    /// `Gradient.Stop(color:location:)` — one more color the ramp passes
+    /// through, at `location` along it (0 the start, 1 the end):
+    /// `Gradient::linear(red, blue).stop(0.5, green)`. A stop at the
+    /// place of another draws a hard edge between them.
+    #[must_use]
+    pub fn stop(self, location: f64, color: Color) -> Gradient {
+        match self {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => Gradient::Radial {
+                center,
+                start,
+                end,
+                aspect,
+                inner,
+                outer,
+                stops: stops.with(location, color, inner, outer),
+            },
+            Gradient::Linear { start, end, from, to, stops } => {
+                Gradient::Linear { start, end, from, to, stops: stops.with(location, color, from, to) }
+            }
+        }
+    }
+
+    /// The stops between the ramp's two ends.
+    #[must_use]
+    pub const fn stops(&self) -> &Stops {
+        match self {
+            Gradient::Radial { stops, .. } | Gradient::Linear { stops, .. } => stops,
+        }
     }
 
     /// Moves a radial gradient's centre (a linear one keeps its line).
     pub fn center(self, center: UnitPoint) -> Gradient {
         match self {
-            Gradient::Radial { start, end, aspect, inner, outer, .. } => {
-                Gradient::Radial { center, start, end, aspect, inner, outer }
+            Gradient::Radial { start, end, aspect, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2177,8 +2348,8 @@ impl Gradient {
     /// The two radii of a radial gradient, in px.
     pub fn radius(self, start: Px, end: Px) -> Gradient {
         match self {
-            Gradient::Radial { center, aspect, inner, outer, .. } => {
-                Gradient::Radial { center, start, end: Some(end), aspect, inner, outer }
+            Gradient::Radial { center, aspect, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end: Some(end), aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2193,8 +2364,8 @@ impl Gradient {
     /// through `.clipped()`, which cuts every paint anyway.
     pub fn aspect(self, aspect: f64) -> Gradient {
         match self {
-            Gradient::Radial { center, start, end, inner, outer, .. } => {
-                Gradient::Radial { center, start, end, aspect, inner, outer }
+            Gradient::Radial { center, start, end, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2204,7 +2375,7 @@ impl Gradient {
     /// rings).
     pub fn direction(self, start: UnitPoint, end: UnitPoint) -> Gradient {
         match self {
-            Gradient::Linear { from, to, .. } => Gradient::Linear { start, end, from, to },
+            Gradient::Linear { from, to, stops, .. } => Gradient::Linear { start, end, from, to, stops },
             other => other,
         }
     }
@@ -2214,7 +2385,7 @@ impl Gradient {
     /// only evaluate).
     pub fn resolve(self, rect: Rect) -> GradientPaint {
         match self {
-            Gradient::Radial { center, start, end, aspect, inner, outer } => {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => {
                 let center = center.resolve(rect);
                 let reach = end.unwrap_or_else(|| corner_reach(center, rect));
                 GradientPaint::Radial {
@@ -2224,13 +2395,15 @@ impl Gradient {
                     aspect: if aspect > 0.0 { aspect } else { 1.0 },
                     inner,
                     outer,
+                    stops,
                 }
             }
-            Gradient::Linear { start, end, from, to } => GradientPaint::Linear {
+            Gradient::Linear { start, end, from, to, stops } => GradientPaint::Linear {
                 start: start.resolve(rect),
                 end: end.resolve(rect),
                 from,
                 to,
+                stops,
             },
         }
     }
@@ -2247,31 +2420,39 @@ fn corner_reach(center: Point, rect: Rect) -> Px {
 /// carries.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum GradientPaint {
-    Radial { center: Point, start: Px, end: Px, aspect: f64, inner: Color, outer: Color },
-    Linear { start: Point, end: Point, from: Color, to: Color },
+    Radial { center: Point, start: Px, end: Px, aspect: f64, inner: Color, outer: Color, stops: Stops },
+    Linear { start: Point, end: Point, from: Color, to: Color, stops: Stops },
 }
 
 impl GradientPaint {
     /// The color at a point, straight sRGB — the one formula, which the
-    /// shaders repeat.
+    /// shaders repeat piece by piece ([`ramp_pieces`]).
     pub fn at(&self, point: Point) -> Color {
         match *self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, ref stops } => {
                 // the ellipse is a circle in a Y-scaled space: at the
                 // point (0, end·aspect) the division lands on `end`
                 let distance =
                     (point.x - center.x).hypot((point.y - center.y) / aspect);
-                mix(inner, outer, ((distance - start) / (end - start)).clamp(0.0, 1.0))
+                ramp(inner, outer, stops, ((distance - start) / (end - start)).clamp(0.0, 1.0))
             }
-            GradientPaint::Linear { start, end, from, to } => {
+            GradientPaint::Linear { start, end, from, to, ref stops } => {
                 let (dx, dy) = (end.x - start.x, end.y - start.y);
                 let length = dx * dx + dy * dy;
                 if length <= 0.0 {
                     return to;
                 }
                 let along = ((point.x - start.x) * dx + (point.y - start.y) * dy) / length;
-                mix(from, to, along.clamp(0.0, 1.0))
+                ramp(from, to, stops, along.clamp(0.0, 1.0))
             }
+        }
+    }
+
+    /// The stops between the ramp's two ends.
+    #[must_use]
+    pub const fn stops(&self) -> &Stops {
+        match self {
+            GradientPaint::Radial { stops, .. } | GradientPaint::Linear { stops, .. } => stops,
         }
     }
 
@@ -2279,7 +2460,7 @@ impl GradientPaint {
     pub fn scaled(self, factor: f64) -> GradientPaint {
         let scale = |point: Point| Point { x: point.x * factor, y: point.y * factor };
         match self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
                 GradientPaint::Radial {
                     center: scale(center),
                     start: start * factor,
@@ -2287,10 +2468,11 @@ impl GradientPaint {
                     aspect,
                     inner,
                     outer,
+                    stops,
                 }
             }
-            GradientPaint::Linear { start, end, from, to } => {
-                GradientPaint::Linear { start: scale(start), end: scale(end), from, to }
+            GradientPaint::Linear { start, end, from, to, stops } => {
+                GradientPaint::Linear { start: scale(start), end: scale(end), from, to, stops }
             }
         }
     }
@@ -2299,11 +2481,11 @@ impl GradientPaint {
     pub(crate) fn shifted(self, dx: Px, dy: Px) -> GradientPaint {
         let shift = |point: Point| Point { x: point.x + dx, y: point.y + dy };
         match self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                GradientPaint::Radial { center: shift(center), start, end, aspect, inner, outer }
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                GradientPaint::Radial { center: shift(center), start, end, aspect, inner, outer, stops }
             }
-            GradientPaint::Linear { start, end, from, to } => {
-                GradientPaint::Linear { start: shift(start), end: shift(end), from, to }
+            GradientPaint::Linear { start, end, from, to, stops } => {
+                GradientPaint::Linear { start: shift(start), end: shift(end), from, to, stops }
             }
         }
     }
@@ -3958,11 +4140,11 @@ impl DisplayList {
                 DrawCommand::Gradient { rect: r, paint, corner_radius } => DrawCommand::Gradient {
                     rect: rect(r),
                     paint: match paint {
-                        GradientPaint::Linear { start, end, from, to } => {
-                            GradientPaint::Linear { start: point(start), end: point(end), from, to }
+                        GradientPaint::Linear { start, end, from, to, stops } => {
+                            GradientPaint::Linear { start: point(start), end: point(end), from, to, stops }
                         }
-                        GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                            GradientPaint::Radial { center: point(center), start, end, aspect, inner, outer }
+                        GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                            GradientPaint::Radial { center: point(center), start, end, aspect, inner, outer, stops }
                         }
                     },
                     corner_radius: corners(corner_radius),
@@ -12034,6 +12216,7 @@ mod tests {
             end: UnitPoint::TRAILING,
             from: Color::WHITE,
             to: Color::BLACK,
+            stops: crate::layout::Stops::NONE,
         };
         let Gradient::Linear { start, end, .. } = ramp.flipped() else { panic!("a ramp stays a ramp") };
         assert_eq!((start, end), (UnitPoint::TRAILING, UnitPoint::LEADING));

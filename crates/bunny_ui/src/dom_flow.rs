@@ -2550,6 +2550,7 @@ mod tests {
                     end: crate::layout::UnitPoint::TRAILING,
                     from: Color::BLACK,
                     to: Color::WHITE,
+                    stops: crate::layout::Stops::NONE,
                 }),
                 ..Default::default()
             }

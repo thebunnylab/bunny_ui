@@ -60,7 +60,8 @@ pub enum ImageSource {
         key: u64,
         verbs: Rc<[crate::icon::Verb]>,
         paint: crate::icon::Paint,
-        ink: crate::icon::Ink,
+        /// Shared: a ramp carries its stops inline.
+        ink: Rc<crate::icon::Ink>,
         box_size: (f32, f32),
     },
     /// Pixels the APP already holds: an RGBA buffer it filled itself,
@@ -376,7 +377,7 @@ impl ImageSource {
             Ink::Ramp(ramp) => {
                 hasher.write_u8(8);
                 match ramp {
-                    crate::layout::Gradient::Linear { start, end, from, to } => {
+                    crate::layout::Gradient::Linear { start, end, from, to, .. } => {
                         hasher.write_u8(0);
                         for value in [start.x, start.y, end.x, end.y] {
                             hasher.write_u64(value.to_bits());
@@ -391,6 +392,7 @@ impl ImageSource {
                         aspect,
                         inner,
                         outer,
+                        ..
                     } => {
                         hasher.write_u8(1);
                         for value in
@@ -402,11 +404,15 @@ impl ImageSource {
                         colour(&mut hasher, outer);
                     }
                 }
+                for (location, color) in ramp.stops().iter() {
+                    hasher.write_u64(location.to_bits());
+                    colour(&mut hasher, color);
+                }
             }
         }
         number(&mut hasher, box_size.0);
         number(&mut hasher, box_size.1);
-        ImageSource::Path { key: hasher.finish(), verbs, paint, ink, box_size }
+        ImageSource::Path { key: hasher.finish(), verbs, paint, ink: Rc::new(ink), box_size }
     }
 
     /// The same source behind a veil. `1.0` gives the source back
@@ -706,7 +712,7 @@ pub fn raster_source(
             crate::icon::raster(*key, symbol, *color, *forced, *turn, width, height)
         }
         ImageSource::Path { key, verbs, paint, ink, box_size } => {
-            crate::icon::raster_trace(*key, verbs, *paint, *ink, *box_size, width, height)
+            crate::icon::raster_trace(*key, verbs, *paint, **ink, *box_size, width, height)
         }
         // the app's own pixels: no decode, no platform — resampled to
         // the box the frame asked for and handed on

@@ -234,6 +234,16 @@ pub const KIND_LINEAR: f32 = 4.0;
 /// The elliptical rings: the ASPECT rides params.x (the corner slot),
 /// start and end radii stay in params.y/.w.
 pub const KIND_ELLIPTIC: f32 = 5.0;
+/// Added to a gradient's kind: the piece paints nothing before its start.
+///
+/// A ramp of more than two colors is painted piece by piece, each piece
+/// a gradient of two ([`crate::layout::ramp_pieces`]) that paints its
+/// own stretch of the ramp alone. The stretch rides the kind, in tens.
+pub const BAND_CUTS_BELOW: f32 = 10.0;
+/// Added to a gradient's kind: the piece paints nothing at its end or
+/// past it. A shader reads `floor(kind / 10)` as the two bits and the
+/// rest as the kind.
+pub const BAND_CUTS_ABOVE: f32 = 20.0;
 
 // MARK: - The ground seam (what a tier must offer the atlas)
 
@@ -1125,6 +1135,18 @@ fn push_rect(
     });
 }
 
+/// The number `location` of the way from `near` to `far`, the ends
+/// themselves at 0 and 1: a two-color ramp is the instance it always was.
+fn between(near: f64, far: f64, location: f64) -> f64 {
+    if location <= 0.0 {
+        near
+    } else if location >= 1.0 {
+        far
+    } else {
+        (far - near).mul_add(location, near)
+    }
+}
+
 /// One gradient instance: the fill's quad and corner, plus the second
 /// half of the ramp packed into the bytes the struct already had.
 #[allow(clippy::too_many_arguments)]
@@ -1560,57 +1582,64 @@ pub fn build_frame(
                     continue;
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
-                match paint.scaled(factor) {
-                    crate::layout::GradientPaint::Radial {
-                        center,
-                        start,
-                        end,
-                        aspect,
-                        inner,
-                        outer,
-                    } => {
-                        // the circle keeps its kind (and its corner)
-                        // byte for byte; the ellipse trades the corner
-                        // slot for the aspect
-                        let (kind, corners) = if aspect == 1.0 {
-                            (KIND_RADIAL, radii)
-                        } else {
-                            (KIND_ELLIPTIC, Corners::ZERO)
-                        };
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            inner,
-                            outer,
-                            corners,
-                            aspect,
-                            start,
-                            end,
-                            (center.x, center.y),
-                            kind,
-                        )
+                let paint = paint.scaled(factor);
+                let (near, far) = match paint {
+                    crate::layout::GradientPaint::Radial { inner, outer, .. } => (inner, outer),
+                    crate::layout::GradientPaint::Linear { from, to, .. } => (from, to),
+                };
+                let opened = out.len();
+                for piece in crate::layout::ramp_pieces(near, far, paint.stops()) {
+                    let band = if piece.cuts_below { BAND_CUTS_BELOW } else { 0.0 }
+                        + if piece.cuts_above { BAND_CUTS_ABOVE } else { 0.0 };
+                    match paint {
+                        crate::layout::GradientPaint::Radial { center, start, end, aspect, .. } => {
+                            // the circle keeps its kind (and its corner)
+                            // byte for byte; the ellipse trades the corner
+                            // slot for the aspect
+                            let (kind, corners) = if aspect == 1.0 {
+                                (KIND_RADIAL, radii)
+                            } else {
+                                (KIND_ELLIPTIC, Corners::ZERO)
+                            };
+                            let reach = |location: f64| between(start, end, location);
+                            push_gradient(
+                                out,
+                                snapped,
+                                clip,
+                                piece.from.1,
+                                piece.to.1,
+                                corners,
+                                aspect,
+                                reach(piece.from.0),
+                                reach(piece.to.0),
+                                (center.x, center.y),
+                                kind + band,
+                            );
+                        }
+                        // the line's two ends fill the four numbers the
+                        // struct still had: its start in the params, its
+                        // end in the point — the quad stays the box
+                        crate::layout::GradientPaint::Linear { start, end, .. } => {
+                            let along = |location: f64| (between(start.x, end.x, location), between(start.y, end.y, location));
+                            let (first, last) = (along(piece.from.0), along(piece.to.0));
+                            push_gradient(
+                                out,
+                                snapped,
+                                clip,
+                                piece.from.1,
+                                piece.to.1,
+                                radii,
+                                0.0,
+                                first.0,
+                                first.1,
+                                last,
+                                KIND_LINEAR + band,
+                            );
+                        }
                     }
-                    // the line's two ends fill the four numbers the
-                    // struct still had: its start in the params, its
-                    // end in the point — the quad stays the box
-                    crate::layout::GradientPaint::Linear { start, end, from, to } => {
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            from,
-                            to,
-                            radii,
-                            0.0,
-                            start.x,
-                            start.y,
-                            (end.x, end.y),
-                            KIND_LINEAR,
-                        )
-                    }
+                    note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
                 }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                debug_assert!(out.len() > opened, "a ramp is at least one piece");
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -2305,6 +2334,55 @@ mod tests {
         )
         .expect("the scene fits the atlas");
         batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect()
+    }
+
+    /// A ramp of three colors is two two-color instances: the first
+    /// owns everything up to the middle stop, the second the rest. A
+    /// ramp of two is the one instance it always was.
+    #[test]
+    fn a_ramp_with_a_stop_is_painted_piece_by_piece() {
+        let rects = |gradient: crate::layout::Gradient| {
+            let rect = Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 100.0, height: 100.0 },
+            };
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::Gradient { rect, paint: gradient.resolve(rect), corner_radius: Corners::ZERO });
+            let mut ground = RecordingGround::default();
+            let mut atlas = RunAtlas::new();
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut ground,
+                &display,
+                1,
+                (400, 400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut atlas,
+                &mut batches,
+                None,
+            )
+            .expect("the scene fits the atlas");
+            batches.rects.iter().map(|rect| (rect.params, rect.color, rect.pad)).collect::<Vec<_>>()
+        };
+        let (red, green, blue) = (Color::rgb(255, 0, 0), Color::rgb(0, 255, 0), Color::rgb(0, 0, 255));
+        let two = rects(crate::layout::Gradient::linear(red, blue));
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].0, [0.0, 50.0, KIND_LINEAR, 0.0]);
+        let three = rects(crate::layout::Gradient::linear(red, blue).stop(0.5, green));
+        assert_eq!(three.len(), 2);
+        // the top half: red into green, from the top edge to the middle,
+        // cut at its end
+        assert_eq!(three[0].0, [0.0, 50.0, KIND_LINEAR + BAND_CUTS_ABOVE, 0.0]);
+        assert_eq!(three[0].1, [255, 0, 0, 255]);
+        assert_eq!(three[0].2[0..4], [0, 255, 0, 255]);
+        assert_eq!(three[0].2[8..12], 50f32.to_ne_bytes());
+        // the bottom half: green into blue, cut before its start
+        assert_eq!(three[1].0, [0.0, 50.0, KIND_LINEAR + BAND_CUTS_BELOW, 50.0]);
+        assert_eq!(three[1].1, [0, 255, 0, 255]);
+        assert_eq!(three[1].2[0..4], [0, 0, 255, 255]);
+        let rings = rects(crate::layout::Gradient::radial(red, blue).radius(0.0, 40.0).stop(0.25, green));
+        assert_eq!(rings.iter().map(|rect| (rect.0[1], rect.0[3])).collect::<Vec<_>>(), [(0.0, 10.0), (10.0, 40.0)]);
     }
 
     fn row(display: &mut DisplayList, y: f64, word: &str) {
