@@ -86,7 +86,8 @@ impl Component for Choices {
     }
 }
 
-/// A number moved one step at a time, and one moved along a line.
+/// A number moved one step at a time, one moved along a line, and the
+/// bar that shows the second as a share of the way.
 #[derive(Clone, Copy)]
 struct Numbers {
     guests: State<i32>,
@@ -104,6 +105,10 @@ impl Component for Numbers {
             form!(
                 labeled("Stepper", stepper(self.guests.binding(), 1..=8)),
                 labeled("Slider", slider(self.level.binding(), percent).frame_width(180.0)),
+                labeled(
+                    "Progress",
+                    progress_view().value((self.level.get() / 100.0) as f32).frame_width(180.0),
+                ),
             ),
             text(held).foreground_color(theme::current().fg_secondary),
             spacer(),

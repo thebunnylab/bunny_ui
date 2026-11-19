@@ -91,6 +91,7 @@ mod paranoid;
 mod reconciler;
 mod shapes;
 pub use shapes::{BorderStyle, Stripes};
+pub mod progress;
 pub mod runtime;
 pub mod search_field;
 #[cfg(feature = "canvas")]
