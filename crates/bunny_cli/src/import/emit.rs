@@ -723,6 +723,8 @@ impl Writer<'_> {
             for function in css::split_top(value, ' ') {
                 if let Some(radius) = function.strip_prefix("blur(").and_then(|rest| rest.strip_suffix(')')).and_then(css::px) {
                     let _ = write!(view, "\n.{modifier}({})", num(radius));
+                } else if let Some(code) = color_filter(function).filter(|_| property == "filter") {
+                    view.push_str(&code);
                 } else {
                     let name = function.split('(').next().unwrap_or(function);
                     self.gap(node, &format!("{property}: {name}"), function.to_owned());
@@ -1519,6 +1521,36 @@ fn rotation(node: &Node) -> Option<String> {
     })
 }
 
+/// A CSS color filter function as the modifier that draws it: `None` for
+/// one bunny has none for — a brightness (`SwiftUI`'s adds where CSS's
+/// multiplies), a sepia, a shadow, an inversion part of the way.
+fn color_filter(function: &str) -> Option<String> {
+    let (name, rest) = function.split_once('(')?;
+    let argument = rest.strip_suffix(')')?.trim();
+    // a number or a percentage; none given is the function's whole effect
+    let amount = || if argument.is_empty() { Some(1.0) } else { css::number(argument).or_else(|| css::percent(argument)) };
+    match name {
+        "grayscale" => Some(format!("\n.grayscale({})", num(amount()?))),
+        "saturate" => Some(format!("\n.saturation({})", num(amount()?))),
+        "contrast" => Some(format!("\n.contrast({})", num(amount()?))),
+        "hue-rotate" => {
+            let units = [("deg", 1.0), ("grad", 0.9), ("rad", 180.0 / std::f64::consts::PI), ("turn", 360.0)];
+            let degrees = if argument.is_empty() || argument == "0" {
+                0.0
+            } else {
+                units.iter().find_map(|(unit, scale)| argument.strip_suffix(unit)?.trim().parse::<f64>().ok().map(|value| value * scale))?
+            };
+            Some(format!("\n.hue_rotation(Angle::degrees({}))", num(degrees)))
+        }
+        "invert" => match amount()? {
+            amount if (amount - 1.0).abs() < 1e-9 => Some("\n.color_invert()".to_owned()),
+            amount if amount.abs() < 1e-9 => Some(String::new()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A CSS ramp as bunny holds it: the colors at the two ends of the
 /// box's gradient line and the stops between them.
 struct Ramp {
@@ -1896,6 +1928,24 @@ mod tests {
         assert!(writer.gaps.is_empty(), "{:?}", writer.gaps);
         clamped.style.insert("-webkit-line-clamp".to_owned(), "none".to_owned());
         assert!(!writer.words_view(&clamped, "words").contains("line_limit"));
+    }
+
+    /// The CSS color filters bunny has a modifier for are written as it,
+    /// in their order; the rest stay gaps.
+    #[test]
+    fn a_color_filter_is_its_modifier() {
+        assert_eq!(color_filter("grayscale(1)").as_deref(), Some("\n.grayscale(1.0)"));
+        assert_eq!(color_filter("grayscale(50%)").as_deref(), Some("\n.grayscale(0.5)"));
+        assert_eq!(color_filter("saturate(1.4)").as_deref(), Some("\n.saturation(1.4)"));
+        assert_eq!(color_filter("contrast(1.3)").as_deref(), Some("\n.contrast(1.3)"));
+        assert_eq!(color_filter("hue-rotate(90deg)").as_deref(), Some("\n.hue_rotation(Angle::degrees(90.0))"));
+        assert_eq!(color_filter("hue-rotate(0.5turn)").as_deref(), Some("\n.hue_rotation(Angle::degrees(180.0))"));
+        assert_eq!(color_filter("invert(1)").as_deref(), Some("\n.color_invert()"));
+        assert_eq!(color_filter("invert()").as_deref(), Some("\n.color_invert()"));
+        assert_eq!(color_filter("invert(0.5)"), None, "SwiftUI inverts all the way");
+        assert_eq!(color_filter("brightness(1.2)"), None, "SwiftUI's brightness adds, CSS's multiplies");
+        assert_eq!(color_filter("sepia(0.6)"), None);
+        assert_eq!(color_filter("drop-shadow(rgba(0, 0, 0, 0.4) 0px 1px 2px)"), None);
     }
 
     #[test]
