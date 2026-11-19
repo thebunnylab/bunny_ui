@@ -104,7 +104,7 @@ mod tests {
         ])
         .unwrap();
         let path = dir.join("notes.tar.gz");
-        std::fs::write(&path, crate::formats::deflate::gzip(&archive)).unwrap();
+        std::fs::write(&path, crate::deflate::gzip(&archive)).unwrap();
         let Ok(out) = std::process::Command::new("tar").arg("-xzf").arg(&path).arg("-C").arg(&dir).output() else { return };
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let binary = dir.join("notes/bin/notes");

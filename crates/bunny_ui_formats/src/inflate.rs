@@ -201,11 +201,26 @@ pub fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
     let at = 2 + bits.at;
     if let Some(tail) = bytes.get(at..at + 4) {
         let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
-        if super::png::adler32(&out) != want {
+        if adler32(&out) != want {
             return None;
         }
     }
     Some(out)
+}
+
+/// Adler-32 (RFC 1950), what a zlib stream ends with.
+pub fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    // 5552 bytes fit before the sums can overflow a u32
+    for run in bytes.chunks(5552) {
+        for &byte in run {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    (b << 16) | a
 }
 
 #[cfg(test)]
@@ -217,8 +232,8 @@ mod tests {
     fn the_lanes_own_stream_inflates() {
         let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog, ".repeat(40);
         let mut zlib = vec![0x78, 0x01];
-        zlib.extend(super::super::deflate::deflate(&text));
-        zlib.extend_from_slice(&super::super::png::adler32(&text).to_be_bytes());
+        zlib.extend(crate::deflate::deflate(&text));
+        zlib.extend_from_slice(&adler32(&text).to_be_bytes());
         assert_eq!(inflate_zlib(&zlib).as_deref(), Some(&text[..]));
         // a tail that lies is refused
         let last = zlib.len() - 1;

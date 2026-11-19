@@ -69,6 +69,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 name = "bunny-cli"
 version = "0.5.0"
 dependencies = [
+ "bunny-ui-formats",
  "bunny-ui-preview",
 ]
 
@@ -130,6 +131,10 @@ dependencies = [
  "bunny-ui-motor",
  "bunny-ui-windows",
 ]
+
+[[package]]
+name = "bunny-ui-formats"
+version = "0.5.0"
 
 [[package]]
 name = "bunny-ui-hot"

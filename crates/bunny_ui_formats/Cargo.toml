@@ -1,0 +1,14 @@
+[package]
+name = "bunny-ui-formats"
+version.workspace = true
+edition.workspace = true
+description = "The file formats and digests of bunny-ui on the standard library alone: SHA-1, SHA-256, DEFLATE, zip, tar"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "sha256", "deflate", "tar", "zip"]
+categories = ["compression", "cryptography", "encoding"]
+
+# No dependency: the `bunny` command and the updater both read and
+# write these formats, and neither of them carries a crate for it.
+[dependencies]
