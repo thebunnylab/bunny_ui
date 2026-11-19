@@ -1078,6 +1078,12 @@ thread_local! {
     /// the ranged half of firstRectForCharacterRange.
     static IME_RECT: RefCell<Option<Box<dyn Fn(u64) -> Option<CGRect>>>> =
         const { RefCell::new(None) };
+    /// What the focused field holds (`TextField::autocomplete`) — kept to
+    /// resolve AppKit's constant only when it changes.
+    static HOLDS: Cell<Option<bunny_ui::text_input::Autocomplete>> = const { Cell::new(None) };
+    /// The `NSTextContentType` constant the view answers to
+    /// `contentType` — null when the focused field says nothing.
+    static CONTENT_TYPE: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// The shell installs the two synchronous answers the input system may
@@ -1102,6 +1108,55 @@ pub fn sync_ime(state: Option<(std::sync::Arc<str>, NSRange, Option<NSRange>, CG
         });
     });
 }
+
+/// The shell says what the focused field holds — the view's
+/// `NSTextContent.contentType`, which the system's AutoFill reads to
+/// offer the saved account to the address box, the password to the
+/// password box and the one-time code to the code box.
+pub fn sync_content_type(holds: Option<bunny_ui::text_input::Autocomplete>) {
+    if HOLDS.with(|slot| slot.replace(holds)) == holds {
+        return;
+    }
+    let content = bunny_ui_apple::autofill::content_type(holds, bunny_ui_apple::autofill::Kit::AppKit);
+    CONTENT_TYPE.with(|slot| slot.set(content));
+}
+
+/// `contentType` — what the focused field holds, in AppKit's words; nil
+/// when it says nothing.
+extern "C" fn bunny_content_type(_this: Id, _sel: Sel) -> Id {
+    CONTENT_TYPE.with(Cell::get)
+}
+
+/// `setContentType:` — the property is the focused FIELD's, and the
+/// field says it through the scene ([`sync_content_type`]); a write
+/// from outside has nothing to change.
+extern "C" fn bunny_set_content_type(_this: Id, _sel: Sel, _content: Id) {}
+
+/// The window the system's sheets hang from: the app's window that is
+/// key, else the main one, else the first it opened — a `.task` that
+/// asks as its view first appears runs before AppKit has made the new
+/// window key. Null when the app shows no window at all.
+pub fn sheet_window() -> Id {
+    let ours = |window: usize| {
+        WINDOWS.with(|windows| windows.borrow().iter().any(|(open, _, _)| *open == window))
+    };
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        for question in ["keyWindow", "mainWindow"] {
+            let owner = owning_window(msg_id(app, sel(question)));
+            if owner != 0 && ours(owner) {
+                return owner as Id;
+            }
+        }
+    }
+    WINDOWS.with(|windows| {
+        windows.borrow().first().map_or(std::ptr::null_mut(), |(window, _, _)| *window as Id)
+    })
+}
+
+#[cfg(test)]
+#[path = "content_type_tests.rs"]
+mod content_type_tests;
 
 fn ime_mirror() -> Option<ImeMirror> {
     IME.with(|ime| ime.borrow().clone())
@@ -2401,6 +2456,26 @@ unsafe fn register_classes() {
         let protocol = objc_getProtocol(
             CString::new("NSTextInputClient").expect("name").as_ptr(),
         );
+        if !protocol.is_null() {
+            class_addProtocol(view, protocol);
+        }
+
+        // NSTextContent — what the focused field holds, for AutoFill
+        let content_types = encode("@@:");
+        class_addMethod(
+            view,
+            sel("contentType"),
+            bunny_content_type as *const c_void,
+            content_types.as_ptr(),
+        );
+        let set_content_types = encode("v@:@");
+        class_addMethod(
+            view,
+            sel("setContentType:"),
+            bunny_set_content_type as *const c_void,
+            set_content_types.as_ptr(),
+        );
+        let protocol = objc_getProtocol(c"NSTextContent".as_ptr());
         if !protocol.is_null() {
             class_addProtocol(view, protocol);
         }

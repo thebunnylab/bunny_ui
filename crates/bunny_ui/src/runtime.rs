@@ -4773,6 +4773,34 @@ impl Runtime {
         }
     }
 
+    /// What the field holding the keyboard says it holds, for the
+    /// platform's autofill (`TextField::autocomplete`) — `None` for a
+    /// field that said nothing, for a box the app owns, and for no focus.
+    /// A native shell hands it to its input system with the focus, so a
+    /// password manager offers the saved address to the address box and
+    /// the one-time code to the code box.
+    pub fn focus_autocomplete(&self) -> Option<crate::text_input::Autocomplete> {
+        self.enter_scene();
+        let path = self.focused()?;
+        if self.custom_at(&path).is_some() {
+            return None;
+        }
+        self.field_at(&path)?.autocomplete
+    }
+
+    /// Does the field holding the keyboard hide what it holds
+    /// (`TextField::secret`)? A native shell says so to its input
+    /// system: a secure box is never learned from or dictated into, and
+    /// it is the box the system's password AutoFill looks for. A box the
+    /// app owns and no focus answer `false`.
+    pub fn focus_is_secret(&self) -> bool {
+        self.enter_scene();
+        self.focused()
+            .filter(|path| self.custom_at(path).is_none())
+            .and_then(|path| self.field_at(&path))
+            .is_some_and(|field| field.secret)
+    }
+
     /// Focuses a field. The caret goes to the END the first time (the
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.

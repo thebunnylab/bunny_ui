@@ -230,6 +230,15 @@ thread_local! {
     /// view answers to `keyboardType` — the focused field's
     /// (`TextField::keyboard_type`).
     static KEYBOARD_KIND: Cell<i64> = const { Cell::new(0) };
+    /// What the focused field holds (`TextField::autocomplete`) — kept to
+    /// resolve the kit's constant only when it changes.
+    static HOLDS: Cell<Option<bunny_ui::text_input::Autocomplete>> = const { Cell::new(None) };
+    /// The `UITextContentType` constant the view answers to
+    /// `textContentType` — null when the focused field says nothing.
+    static CONTENT_TYPE: Cell<Id> = const { Cell::new(null_mut()) };
+    /// Whether the focused field hides what it holds — the view's
+    /// `isSecureTextEntry` (`TextField::secret`).
+    static SECURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Registers who receives the events (the shell's loop).
@@ -670,10 +679,6 @@ extern "C" fn bunny_yes(_this: Id, _sel: Sel) -> i8 {
     1
 }
 
-extern "C" fn bunny_no(_this: Id, _sel: Sel) -> i8 {
-    0
-}
-
 /// `UITextInputTraits` answered by hand: an empty adoption leaves every
 /// getter nil, and the keyboard then guesses — sentence capitals and
 /// autocorrection on a field that wanted neither. The traits say NO
@@ -689,6 +694,19 @@ extern "C" fn bunny_trait_zero(_this: Id, _sel: Sel) -> i64 {
 
 extern "C" fn bunny_keyboard_type(_this: Id, _sel: Sel) -> i64 {
     KEYBOARD_KIND.with(Cell::get)
+}
+
+/// `isSecureTextEntry` — the focused field's `secret` ([`want_traits`]):
+/// a password box reaches the system as one, so the keyboard learns
+/// nothing from it and Passwords offers to fill it.
+extern "C" fn bunny_secure_entry(_this: Id, _sel: Sel) -> i8 {
+    i8::from(SECURE.with(Cell::get))
+}
+
+/// `textContentType` — what the focused field holds, in UIKit's words
+/// ([`want_traits`]); nil when it says nothing.
+extern "C" fn bunny_content_type(_this: Id, _sel: Sel) -> Id {
+    CONTENT_TYPE.with(Cell::get)
 }
 
 /// The keys change under a keyboard that is up: UIKit read `keyboardType`
@@ -924,6 +942,30 @@ pub fn want_keys(keyboard: bunny_ui::text_input::KeyboardType) {
     if KEYBOARD_KIND.with(|slot| slot.replace(kind)) == kind || !KEYBOARD_WANTED.with(Cell::get) {
         return;
     }
+    reload_keys_soon();
+}
+
+/// What the field holding the keyboard holds and whether it hides it —
+/// the view's `textContentType` and `isSecureTextEntry`, read by the
+/// system's AutoFill: the address box is offered the saved account, the
+/// password box the password, the code box the one-time code. Said with
+/// [`want_keys`], and like it a keyboard already up is told to read the
+/// traits again on the next turn of the main queue.
+pub fn want_traits(holds: Option<bunny_ui::text_input::Autocomplete>, secret: bool) {
+    let mut moved = SECURE.with(|slot| slot.replace(secret)) != secret;
+    if HOLDS.with(|slot| slot.replace(holds)) != holds {
+        let content = bunny_ui_apple::autofill::content_type(holds, bunny_ui_apple::autofill::Kit::UIKit);
+        CONTENT_TYPE.with(|slot| slot.set(content));
+        moved = true;
+    }
+    if moved && KEYBOARD_WANTED.with(Cell::get) {
+        reload_keys_soon();
+    }
+}
+
+/// The keyboard that is up reads the view's traits again, on the next
+/// turn of the main queue ([`bunny_reload_keys`]).
+fn reload_keys_soon() {
     let view = VIEW.with(Cell::get);
     if view.is_null() {
         return;
@@ -937,6 +979,16 @@ pub fn want_keys(keyboard: bunny_ui::text_input::KeyboardType) {
             0.0,
         );
     }
+}
+
+/// The window the system's sheets hang from: the app's view's own —
+/// null before the scene put the view in one.
+pub fn anchor_window() -> Id {
+    let view = VIEW.with(Cell::get);
+    if view.is_null() {
+        return null_mut();
+    }
+    unsafe { msg_id(view, sel("window")) }
 }
 
 /// Claims (or drops) the soft keyboard — deferred to the next turn of
@@ -1072,7 +1124,9 @@ unsafe fn register_classes() {
         class_addMethod(view, sel("layoutSubviews"), bunny_layout_subviews as *const c_void, v.as_ptr());
         class_addMethod(view, sel("canBecomeFirstResponder"), bunny_yes as *const c_void, bool_.as_ptr());
         class_addMethod(view, sel("hasText"), bunny_yes as *const c_void, bool_.as_ptr());
-        class_addMethod(view, sel("isSecureTextEntry"), bunny_no as *const c_void, bool_.as_ptr());
+        class_addMethod(view, sel("isSecureTextEntry"), bunny_secure_entry as *const c_void, bool_.as_ptr());
+        let object = CString::new("@@:").expect("type encoding");
+        class_addMethod(view, sel("textContentType"), bunny_content_type as *const c_void, object.as_ptr());
         class_addMethod(view, sel("insertText:"), bunny_insert_text as *const c_void, v_id.as_ptr());
         class_addMethod(view, sel("deleteBackward"), bunny_delete_backward as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyClaimKeyboard"), bunny_claim_keyboard as *const c_void, v.as_ptr());

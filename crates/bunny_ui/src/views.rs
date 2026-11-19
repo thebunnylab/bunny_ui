@@ -798,7 +798,9 @@ impl TextField {
     /// The element lowering writes it as the input's `autocomplete`
     /// attribute; a field that says nothing leaves the choice with the
     /// browser, and [`Autocomplete::Off`] asks for no suggestion at all.
-    /// The pixel shells own no native field to fill, and ignore it.
+    /// The macOS and iOS shells hand it to their input system with the
+    /// focus, so Passwords fills the box in place; the other pixel shells
+    /// have no input system that asks, and ignore it.
     ///
     /// A sign-in form says both halves, and names each box for a reader
     /// that cannot see the words beside it:

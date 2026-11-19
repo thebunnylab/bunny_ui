@@ -45,6 +45,7 @@ pub mod preview;
 pub mod action;
 pub mod angle;
 pub mod audio;
+pub mod autofill;
 pub mod anim;
 pub mod beat;
 pub mod bind;
@@ -12109,6 +12110,57 @@ mod tests {
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Email, "the address keys");
         assert!(runtime.focus_named("note"));
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Text, "a field that named nothing");
+    }
+
+    /// A field names what it holds for the platform's autofill, and the
+    /// runtime answers for whatever holds the keyboard — the shells that
+    /// own an input system hand it over with the focus: the address box
+    /// is the username, the password box a secret current password, and a
+    /// field that named nothing (or no focus at all) says nothing.
+    #[test]
+    fn the_focused_field_names_what_it_holds() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::Autocomplete;
+
+        #[derive(Clone, Copy)]
+        struct SignIn {
+            email: State<String>,
+            password: State<String>,
+            note: State<String>,
+        }
+        impl Component for SignIn {
+            fn body(self) -> impl View {
+                vstack!(
+                    text_field("email", self.email.binding())
+                        .autocomplete(Autocomplete::Username)
+                        .id("email"),
+                    text_field("password", self.password.binding())
+                        .secret(true)
+                        .autocomplete(Autocomplete::CurrentPassword)
+                        .id("password"),
+                    text_field("note", self.note.binding()).id("note"),
+                )
+            }
+        }
+
+        let form = SignIn {
+            email: State::new(String::new()),
+            password: State::new(String::new()),
+            note: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 160.0 }));
+        assert_eq!(runtime.focus_autocomplete(), None, "no focus says nothing");
+        assert!(!runtime.focus_is_secret(), "no focus hides nothing");
+        assert!(runtime.focus_named("email"));
+        assert_eq!(runtime.focus_autocomplete(), Some(Autocomplete::Username));
+        assert!(!runtime.focus_is_secret(), "an address is shown");
+        assert!(runtime.focus_named("password"));
+        assert_eq!(runtime.focus_autocomplete(), Some(Autocomplete::CurrentPassword));
+        assert!(runtime.focus_is_secret(), "the password box hides what it holds");
+        assert!(runtime.focus_named("note"));
+        assert_eq!(runtime.focus_autocomplete(), None, "a field that named nothing");
+        assert!(!runtime.focus_is_secret());
     }
 
     /// A form that paints its own focus ring hears the keyboard move,
