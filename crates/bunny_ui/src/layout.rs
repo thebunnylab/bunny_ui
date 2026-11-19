@@ -2763,6 +2763,13 @@ pub struct VisualProps {
     /// corner radius — including the notch behind a rounded corner,
     /// which belongs to the shadow, not to the backdrop.
     pub shadow: Option<(Px, Color)>,
+    /// `.shadow_offset(x, y)` — where the halo sits from the box: SwiftUI's
+    /// `.shadow(…, x:, y:)`, CSS's offset. `None` is under the box.
+    pub shadow_offset: Option<(Px, Px)>,
+    /// `.offset(x, y)` — the box and everything in it drawn this far from
+    /// where the layout put it, as SwiftUI's `.offset`: paint and pointer
+    /// move, the layout around it never hears of it.
+    pub offset: Option<(Px, Px)>,
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one. Paint
     /// only, like everything here: the measure never hears about it.
@@ -2849,6 +2856,8 @@ impl VisualProps {
             direction: self.direction.or(outer.direction),
             flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
+            shadow_offset: self.shadow_offset.or(outer.shadow_offset),
+            offset: self.offset.or(outer.offset),
             opacity: self.opacity.or(outer.opacity),
             blur: self.blur.or(outer.blur),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
@@ -9744,6 +9753,12 @@ impl LayoutNode {
             }
 
             (LayoutNode::Styled { props, child, .. }, fit) => {
+                // `.offset(x, y)`: the box is drawn — and found by the
+                // pointer — this far from where the layout put it
+                let frame = props.offset.map_or(frame, |(x, y)| Rect {
+                    origin: Point { x: frame.origin.x + x, y: frame.origin.y + y },
+                    size: frame.size,
+                });
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -9825,8 +9840,9 @@ impl LayoutNode {
                 }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
+                    let (dx, dy) = props.shadow_offset.unwrap_or_default();
                     out.draw(DrawCommand::Shadow {
-                        rect: frame,
+                        rect: Rect { origin: Point { x: frame.origin.x + dx, y: frame.origin.y + dy }, size: frame.size },
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
                         corner_radius: props.corner_radius.unwrap_or_default(),

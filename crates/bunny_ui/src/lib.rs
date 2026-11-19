@@ -2375,9 +2375,10 @@ mod tests {
             };
             let bytes = crate::dom::encode(&[look_with(text)]);
             // count(4), op(1), rule(8), kind(1), flags(1), a bare style
-            // mask(4), a bare flow mask(2), the text flag(1) — then the
-            // face: color(4), inherits(1), size(4), and the weight
-            bytes[4 + 1 + 8 + 1 + 1 + 4 + 2 + 1 + 4 + 1 + 4]
+            // mask(4) and its second byte (ABI 28), a bare flow mask(2),
+            // the text flag(1) — then the face: color(4), inherits(1),
+            // size(4), and the weight
+            bytes[4 + 1 + 8 + 1 + 1 + 4 + 1 + 2 + 1 + 4 + 1 + 4]
         };
         let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
         assert_eq!(codes, vec![6, 7, 8, 0, 1, 2, 3, 4, 5]);

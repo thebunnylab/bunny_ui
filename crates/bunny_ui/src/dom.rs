@@ -348,6 +348,11 @@ pub struct DomLook {
     pub turn: Option<(crate::angle::QuarterTurn, bool)>,
     pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
+    /// Where the halo sits from the box (`.shadow_offset`).
+    pub shadow_offset: Option<(Px, Px)>,
+    /// How far the box is drawn from its place (`.offset`): CSS
+    /// `translate`, which the box's neighbours never feel.
+    pub offset: Option<(Px, Px)>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -430,6 +435,8 @@ impl DomLook {
         turn: None,
         corner_radius: None,
         shadow: None,
+        shadow_offset: None,
+        offset: None,
         transition: None,
         focus_border: None,
         placeholder_color: None,
@@ -460,6 +467,8 @@ impl DomLook {
             turn: None,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
+            shadow_offset: props.shadow_offset.filter(|_| props.shadow.is_some()),
+            offset: props.offset,
             transition: None,
             focus_border: None,
             placeholder_color: None,
@@ -491,6 +500,7 @@ impl DomLook {
             || props.stripes.is_some()
             || props.corner_radius.is_some()
             || props.shadow.is_some()
+            || props.offset.is_some()
             || props.clip
             || props.hidden
             || props.passive
@@ -2434,6 +2444,14 @@ fn look_hash(node: &DomNode) -> u64 {
         .map(|corners| [corners.top_left.to_bits(), corners.top_right.to_bits(), corners.bottom_right.to_bits(), corners.bottom_left.to_bits()])
         .hash(&mut hasher);
     style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
+    // hashed only when present: a look without them keeps the name a
+    // served page gave it before they existed
+    if let Some((x, y)) = style.shadow_offset {
+        (1u8, x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some((x, y)) = style.offset {
+        (2u8, x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
@@ -4420,7 +4438,12 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// u16-length string, empty for none; the glue writes it as
 /// `data-testid`. The fit byte of `SetImage` (op 9) gains a value: 2 is
 /// `object-fit: contain`, for a flow picture that holds its whole box.
-pub const ABI_VERSION: u32 = 27;
+///
+/// 28 (2026-11-19): a look's record ends with a second mask, a byte:
+/// bit 0 the halo's offset (`.shadow_offset`, f32 x + f32 y), bit 1 the
+/// box's own offset (`.offset`, f32 x + f32 y, CSS `translate`) — the
+/// first mask's thirty-two bits were all taken.
+pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -5123,6 +5146,13 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
             crate::layout::ScrollIndicators::Hidden | crate::layout::ScrollIndicators::Visible => 0,
         });
     }
+    // the first mask is full: what came after rides a second one, a byte
+    let more = u8::from(style.shadow_offset.is_some()) | u8::from(style.offset.is_some()) << 1;
+    out.push(more);
+    for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
+        push_f32(out, x);
+        push_f32(out, y);
+    }
 }
 
 fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
@@ -5536,8 +5566,9 @@ mod tests {
     /// count, the op, the rule's two words, the kind and the flags.
     const MASK_AT: usize = 4 + 1 + 8 + 1 + 1;
     /// What follows a look's style record when the flow record is bare
-    /// and no text face rides along: the flow mask and the text flag.
-    const BARE_TAIL: usize = 2 + 1;
+    /// and no text face rides along: the second style mask (ABI 28), the
+    /// flow mask and the text flag.
+    const BARE_TAIL: usize = 1 + 2 + 1;
 
     #[derive(Clone)]
     struct MiniList {
@@ -8102,6 +8133,8 @@ mod tests {
             turn: None,
             corner_radius: Some(Corners::all(6.0)),
             shadow: Some((4.0, Color::hex_a(0x0000_0040))),
+            shadow_offset: None,
+            offset: None,
             transition: Some((0.4, 0.8)),
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
@@ -8152,7 +8185,7 @@ mod tests {
         let soft = DomLook { background: Some(Color::WHITE), blur: Some(3.5), ..DomLook::default() };
         let mut encoded = Vec::new();
         encode_style(&mut encoded, &soft);
-        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64]);
+        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64, 0]);
     }
 
     #[test]
@@ -8298,6 +8331,8 @@ mod tests {
         tail.extend_from_slice(&pack_color(ink).to_le_bytes());
         // three quarters, laid out by the browser: the flow's code
         tail.push(2 + 3);
+        // and the second mask, empty (ABI 28)
+        tail.push(0);
         assert!(out.ends_with(&tail), "{out:?}");
         // the glue reads all three
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
@@ -9516,6 +9551,8 @@ mod tests {
             &[10, 1],
             &1u32.to_le_bytes()[..],
             &0x112233FFu32.to_le_bytes()[..],
+            // the second style mask, empty (ABI 28)
+            &[0],
             &(1u16 | 1 << 7).to_le_bytes()[..],
             &8f32.to_le_bytes()[..],
             &[0],

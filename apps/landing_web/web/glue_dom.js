@@ -72,7 +72,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 27;
+const EXPECTED_ABI = 28;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -675,6 +675,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // the halo and the glass rim share one property
   if (style.shadows.length) decl["box-shadow"] = style.shadows.join(",");
   if (style.transition) decl.transition = style.transition;
+  // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
+  if (style.offset) decl.translate = `${style.offset[0]}px ${style.offset[1]}px`;
   // the ink the subtree INHERITS: the text below sets no color of its
   // own, so the hover and active rules flip the box at once
   if (style.ink) decl.color = style.ink;
@@ -890,7 +892,7 @@ const HALO_LAYERS = [
   [0.0738, 0.1164, 0.3444],
 ];
 
-function halo(radius, packed) {
+function halo(radius, packed, [x, y] = [0, 0]) {
   const reach = Math.max(radius, 1);
   const r = (packed >>> 24) & 0xff;
   const g = (packed >>> 16) & 0xff;
@@ -899,7 +901,7 @@ function halo(radius, packed) {
   const decimal = (value, places) => Number(value.toFixed(places));
   return HALO_LAYERS.map(([spread, blur, weight]) => {
     const alpha = 1 - Math.pow(1 - opacity, weight);
-    return `0 0 ${decimal(blur * reach, 3)}px ${decimal(spread * reach, 3)}px ` +
+    return `${decimal(x, 3)}px ${decimal(y, 3)}px ${decimal(blur * reach, 3)}px ${decimal(spread * reach, 3)}px ` +
       `rgba(${r}, ${g}, ${b}, ${decimal(alpha, 4)})`;
   });
 }
@@ -1066,6 +1068,8 @@ function applyPatches(view, length) {
       blur: null,
       turn: null,
       scrollbar: null,
+      halo: null,
+      offset: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -1080,10 +1084,8 @@ function applyPatches(view, length) {
     // bit 4 is the one radius every corner shares; bit 22 below is the
     // four, and a box sends one or the other, never both
     if (mask & 16) style.radius = `${f32()}px`;
-    if (mask & 32) {
-      const radius = f32();
-      style.shadows.push(...halo(radius, u32()));
-    }
+    // the halo waits for its offset, which rides the second mask
+    if (mask & 32) style.halo = [f32(), u32()];
     if (mask & 64) {
       const response = f32();
       f32(); // damping — the CSS side keeps the duration
@@ -1198,6 +1200,12 @@ function applyPatches(view, length) {
     if (mask & 1073741824) style.turn = u8();
     // bit 31: a viewport that keeps its thumb to itself
     if (mask >>> 31) style.scrollbar = u8() === 1 ? "none" : "thin";
+    // the first mask is full: a second one, a byte — bit 0 the halo's
+    // offset, bit 1 the box's own (`translate`)
+    const more = u8();
+    const shadowOffset = more & 1 ? [f32(), f32()] : [0, 0];
+    if (more & 2) style.offset = [f32(), f32()];
+    if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };
   const readLayout = () => {
@@ -2235,6 +2243,7 @@ const imports = {
       familyPointer,
       familyLength,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(bytesAt(pointer, length));
       // measured at the device's size, as the page lays text out on a
@@ -2243,7 +2252,6 @@ const imports = {
       const ink = inkSurface();
       ink.font = cssFont(
         size * ratio,
-      tracking = 0,
         weight,
         mono,
         italic,
@@ -2253,6 +2261,8 @@ const imports = {
       // measures a line with spaces wider than the element that shows it,
       // and breaks a paragraph a word early
       ink.fontKerning = "normal";
+      // `.tracking`: the letters spread as the page spreads them
+      ink.letterSpacing = `${tracking * ratio}px`;
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(memory.buffer, out, 3);
       metrics[0] = text ? probe.width / ratio : 0;
@@ -2261,8 +2271,6 @@ const imports = {
     },
     // canvas islands raster their text through the engine — the same
     // contract as the full-canvas mode
-      // `.tracking`: the letters spread as the page spreads them
-      ink.letterSpacing = `${tracking * ratio}px`;
     js_raster_text(
       pointer,
       length,
@@ -2278,6 +2286,7 @@ const imports = {
       descent,
       color,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(bytesAt(pointer, length));
       const ink = inkSurface(width, height);
@@ -2286,12 +2295,12 @@ const imports = {
       ink.font = cssFont(
         size * scale,
         weight,
-      tracking = 0,
         mono,
         italic,
         familyOf(familyPointer, familyLength),
       );
       ink.fontKerning = "normal";
+      ink.letterSpacing = `${tracking * scale}px`;
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
@@ -2300,7 +2309,6 @@ const imports = {
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
       ink.fillText(text, 0, height - descent * scale);
       const pixels = ink.getImageData(0, 0, width, height).data;
-      ink.letterSpacing = `${tracking * scale}px`;
       new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },
   },

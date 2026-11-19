@@ -1327,6 +1327,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Shadow(radius, crate::layout::Color::rgba(0, 0, 0, 80)))
     }
 
+    /// `.shadow(color:radius:x:y:)`'s offset: the halo of
+    /// [`ViewExt::shadow_color`] drawn this far from the box — a light
+    /// from above casts it down (`y > 0`). The box itself stays.
+    #[track_caller]
+    fn shadow_offset(self, x: f64, y: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ShadowOffset(x, y))
+    }
+
+    /// `.offset(x: 4, y: -6)` — the view drawn this far from where the
+    /// layout put it, as SwiftUI's `.offset`: what is around it keeps its
+    /// place, the pointer finds the view where it is drawn. A badge
+    /// hanging off a corner, a card lifted as it is dragged.
+    #[track_caller]
+    fn offset(self, x: f64, y: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::Offset(x, y))
+    }
+
     /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
     /// panels).
     #[track_caller]

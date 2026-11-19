@@ -930,13 +930,15 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
 /// spells the same two.
 const HALO_LAYERS: [(f64, f64, f64); 2] = [(0.3262, 0.5124, 0.8489), (0.0738, 0.1164, 0.3444)];
 
-fn halo(radius: f64, ink: Color) -> impl Iterator<Item = String> {
+fn halo(radius: f64, ink: Color, (x, y): (f64, f64)) -> impl Iterator<Item = String> {
     let reach = radius.max(1.0);
     let opacity = f64::from(ink.a) / 255.0;
     HALO_LAYERS.iter().map(move |&(spread, blur, weight)| {
         let alpha = 1.0 - (1.0 - opacity).powf(weight);
         format!(
-            "0 0 {}px {}px rgba({}, {}, {}, {})",
+            "{}px {}px {}px {}px rgba({}, {}, {}, {})",
+            decimal(x, 3),
+            decimal(y, 3),
             decimal(blur * reach, 3),
             decimal(spread * reach, 3),
             ink.r,
@@ -1141,7 +1143,11 @@ fn rule_text(
     // the halo and the glass rim share one property
     let mut shadows: Vec<String> = Vec::new();
     if let Some((radius, shadow)) = style.shadow {
-        shadows.extend(halo(radius, shadow));
+        shadows.extend(halo(radius, shadow, style.shadow_offset.unwrap_or_default()));
+    }
+    // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
+    if let Some((x, y)) = style.offset {
+        base.insert("translate", format!("{} {}", px(x), px(y)));
     }
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
@@ -1604,7 +1610,7 @@ mod tests {
 
         let page = render(&Lifted, Size { width: 240.0, height: 120.0 });
         assert!(
-            page.css.contains("box-shadow:0 0 5.124px 3.262px rgba(0, 0, 0, 0.4466),0 0 1.164px 0.738px rgba(0, 0, 0, 0.2134)"),
+            page.css.contains("box-shadow:0px 0px 5.124px 3.262px rgba(0, 0, 0, 0.4466),0px 0px 1.164px 0.738px rgba(0, 0, 0, 0.2134)"),
             "{}",
             page.css
         );

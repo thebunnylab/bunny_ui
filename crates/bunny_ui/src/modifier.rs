@@ -83,6 +83,10 @@ pub enum Modifier {
     BackgroundBlend(crate::layout::BackgroundBlend),
     ForegroundColor(Color),
     Border(Color, f64),
+    /// `.shadow_offset(x, y)` — where the halo sits from the box.
+    ShadowOffset(f64, f64),
+    /// `.offset(x, y)` — the box drawn this far from its place.
+    Offset(f64, f64),
     /// `.border_style(…)` — how the border's line is drawn.
     BorderStyle(crate::shapes::BorderStyle),
     /// `.background_stripes(…)` — bands over the background.
@@ -325,6 +329,8 @@ impl Modifier {
             Modifier::BackgroundBlend { .. } => "background_blend",
             Modifier::ForegroundColor { .. } => "foreground_color",
             Modifier::Border { .. } => "border",
+            Modifier::ShadowOffset { .. } => "shadow_offset",
+            Modifier::Offset { .. } => "offset",
             Modifier::BorderStyle { .. } => "border_style",
             Modifier::BackgroundStripes { .. } => "background_stripes",
             Modifier::QuarterTurn { .. } => "quarter_turn",
@@ -467,6 +473,8 @@ impl Modifier {
             },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
+            Modifier::ShadowOffset(x, y) => format!(" [.shadow(x: {x}, y: {y})]"),
+            Modifier::Offset(x, y) => format!(" [.offset(x: {x}, y: {y})]"),
             Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
             Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
             Modifier::BackgroundStripes(stripes) => format!(
@@ -1453,6 +1461,16 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
+        ),
+        Modifier::ShadowOffset(x, y) => wrap_styled(
+            out,
+            mark,
+            VisualProps { shadow_offset: Some((*x, *y)), ..VisualProps::default() },
+        ),
+        Modifier::Offset(x, y) => wrap_styled(
+            out,
+            mark,
+            VisualProps { offset: Some((*x, *y)), ..VisualProps::default() },
         ),
         Modifier::BorderStyle(style) => wrap_styled(
             out,
