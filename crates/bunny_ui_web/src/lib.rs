@@ -1778,8 +1778,17 @@ pub extern "C" fn bunny_hits_json() -> u32 {
 /// [`bunny_probe_ptr`] reads it.
 #[cfg(feature = "probe")]
 fn probe_test_frames(runtime: &Runtime) {
+    // JSON has no infinity: a frame the layout could not bound is written
+    // as null, which a reader takes for a box it lacks
+    let number = |value: f64| if value.is_finite() { value.to_string() } else { String::from("null") };
     let rect = |rect: &bunny_ui::layout::Rect| {
-        format!("\"x\":{},\"y\":{},\"w\":{},\"h\":{}", rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+        format!(
+            "\"x\":{},\"y\":{},\"w\":{},\"h\":{}",
+            number(rect.origin.x),
+            number(rect.origin.y),
+            number(rect.size.width),
+            number(rect.size.height)
+        )
     };
     let ids: Vec<String> = runtime
         .test_frames()
