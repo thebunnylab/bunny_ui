@@ -2,6 +2,9 @@
 # and `bunny fidelity sweep --bless` writes the numbers that shrank.
 # chrome	Chrome/150.0.7871.24
 # flags	--force-device-scale-factor=2 --headless=new --disable-gpu --disable-gpu-rasterization --disable-gpu-compositing --force-color-profile=srgb --disable-lcd-text --font-render-hinting=none --hide-scrollbars --enable-unsafe-swiftshader
+app_hop	AxB	261	7279861	1507661
+app_hop	AxC	332	14620880	3447614
+app_hop	BxC	65	14242221	3431151
 case	pair	geometry	pixels_outside_text	pixels_in_text
 align	AxB	0	0	0
 align	AxC	0	0	0

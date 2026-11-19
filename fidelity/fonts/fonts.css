@@ -7,3 +7,25 @@
   font-weight: 100 900;
   font-style: normal;
 }
+
+/* The faces of hop's landing (app_hop), from hop's own copies: Inter,
+   which also stands in for Inter Tight (not shipped), and Fira Mono's one
+   weight. The page and both bunny modes read the same files. */
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/InterVariable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+}
+@font-face {
+  font-family: "Inter Tight";
+  src: url("/fonts/InterVariable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+}
+@font-face {
+  font-family: "Fira Mono";
+  src: url("/fonts/FiraMono-Medium.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+}
