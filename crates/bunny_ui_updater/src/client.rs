@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use bunny_ui_formats::sha::{self, Sha256};
 use bunny_ui_release::{
-    Format, InstallProgress, Offer, PlatformRelease, ReleaseAsset, ReleaseManifest, Transfer, UpdateError,
+    Format, InstallProgress, Installed, Offer, PlatformRelease, ReleaseAsset, ReleaseManifest, Transfer, UpdateError,
     UpdateStatus, Version,
 };
 
+use crate::apply::{ApplyStrategy, PlatformStrategy};
 use crate::config::{Feed, UpdaterConfig};
 use crate::fetch::Fetch;
 
@@ -161,6 +162,7 @@ impl<F: Fetch> Updater<F> {
         if self.config.keys.is_empty() {
             return Err(UpdateError::Apply("the updater has no public key, so no artifact can verify".into()));
         }
+        crate::apply::sweep_helpers(&std::env::temp_dir(), self.config.product.as_str());
         let staging = self.config.staging();
         std::fs::create_dir_all(&staging)
             .map_err(|error| UpdateError::Apply(format!("update folder {}: {error}", staging.display())))?;
@@ -201,6 +203,50 @@ impl<F: Fetch> Updater<F> {
         let path = self.config.staging().join(staged_name(&self.config.product, asset.format, &digest));
         std::fs::rename(partial, &path).map_err(|error| UpdateError::Apply(format!("keeping the download: {error}")))?;
         Ok(Verified { path, format: asset.format })
+    }
+}
+
+impl<F: Fetch> Updater<F> {
+    /// Whether this system can install an update of this copy at all.
+    /// [`Updater::update`] asks it before the download.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdateError::Apply`] that says what stands in the way: on Linux, a
+    /// copy that a package manager, a store or an AppImage owns, or a folder
+    /// that is not writable.
+    pub fn precheck(&self) -> Result<(), UpdateError> {
+        PlatformStrategy::for_config(&self.config).precheck()
+    }
+
+    /// Puts a verified build in place with the strategy of this system.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdateError::Apply`] when the install fails.
+    pub fn install(&self, artifact: &Verified) -> Result<Installed, UpdateError> {
+        PlatformStrategy::for_config(&self.config).apply(artifact)
+    }
+
+    /// The whole update of `asset`: the precheck, the download, the
+    /// verification and the install, each stage told to `progress`.
+    ///
+    /// The process is still the old build when this returns: start the
+    /// new one with [`crate::relaunch`], then quit.
+    ///
+    /// # Errors
+    ///
+    /// The first error of [`Updater::precheck`], [`Updater::download`] or
+    /// [`Updater::install`]. Nothing is installed unless it verified.
+    pub fn update(
+        &self,
+        asset: &ReleaseAsset,
+        progress: &mut dyn FnMut(InstallProgress),
+    ) -> Result<Installed, UpdateError> {
+        self.precheck()?;
+        let verified = self.download(asset, progress)?;
+        progress(InstallProgress::Applying);
+        self.install(&verified)
     }
 }
 
