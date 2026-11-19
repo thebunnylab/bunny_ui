@@ -1176,8 +1176,9 @@ pub enum LayoutNode {
         secret: bool,
         /// What the field holds, for the platform's autofill
         /// (`TextField::autocomplete`). `None` says nothing: the
-        /// platform decides. Read by the element lowering alone — the
-        /// pixel shells own no native field to fill.
+        /// platform decides. The element lowering writes it on the
+        /// input; the placement carries it to the shells whose input
+        /// system asks the focused view what it holds (macOS, iOS).
         autocomplete: Option<crate::text_input::Autocomplete>,
         /// The field's accessible name, when a chain gave it one
         /// (`.accessibility_label`). It rides the node, and not only
@@ -4710,6 +4711,11 @@ pub struct FieldPlacement {
     /// measures the MASK when it turns a click into a caret, and
     /// refuses the platform a copy.
     pub secret: bool,
+    /// What the field holds, for the platform's autofill
+    /// (`TextField::autocomplete`) — `None` when it said nothing. The
+    /// runtime answers it for the focused field
+    /// ([`crate::runtime::Runtime::focus_autocomplete`]).
+    pub autocomplete: Option<crate::text_input::Autocomplete>,
     /// Which way the scene around the field reads: where a line that
     /// fits is anchored ([`field_run_x`]). A line's OWN direction is its
     /// first letter's, decided by whoever reads it.
@@ -8492,6 +8498,7 @@ impl LayoutNode {
                     multiline,
                     auto_focus: *auto_focus,
                     secret,
+                    autocomplete: *autocomplete,
                     direction: env.direction,
                     text_align: env.text_align,
                 });

@@ -238,6 +238,10 @@ impl App {
         // the app's life outside its window: the notifier is the shared
         // half's, installed on the main thread — the one UIKit runs on
         bunny_ui::app::install_notifier(bunny_ui_apple::notifications::notify);
+        // the saved-password sheet hangs from the app's window
+        bunny_ui::autofill::install_requester(|answer| unsafe {
+            bunny_ui_apple::autofill::request_saved_password(ffi::anchor_window(), answer);
+        });
         // the general pasteboard, for the app's own handlers too
         bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
@@ -663,6 +667,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             // the keys — the ones it asks for — and a scene with none
             // wants them gone
             ffi::want_keys(runtime.focus_keyboard_type());
+            ffi::want_traits(runtime.focus_autocomplete(), runtime.focus_is_secret());
             ffi::want_keyboard(runtime.focus_takes_text());
             // wake or park the frame driver — the event may have
             // started (or finished) an animation, or a finger's clock

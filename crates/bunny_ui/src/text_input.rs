@@ -571,8 +571,12 @@ pub enum KeyboardType {
 /// a new one. Nothing here changes what the field shows or how it edits.
 ///
 /// The element lowering says it as the input's `autocomplete` attribute,
-/// in the HTML standard's own tokens ([`Autocomplete::token`]). The pixel
-/// shells own no native field for an autofill to fill, and say nothing.
+/// in the HTML standard's own tokens ([`Autocomplete::token`]). The macOS
+/// and iOS shells say it to their input system as the focused view's
+/// content type, which is what Passwords reads to fill the box in place;
+/// the other pixel shells own no input system that asks, and say nothing.
+/// Asking the system for a saved account before anything is typed is
+/// [`crate::autofill::saved_password`].
 ///
 /// ```ignore
 /// text_field("", password).secret(true).autocomplete(Autocomplete::CurrentPassword)

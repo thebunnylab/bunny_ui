@@ -2161,6 +2161,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 ),
             )
         }));
+        ffi::sync_content_type(runtime.focus_autocomplete());
         // wake or park the frame driver — the event may have started
         // (or finished) an animation
         sync_frame_driver(runtime, &pacer, window_id);
