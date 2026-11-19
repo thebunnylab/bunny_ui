@@ -176,6 +176,7 @@ pub fn view() -> impl View {
                     .frame_aligned(7.0, 4.0, Alignment::TopLeading)
                     .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(255, 255, 255)))
                     .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(255, 255, 255)))
+                    .rotation_effect(Angle::degrees(-45.0))
                     .offset(4.5, 3.5))
                 .test_id("span.badge-20"),
             )

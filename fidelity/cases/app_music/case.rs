@@ -46,6 +46,7 @@ pub fn view() -> impl View {
             .overlay(UnitPoint::TRAILING, spacer().frame_width(2.5).background_color(Color::rgb(255, 255, 255)))
             .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.5).background_color(Color::rgb(255, 255, 255)))
             .test_id("span.chev-4")
+            .rotation_effect(Angle::degrees(45.0))
             .padding_edge(Edge::Bottom, 6.0),
             spacer(),
             text("NOW PLAYING")
@@ -106,6 +107,7 @@ pub fn view() -> impl View {
                     .border(Color::rgb(0, 0, 0), 2.0)
                     .offset(70.0, 70.0))
                 .test_id("div.vinyl-12")
+                .rotation_effect(Angle::degrees(12.0))
                 .offset(112.0, 6.0))
             .overlay(UnitPoint::TOP_LEADING, image(picture_album_0())
                 .resizable()

@@ -30,6 +30,7 @@ pub fn view() -> impl View {
                     .frame_aligned(7.0, 7.0, Alignment::TopLeading)
                     .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(58, 58, 60)))
                     .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(58, 58, 60)))
+                    .rotation_effect(Angle::degrees(45.0))
                     .offset(10.0, 8.0))
                 .test_id("i.p-6"),
                 spacer()
@@ -42,6 +43,7 @@ pub fn view() -> impl View {
                     .frame_aligned(7.0, 7.0, Alignment::TopLeading)
                     .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(58, 58, 60)))
                     .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(58, 58, 60)))
+                    .rotation_effect(Angle::degrees(-135.0))
                     .offset(6.0, 8.0))
                 .test_id("i.n-7"),
             )
@@ -653,6 +655,7 @@ pub fn view() -> impl View {
                         .frame_aligned(3.0, 7.0, Alignment::TopLeading)
                         .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(255, 255, 255)))
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.5).background_color(Color::rgb(255, 255, 255)))
+                        .rotation_effect(Angle::degrees(40.0))
                         .offset(3.0, 0.0))
                     .test_id("input-71"),
                     text("Work")
@@ -682,6 +685,7 @@ pub fn view() -> impl View {
                         .frame_aligned(3.0, 7.0, Alignment::TopLeading)
                         .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(255, 255, 255)))
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.5).background_color(Color::rgb(255, 255, 255)))
+                        .rotation_effect(Angle::degrees(40.0))
                         .offset(3.0, 0.0))
                     .test_id("input-74"),
                     text("Health")
@@ -710,6 +714,7 @@ pub fn view() -> impl View {
                         .frame_aligned(3.0, 7.0, Alignment::TopLeading)
                         .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(255, 255, 255)))
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.5).background_color(Color::rgb(255, 255, 255)))
+                        .rotation_effect(Angle::degrees(40.0))
                         .offset(3.0, 0.0))
                     .test_id("input-77"),
                     text("Social")
@@ -738,6 +743,7 @@ pub fn view() -> impl View {
                         .frame_aligned(3.0, 7.0, Alignment::TopLeading)
                         .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(255, 255, 255)))
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(1.5).background_color(Color::rgb(255, 255, 255)))
+                        .rotation_effect(Angle::degrees(40.0))
                         .offset(3.0, 0.0))
                     .test_id("input-80"),
                     text("Errands")
@@ -946,8 +952,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-105")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-104"),
                         spacer()
@@ -958,8 +964,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-107")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-106"),
                         spacer()
@@ -970,8 +976,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-109")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-108"),
                         spacer()
@@ -982,8 +988,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-111")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-110"),
                         spacer()
@@ -994,8 +1000,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-113")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-112"),
                         spacer()
@@ -1006,8 +1012,8 @@ pub fn view() -> impl View {
                             .tracking(0.5)
                             .multiline_text_alignment(TextAlignment::Center)
                             .frame_aligned(40.0, 11.0, Alignment::Top)
-                            .quarter_turn(QuarterTurn::Counterclockwise)
                             .test_id("em-115")
+                            .rotation_effect(Angle::degrees(-90.0))
                             .offset(-12.5, 39.0))
                         .test_id("span-114"),
                     )

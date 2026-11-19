@@ -1,6 +1,6 @@
 # Import gaps — apps/music.html
 
-67 views named; 36 gaps in 18 features.
+67 views named; 34 gaps in 17 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -9,7 +9,6 @@
 | `box-shadow: layers` | 4 | div.knob-22, section.card-10, span.play-30, img.art-13 | rgba(0, 0, 0, 0.3) 0px -2px 3px 0px inset, rgb(255, 255, 255) 0px 1px 1px 0px inset, rgba(0, 0, 0, 0.4) 0px 2px 6px 0px |
 | `clip-path` | 3 | span.play-30::after, span.spk-35, span.heart-18::after | polygon(0px 0px, 100% 50%, 0px 100%) |
 | `conic-gradient` | 2 | div.vinyl-12, div.vinyl-12::before | not drawn |
-| `transform: rotate` | 2 | div.vinyl-12, span.chev-4 | 12.0deg |
 | `background-blend-mode` | 1 | div.vinyl-12 | normal, normal, normal |
 | `background-image: layers` | 1 | div.vinyl-12 | 3 layers |
 | `border-style: one side` | 1 | i-33 | dashed |

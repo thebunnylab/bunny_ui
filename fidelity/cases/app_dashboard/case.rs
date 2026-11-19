@@ -172,6 +172,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TRAILING, spacer().frame_width(2.0).background_color(Color::rgb(156, 163, 175)))
                 .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(156, 163, 175)))
                 .test_id("span.chev-17")
+                .rotation_effect(Angle::degrees(45.0))
                 .offset(0.0, -2.8284),
             )
             .spacing(8.0)
@@ -347,6 +348,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(5.0, 2.0, Alignment::TopLeading)
                     .background_color(Color::rgb(107, 114, 128))
+                    .rotation_effect(Angle::degrees(45.0))
                     .offset(23.0, 21.0))
                 .test_id("div.search-34"),
                 spacer()
@@ -1208,6 +1210,7 @@ pub fn view() -> impl View {
                                 .overlay(UnitPoint::TOP_LEADING, spacer()
                                     .frame_aligned(9.0, 9.0, Alignment::TopLeading)
                                     .background_color(Color::rgb(17, 24, 39))
+                                    .rotation_effect(Angle::degrees(45.0))
                                     .offset(14.0, 52.5))
                                 .test_id("div.tip-157")
                                 .offset(163.6641, 34.0))

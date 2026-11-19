@@ -1,12 +1,11 @@
 # Import gaps — apps/calendar.html
 
-278 views named; 79 gaps in 8 features.
+278 views named; 73 gaps in 7 features.
 
 | feature | count | where | what |
 |---|---|---|---|
 | `min-width` | 42 | b-118, b-120, b-122, b-124, … | 17px |
 | `background-clip: text` | 25 | b-271, div.bar-246, div.ev-270, i-127, … | gradient text drawn in the text's own ink |
-| `transform: rotate` | 6 | i.n-7::before, input-71::after, input-74::after, input-77::after, … | -135.0deg |
 | `gradient: stops` | 2 | button.new-14, div.tl-253 | 3 stops drawn as the first and the last |
 | `background-blend-mode` | 1 | button.new-14::before | normal, normal |
 | `background-image: layers` | 1 | button.new-14::before | 2 layers |

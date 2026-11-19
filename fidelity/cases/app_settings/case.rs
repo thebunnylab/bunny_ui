@@ -655,6 +655,7 @@ pub fn view() -> impl View {
                 .frame_aligned(5.0, 5.0, Alignment::TopLeading)
                 .overlay(UnitPoint::TRAILING, spacer().frame_width(2.0).background_color(Color::rgb(52, 120, 246)))
                 .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(52, 120, 246)))
+                .rotation_effect(Angle::degrees(45.0))
                 .on_click(|| {})
                 .padding_edge(Edge::Trailing, 3.0),
                 text("Advanced")

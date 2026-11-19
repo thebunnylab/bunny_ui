@@ -1,6 +1,6 @@
 # Import gaps — apps/profile.html
 
-63 views named; 32 gaps in 15 features.
+63 views named; 31 gaps in 14 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -17,5 +17,4 @@
 | `gradient: stops` | 1 | div.cover-1::after | 3 stops drawn as the first and the last |
 | `justify-content: space-around` | 1 | div.nav-67 | drawn as space-evenly |
 | `object-position` | 1 | img-2 | 50% 30% |
-| `transform: rotate` | 1 | span.badge-20::after | -45.0deg |
 | `writing-mode` | 1 | div.rail-66 | vertical-rl |

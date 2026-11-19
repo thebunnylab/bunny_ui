@@ -165,7 +165,6 @@ pub fn view() -> impl View {
         .corner_radius(14.0)
         .clipped()
         .test_id("img-21")
-        .padding_edge(Edge::Leading, 12.3441)
         .frame_aligned(440.0, 220.0, Alignment::TopLeading)
         .overlay(UnitPoint::TOP_LEADING, vstack!(
                 vstack!(
@@ -255,6 +254,7 @@ pub fn view() -> impl View {
         .frame_aligned(1064.0, 40.0, Alignment::Leading)
         .background_color(Color::rgb(29, 29, 31))
         .test_id("div.banner-26")
+        .rotation_effect(Angle::degrees(-2.0))
         .offset(-20.0, 322.0))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             hstack!(
@@ -349,6 +349,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(14.0, 14.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
+                    .rotation_effect(Angle::degrees(45.0))
                     .offset(11.0, 11.0))
                 .test_id("div.ico-43"),
                 vstack!(
@@ -487,6 +488,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-59"),
                     text("7-day history")
@@ -500,6 +502,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-60"),
                     text("Community support")
@@ -513,6 +516,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-61"),
                 )
@@ -539,10 +543,7 @@ pub fn view() -> impl View {
                 .foreground_color(Color::rgb(107, 107, 115))
                 .tracking(1.04)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .test_id("h4-64")
-                .padding_edge(Edge::Top, -3.15)
-                .padding_edge(Edge::Leading, -5.9986)
-                .padding_edge(Edge::Trailing, -5.9987),
+                .test_id("h4-64"),
                 rich_text([
                     run("€29"),
                     run(" / seat").weight(Weight::Regular).font_size(12.0).foreground_color(Color::rgb(107, 107, 115)),
@@ -551,9 +552,7 @@ pub fn view() -> impl View {
                 .font_weight(Weight::Black)
                 .tracking(-0.84)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .test_id("div.price-65")
-                .padding_edge(Edge::Leading, -5.9986)
-                .padding_edge(Edge::Trailing, -5.9987),
+                .test_id("div.price-65"),
                 vstack!(
                     text("Unlimited projects")
                     .font_size(12.0)
@@ -566,6 +565,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-68"),
                     text("1-year history")
@@ -579,6 +579,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-69"),
                     text("Priority support")
@@ -592,22 +593,21 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-70"),
                 )
                 .alignment(HorizontalAlignment::Leading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("ul-67")
-                .padding_edge(Edge::Top, 4.2)
-                .padding_edge(Edge::Leading, -5.9986)
-                .padding_edge(Edge::Trailing, -5.9987),
+                .padding_edge(Edge::Top, 4.0),
             )
             .alignment(HorizontalAlignment::Leading)
             .padding_edge(Edge::Top, 12.0)
             .padding_edge(Edge::Trailing, 18.0)
             .padding_edge(Edge::Bottom, 12.0)
             .padding_edge(Edge::Leading, 18.0)
-            .frame_aligned(283.0, 150.0, Alignment::TopLeading)
+            .frame_aligned(282.6641, 150.0, Alignment::TopLeading)
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(14.0)
             .border(Color::rgb(109, 40, 217), 2.0)
@@ -625,9 +625,10 @@ pub fn view() -> impl View {
                 .frame_aligned(110.0, 18.0, Alignment::Top)
                 .background_color(Color::rgb(236, 72, 153))
                 .test_id("span.ribbon-63")
-                .offset(206.5486, 13.5))
+                .rotation_effect(Angle::degrees(45.0))
+                .offset(200.6641, 16.0))
             .test_id("div.card-62")
-            .padding_edge(Edge::Leading, 27.832),
+            .padding_edge(Edge::Leading, 28.0),
             vstack!(
                 text("SCALE")
                 .font_size(13.0)
@@ -657,6 +658,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-76"),
                     text("Custom retention")
@@ -670,6 +672,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-77"),
                     text("Dedicated manager")
@@ -683,6 +686,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
+                        .rotation_effect(Angle::degrees(-45.0))
                         .offset(2.0, 5.0))
                     .test_id("li-78"),
                 )
@@ -702,7 +706,7 @@ pub fn view() -> impl View {
             .border(Color::rgb(229, 225, 245), 1.0)
             .clipped()
             .test_id("div.card-71")
-            .padding_edge(Edge::Leading, 27.832),
+            .padding_edge(Edge::Leading, 28.0),
         )
         .alignment(VerticalAlignment::Top)
         .padding_edge(Edge::Trailing, 20.0)
@@ -720,7 +724,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP, spacer().frame_height(5.0).background_color(Color::rgba(0, 0, 0, 0)))
                 .overlay(UnitPoint::BOTTOM, spacer().frame_height(5.0).background_color(Color::rgba(0, 0, 0, 0)))
                 .overlay(UnitPoint::LEADING, spacer().frame_width(8.0).background_color(Color::rgb(109, 40, 217)))
-                .quarter_turn(QuarterTurn::Clockwise)
+                .rotation_effect(Angle::degrees(90.0))
                 .on_click(|| {}),
                 text("Can I switch plans at any time?")
                 .font_size(13.0)

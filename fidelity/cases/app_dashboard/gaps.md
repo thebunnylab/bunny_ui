@@ -1,6 +1,6 @@
 # Import gaps — apps/dashboard.html
 
-227 views named; 42 gaps in 16 features.
+227 views named; 39 gaps in 15 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -8,7 +8,6 @@
 | `width: %` | 8 | div.app-1, i-193, input-35, table-167, … | 100% written as 1024.0 points |
 | `inline box: padding/radius` | 4 | span.trend-44, span.trend-56, span.trend-68, span.trend-80 | the run keeps its ground, not its box |
 | `inline-block in a line` | 4 | span.trend-44, span.trend-56, span.trend-68, span.trend-80 | drawn as a run of its words |
-| `transform: rotate` | 3 | div.search-34::after, div.tip-157::before, span.chev-17 | 45.0deg |
 | `background-blend-mode` | 2 | div.donut-96, span.ico-8 | normal, normal |
 | `background-image: layers` | 2 | div.donut-96, span.ico-8 | 2 layers |
 | `gradient: stops` | 2 | div.donut-96, div.plot-121 | 3 stops drawn as the first and the last |

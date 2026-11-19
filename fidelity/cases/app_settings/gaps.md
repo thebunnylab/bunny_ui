@@ -1,6 +1,6 @@
 # Import gaps — apps/settings.html
 
-100 views named; 42 gaps in 16 features.
+100 views named; 41 gaps in 15 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -19,4 +19,3 @@
 | `radial-gradient: shape` | 1 | input.rd-39 | rgb(52, 120, 246) 0px |
 | `repeating-linear-gradient` | 1 | div.drop-11 | drawn once |
 | `select` | 1 | select-53 | drawn as its label |
-| `transform: rotate` | 1 | summary-77::before | 45.0deg |
