@@ -1,0 +1,21 @@
+[package]
+name = "bunny-ui-release"
+version.workspace = true
+edition.workspace = true
+description = "The release contract of bunny-ui: manifests, channels, versions and targets that a publisher, a release server and the updater share"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "updater", "release", "manifest", "semver"]
+categories = ["gui", "data-structures"]
+
+# serde alone: a release server uses the contract with no UI and no HTTP
+# client, and the version order is written here rather than taken from
+# a crate.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# the tests hold the own version order to the semver crate's
+semver = "1"

@@ -212,6 +212,15 @@ name = "bunny-ui-preview-macros"
 version = "0.5.0"
 
 [[package]]
+name = "bunny-ui-release"
+version = "0.5.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bunny-ui-vulkan"
 version = "0.5.0"
 dependencies = [
