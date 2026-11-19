@@ -271,7 +271,13 @@ fn is_inline(node: &Node) -> bool {
         Kind::Text | Kind::Space => true,
         Kind::Before | Kind::After => node.css("display") == "inline" && !is_layer(node),
         Kind::Element => {
-            node.css("display") == "inline"
+            // an inline block that holds words alone and names no size of
+            // its own reads as a run of its line: bunny's paragraphs hold
+            // runs, not boxes
+            let text_block = node.css("display") == "inline-block"
+                && css::px(node.size("width")).is_none()
+                && css::px(node.size("height")).is_none();
+            (node.css("display") == "inline" || text_block)
                 && !matches!(node.tag.as_str(), "img" | "svg" | "input" | "select" | "textarea" | "button" | "br" | "progress" | "meter" | "video" | "canvas" | "iframe")
                 && node.children.iter().all(|child| is_inline(child) || is_layer(child))
         }
@@ -964,6 +970,12 @@ impl Writer<'_> {
                     }
                     let inner = TextStyle::of(item);
                     self.filters(item, &mut String::new());
+                    if item.css("display") == "inline-block" {
+                        self.gap(item, "inline-block in a line", "drawn as a run of its words");
+                    }
+                    if item.children.iter().any(is_layer) {
+                        self.gap(item, "positioned box in a line", "not drawn");
+                    }
                     if item.px("padding-left") > 0.0 || item.px("padding-right") > 0.0 || item.px("border-top-left-radius") > 0.0 {
                         self.gap(item, "inline box: padding/radius", "the run keeps its ground, not its box");
                     }

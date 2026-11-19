@@ -414,18 +414,8 @@ pub fn view() -> impl View {
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-43")
                         .padding_edge(Edge::Top, 2.0),
-                        text("+12.4%")
-                        .font_size(11.0)
-                        .font_weight(Weight::Bold)
-                        .foreground_color(Color::rgb(21, 128, 61))
-                        .padding_edge(Edge::Top, 1.0)
-                        .padding_edge(Edge::Trailing, 8.0)
-                        .padding_edge(Edge::Bottom, 1.0)
-                        .padding_edge(Edge::Leading, 8.0)
-                        .background_color(Color::rgb(220, 252, 231))
-                        .corner_radius(7.75)
-                        .test_id("span.trend-44")
-                        .padding_edge(Edge::Top, 6.0),
+                        rich_text([run("+12.4%").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(21, 128, 61))])
+                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
                     )
                     .alignment(HorizontalAlignment::Leading)
                     .padding_edge(Edge::Top, 13.0)
@@ -510,18 +500,8 @@ pub fn view() -> impl View {
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-55")
                         .padding_edge(Edge::Top, 2.0),
-                        text("+5.1%")
-                        .font_size(11.0)
-                        .font_weight(Weight::Bold)
-                        .foreground_color(Color::rgb(21, 128, 61))
-                        .padding_edge(Edge::Top, 1.0)
-                        .padding_edge(Edge::Trailing, 8.0)
-                        .padding_edge(Edge::Bottom, 1.0)
-                        .padding_edge(Edge::Leading, 8.0)
-                        .background_color(Color::rgb(220, 252, 231))
-                        .corner_radius(7.75)
-                        .test_id("span.trend-56")
-                        .padding_edge(Edge::Top, 6.0),
+                        rich_text([run("+5.1%").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(21, 128, 61))])
+                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
                     )
                     .alignment(HorizontalAlignment::Leading)
                     .padding_edge(Edge::Top, 13.0)
@@ -607,18 +587,8 @@ pub fn view() -> impl View {
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-67")
                         .padding_edge(Edge::Top, 2.0),
-                        text("−1.2%")
-                        .font_size(11.0)
-                        .font_weight(Weight::Bold)
-                        .foreground_color(Color::rgb(185, 28, 28))
-                        .padding_edge(Edge::Top, 1.0)
-                        .padding_edge(Edge::Trailing, 8.0)
-                        .padding_edge(Edge::Bottom, 1.0)
-                        .padding_edge(Edge::Leading, 8.0)
-                        .background_color(Color::rgb(254, 226, 226))
-                        .corner_radius(7.75)
-                        .test_id("span.trend-68")
-                        .padding_edge(Edge::Top, 6.0),
+                        rich_text([run("−1.2%").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(185, 28, 28))])
+                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
                     )
                     .alignment(HorizontalAlignment::Leading)
                     .padding_edge(Edge::Top, 13.0)
@@ -704,18 +674,8 @@ pub fn view() -> impl View {
                         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .test_id("div.val-79")
                         .padding_edge(Edge::Top, 2.0),
-                        text("+2.7%")
-                        .font_size(11.0)
-                        .font_weight(Weight::Bold)
-                        .foreground_color(Color::rgb(21, 128, 61))
-                        .padding_edge(Edge::Top, 1.0)
-                        .padding_edge(Edge::Trailing, 8.0)
-                        .padding_edge(Edge::Bottom, 1.0)
-                        .padding_edge(Edge::Leading, 8.0)
-                        .background_color(Color::rgb(220, 252, 231))
-                        .corner_radius(7.75)
-                        .test_id("span.trend-80")
-                        .padding_edge(Edge::Top, 6.0),
+                        rich_text([run("+2.7%").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(21, 128, 61))])
+                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
                     )
                     .alignment(HorizontalAlignment::Leading)
                     .padding_edge(Edge::Top, 13.0)

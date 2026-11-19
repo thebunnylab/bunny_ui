@@ -96,35 +96,15 @@ pub fn view() -> impl View {
         .frame_aligned(1024.0, 56.0, Alignment::Leading)
         .test_id("nav-2"))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
-            vstack!(
-                text("Ship software that feels")
-                .font_size(46.0)
-                .font_weight(Weight::Black)
-                .tracking(-1.38)
-                .line_height(48.3)
-                .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
-                text("calm")
-                .font_size(46.0)
-                .font_weight(Weight::Black)
-                .foreground_color(Color::rgb(255, 255, 255))
-                .tracking(-1.38)
-                .line_height(48.3)
-                .padding_edge(Edge::Trailing, 6.0)
-                .padding_edge(Edge::Leading, 6.0)
-                .overlay(UnitPoint::TOP_LEADING, spacer()
-                    .frame_aligned(100.484, 42.2969, Alignment::TopLeading)
-                    .background_color(Color::rgb(109, 40, 217))
-                    .corner_radius(3.0)
-                    .offset(0.0, 4.0))
-                .test_id("span.hl-14"),
-                text("to use.")
-                .font_size(46.0)
-                .font_weight(Weight::Black)
-                .tracking(-1.38)
-                .line_height(48.3)
-                .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
-            )
-            .alignment(HorizontalAlignment::Leading)
+            rich_text([
+                run("Ship software that feels "),
+                run("calm").foreground_color(Color::rgb(255, 255, 255)),
+                run(" to use."),
+            ])
+            .font_size(46.0)
+            .font_weight(Weight::Black)
+            .tracking(-1.38)
+            .line_height(48.3)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("h1-13"),
             text("Lumen turns scattered product signals into one quiet dashboard, so your team spends less time chasing alerts and more time building.")
