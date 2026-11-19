@@ -6,9 +6,9 @@ case	pair	geometry	pixels_outside_text	pixels_in_text
 align	AxB	0	0	0
 align	AxC	0	0	0
 align	BxC	0	0	0
-app_calendar	AxB	98	103985	31672
-app_calendar	AxC	47	174468	55319
-app_calendar	BxC	57	90774	33295
+app_calendar	AxB	56	103890	20590
+app_calendar	AxC	5	175276	47822
+app_calendar	BxC	57	90776	33110
 app_chat	AxB	19	316373	89408
 app_chat	AxC	14	557114	72444
 app_chat	BxC	19	734397	100788
@@ -27,9 +27,9 @@ app_music	BxC	0	1085321	130165
 app_profile	AxB	20	670176	40538
 app_profile	AxC	40	420717	49519
 app_profile	BxC	0	650494	51534
-app_settings	AxB	2	212744	74212
-app_settings	AxC	8	211635	86296
-app_settings	BxC	8	31820	35555
+app_settings	AxB	0	212731	74163
+app_settings	AxC	8	211622	86289
+app_settings	BxC	8	31827	35557
 baseline	AxB	0	0	0
 baseline	AxC	0	0	2628
 baseline	BxC	0	0	2628
@@ -48,6 +48,9 @@ grid	BxC	0	0	0
 grow_shrink	AxB	0	0	0
 grow_shrink	AxC	0	0	1943
 grow_shrink	BxC	0	0	1943
+hop_landing	AxB	374	17781821	5113504
+hop_landing	AxC	375	16121020	4627163
+hop_landing	BxC	375	14883676	4041912
 image_scale	AxB	0	0	0
 image_scale	AxC	0	0	0
 image_scale	BxC	0	0	0
