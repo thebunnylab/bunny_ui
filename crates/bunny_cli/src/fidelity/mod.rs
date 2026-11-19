@@ -49,7 +49,7 @@ struct Captured {
 }
 
 /// The checkout holding `fidelity/cases`, from the working directory up.
-fn find_root() -> Result<PathBuf> {
+pub(crate) fn find_root() -> Result<PathBuf> {
     let start = std::env::current_dir().map_err(|error| Error::new(error.to_string()))?;
     start
         .ancestors()
@@ -60,7 +60,7 @@ fn find_root() -> Result<PathBuf> {
 
 /// This checkout, and the main one when this is a worktree — where a
 /// browser kept under `gitignore/` lives.
-fn checkouts(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn checkouts(root: &Path) -> Vec<PathBuf> {
     let mut found = vec![root.to_path_buf()];
     let common = std::process::Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])

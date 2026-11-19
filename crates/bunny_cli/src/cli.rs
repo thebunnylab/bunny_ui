@@ -84,6 +84,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::fidelity::run,
     },
     Command {
+        name: "import",
+        summary: commands::import::SUMMARY,
+        usage: commands::import::USAGE,
+        about: commands::import::ABOUT,
+        options: commands::import::OPTIONS,
+        run: commands::import::run,
+    },
+    Command {
         name: "devices",
         summary: commands::devices::DEVICES_SUMMARY,
         usage: commands::devices::DEVICES_USAGE,

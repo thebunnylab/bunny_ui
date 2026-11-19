@@ -175,7 +175,31 @@ pub fn capture(chrome: &mut Chrome, url: &str, kind: Kind, viewport: Viewport) -
     shot
 }
 
+/// One page loaded the way a capture loads it — frozen clock and
+/// chance, the virtual load, every face and picture in — and asked one
+/// question: the value `script` evaluates to.
+///
+/// # Errors
+///
+/// A page that would not load or settle, or a script that threw.
+pub fn read(chrome: &mut Chrome, url: &str, viewport: Viewport, script: &str) -> Result<Value> {
+    let mut page = chrome.open_page()?;
+    let answer = load(&mut page.session, url, viewport)
+        .and_then(|()| settle(&mut page.session, Kind::Html))
+        .and_then(|()| page.session.evaluate(script));
+    chrome.close_page(page)?;
+    answer
+}
+
 fn capture_on(session: &mut Session, url: &str, kind: Kind, viewport: Viewport) -> Result<Shot> {
+    load(session, url, viewport)?;
+    settle(session, kind)?;
+    finish(session, kind)
+}
+
+/// Loads `url` at `viewport`, with the clock and chance frozen and the
+/// load run on the virtual clock.
+fn load(session: &mut Session, url: &str, viewport: Viewport) -> Result<()> {
     for domain in ["Page.enable", "Network.enable", "Runtime.enable"] {
         session.call(domain, cdp::object(&[]))?;
     }
@@ -219,7 +243,10 @@ fn capture_on(session: &mut Session, url: &str, kind: Kind, viewport: Viewport) 
     // then the clock runs again, as fast as the page lets it, for the
     // waits that confirm the page is still
     session.call("Emulation.setVirtualTimePolicy", cdp::object(&[("policy", cdp::text("advance"))]))?;
-    settle(session, kind)?;
+    Ok(())
+}
+
+fn finish(session: &mut Session, kind: Kind) -> Result<Shot> {
     let geometry = match kind {
         Kind::Html => format!("{}('data-fid')", geometry_script(kind)),
         Kind::Dom => format!("{}('data-testid')", geometry_script(kind)),

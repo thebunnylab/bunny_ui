@@ -19,6 +19,7 @@ pub mod fidelity;
 pub mod formats;
 pub mod hot;
 pub mod ids;
+pub mod import;
 pub mod json;
 pub mod keys;
 pub mod net;
