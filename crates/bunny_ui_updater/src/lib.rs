@@ -14,6 +14,11 @@
 //!   is downloaded.
 //! - [`Updater::download`] gives a [`Verified`] artifact, or an error. Only
 //!   bytes that verified ever become a `Verified`.
+//! - [`Updater::install`] puts a `Verified` build in place, one strategy for
+//!   each system, and [`relaunch`] starts it. [`Updater::update`] does the
+//!   precheck, the download, the verification and the install in order.
+//! - [`run_helper_if_asked`] runs the Windows update helper when this
+//!   launch is one. The app's start calls it first.
 //! - [`UpdateLog`] keeps the reason of each failure on this machine.
 //! - [`Fetch`] is the network. The `curl` feature (on by default) gives
 //!   [`CurlFetch`]. An app with its own HTTP client implements the trait.
@@ -31,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 mod client;
 mod config;
 #[cfg(feature = "curl")]
@@ -49,6 +55,7 @@ pub use bunny_ui_formats::ed25519::VerifyingKey;
 pub use bunny_ui_release as release;
 pub use bunny_ui_release::{InstallProgress, Installed, Offer, ReleaseAsset, UpdateError, UpdateStatus, Version};
 
+pub use apply::{ApplyStrategy, PlatformStrategy, relaunch, run_helper_if_asked};
 pub use client::{Updater, Verified, verify_file};
 pub use config::{Feed, UpdaterConfig, default_cache, parse_key};
 #[cfg(feature = "curl")]

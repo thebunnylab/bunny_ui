@@ -40,6 +40,10 @@ pub struct UpdaterConfig {
     /// Where downloads wait before they are installed, and where the log
     /// goes.
     pub cache: PathBuf,
+    /// The other executables of the Windows package, by file stem
+    /// (`tool` for `tool.exe`). The update waits until each is free,
+    /// because an installer that meets a held file half-succeeds.
+    pub sidecars: Vec<String>,
 }
 
 impl UpdaterConfig {
@@ -56,6 +60,7 @@ impl UpdaterConfig {
             target: bunny_ui_release::current_target(),
             keys: Vec::new(),
             cache,
+            sidecars: Vec::new(),
         }
     }
 
@@ -68,6 +73,12 @@ impl UpdaterConfig {
     #[must_use]
     pub fn cache(mut self, cache: impl Into<PathBuf>) -> UpdaterConfig {
         self.cache = cache.into();
+        self
+    }
+
+    #[must_use]
+    pub fn sidecars<I: IntoIterator<Item = S>, S: Into<String>>(mut self, stems: I) -> UpdaterConfig {
+        self.sidecars = stems.into_iter().map(Into::into).collect();
         self
     }
 
