@@ -826,6 +826,8 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("box-sizing", "border-box"),
                 ("padding", "5px 8px"),
                 ("outline", "none"),
+                ("border", "0"),
+                ("background", "transparent"),
             ],
         ),
         CreateKind::Editor => (
@@ -834,6 +836,8 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("box-sizing", "border-box"),
                 ("padding", "5px 8px"),
                 ("outline", "none"),
+                ("border", "0"),
+                ("background", "transparent"),
                 ("resize", "none"),
                 ("font", "inherit"),
             ],
@@ -1734,6 +1738,29 @@ mod tests {
     #[test]
     fn a_served_shadow_follows_the_house_halo() {
         #[derive(Clone, Copy)]
+    /// A field's chrome is the theme's or none: the browser's own white
+    /// box and sunken edge never show, so a bare field shows what is
+    /// behind it, and a themed one wears the look's ground over the reset.
+    #[test]
+    fn a_served_field_never_wears_the_browsers_box() {
+        #[derive(Clone)]
+        struct Fields(State<String>);
+        impl Component for Fields {
+            fn body(self) -> impl View {
+                vstack!(text_field("bare", self.0.binding()).bare(), text_field("themed", self.0.binding()))
+            }
+        }
+
+        let page = render(&Fields(State::new(String::new())), Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        let fields: Vec<&str> = css.lines().filter(|rule| rule.contains("padding:5px 8px")).collect();
+        assert_eq!(fields.len(), 2, "{css}");
+        for rule in &fields {
+            assert!(rule.contains("background:transparent;") && rule.contains("border:0;"), "{rule}");
+        }
+        assert!(fields.iter().any(|rule| rule.contains("background-color:")), "the theme's ground: {css}");
+    }
+
         struct Lifted;
         impl Component for Lifted {
             fn body(self) -> impl View {

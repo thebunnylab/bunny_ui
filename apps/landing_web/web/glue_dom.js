@@ -541,8 +541,9 @@ const KIND_BASE = [
   // the engine's explicit newlines and wraps the rest
   "box-sizing:border-box;white-space:pre-wrap;cursor:default",
   // 3 field: the padding mirrors the engine's FIELD_PAD; every color
-  // and border arrives through the look — the theme owns the chrome
-  "box-sizing:border-box;padding:5px 8px;outline:none",
+  // and border arrives through the look — the theme owns the chrome, and
+  // the browser's own box never shows
+  "box-sizing:border-box;padding:5px 8px;outline:none;border:0;background:transparent",
   // 4 scroll
   "box-sizing:border-box;min-width:0;min-height:0;overflow:auto;scroll-behavior:smooth",
   // 5 content: hosts virtual rows at absolute slots
@@ -562,7 +563,7 @@ const KIND_BASE = [
   // the anchor's real box once the placement round lands
   "position:absolute;left:0;top:0;box-sizing:border-box",
   // 13 editor: the field of MANY lines
-  "box-sizing:border-box;padding:5px 8px;outline:none;resize:none;font:inherit",
+  "box-sizing:border-box;padding:5px 8px;outline:none;border:0;background:transparent;resize:none;font:inherit",
   // 14 iframe: the native host's page, pointer events ON
   "border:0;box-sizing:border-box;min-width:0;min-height:0",
   // 15 video: the video host's stream, the box underneath owns the clicks
