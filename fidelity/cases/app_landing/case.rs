@@ -423,7 +423,8 @@ pub fn view() -> impl View {
                 .frame_aligned(26.0, 26.0, Alignment::TopLeading)
                 .corner_radius(13.0)
                 .clipped()
-                .test_id("img-48"),
+                .test_id("img-48")
+                .padding_edge(Edge::Leading, -50.0),
                 text("Maya Ortiz — VP Engineering, Northwind")
                 .font_size(11.0)
                 .foreground_color(Color::rgb(85, 85, 92))
@@ -559,7 +560,10 @@ pub fn view() -> impl View {
                 .foreground_color(Color::rgb(107, 107, 115))
                 .tracking(1.04)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .test_id("h4-64"),
+                .test_id("h4-64")
+                .padding_edge(Edge::Top, -3.15)
+                .padding_edge(Edge::Leading, -6.0)
+                .padding_edge(Edge::Trailing, -6.0),
                 rich_text([
                     run("€29"),
                     run(" / seat").weight(Weight::Regular).font_size(12.0).foreground_color(Color::rgb(107, 107, 115)),
@@ -568,7 +572,9 @@ pub fn view() -> impl View {
                 .font_weight(Weight::Black)
                 .tracking(-0.84)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
-                .test_id("div.price-65"),
+                .test_id("div.price-65")
+                .padding_edge(Edge::Leading, -6.0)
+                .padding_edge(Edge::Trailing, -6.0),
                 vstack!(
                     text("Unlimited projects")
                     .font_size(12.0)
@@ -613,7 +619,9 @@ pub fn view() -> impl View {
                 .alignment(HorizontalAlignment::Leading)
                 .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                 .test_id("ul-67")
-                .padding_edge(Edge::Top, 4.2),
+                .padding_edge(Edge::Top, 4.2)
+                .padding_edge(Edge::Leading, -6.0)
+                .padding_edge(Edge::Trailing, -6.0),
             )
             .alignment(HorizontalAlignment::Leading)
             .padding_edge(Edge::Top, 12.0)

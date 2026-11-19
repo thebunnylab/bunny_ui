@@ -73,7 +73,8 @@ pub fn view() -> impl View {
             .shadow_color(14.0, Color::rgba(0, 0, 0, 64))
             .shadow_offset(0.0, 4.0)
             .clipped()
-            .test_id("img.avatar-7"),
+            .test_id("img.avatar-7")
+            .padding_edge(Edge::Top, -48.0),
             image(picture_photo2_2())
             .resizable()
             .aspect_ratio(ContentMode::Fill)

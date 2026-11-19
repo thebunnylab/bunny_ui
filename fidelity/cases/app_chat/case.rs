@@ -327,6 +327,7 @@ pub fn view() -> impl View {
             .foreground_color(Color::rgb(138, 143, 156))
             .tracking(0.4)
             .test_id("div.seen-33")
+            .padding_edge(Edge::Top, -3.0)
             .padding_edge(Edge::Trailing, 4.0),
             vstack!(
                 text("Latin text set right to left, ok!")

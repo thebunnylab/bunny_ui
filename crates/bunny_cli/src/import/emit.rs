@@ -811,15 +811,15 @@ impl Writer<'_> {
             let Some(mut view) = self.block_child(child) else { continue };
             let rect = child_rect(node, child);
             let top = rect.y - previous_bottom;
-            if top > 0.25 && child.kind == Kind::Element {
+            if top.abs() > 0.25 && child.kind == Kind::Element {
                 let _ = write!(view, "\n.padding_edge(Edge::Top, {})", num(top));
             }
             let leading = rect.x - content_left;
-            if leading > 0.25 && child.kind == Kind::Element {
+            if leading.abs() > 0.25 && child.kind == Kind::Element {
                 let _ = write!(view, "\n.padding_edge(Edge::Leading, {})", num(leading));
             }
             let trailing = content_right - rect.right();
-            if trailing > 0.25 && child.kind == Kind::Element && matches!(self.sizing(child, Flow::Block).0, Size::Fill(_)) {
+            if trailing.abs() > 0.25 && child.kind == Kind::Element && matches!(self.sizing(child, Flow::Block).0, Size::Fill(_)) {
                 let _ = write!(view, "\n.padding_edge(Edge::Trailing, {})", num(trailing));
             }
             if child.kind == Kind::Element {
@@ -1302,8 +1302,10 @@ fn margins(child: &Node, lead_taken: bool, row: bool) -> String {
         if lead_taken && side == lead {
             continue;
         }
+        // a negative margin is a negative padding: the box overlaps its
+        // neighbour and gives the line that much back
         let margin = child.px(&format!("margin-{side}"));
-        if margin > 0.0 && child.sizes.get(&format!("margin-{side}")).is_none_or(|value| value != "auto") {
+        if margin.abs() > 1e-9 && child.sizes.get(&format!("margin-{side}")).is_none_or(|value| value != "auto") {
             let _ = write!(code, "\n.padding_edge(Edge::{edge}, {})", num(margin));
         }
     }

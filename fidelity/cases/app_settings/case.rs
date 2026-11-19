@@ -35,6 +35,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Leading, 6.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-6")
+            .padding_edge(Edge::Top, -6.0)
             .padding_edge(Edge::Trailing, 492.68),
             hstack!(
                 vstack!(
@@ -226,6 +227,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Leading, 6.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-26")
+            .padding_edge(Edge::Top, -6.0)
             .padding_edge(Edge::Trailing, 462.04),
             hstack!(
                 vstack!(
@@ -463,6 +465,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Leading, 6.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-55")
+            .padding_edge(Edge::Top, -6.0)
             .padding_edge(Edge::Trailing, 465.29),
             hstack!(
                 vstack!(
@@ -554,6 +557,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Leading, 6.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-66")
+            .padding_edge(Edge::Top, -6.0)
             .padding_edge(Edge::Trailing, 452.95),
             hstack!(
                 vstack!(
@@ -837,6 +841,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Leading, 6.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
             .test_id("legend-90")
+            .padding_edge(Edge::Top, -6.0)
             .padding_edge(Edge::Trailing, 406.11),
             hstack!(
                 spacer()
