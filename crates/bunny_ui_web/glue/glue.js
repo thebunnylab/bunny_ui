@@ -381,6 +381,7 @@ const imports = {
       familyPointer,
       familyLength,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
@@ -394,6 +395,8 @@ const imports = {
       // measures a line with spaces wider than the element that shows it,
       // and breaks a paragraph a word early
       ink.fontKerning = "normal";
+      // `.tracking`: the letters spread as the page spreads them
+      ink.letterSpacing = `${tracking * ratio}px`;
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(wasm.memory.buffer, out, 3);
       metrics[0] = text ? probe.width / ratio : 0;
@@ -418,6 +421,7 @@ const imports = {
       descent,
       color,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
@@ -427,6 +431,7 @@ const imports = {
       ink.clearRect(0, 0, width, height);
       ink.font = cssFont(size * scale, weight, mono, italic, familyOf(familyPointer, familyLength));
       ink.fontKerning = "normal";
+      ink.letterSpacing = `${tracking * scale}px`;
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;

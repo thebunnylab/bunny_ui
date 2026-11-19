@@ -466,11 +466,11 @@ export function js_image_raster(hi, lo, width, height, out) {
 // Ascent/descent come from the FONT's bounding box (stable per font);
 // an empty string keeps the metrics and reports width 0.
 export function js_measure_text(
-  pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
+  pointer, length, size, weight, mono, italic, familyPointer, familyLength, out, tracking = 0,
 ) {
   if (dom) {
     return dom.js_measure_text(
-      pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
+      pointer, length, size, weight, mono, italic, familyPointer, familyLength, out, tracking,
     );
   }
   if (!host) return;
@@ -484,6 +484,8 @@ export function js_measure_text(
   // measures a line with spaces wider than the element that shows it,
   // and breaks a paragraph a word early
   ink.fontKerning = "normal";
+  // `.tracking`: the letters spread as the page spreads them
+  ink.letterSpacing = `${tracking * ratio}px`;
   const probe = ink.measureText(line || "Mg");
   const metrics = new Float64Array(memory.buffer, out >>> 0, 3);
   metrics[0] = line ? probe.width / ratio : 0;
@@ -496,12 +498,12 @@ export function js_measure_text(
 // alpha — the compositor's contract, no conversion here.
 export function js_raster_text(
   pointer, length, size, weight, mono, italic, familyPointer, familyLength,
-  scale, width, height, descent, color, out,
+  scale, width, height, descent, color, out, tracking = 0,
 ) {
   if (dom) {
     return dom.js_raster_text(
       pointer, length, size, weight, mono, italic, familyPointer, familyLength,
-      scale, width, height, descent, color, out,
+      scale, width, height, descent, color, out, tracking,
     );
   }
   if (!host) return;
@@ -511,6 +513,7 @@ export function js_raster_text(
   ink.clearRect(0, 0, width, height);
   ink.font = cssFont(size * scale, weight, mono, italic, text(familyPointer, familyLength) || null);
   ink.fontKerning = "normal";
+  ink.letterSpacing = `${tracking * scale}px`;
   ink.textBaseline = "alphabetic";
   const r = (color >>> 24) & 0xff;
   const g = (color >>> 16) & 0xff;

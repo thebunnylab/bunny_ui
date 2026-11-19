@@ -2243,6 +2243,7 @@ const imports = {
       const ink = inkSurface();
       ink.font = cssFont(
         size * ratio,
+      tracking = 0,
         weight,
         mono,
         italic,
@@ -2260,6 +2261,8 @@ const imports = {
     },
     // canvas islands raster their text through the engine — the same
     // contract as the full-canvas mode
+      // `.tracking`: the letters spread as the page spreads them
+      ink.letterSpacing = `${tracking * ratio}px`;
     js_raster_text(
       pointer,
       length,
@@ -2283,6 +2286,7 @@ const imports = {
       ink.font = cssFont(
         size * scale,
         weight,
+      tracking = 0,
         mono,
         italic,
         familyOf(familyPointer, familyLength),
@@ -2296,6 +2300,7 @@ const imports = {
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
       ink.fillText(text, 0, height - descent * scale);
       const pixels = ink.getImageData(0, 0, width, height).data;
+      ink.letterSpacing = `${tracking * scale}px`;
       new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },
   },
