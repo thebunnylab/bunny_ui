@@ -18,6 +18,17 @@ use crate::wasm;
 
 pub const TARGET: &str = "wasm32-unknown-unknown";
 
+/// The wasm's stack: eight megabytes.
+///
+/// Rust links the target with one, and a screen of real size — a month
+/// of a calendar, a dashboard, a dozen stacks deep with their modifiers —
+/// lays out deeper than that: the page dies with "memory access out of
+/// bounds" before it draws. Linear memory costs nothing until touched.
+#[must_use]
+pub fn stack_args() -> Vec<String> {
+    vec![String::from("-C"), String::from("link-arg=-zstack-size=8388608")]
+}
+
 /// Which glue the page boots the wasm with — by the entry it exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -62,7 +73,7 @@ pub fn build(project: &Project, options: &Options, dev: bool) -> Result<Site> {
         target: Some(TARGET.to_string()),
         features: options.features.clone(),
         env: project.build_env(),
-        rustc_args: Vec::new(),
+        rustc_args: stack_args(),
         quiet: false,
         diagnostics: cargo::Diagnostics::Render,
     })?;

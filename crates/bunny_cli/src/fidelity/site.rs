@@ -92,6 +92,7 @@ pub fn build_wasm(root: &Path) -> Result<(PathBuf, PathBuf)> {
         what: Target::CdylibLib,
         release: true,
         target: Some(String::from(crate::platform::web::TARGET)),
+        rustc_args: crate::platform::web::stack_args(),
         ..cargo::Build::default()
     })?;
     let glue = built
