@@ -682,6 +682,10 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     caret: cg_rect(snapshot.caret_rect),
                 }
             }));
+            // the focused field's form, its other boxes as proxies, so one
+            // Passwords pick fills them all — before the keys are claimed,
+            // so the keyboard that comes up finds the form whole
+            ffi::sync_autofill(&runtime.autofill_group(), runtime.focused().as_deref());
             // the keyboard follows the focus: a field that took it wants
             // the keys — the ones it asks for — and a scene with none
             // wants them gone
@@ -810,7 +814,16 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         if trace && !matches!(event, AppEvent::Blink | AppEvent::Frame { .. }) {
-            eprintln!("bunny_ui ios: {event:?}");
+            // what the keyboard writes into a box that hides it — a pick
+            // from Passwords lands here whole — is named, never printed
+            match &event {
+                AppEvent::Text(text) | AppEvent::Marked { text, .. } | AppEvent::Replace { text, .. }
+                    if runtime.focus_is_secret() =>
+                {
+                    eprintln!("bunny_ui ios: {} chars into a secret box", text.chars().count());
+                }
+                _ => eprintln!("bunny_ui ios: {event:?}"),
+            }
         }
         match event {
             AppEvent::Redraw => blit(runtime, root),
@@ -942,6 +955,14 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 if placed || replaced {
                     blit(runtime, root);
                 }
+            }
+            // AutoFill wrote a box beside the one being typed into: the
+            // box takes it by path, and the keyboard stays where it is.
+            // The frame runs either way — the proxy already holds what the
+            // system wrote, and a box that refused it shows it back
+            AppEvent::Fill { field, text } => {
+                let _ = runtime.autofill(&field, text.as_str());
+                blit(runtime, root);
             }
             AppEvent::Modifiers(held) => {
                 if runtime.modifiers_changed(held).present {

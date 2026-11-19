@@ -3,7 +3,7 @@
 //! This module is the shell's `unsafe` border on the phone. UIKit is
 //! called through `objc_msgSend` re-declared with the concrete signature
 //! of each message (the shared Apple half carries the vocabulary; every
-//! module declares its own aliases), and seven classes are born at
+//! module declares its own aliases), and eight classes are born at
 //! runtime via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyAppDelegate` (UIResponder) — the application delegate: the
@@ -19,20 +19,32 @@
 //! - `BunnyViewController` (UIViewController) — the safe area and the
 //!   traits (dark, the size class), which UIKit tells the controller;
 //! - `BunnyView` (UIView) — whose backing layer IS a `CAMetalLayer`
-//!   (`+layerClass`), which hears every touch, and which is the
-//!   responder the soft keyboard types into. It adopts the whole of
-//!   `UITextInput`, not only `UIKeyInput`: the keyboard's input
-//!   assistant — the QuickType bar, the Passwords key, the one-time code
-//!   from Messages — attaches only to a responder that can say what the
-//!   focused field holds, where its caret stands and what is being
-//!   composed. It answers from a mirror of that field the shell syncs
-//!   after every frame ([`sync_text`]);
-//! - `BunnyKeyInput` (UIView) — the keyboard's second door: an empty
-//!   point inside `BunnyView` that answers the keyboard as it does. When
-//!   the focus moves from one field to another with the keyboard up, the
-//!   keyboard moves to the other door. The input system then meets each
-//!   field as a responder of its own; AutoFill keeps what it learned of a
-//!   responder for as long as that responder holds the keyboard;
+//!   (`+layerClass`), and which hears every touch. It is no text view
+//!   itself: AutoFill looks for the boxes of a form among the text views
+//!   inside the view controller's view, and stops at the first one it
+//!   meets — a `BunnyView` that took text would hide every box inside it;
+//! - `BunnyKeyInput` (UIView) — the keyboard's doors, two empty views
+//!   inside `BunnyView`, the responders the soft keyboard types into.
+//!   They adopt the whole of `UITextInput`, not only `UIKeyInput`: the
+//!   keyboard's input assistant — the QuickType bar, the Passwords key,
+//!   the one-time code from Messages — attaches only to a responder that
+//!   can say what the focused field holds, where its caret stands and what
+//!   is being composed. A door answers from a mirror of that field the
+//!   shell syncs after every frame ([`sync_text`]). When the focus moves
+//!   from one field to another with the keyboard up, the keyboard moves to
+//!   the other door: the input system then meets each field as a responder
+//!   of its own, since AutoFill keeps what it learned of a responder for
+//!   as long as that responder holds the keyboard;
+//! - `BunnyAutofillBox` (UIView) — the other boxes of the focused field's
+//!   form, one hidden view each, while a box of the form holds the
+//!   keyboard ([`sync_autofill`]). AutoFill pairs a name box with a
+//!   password box only across separate text views, and every box of the
+//!   scene types through the doors; so each other box gets a view of its
+//!   own, wearing its `textContentType` and its frame, and one Passwords
+//!   pick fills the form. A proxy answers the same `UITextInput` from its
+//!   box's text, never takes the keyboard, a touch or VoiceOver, draws
+//!   nothing, and hands what the system writes into it back to its box by
+//!   path ([`AppEvent::Fill`]);
 //! - `BunnyTextPosition` (UITextPosition) and `BunnyTextRange`
 //!   (UITextRange) — an offset, and a pair of them, in UTF-16: the
 //!   objects the keyboard holds and hands back. Each carries its
@@ -201,6 +213,10 @@ pub enum AppEvent {
     Select { location: u64, length: u64 },
     /// The keyboard replaces a range of the text (`replaceRange:withText:`).
     Replace { location: u64, length: u64, text: String },
+    /// The system's AutoFill wrote a box of the form that does not hold
+    /// the keyboard, through the box's proxy ([`sync_autofill`]): the
+    /// box's path, and its whole text now.
+    Fill { field: String, text: Filled },
     /// A hardware key the keymap gate did not take, that types nothing
     /// — an arrow, a forward delete, an escape, a chord with command.
     Key(KeyStroke),
@@ -213,6 +229,34 @@ pub enum AppEvent {
     /// `dt` is the animations' step, clamped; `elapsed` the seconds since
     /// the last beat by the wall, which the hand's clock reads.
     Frame { dt: f64, elapsed: f64 },
+}
+
+/// A box's text as AutoFill wrote it — as often as not a saved password,
+/// whole. Its `Debug`, which the trace prints, says how long it is and
+/// nothing more, and its bytes are overwritten when it is dropped.
+#[derive(Clone)]
+pub struct Filled(String);
+
+impl Filled {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Filled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} chars>", self.0.chars().count())
+    }
+}
+
+impl Drop for Filled {
+    fn drop(&mut self) {
+        // `black_box` keeps the optimizer from deciding a write to memory
+        // about to be released is dead (`bunny_ui::autofill::SavedPassword`)
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        bytes.fill(0);
+        std::hint::black_box(&bytes);
+    }
 }
 
 /// One hardware key press, in the terms the keymap reads.
@@ -417,17 +461,17 @@ extern "C" fn bunny_scene_connect(_this: Id, _sel: Sel, scene: Id, _session: Id,
             // is never reported at all
             msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
             msg_void_id(controller, sel("setView:"), view);
-            // the keyboard's second door: an empty point of a view inside
-            // this one, that no finger reaches ([`bunny_renew_keyboard`]).
-            // The view keeps it, and so do we, for the life of the app
-            let second = msg_init_rect(
-                msg_id(class("BunnyKeyInput"), sel("alloc")),
-                sel("initWithFrame:"),
-                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 1.0, height: 1.0 } },
-            );
-            msg_void_bool(second, sel("setUserInteractionEnabled:"), 0);
-            msg_void_id(view, sel("addSubview:"), second);
-            SECOND_DOOR.with(|slot| slot.set(second));
+            // the keyboard's two doors: empty views inside this one, that
+            // no finger reaches ([`bunny_renew_keyboard`]); the first holds
+            // the keyboard first. The view keeps them, and so do we, for
+            // the life of the app
+            let doors = [DOOR_OPEN, NO_RECT].map(|frame| {
+                let door = msg_init_rect(msg_id(class("BunnyKeyInput"), sel("alloc")), sel("initWithFrame:"), frame);
+                msg_void_bool(door, sel("setUserInteractionEnabled:"), 0);
+                msg_void_id(view, sel("addSubview:"), door);
+                door
+            });
+            DOORS.with(|slot| slot.set(doors));
             msg_void_id(window, sel("setRootViewController:"), controller);
             WINDOW.with(|slot| slot.set(window));
             VIEW.with(|slot| slot.set(view));
@@ -753,17 +797,29 @@ extern "C" fn bunny_keyboard_type(_this: Id, _sel: Sel) -> i64 {
 /// `isSecureTextEntry` — the focused field's `secret` ([`want_traits`]):
 /// a password box reaches the system as one, so the keyboard learns
 /// nothing from it and Passwords offers to fill it. Only the door that
-/// holds the keyboard is the field; the other is no box of any kind.
+/// holds the keyboard is the field; the other is no box of any kind. A
+/// proxy answers for its own box ([`sync_autofill`]).
 extern "C" fn bunny_secure_entry(this: Id, _sel: Sel) -> i8 {
-    i8::from(this == door() && SECURE.with(Cell::get))
+    let secret = with_proxy(this, |proxy| proxy.secret)
+        .unwrap_or_else(|| this == door() && SECURE.with(Cell::get));
+    i8::from(secret)
 }
 
 /// `textContentType` — what the focused field holds, in UIKit's words
 /// ([`want_traits`]); nil when it says nothing, and nil from the door
 /// that does not hold the keyboard — AutoFill looks over every text view
-/// in the window for its group, and must not find the field twice.
+/// in the window for its group, and must not find the field twice. A
+/// proxy says what its own box holds: it is how the group finds the
+/// form's other boxes.
 extern "C" fn bunny_content_type(this: Id, _sel: Sel) -> Id {
-    if this == door() { CONTENT_TYPE.with(Cell::get) } else { null_mut() }
+    with_proxy(this, |proxy| proxy.content_type)
+        .unwrap_or_else(|| if this == door() { CONTENT_TYPE.with(Cell::get) } else { null_mut() })
+}
+
+/// `hasText` — a door always has a field behind it; a proxy has text
+/// when its box holds some.
+extern "C" fn bunny_has_text(this: Id, _sel: Sel) -> i8 {
+    i8::from(with_proxy(this, |proxy| proxy.mirror.units > 0).unwrap_or(true))
 }
 
 /// The keys change under a keyboard that is up: UIKit read `keyboardType`
@@ -783,20 +839,29 @@ extern "C" fn bunny_reload_keys(_this: Id, _sel: Sel) {
 
 extern "C" fn bunny_insert_text(this: Id, _sel: Sel, text: Id) {
     let text = unsafe { text_argument_to_string(text) };
-    if !text.is_empty() {
+    if text.is_empty() {
+        return;
+    }
+    if is_proxy(this) {
+        proxy_write(this, Write::Insert(text));
+    } else {
         keyboard_edit(this, AppEvent::Text(text));
     }
 }
 
 extern "C" fn bunny_delete_backward(this: Id, _sel: Sel) {
-    keyboard_edit(this, AppEvent::DeleteBackward);
+    if is_proxy(this) {
+        proxy_write(this, Write::DeleteBackward);
+    } else {
+        keyboard_edit(this, AppEvent::DeleteBackward);
+    }
 }
 
-/// The door the keyboard types through now — the view, or the second
-/// door ([`bunny_renew_keyboard`]).
+/// The door the keyboard types through now — the first until a renewal
+/// moves it ([`bunny_renew_keyboard`]).
 fn door() -> Id {
     let door = DOOR.with(Cell::get);
-    if door.is_null() { VIEW.with(Cell::get) } else { door }
+    if door.is_null() { DOORS.with(Cell::get)[0] } else { door }
 }
 
 extern "C" fn bunny_claim_keyboard(_this: Id, _sel: Sel) {
@@ -825,14 +890,19 @@ extern "C" fn bunny_renew_keyboard(_this: Id, _sel: Sel) {
     if !KEYBOARD_WANTED.with(Cell::get) {
         return;
     }
-    let (view, second) = (VIEW.with(Cell::get), SECOND_DOOR.with(Cell::get));
+    let [first, second] = DOORS.with(Cell::get);
     let held = door();
     if second.is_null() || unsafe { msg_bool(held, sel("isFirstResponder")) } == 0 {
         return;
     }
-    let next = if held == view { second } else { view };
-    // the door answers as the field before UIKit asks it anything
+    let next = if held == first { second } else { first };
+    // the door answers as the field before UIKit asks it anything, and
+    // only the door that holds the keyboard has a size ([`DOOR_OPEN`])
     DOOR.with(|slot| slot.set(next));
+    unsafe {
+        msg_void_rect(next, sel("setFrame:"), DOOR_OPEN);
+        msg_void_rect(held, sel("setFrame:"), NO_RECT);
+    }
     RENEWING.with(|flag| flag.set(true));
     unsafe {
         let _ = msg_bool(next, sel("becomeFirstResponder"));
@@ -898,22 +968,22 @@ thread_local! {
     /// new field ([`bunny_renew_keyboard`]): the hide UIKit posts on the
     /// way is no move of the keyboard.
     static RENEWING: Cell<bool> = const { Cell::new(false) };
-    /// The input system's delegate of each door — the view's, then the
-    /// second door's — held weakly (`objc_storeWeak` writes these very
+    /// The input system's delegate of each door, in [`DOORS`]'s order,
+    /// held weakly (`objc_storeWeak` writes these very
     /// cells, which live as long as the main thread). One cell for both
     /// would be cleared by the door UIKit lets go of after it set the
     /// other's.
     static INPUT_DELEGATES: [Cell<Id>; 2] = const { [Cell::new(null_mut()), Cell::new(null_mut())] };
-    /// The second door: an empty view inside `BunnyView` that answers the
-    /// keyboard like it, so a field that takes the keyboard from another
-    /// meets the input system as another responder
+    /// The keyboard's two doors: empty views inside `BunnyView` that
+    /// answer the keyboard, so a field that takes the keyboard from
+    /// another meets the input system as another responder
     /// ([`bunny_renew_keyboard`]).
-    static SECOND_DOOR: Cell<Id> = const { Cell::new(null_mut()) };
+    static DOORS: Cell<[Id; 2]> = const { Cell::new([null_mut(); 2]) };
     /// The door the keyboard types through now — null until the second
-    /// door first takes it, which reads as the view ([`door`]).
+    /// door first takes it, which reads as the first ([`door`]).
     static DOOR: Cell<Id> = const { Cell::new(null_mut()) };
     /// The string tokenizer the kit asks for words and lines — one, made
-    /// on the first question, for the one view.
+    /// on the first question, for the doors.
     static TOKENIZER: Cell<Id> = const { Cell::new(null_mut()) };
     static TEXT_INDEX: RefCell<Option<IndexAt>> = const { RefCell::new(None) };
     static TEXT_RECT: RefCell<Option<RectAt>> = const { RefCell::new(None) };
@@ -994,20 +1064,42 @@ fn mirror() -> Option<Rc<Mirror>> {
     MIRROR.with(|slot| slot.borrow().clone())
 }
 
-/// The document's length in UTF-16 — 0 without a field.
-fn units() -> u64 {
-    mirror().map_or(0, |mirror| mirror.units)
+/// The document `this` answers from: a door's is the focused field's
+/// mirror ([`sync_text`]), a proxy's is its own box ([`sync_autofill`]),
+/// and any other object — a proxy already let go of — has none.
+fn mirror_of(this: Id) -> Option<Rc<Mirror>> {
+    match with_proxy(this, |proxy| Rc::clone(&proxy.mirror)) {
+        Some(mirror) => Some(mirror),
+        None if is_door(this) => mirror(),
+        None => None,
+    }
 }
 
-/// The weak cell holding `door`'s input delegate.
-fn delegate_cell(door: Id) -> *mut Id {
-    let second = usize::from(door != VIEW.with(Cell::get));
-    INPUT_DELEGATES.with(|cells| cells[second].as_ptr())
+/// The document's length in UTF-16 — 0 without a field.
+fn units_of(this: Id) -> u64 {
+    mirror_of(this).map_or(0, |mirror| mirror.units)
+}
+
+/// One of the two responders the keyboard types through
+/// ([`bunny_renew_keyboard`]).
+fn is_door(this: Id) -> bool {
+    DOORS.with(Cell::get).contains(&this)
+}
+
+/// The weak cell holding `this`'s input delegate — a door's, a proxy's,
+/// and none for anything else: a proxy already let go of must not write
+/// over a door's.
+fn delegate_cell(this: Id) -> Option<*mut Id> {
+    if let Some(cell) = with_proxy(this, |proxy| proxy.delegate.as_ptr()) {
+        return Some(cell);
+    }
+    let door = DOORS.with(Cell::get).iter().position(|door| *door == this)?;
+    Some(INPUT_DELEGATES.with(|cells| cells[door].as_ptr()))
 }
 
 /// The input delegate of the door that holds the keyboard.
 fn input_delegate() -> Id {
-    unsafe { objc_loadWeak(delegate_cell(door())) }
+    delegate_cell(door()).map_or(null_mut(), |cell| unsafe { objc_loadWeak(cell) })
 }
 
 /// An edit the keyboard asked for: the frame it draws syncs the
@@ -1024,17 +1116,36 @@ fn keyboard_edit(door: Id, event: AppEvent) {
     KEYBOARD_EDITING.with(|flag| flag.set(was));
 }
 
-fn index_at(x: f64, y: f64) -> Option<u64> {
+/// The offset under a point of the focused field — a door's question; a
+/// proxy's box has no geometry the system reads.
+fn index_at(this: Id, x: f64, y: f64) -> Option<u64> {
+    if !is_door(this) {
+        return None;
+    }
     TEXT_INDEX.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
 }
 
-fn rect_at(offset: u64) -> Option<CGRect> {
+/// The caret at an offset of the focused field — a door's question, as
+/// [`index_at`].
+fn rect_at(this: Id, offset: u64) -> Option<CGRect> {
+    if !is_door(this) {
+        return None;
+    }
     TEXT_RECT.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(offset)))
 }
 
 const NO_RECT: CGRect = CGRect {
     origin: CGPoint { x: 0.0, y: 0.0 },
     size: CGSize { width: 0.0, height: 0.0 },
+};
+
+/// The frame of the door that holds the keyboard — a point. The other
+/// door has none ([`NO_RECT`]): AutoFill takes every text view with a
+/// size for a box of the form, and an empty door standing between the
+/// address and the password would break their pair.
+const DOOR_OPEN: CGRect = CGRect {
+    origin: CGPoint { x: 0.0, y: 0.0 },
+    size: CGSize { width: 1.0, height: 1.0 },
 };
 
 /// The `u64` an instance variable holds, by its offset in the instance.
@@ -1158,14 +1269,14 @@ fn step_chars(text: &str, from: u64, steps: u64, ahead: bool) -> Option<u64> {
 /// geometry: the caret's rect there, a row's height over or under it,
 /// the offset under that point. Off the field's first row it is the
 /// start, off its last the end — where an arrow key takes a caret.
-fn step_lines(from: u64, lines: u64, up: bool, units: u64) -> u64 {
+fn step_lines(this: Id, from: u64, lines: u64, up: bool, units: u64) -> u64 {
     let edge = if up { 0 } else { units };
     let mut at = from;
     for _ in 0..lines {
-        let Some(caret) = rect_at(at) else { return edge };
+        let Some(caret) = rect_at(this, at) else { return edge };
         let height = caret.size.height.max(1.0);
         let y = if up { caret.origin.y - height / 2.0 } else { caret.origin.y + height * 1.5 };
-        match index_at(caret.origin.x, y) {
+        match index_at(this, caret.origin.x, y) {
             Some(next) if next != at => at = next,
             _ => return edge,
         }
@@ -1176,8 +1287,8 @@ fn step_lines(from: u64, lines: u64, up: bool, units: u64) -> u64 {
 // The questions (the kit's reads)
 
 /// `textInRange:` — clamped to the text that exists; nil without a field.
-extern "C" fn bunny_text_in_range(_this: Id, _sel: Sel, range: Id) -> Id {
-    let (Some(mirror), Some((start, end))) = (mirror(), unsafe { span_of(range) }) else {
+extern "C" fn bunny_text_in_range(this: Id, _sel: Sel, range: Id) -> Id {
+    let (Some(mirror), Some((start, end))) = (mirror_of(this), unsafe { span_of(range) }) else {
         return null_mut();
     };
     let text = &mirror.document.text;
@@ -1186,8 +1297,8 @@ extern "C" fn bunny_text_in_range(_this: Id, _sel: Sel, range: Id) -> Id {
     unsafe { ns_text(&text[from..to]) }
 }
 
-extern "C" fn bunny_selected_text_range(_this: Id, _sel: Sel) -> Id {
-    mirror().map_or(null_mut(), |mirror| {
+extern "C" fn bunny_selected_text_range(this: Id, _sel: Sel) -> Id {
+    mirror_of(this).map_or(null_mut(), |mirror| {
         let (location, length) = mirror.document.selected;
         unsafe { range(location, location + length) }
     })
@@ -1195,8 +1306,8 @@ extern "C" fn bunny_selected_text_range(_this: Id, _sel: Sel) -> Id {
 
 /// nil when nothing is being composed — what tells the keyboard there is
 /// no composition of its own to carry on.
-extern "C" fn bunny_marked_text_range(_this: Id, _sel: Sel) -> Id {
-    mirror()
+extern "C" fn bunny_marked_text_range(this: Id, _sel: Sel) -> Id {
+    mirror_of(this)
         .and_then(|mirror| mirror.document.marked)
         .map_or(null_mut(), |(location, length)| unsafe { range(location, location + length) })
 }
@@ -1210,8 +1321,8 @@ extern "C" fn bunny_beginning_of_document(_this: Id, _sel: Sel) -> Id {
     unsafe { position(0) }
 }
 
-extern "C" fn bunny_end_of_document(_this: Id, _sel: Sel) -> Id {
-    unsafe { position(units()) }
+extern "C" fn bunny_end_of_document(this: Id, _sel: Sel) -> Id {
+    unsafe { position(units_of(this)) }
 }
 
 extern "C" fn bunny_range_between(_this: Id, _sel: Sel, from: Id, to: Id) -> Id {
@@ -1223,17 +1334,17 @@ extern "C" fn bunny_range_between(_this: Id, _sel: Sel, from: Id, to: Id) -> Id 
 
 /// `positionFromPosition:offset:` — nil before the start or past the end,
 /// as the kit asks.
-extern "C" fn bunny_position_offset(_this: Id, _sel: Sel, from: Id, offset: i64) -> Id {
+extern "C" fn bunny_position_offset(this: Id, _sel: Sel, from: Id, offset: i64) -> Id {
     unsafe { offset_of(from) }
         .and_then(|from| from.checked_add_signed(offset))
-        .filter(|to| *to <= units())
+        .filter(|to| *to <= units_of(this))
         .map_or(null_mut(), |to| unsafe { position(to) })
 }
 
 /// `positionFromPosition:inDirection:offset:` — along the text by whole
 /// characters, across it by rows.
-extern "C" fn bunny_position_toward(_this: Id, _sel: Sel, from: Id, direction: i64, offset: i64) -> Id {
-    let (Some(mirror), Some(from)) = (mirror(), unsafe { offset_of(from) }) else {
+extern "C" fn bunny_position_toward(this: Id, _sel: Sel, from: Id, direction: i64, offset: i64) -> Id {
+    let (Some(mirror), Some(from)) = (mirror_of(this), unsafe { offset_of(from) }) else {
         return null_mut();
     };
     let from = from.min(mirror.units);
@@ -1241,7 +1352,7 @@ extern "C" fn bunny_position_toward(_this: Id, _sel: Sel, from: Id, direction: i
     let steps = offset.unsigned_abs();
     let to = match toward {
         Toward::Start | Toward::End => step_chars(&mirror.document.text, from, steps, toward.ahead()),
-        Toward::Up | Toward::Down => Some(step_lines(from, steps, toward == Toward::Up, mirror.units)),
+        Toward::Up | Toward::Down => Some(step_lines(this, from, steps, toward == Toward::Up, mirror.units)),
     };
     to.map_or(null_mut(), |to| unsafe { position(to) })
 }
@@ -1263,26 +1374,36 @@ extern "C" fn bunny_offset_between(_this: Id, _sel: Sel, from: Id, to: Id) -> i6
 }
 
 extern "C" fn bunny_input_delegate(this: Id, _sel: Sel) -> Id {
-    unsafe { objc_loadWeak(delegate_cell(this)) }
+    delegate_cell(this).map_or(null_mut(), |cell| unsafe { objc_loadWeak(cell) })
 }
 
 extern "C" fn bunny_set_input_delegate(this: Id, _sel: Sel, delegate: Id) {
-    unsafe { objc_storeWeak(delegate_cell(this), delegate) };
+    if let Some(cell) = delegate_cell(this) {
+        unsafe { objc_storeWeak(cell, delegate) };
+    }
 }
 
 /// `tokenizer` — UIKit's own string tokenizer over this view, made on the
 /// first question and kept for the life of the view, which is the app's.
+/// A proxy gets one of its own, let go with it ([`unmount`]).
 extern "C" fn bunny_tokenizer(this: Id, _sel: Sel) -> Id {
+    let made = |input: Id| unsafe {
+        msg_id_id(msg_id(class("UITextInputStringTokenizer"), sel("alloc")), sel("initWithTextInput:"), input)
+    };
+    if let Some(kept) = with_proxy(this, |proxy| proxy.tokenizer.get()) {
+        if !kept.is_null() {
+            return kept;
+        }
+        let tokenizer = made(this);
+        if with_proxy(this, |proxy| proxy.tokenizer.set(tokenizer)).is_none() {
+            // the pool moved under the question: autoreleased, the kit's alone
+            unsafe { msg_id(tokenizer, sel("autorelease")) };
+        }
+        return tokenizer;
+    }
     TOKENIZER.with(|slot| {
         if slot.get().is_null() {
-            let tokenizer = unsafe {
-                msg_id_id(
-                    msg_id(class("UITextInputStringTokenizer"), sel("alloc")),
-                    sel("initWithTextInput:"),
-                    this,
-                )
-            };
-            slot.set(tokenizer);
+            slot.set(made(this));
         }
         slot.get()
     })
@@ -1296,8 +1417,8 @@ extern "C" fn bunny_farthest_in_range(_this: Id, _sel: Sel, range: Id, direction
 
 /// `characterRangeByExtendingPosition:inDirection:` — the one character
 /// on that side of the position.
-extern "C" fn bunny_extend_position(_this: Id, _sel: Sel, at: Id, direction: i64) -> Id {
-    let (Some(mirror), Some(at)) = (mirror(), unsafe { offset_of(at) }) else {
+extern "C" fn bunny_extend_position(this: Id, _sel: Sel, at: Id, direction: i64) -> Id {
+    let (Some(mirror), Some(at)) = (mirror_of(this), unsafe { offset_of(at) }) else {
         return null_mut();
     };
     let at = at.min(mirror.units);
@@ -1318,14 +1439,14 @@ extern "C" fn bunny_set_writing_direction(_this: Id, _sel: Sel, _direction: i64,
 /// `firstRectForRange:` — where the keyboard's own panels look: a range on
 /// one row runs from its start's caret to its end's; one that wraps
 /// answers its first row's start.
-extern "C" fn bunny_first_rect(_this: Id, _sel: Sel, range: Id) -> CGRect {
+extern "C" fn bunny_first_rect(this: Id, _sel: Sel, range: Id) -> CGRect {
     let Some((start, end)) = (unsafe { span_of(range) }) else {
         return NO_RECT;
     };
-    let Some(first) = rect_at(start).or_else(|| mirror().map(|mirror| mirror.document.caret)) else {
+    let Some(first) = rect_at(this, start).or_else(|| mirror_of(this).map(|mirror| mirror.document.caret)) else {
         return NO_RECT;
     };
-    match rect_at(end) {
+    match rect_at(this, end) {
         Some(last)
             if end > start
                 && (last.origin.y - first.origin.y).abs() < 0.5
@@ -1340,10 +1461,10 @@ extern "C" fn bunny_first_rect(_this: Id, _sel: Sel, range: Id) -> CGRect {
     }
 }
 
-extern "C" fn bunny_caret_rect(_this: Id, _sel: Sel, at: Id) -> CGRect {
+extern "C" fn bunny_caret_rect(this: Id, _sel: Sel, at: Id) -> CGRect {
     unsafe { offset_of(at) }
-        .and_then(rect_at)
-        .or_else(|| mirror().map(|mirror| mirror.document.caret))
+        .and_then(|at| rect_at(this, at))
+        .or_else(|| mirror_of(this).map(|mirror| mirror.document.caret))
         .unwrap_or(NO_RECT)
 }
 
@@ -1354,19 +1475,19 @@ extern "C" fn bunny_selection_rects(_this: Id, _sel: Sel, _range: Id) -> Id {
 }
 
 /// `closestPositionToPoint:` — nil off the field.
-extern "C" fn bunny_closest_position(_this: Id, _sel: Sel, point: CGPoint) -> Id {
-    index_at(point.x, point.y).map_or(null_mut(), |at| unsafe { position(at) })
+extern "C" fn bunny_closest_position(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    index_at(this, point.x, point.y).map_or(null_mut(), |at| unsafe { position(at) })
 }
 
-extern "C" fn bunny_closest_position_within(_this: Id, _sel: Sel, point: CGPoint, range: Id) -> Id {
-    match (index_at(point.x, point.y), unsafe { span_of(range) }) {
+extern "C" fn bunny_closest_position_within(this: Id, _sel: Sel, point: CGPoint, range: Id) -> Id {
+    match (index_at(this, point.x, point.y), unsafe { span_of(range) }) {
         (Some(at), Some((start, end))) => unsafe { position(at.clamp(start, end)) },
         _ => null_mut(),
     }
 }
 
-extern "C" fn bunny_character_range_at(_this: Id, _sel: Sel, point: CGPoint) -> Id {
-    let (Some(mirror), Some(at)) = (mirror(), index_at(point.x, point.y)) else {
+extern "C" fn bunny_character_range_at(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    let (Some(mirror), Some(at)) = (mirror_of(this), index_at(this, point.x, point.y)) else {
         return null_mut();
     };
     let next = step_chars(&mirror.document.text, at, 1, true).unwrap_or(at);
@@ -1374,9 +1495,10 @@ extern "C" fn bunny_character_range_at(_this: Id, _sel: Sel, point: CGPoint) -> 
 }
 
 /// `textInputView` — the view, from either door: every rect and point the
-/// kit trades is in the view's points, the layout's.
-extern "C" fn bunny_text_input_view(_this: Id, _sel: Sel) -> Id {
-    VIEW.with(Cell::get)
+/// kit trades is in the view's points, the layout's. A proxy is its own:
+/// its caret stands at its own edge.
+extern "C" fn bunny_text_input_view(this: Id, _sel: Sel) -> Id {
+    if is_proxy(this) { this } else { VIEW.with(Cell::get) }
 }
 
 // The keyboard's edits (they travel as events, like typing)
@@ -1388,6 +1510,10 @@ extern "C" fn bunny_set_selected_text_range(this: Id, _sel: Sel, range: Id) {
     let Some((start, end)) = (unsafe { span_of(range) }) else {
         return;
     };
+    if is_proxy(this) {
+        proxy_write(this, Write::Select { start, end });
+        return;
+    }
     let unmoved = mirror().is_some_and(|mirror| {
         let (location, length) = mirror.document.selected;
         (location, location + length) == (start, end)
@@ -1405,11 +1531,17 @@ extern "C" fn bunny_set_marked_text(this: Id, _sel: Sel, text: Id, selected: NSR
     let units = text.encode_utf16().count() as u64;
     let location = if selected.location == NS_NOT_FOUND { units } else { selected.location.min(units) };
     let length = selected.length.min(units - location);
-    keyboard_edit(this, AppEvent::Marked { text, location, length });
+    // a proxy never holds the keyboard, so nothing composes in it — and
+    // a composition half-applied as a fill would write the box twice
+    if !is_proxy(this) {
+        keyboard_edit(this, AppEvent::Marked { text, location, length });
+    }
 }
 
 extern "C" fn bunny_unmark_text(this: Id, _sel: Sel) {
-    keyboard_edit(this, AppEvent::Unmark);
+    if !is_proxy(this) {
+        keyboard_edit(this, AppEvent::Unmark);
+    }
 }
 
 extern "C" fn bunny_set_marked_text_style(_this: Id, _sel: Sel, _style: Id) {}
@@ -1419,7 +1551,11 @@ extern "C" fn bunny_replace_range(this: Id, _sel: Sel, range: Id, text: Id) {
         return;
     };
     let text = unsafe { text_argument_to_string(text) };
-    keyboard_edit(this, AppEvent::Replace { location: start, length: end - start, text });
+    if is_proxy(this) {
+        proxy_write(this, Write::Replace { start, end, text });
+    } else {
+        keyboard_edit(this, AppEvent::Replace { location: start, length: end - start, text });
+    }
 }
 
 // The position and the range themselves
@@ -1452,6 +1588,314 @@ extern "C" fn bunny_range_equal(this: Id, _sel: Sel, other: Id) -> i8 {
 
 extern "C" fn bunny_range_hash(this: Id, _sel: Sel) -> u64 {
     unsafe { span_of(this) }.map_or(0, |(start, end)| start.rotate_left(32) ^ end)
+}
+
+// MARK: - The form's other boxes (AutoFill's proxies)
+
+/// One box of the form that does not hold the keyboard, standing as a
+/// hidden `BunnyAutofillBox` ([`sync_autofill`]).
+struct Proxy {
+    view: Id,
+    /// The box as the system reads it: its path, its text, a caret at the
+    /// proxy's own edge.
+    mirror: Rc<Mirror>,
+    holds: Option<bunny_ui::text_input::Autocomplete>,
+    /// The `UITextContentType` constant for what the box holds — the
+    /// kit's own string, nil when the box names nothing.
+    content_type: Id,
+    secret: bool,
+    frame: CGRect,
+    /// The input system's delegate, held weakly — boxed, so the cell
+    /// `objc_storeWeak` writes never moves while the proxy stands.
+    delegate: Box<Cell<Id>>,
+    /// The tokenizer the kit asked this proxy for, made on the first
+    /// question and owned until the proxy goes.
+    tokenizer: Cell<Id>,
+}
+
+thread_local! {
+    /// The proxies standing now, in the form's order. Never borrowed
+    /// across a call into UIKit: an answer reads the pool, and a pool
+    /// borrowed for writing answers nothing rather than abort the frame
+    /// UIKit called in from.
+    static PROXIES: RefCell<Vec<Proxy>> = const { RefCell::new(Vec::new()) };
+    /// The view the proxies stand in: inside `BunnyView`, its bounds, with
+    /// no touch and no VoiceOver for anything in it — made with the first
+    /// proxy, kept for the life of the app.
+    static SHELF: Cell<Id> = const { Cell::new(null_mut()) };
+    /// `BUNNY_IOS_TRACE`: the shelf and the proxies say what they are and
+    /// what the system wrote into them (a path and a length, never text).
+    static TRACING: bool = std::env::var_os("BUNNY_IOS_TRACE").is_some();
+}
+
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    /// The weak cell's last word, before the memory that holds it goes.
+    fn objc_destroyWeak(location: *mut Id);
+}
+
+/// What the proxy `this` answers, read through `read` — `None` when
+/// `this` is no proxy standing now.
+fn with_proxy<T>(this: Id, read: impl FnOnce(&Proxy) -> T) -> Option<T> {
+    PROXIES.with(|pool| {
+        let pool = pool.try_borrow().ok()?;
+        pool.iter().find(|proxy| proxy.view == this).map(read)
+    })
+}
+
+fn is_proxy(this: Id) -> bool {
+    with_proxy(this, |_| ()).is_some()
+}
+
+fn tracing() -> bool {
+    TRACING.with(|on| *on)
+}
+
+/// A box's document as its proxy keeps it: the caret at the end, where a
+/// fill leaves it, and the caret's rect at the proxy's own leading edge.
+fn box_mirror(field: String, text: Arc<str>, selected: Option<(u64, u64)>, frame: CGRect) -> Rc<Mirror> {
+    let units = byte_to_utf16(&text, text.len()) as u64;
+    let selected = selected.map_or((units, 0), |(location, length)| {
+        let location = location.min(units);
+        (location, length.min(units - location))
+    });
+    let caret = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: frame.size.height } };
+    Rc::new(Mirror { document: Document { field, text, selected, marked: None, caret }, units })
+}
+
+/// The shell syncs the form after a frame
+/// ([`bunny_ui::runtime::Runtime::autofill_group`]): every box but the
+/// one holding the keyboard gets a proxy wearing what it holds, whether
+/// it hides it, its frame and its text; a proxy whose box left the form
+/// goes. Said before the keyboard is claimed — the claim and a door's
+/// renewal wait for the next turn of the main queue — so the group
+/// AutoFill builds for the door that takes the keyboard finds the form
+/// whole. An empty group lets every proxy go.
+///
+/// A box the app rewrote is announced to its proxy's input delegate
+/// around the swap, as [`sync_text`] does for the door; a box that reads
+/// back what the proxy itself wrote is no news.
+pub fn sync_autofill(group: &[bunny_ui::runtime::AutofillBox], focused: Option<&str>) {
+    let view = VIEW.with(Cell::get);
+    if view.is_null() {
+        return;
+    }
+    let others: Vec<_> = group.iter().filter(|member| Some(member.path.as_str()) != focused).collect();
+    // out of the pool first, out of the view after: UIKit may ask the
+    // pool something on the way
+    let gone: Vec<Proxy> = PROXIES.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let (kept, gone) = std::mem::take(&mut *pool)
+            .into_iter()
+            .partition(|proxy| others.iter().any(|member| member.path == proxy.mirror.document.field));
+        *pool = kept;
+        gone
+    });
+    for proxy in gone {
+        unsafe { unmount(proxy) };
+    }
+    for member in others {
+        let frame = CGRect {
+            origin: CGPoint { x: member.frame.origin.x, y: member.frame.origin.y },
+            size: CGSize { width: member.frame.size.width, height: member.frame.size.height },
+        };
+        let standing = PROXIES.with(|pool| {
+            pool.borrow().iter().find(|proxy| proxy.mirror.document.field == member.path).map(|proxy| {
+                (proxy.view, Rc::clone(&proxy.mirror), proxy.holds, proxy.frame, proxy.delegate.as_ptr())
+            })
+        });
+        match standing {
+            Some((proxy, mirror, holds, was, delegate)) => unsafe {
+                if holds != member.holds {
+                    let content = bunny_ui_apple::autofill::content_type(member.holds, bunny_ui_apple::autofill::Kit::UIKit);
+                    update_proxy(proxy, |standing| {
+                        standing.holds = member.holds;
+                        standing.content_type = content;
+                    });
+                }
+                update_proxy(proxy, |standing| standing.secret = member.secret);
+                let moved = was.origin.x != frame.origin.x
+                    || was.origin.y != frame.origin.y
+                    || was.size.width != frame.size.width
+                    || was.size.height != frame.size.height;
+                if moved {
+                    update_proxy(proxy, |standing| standing.frame = frame);
+                    msg_void_rect(proxy, sel("setFrame:"), frame);
+                }
+                let rewritten = *mirror.document.text != *member.text;
+                if rewritten || moved {
+                    let selected = (!rewritten).then_some(mirror.document.selected);
+                    let fresh = box_mirror(member.path.clone(), Arc::clone(&member.text), selected, frame);
+                    let delegate = if rewritten { objc_loadWeak(delegate) } else { null_mut() };
+                    if !delegate.is_null() {
+                        msg_void_id(delegate, sel("textWillChange:"), proxy);
+                    }
+                    update_proxy(proxy, |standing| standing.mirror = fresh);
+                    if !delegate.is_null() {
+                        msg_void_id(delegate, sel("textDidChange:"), proxy);
+                    }
+                }
+            },
+            None => unsafe { mount(view, member, frame) },
+        }
+    }
+}
+
+/// Writes a standing proxy's record — briefly, and never across a call
+/// into UIKit.
+fn update_proxy(view: Id, write: impl FnOnce(&mut Proxy)) {
+    PROXIES.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut()
+            && let Some(proxy) = pool.iter_mut().find(|proxy| proxy.view == view)
+        {
+            write(proxy);
+        }
+    });
+}
+
+/// The shelf the proxies stand in, made on the first call: inside the
+/// view, its bounds and resized with it, deaf to touches (a view that
+/// takes no touch hands none to anything inside it), and hidden from
+/// VoiceOver — the scene's own boxes are what an assistive technology
+/// reads, never their proxies.
+unsafe fn shelf(view: Id) -> Id {
+    let kept = SHELF.with(Cell::get);
+    if !kept.is_null() {
+        return kept;
+    }
+    unsafe {
+        let shelf = msg_init_rect(msg_id(class("UIView"), sel("alloc")), sel("initWithFrame:"), msg_rect(view, sel("bounds")));
+        // UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight
+        msg_void_u64(shelf, sel("setAutoresizingMask:"), 2 | 16);
+        msg_void_bool(shelf, sel("setUserInteractionEnabled:"), 0);
+        msg_void_bool(shelf, sel("setAccessibilityElementsHidden:"), 1);
+        msg_void_bool(shelf, sel("setIsAccessibilityElement:"), 0);
+        msg_void_id(view, sel("addSubview:"), shelf);
+        SHELF.with(|slot| slot.set(shelf));
+        if tracing() {
+            eprintln!(
+                "bunny_ui ios: AutoFill shelf up — userInteractionEnabled {}, accessibilityElementsHidden {}, isAccessibilityElement {}",
+                msg_bool(shelf, sel("isUserInteractionEnabled")),
+                msg_bool(shelf, sel("accessibilityElementsHidden")),
+                msg_bool(shelf, sel("isAccessibilityElement")),
+            );
+        }
+        shelf
+    }
+}
+
+/// A proxy for `member`, into the pool first and onto the shelf after.
+unsafe fn mount(view: Id, member: &bunny_ui::runtime::AutofillBox, frame: CGRect) {
+    unsafe {
+        let shelf = shelf(view);
+        let proxy = msg_init_rect(msg_id(class("BunnyAutofillBox"), sel("alloc")), sel("initWithFrame:"), frame);
+        msg_void_bool(proxy, sel("setIsAccessibilityElement:"), 0);
+        let content_type = bunny_ui_apple::autofill::content_type(member.holds, bunny_ui_apple::autofill::Kit::UIKit);
+        PROXIES.with(|pool| {
+            pool.borrow_mut().push(Proxy {
+                view: proxy,
+                mirror: box_mirror(member.path.clone(), Arc::clone(&member.text), None, frame),
+                holds: member.holds,
+                content_type,
+                secret: member.secret,
+                frame,
+                delegate: Box::new(Cell::new(null_mut())),
+                tokenizer: Cell::new(null_mut()),
+            });
+        });
+        msg_void_id(shelf, sel("addSubview:"), proxy);
+        if tracing() {
+            eprintln!(
+                "bunny_ui ios: AutoFill proxy up — {} holds {:?}, secret {}, isAccessibilityElement {}",
+                member.path,
+                member.holds,
+                member.secret,
+                msg_bool(proxy, sel("isAccessibilityElement")),
+            );
+        }
+    }
+}
+
+/// A proxy let go of: off the shelf, its weak cell closed, its tokenizer
+/// and itself released. UIKit may hold it a while longer; then it answers
+/// as no box at all, since the pool no longer knows it.
+unsafe fn unmount(proxy: Proxy) {
+    unsafe {
+        msg_void(proxy.view, sel("removeFromSuperview"));
+        objc_destroyWeak(proxy.delegate.as_ptr());
+        let tokenizer = proxy.tokenizer.get();
+        if !tokenizer.is_null() {
+            msg_void(tokenizer, sel("release"));
+        }
+        msg_void(proxy.view, sel("release"));
+        if tracing() {
+            eprintln!("bunny_ui ios: AutoFill proxy down — {}", proxy.mirror.document.field);
+        }
+    }
+}
+
+/// What the system writes into a proxy, in its box's text (UTF-16).
+enum Write {
+    /// `insertText:` — over the selection.
+    Insert(String),
+    /// `replaceRange:withText:` — over a span.
+    Replace { start: u64, end: u64, text: String },
+    /// `deleteBackward` — the selection, or the character before the caret.
+    DeleteBackward,
+    /// `setSelectedTextRange:` — the selection alone: nothing to fill.
+    Select { start: u64, end: u64 },
+}
+
+/// Applies what the system wrote into the proxy `this` to the proxy's
+/// copy of its box — at once, so what the system reads back next is what
+/// it wrote — and hands the box's whole new text to the shell
+/// ([`AppEvent::Fill`]). The frame that follows reads the box back from
+/// the runtime ([`sync_autofill`]): a box that kept less than it was
+/// given shows the system what it kept.
+fn proxy_write(this: Id, write: Write) {
+    let Some(mirror) = with_proxy(this, |proxy| Rc::clone(&proxy.mirror)) else {
+        return;
+    };
+    let document = &mirror.document;
+    let (location, length) = document.selected;
+    let (start, end, insert, said) = match write {
+        Write::Insert(text) => (location, location + length, text, "insertText"),
+        Write::Replace { start, end, text } => (start, end, text, "replaceRange"),
+        Write::DeleteBackward if length > 0 => (location, location + length, String::new(), "deleteBackward"),
+        Write::DeleteBackward => {
+            let from = step_chars(&document.text, location, 1, false).unwrap_or(location);
+            (from, location, String::new(), "deleteBackward")
+        }
+        Write::Select { start, end } => {
+            let fresh = box_mirror(
+                document.field.clone(),
+                Arc::clone(&document.text),
+                Some((start.min(end), end.max(start) - start.min(end))),
+                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: document.caret.size },
+            );
+            update_proxy(this, |proxy| proxy.mirror = fresh);
+            return;
+        }
+    };
+    let text = &document.text;
+    let from = utf16_to_byte(text, start.min(mirror.units) as usize);
+    let to = utf16_to_byte(text, end.min(mirror.units) as usize).max(from);
+    let mut filled = String::with_capacity(text.len() - (to - from) + insert.len());
+    filled.push_str(&text[..from]);
+    filled.push_str(&insert);
+    filled.push_str(&text[to..]);
+    let caret = byte_to_utf16(&filled, from + insert.len()) as u64;
+    if tracing() {
+        eprintln!("bunny_ui ios: AutoFill wrote {} through {said}", document.field);
+    }
+    let fresh = box_mirror(
+        document.field.clone(),
+        Arc::from(filled.as_str()),
+        Some((caret, 0)),
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: document.caret.size },
+    );
+    update_proxy(this, |proxy| proxy.mirror = fresh);
+    dispatch(AppEvent::Fill { field: document.field.clone(), text: Filled(filled) });
 }
 
 /// The HID usages that type nothing and therefore never reach
@@ -1830,8 +2274,8 @@ unsafe fn register_classes() {
         objc_registerClassPair(range);
         RANGE_IVARS.with(|slot| slot.set((at(range, c"bunnyStart"), at(range, c"bunnyEnd"))));
 
-        // the view: a CAMetalLayer for a skin, ears for every finger,
-        // and the responder the keyboard types into
+        // the view: a CAMetalLayer for a skin and ears for every finger.
+        // It takes no text — the doors inside it do ([`add_key_input_methods`])
         let view = objc_allocateClassPair(
             class("UIView"),
             CString::new("BunnyView").expect("name").as_ptr(),
@@ -1859,14 +2303,20 @@ unsafe fn register_classes() {
         class_addMethod(view, sel("bunnyDropKeyboard"), bunny_drop_keyboard as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyReloadKeys"), bunny_reload_keys as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyRenewKeyboard"), bunny_renew_keyboard as *const c_void, v.as_ptr());
-        add_key_input_methods(view);
         objc_registerClassPair(view);
 
-        // the second door: the keyboard's methods and nothing else — no
-        // layer of its own to draw, no finger to hear
-        let second = objc_allocateClassPair(class("UIView"), c"BunnyKeyInput".as_ptr(), 0);
-        add_key_input_methods(second);
-        objc_registerClassPair(second);
+        // the keyboard's doors: the keyboard's methods and nothing else —
+        // no layer of their own to draw, no finger to hear
+        let door = objc_allocateClassPair(class("UIView"), c"BunnyKeyInput".as_ptr(), 0);
+        add_key_input_methods(door);
+        objc_registerClassPair(door);
+
+        // AutoFill's proxies: the text and its traits, and none of what
+        // makes a responder — UIView's own `canBecomeFirstResponder` says
+        // no, so the system can never move the keyboard into one
+        let proxy = objc_allocateClassPair(class("UIView"), c"BunnyAutofillBox".as_ptr(), 0);
+        add_text_input_methods(proxy);
+        objc_registerClassPair(proxy);
 
         // the controller: what UIKit tells a controller and not a view
         let controller = objc_allocateClassPair(
@@ -1892,8 +2342,9 @@ unsafe fn register_classes() {
 }
 
 /// The responder the keyboard types into, on a class still open: the
-/// hardware keys, the traits, `UIKeyInput` and the whole of `UITextInput`,
-/// the main menu's rows. Both doors wear it ([`bunny_renew_keyboard`]).
+/// hardware keys, the first responder, the main menu's rows, and the text
+/// ([`add_text_input_methods`]). Both doors wear it
+/// ([`bunny_renew_keyboard`]).
 unsafe fn add_key_input_methods(class: Id) {
     unsafe {
         for (name, imp) in [
@@ -1903,7 +2354,24 @@ unsafe fn add_key_input_methods(class: Id) {
             class_addMethod(class, sel(name), imp, c"v@:@@".as_ptr());
         }
         class_addMethod(class, sel("canBecomeFirstResponder"), bunny_yes as *const c_void, c"c@:".as_ptr());
-        class_addMethod(class, sel("hasText"), bunny_yes as *const c_void, c"c@:".as_ptr());
+        add_text_input_methods(class);
+        // the main menu's rows and the standard edits, while the view
+        // holds the keyboard
+        add_menu_methods(
+            class,
+            bunny_view_validate as *const c_void,
+            bunny_view_can_perform as *const c_void,
+        );
+    }
+}
+
+/// The text the system reads and writes, on a class still open: the
+/// traits, `UIKeyInput` and the whole of `UITextInput`. The doors and
+/// AutoFill's proxies wear it, each answer asking whose document it reads
+/// ([`mirror_of`]).
+unsafe fn add_text_input_methods(class: Id) {
+    unsafe {
+        class_addMethod(class, sel("hasText"), bunny_has_text as *const c_void, c"c@:".as_ptr());
         class_addMethod(class, sel("isSecureTextEntry"), bunny_secure_entry as *const c_void, c"c@:".as_ptr());
         class_addMethod(class, sel("textContentType"), bunny_content_type as *const c_void, c"@@:".as_ptr());
         class_addMethod(class, sel("insertText:"), bunny_insert_text as *const c_void, c"v@:@".as_ptr());
@@ -1993,13 +2461,6 @@ unsafe fn add_key_input_methods(class: Id) {
                 class_addProtocol(view, protocol);
             }
         }
-        // the main menu's rows and the standard edits, while the view
-        // holds the keyboard
-        add_menu_methods(
-            view,
-            bunny_view_validate as *const c_void,
-            bunny_view_can_perform as *const c_void,
-        );
     }
 }
 
