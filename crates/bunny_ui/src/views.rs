@@ -32,6 +32,7 @@
 pub use crate::line_chart::{
     ChartDomain, ChartError, LineChart, LineSample, LineSeries, line_chart,
 };
+pub use crate::progress::{ProgressView, progress_view};
 #[cfg(feature = "canvas")]
 pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
 #[cfg(feature = "canvas")]
@@ -46,7 +47,7 @@ use motor::state::{Binding, Context};
 use motor::view::RenderNode;
 
 use crate::layout::{
-    Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
+    Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit,
     VisualProps,
 };
 use crate::reconciler::LastRun;
@@ -1359,25 +1360,6 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         summon: None,
         autocomplete: None,
     }
-}
-
-/// `ProgressView()`
-#[derive(Clone, Copy, Default)]
-pub struct ProgressView;
-
-impl View for ProgressView {
-    type Arity = Single;
-
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(crate::view::print_label("ProgressView")));
-        out.push_layout(LayoutNode::Leaf {
-            size: LayoutSize { width: 20.0, height: 20.0 },
-        });
-    }
-}
-
-pub fn progress_view() -> ProgressView {
-    ProgressView
 }
 
 /// `Spacer()`

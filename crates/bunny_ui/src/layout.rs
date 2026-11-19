@@ -833,7 +833,8 @@ pub enum LayoutNode {
     },
     /// Flexible on the main axis of the stack that contains it.
     Spacer,
-    /// Rigid box (ProgressView and friends, until they exist for real).
+    /// Rigid box (the indeterminate ProgressView and friends, until
+    /// they exist for real).
     Leaf { size: Size },
     /// An image: the platform decodes and resamples ([`ImageEngine`]),
     /// the layout owns geometry. `source: None` is the print-parity
