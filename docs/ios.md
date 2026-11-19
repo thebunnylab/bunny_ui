@@ -74,6 +74,15 @@ the account, the password and the one-time code there. The keyboard
 deletes by selecting the cluster before the caret and then deleting the
 selection, so each backspace is its own step of a field's undo.
 
+A field that takes the keyboard from another meets the input system as
+a new responder. The keyboard moves between the view and a second door
+inside it, an empty view that answers the keyboard the same way, and
+only the door that holds the keyboard says what its field holds.
+AutoFill keeps the group of boxes it found for a responder for as long
+as that responder holds the keyboard. With one door, a pick in the
+address box after the password box held the keyboard typed the password
+into the address box.
+
 A pick from Passwords fills the box that holds the keyboard, and only
 that box. The address box takes the account's name and the password box
 its password, so a sign-in takes two picks where a form of UIKit text

@@ -3,7 +3,7 @@
 //! This module is the shell's `unsafe` border on the phone. UIKit is
 //! called through `objc_msgSend` re-declared with the concrete signature
 //! of each message (the shared Apple half carries the vocabulary; every
-//! module declares its own aliases), and six classes are born at
+//! module declares its own aliases), and seven classes are born at
 //! runtime via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyAppDelegate` (UIResponder) — the application delegate: the
@@ -27,6 +27,12 @@
 //!   focused field holds, where its caret stands and what is being
 //!   composed. It answers from a mirror of that field the shell syncs
 //!   after every frame ([`sync_text`]);
+//! - `BunnyKeyInput` (UIView) — the keyboard's second door: an empty
+//!   point inside `BunnyView` that answers the keyboard as it does. When
+//!   the focus moves from one field to another with the keyboard up, the
+//!   keyboard moves to the other door. The input system then meets each
+//!   field as a responder of its own; AutoFill keeps what it learned of a
+//!   responder for as long as that responder holds the keyboard;
 //! - `BunnyTextPosition` (UITextPosition) and `BunnyTextRange`
 //!   (UITextRange) — an offset, and a pair of them, in UTF-16: the
 //!   objects the keyboard holds and hands back. Each carries its
@@ -411,6 +417,17 @@ extern "C" fn bunny_scene_connect(_this: Id, _sel: Sel, scene: Id, _session: Id,
             // is never reported at all
             msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
             msg_void_id(controller, sel("setView:"), view);
+            // the keyboard's second door: an empty point of a view inside
+            // this one, that no finger reaches ([`bunny_renew_keyboard`]).
+            // The view keeps it, and so do we, for the life of the app
+            let second = msg_init_rect(
+                msg_id(class("BunnyKeyInput"), sel("alloc")),
+                sel("initWithFrame:"),
+                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 1.0, height: 1.0 } },
+            );
+            msg_void_bool(second, sel("setUserInteractionEnabled:"), 0);
+            msg_void_id(view, sel("addSubview:"), second);
+            SECOND_DOOR.with(|slot| slot.set(second));
             msg_void_id(window, sel("setRootViewController:"), controller);
             WINDOW.with(|slot| slot.set(window));
             VIEW.with(|slot| slot.set(view));
@@ -546,6 +563,12 @@ thread_local! {
 /// against the view's bottom edge — the overlap is what the layout must
 /// give up.
 extern "C" fn bunny_keyboard(_this: Id, _sel: Sel, note: Id) {
+    // the keyboard handed back and taken again in one turn stays on the
+    // screen, but UIKit still posts the hide on the way: heard, the scene
+    // would drop to the bottom for a frame and climb back
+    if RENEWING.with(Cell::get) {
+        return;
+    }
     let overlap = unsafe {
         let view = VIEW.with(Cell::get);
         if view.is_null() {
@@ -729,52 +752,92 @@ extern "C" fn bunny_keyboard_type(_this: Id, _sel: Sel) -> i64 {
 
 /// `isSecureTextEntry` — the focused field's `secret` ([`want_traits`]):
 /// a password box reaches the system as one, so the keyboard learns
-/// nothing from it and Passwords offers to fill it.
-extern "C" fn bunny_secure_entry(_this: Id, _sel: Sel) -> i8 {
-    i8::from(SECURE.with(Cell::get))
+/// nothing from it and Passwords offers to fill it. Only the door that
+/// holds the keyboard is the field; the other is no box of any kind.
+extern "C" fn bunny_secure_entry(this: Id, _sel: Sel) -> i8 {
+    i8::from(this == door() && SECURE.with(Cell::get))
 }
 
 /// `textContentType` — what the focused field holds, in UIKit's words
-/// ([`want_traits`]); nil when it says nothing.
-extern "C" fn bunny_content_type(_this: Id, _sel: Sel) -> Id {
-    CONTENT_TYPE.with(Cell::get)
+/// ([`want_traits`]); nil when it says nothing, and nil from the door
+/// that does not hold the keyboard — AutoFill looks over every text view
+/// in the window for its group, and must not find the field twice.
+extern "C" fn bunny_content_type(this: Id, _sel: Sel) -> Id {
+    if this == door() { CONTENT_TYPE.with(Cell::get) } else { null_mut() }
 }
 
 /// The keys change under a keyboard that is up: UIKit read `keyboardType`
 /// when the view took the first responder and reads it again only when
 /// asked to. A keyboard on its way down is left to go.
-extern "C" fn bunny_reload_keys(this: Id, _sel: Sel) {
+extern "C" fn bunny_reload_keys(_this: Id, _sel: Sel) {
     if !KEYBOARD_WANTED.with(Cell::get) {
         return;
     }
+    let door = door();
     unsafe {
-        if msg_bool(this, sel("isFirstResponder")) != 0 {
-            msg_void(this, sel("reloadInputViews"));
+        if msg_bool(door, sel("isFirstResponder")) != 0 {
+            msg_void(door, sel("reloadInputViews"));
         }
     }
 }
 
-extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, text: Id) {
+extern "C" fn bunny_insert_text(this: Id, _sel: Sel, text: Id) {
     let text = unsafe { text_argument_to_string(text) };
     if !text.is_empty() {
-        keyboard_edit(AppEvent::Text(text));
+        keyboard_edit(this, AppEvent::Text(text));
     }
 }
 
-extern "C" fn bunny_delete_backward(_this: Id, _sel: Sel) {
-    keyboard_edit(AppEvent::DeleteBackward);
+extern "C" fn bunny_delete_backward(this: Id, _sel: Sel) {
+    keyboard_edit(this, AppEvent::DeleteBackward);
 }
 
-extern "C" fn bunny_claim_keyboard(this: Id, _sel: Sel) {
+/// The door the keyboard types through now — the view, or the second
+/// door ([`bunny_renew_keyboard`]).
+fn door() -> Id {
+    let door = DOOR.with(Cell::get);
+    if door.is_null() { VIEW.with(Cell::get) } else { door }
+}
+
+extern "C" fn bunny_claim_keyboard(_this: Id, _sel: Sel) {
     unsafe {
-        let _ = msg_bool(this, sel("becomeFirstResponder"));
+        let _ = msg_bool(door(), sel("becomeFirstResponder"));
     }
 }
 
-extern "C" fn bunny_drop_keyboard(this: Id, _sel: Sel) {
+extern "C" fn bunny_drop_keyboard(_this: Id, _sel: Sel) {
     unsafe {
-        let _ = msg_bool(this, sel("resignFirstResponder"));
+        let _ = msg_bool(door(), sel("resignFirstResponder"));
     }
+}
+
+/// The focus moved to another field with the keyboard up: the keyboard
+/// moves to the other door, which UIKit keeps on the screen as a switch
+/// of responders, and the input system meets the new field as a new
+/// responder. It has to be another object. AutoFill keeps the group of
+/// boxes it found for a responder for as long as that responder holds the
+/// keyboard, by identity, and handing the keyboard back and taking it
+/// again does not clear it. With one door, a pick made in the address
+/// box after the password box held the keyboard typed the password into
+/// the address box, in the clear. `reloadInputViews` lays the keys out
+/// again and nothing more.
+extern "C" fn bunny_renew_keyboard(_this: Id, _sel: Sel) {
+    if !KEYBOARD_WANTED.with(Cell::get) {
+        return;
+    }
+    let (view, second) = (VIEW.with(Cell::get), SECOND_DOOR.with(Cell::get));
+    let held = door();
+    if second.is_null() || unsafe { msg_bool(held, sel("isFirstResponder")) } == 0 {
+        return;
+    }
+    let next = if held == view { second } else { view };
+    // the door answers as the field before UIKit asks it anything
+    DOOR.with(|slot| slot.set(next));
+    RENEWING.with(|flag| flag.set(true));
+    unsafe {
+        let _ = msg_bool(next, sel("becomeFirstResponder"));
+    }
+    RENEWING.with(|flag| flag.set(false));
 }
 
 // MARK: - The document the keyboard reads (UITextInput)
@@ -831,9 +894,24 @@ thread_local! {
     /// The keyboard's own edit is being applied: what it changes is news
     /// the keyboard already has, and is not announced back to it.
     static KEYBOARD_EDITING: Cell<bool> = const { Cell::new(false) };
-    /// The input system's delegate, held weakly (`objc_storeWeak` writes
-    /// this very cell, which lives as long as the main thread).
-    static INPUT_DELEGATE: Cell<Id> = const { Cell::new(null_mut()) };
+    /// The view is handing the keyboard back and taking it again for a
+    /// new field ([`bunny_renew_keyboard`]): the hide UIKit posts on the
+    /// way is no move of the keyboard.
+    static RENEWING: Cell<bool> = const { Cell::new(false) };
+    /// The input system's delegate of each door — the view's, then the
+    /// second door's — held weakly (`objc_storeWeak` writes these very
+    /// cells, which live as long as the main thread). One cell for both
+    /// would be cleared by the door UIKit lets go of after it set the
+    /// other's.
+    static INPUT_DELEGATES: [Cell<Id>; 2] = const { [Cell::new(null_mut()), Cell::new(null_mut())] };
+    /// The second door: an empty view inside `BunnyView` that answers the
+    /// keyboard like it, so a field that takes the keyboard from another
+    /// meets the input system as another responder
+    /// ([`bunny_renew_keyboard`]).
+    static SECOND_DOOR: Cell<Id> = const { Cell::new(null_mut()) };
+    /// The door the keyboard types through now — null until the second
+    /// door first takes it, which reads as the view ([`door`]).
+    static DOOR: Cell<Id> = const { Cell::new(null_mut()) };
     /// The string tokenizer the kit asks for words and lines — one, made
     /// on the first question, for the one view.
     static TOKENIZER: Cell<Id> = const { Cell::new(null_mut()) };
@@ -867,15 +945,25 @@ pub fn set_text_resolvers(index_at: IndexAt, rect_at: RectAt) {
 /// longer there, and offer what it read from the field before.
 pub fn sync_text(document: Option<Document>) {
     let old = mirror();
-    let (text_moved, selection_moved) = match (old.as_deref(), document.as_ref()) {
-        (None, None) => (false, false),
-        (Some(old), Some(new)) => (
-            old.document.field != new.field
-                || !(Arc::ptr_eq(&old.document.text, &new.text) || old.document.text == new.text),
-            old.document.selected != new.selected || old.document.marked != new.marked,
-        ),
-        _ => (true, true),
+    let (field_moved, text_moved, selection_moved) = match (old.as_deref(), document.as_ref()) {
+        (None, None) => (false, false, false),
+        (Some(old), Some(new)) => {
+            let field_moved = old.document.field != new.field;
+            (
+                field_moved,
+                field_moved
+                    || !(Arc::ptr_eq(&old.document.text, &new.text) || old.document.text == new.text),
+                old.document.selected != new.selected || old.document.marked != new.marked,
+            )
+        }
+        _ => (false, true, true),
     };
+    // another field took the keyboard: a fresh session for it, on the
+    // next turn of the main queue (the handler that moved the focus is
+    // still running) — see [`bunny_renew_keyboard`]
+    if field_moved {
+        perform_soon("bunnyRenewKeyboard");
+    }
     let fresh = document.map(|document| {
         let units = match old.as_deref() {
             Some(old) if Arc::ptr_eq(&old.document.text, &document.text) => old.units,
@@ -885,7 +973,7 @@ pub fn sync_text(document: Option<Document>) {
     });
     let announce = (text_moved || selection_moved) && !KEYBOARD_EDITING.with(Cell::get);
     let delegate = if announce { input_delegate() } else { null_mut() };
-    let view = VIEW.with(Cell::get);
+    let view = door();
     let (will, did) = if text_moved {
         ("textWillChange:", "textDidChange:")
     } else {
@@ -911,13 +999,26 @@ fn units() -> u64 {
     mirror().map_or(0, |mirror| mirror.units)
 }
 
+/// The weak cell holding `door`'s input delegate.
+fn delegate_cell(door: Id) -> *mut Id {
+    let second = usize::from(door != VIEW.with(Cell::get));
+    INPUT_DELEGATES.with(|cells| cells[second].as_ptr())
+}
+
+/// The input delegate of the door that holds the keyboard.
 fn input_delegate() -> Id {
-    INPUT_DELEGATE.with(|slot| unsafe { objc_loadWeak(slot.as_ptr()) })
+    unsafe { objc_loadWeak(delegate_cell(door())) }
 }
 
 /// An edit the keyboard asked for: the frame it draws syncs the
-/// keyboard's own news, which is not announced back to it.
-fn keyboard_edit(event: AppEvent) {
+/// keyboard's own news, which is not announced back to it. One that
+/// comes through the door that no longer holds the keyboard was meant
+/// for the field before — its offsets count that field's text — and is
+/// dropped rather than made in the field that has the keyboard now.
+fn keyboard_edit(door: Id, event: AppEvent) {
+    if door != self::door() {
+        return;
+    }
     let was = KEYBOARD_EDITING.with(|flag| flag.replace(true));
     dispatch(event);
     KEYBOARD_EDITING.with(|flag| flag.set(was));
@@ -1161,12 +1262,12 @@ extern "C" fn bunny_offset_between(_this: Id, _sel: Sel, from: Id, to: Id) -> i6
     }
 }
 
-extern "C" fn bunny_input_delegate(_this: Id, _sel: Sel) -> Id {
-    input_delegate()
+extern "C" fn bunny_input_delegate(this: Id, _sel: Sel) -> Id {
+    unsafe { objc_loadWeak(delegate_cell(this)) }
 }
 
-extern "C" fn bunny_set_input_delegate(_this: Id, _sel: Sel, delegate: Id) {
-    INPUT_DELEGATE.with(|slot| unsafe { objc_storeWeak(slot.as_ptr(), delegate) });
+extern "C" fn bunny_set_input_delegate(this: Id, _sel: Sel, delegate: Id) {
+    unsafe { objc_storeWeak(delegate_cell(this), delegate) };
 }
 
 /// `tokenizer` — UIKit's own string tokenizer over this view, made on the
@@ -1272,8 +1373,10 @@ extern "C" fn bunny_character_range_at(_this: Id, _sel: Sel, point: CGPoint) -> 
     unsafe { range(at, next) }
 }
 
-extern "C" fn bunny_text_input_view(this: Id, _sel: Sel) -> Id {
-    this
+/// `textInputView` — the view, from either door: every rect and point the
+/// kit trades is in the view's points, the layout's.
+extern "C" fn bunny_text_input_view(_this: Id, _sel: Sel) -> Id {
+    VIEW.with(Cell::get)
 }
 
 // The keyboard's edits (they travel as events, like typing)
@@ -1281,7 +1384,7 @@ extern "C" fn bunny_text_input_view(this: Id, _sel: Sel) -> Id {
 /// `setSelectedTextRange:` — the kit hands back the selection it just
 /// read as often as it moves one: an unmoved selection is no edit, and
 /// must not commit a composition.
-extern "C" fn bunny_set_selected_text_range(_this: Id, _sel: Sel, range: Id) {
+extern "C" fn bunny_set_selected_text_range(this: Id, _sel: Sel, range: Id) {
     let Some((start, end)) = (unsafe { span_of(range) }) else {
         return;
     };
@@ -1290,33 +1393,33 @@ extern "C" fn bunny_set_selected_text_range(_this: Id, _sel: Sel, range: Id) {
         (location, location + length) == (start, end)
     });
     if !unmoved {
-        keyboard_edit(AppEvent::Select { location: start, length: end - start });
+        keyboard_edit(this, AppEvent::Select { location: start, length: end - start });
     }
 }
 
 /// `setMarkedText:selectedRange:` — the composition, with the selection
 /// INSIDE it; a range the kit leaves unsaid (`NSNotFound`) or overlong is
 /// the composition's end.
-extern "C" fn bunny_set_marked_text(_this: Id, _sel: Sel, text: Id, selected: NSRange) {
+extern "C" fn bunny_set_marked_text(this: Id, _sel: Sel, text: Id, selected: NSRange) {
     let text = unsafe { text_argument_to_string(text) };
     let units = text.encode_utf16().count() as u64;
     let location = if selected.location == NS_NOT_FOUND { units } else { selected.location.min(units) };
     let length = selected.length.min(units - location);
-    keyboard_edit(AppEvent::Marked { text, location, length });
+    keyboard_edit(this, AppEvent::Marked { text, location, length });
 }
 
-extern "C" fn bunny_unmark_text(_this: Id, _sel: Sel) {
-    keyboard_edit(AppEvent::Unmark);
+extern "C" fn bunny_unmark_text(this: Id, _sel: Sel) {
+    keyboard_edit(this, AppEvent::Unmark);
 }
 
 extern "C" fn bunny_set_marked_text_style(_this: Id, _sel: Sel, _style: Id) {}
 
-extern "C" fn bunny_replace_range(_this: Id, _sel: Sel, range: Id, text: Id) {
+extern "C" fn bunny_replace_range(this: Id, _sel: Sel, range: Id, text: Id) {
     let Some((start, end)) = (unsafe { span_of(range) }) else {
         return;
     };
     let text = unsafe { text_argument_to_string(text) };
-    keyboard_edit(AppEvent::Replace { location: start, length: end - start, text });
+    keyboard_edit(this, AppEvent::Replace { location: start, length: end - start, text });
 }
 
 // The position and the range themselves
@@ -1571,6 +1674,13 @@ pub fn want_traits(holds: Option<bunny_ui::text_input::Autocomplete>, secret: bo
 /// The keyboard that is up reads the view's traits again, on the next
 /// turn of the main queue ([`bunny_reload_keys`]).
 fn reload_keys_soon() {
+    perform_soon("bunnyReloadKeys");
+}
+
+/// One of the view's own selectors, on the next turn of the main queue:
+/// UIKit re-enters the app synchronously from a first-responder change,
+/// and the handler that asked is still running.
+fn perform_soon(selector: &str) {
     let view = VIEW.with(Cell::get);
     if view.is_null() {
         return;
@@ -1579,7 +1689,7 @@ fn reload_keys_soon() {
         msg_void_sel_id_f64(
             view,
             sel("performSelector:withObject:afterDelay:"),
-            sel("bunnyReloadKeys"),
+            sel(selector),
             null_mut(),
             0.0,
         );
@@ -1693,12 +1803,7 @@ unsafe fn register_classes() {
         let v_id = CString::new("v@:@").expect("type encoding");
         let v_id_id = CString::new("v@:@@").expect("type encoding");
         let v = CString::new("v@:").expect("type encoding");
-        let bool_ = CString::new("c@:").expect("type encoding");
-        let bool_id_id = CString::new("c@:@@").expect("type encoding");
-        let v_id_id_id = CString::new("v@:@@@").expect("type encoding");
-        let id_id_id_id = CString::new("@@:@@@").expect("type encoding");
         let class_ = CString::new("#@:").expect("type encoding");
-        let int = CString::new("q@:").expect("type encoding");
 
         // the keyboard's positions and ranges: offsets in UTF-16, kept in
         // instance variables (added before the class is registered, read
@@ -1746,22 +1851,65 @@ unsafe fn register_classes() {
             ("touchesMoved:withEvent:", bunny_touches_moved as *const c_void),
             ("touchesEnded:withEvent:", bunny_touches_ended as *const c_void),
             ("touchesCancelled:withEvent:", bunny_touches_cancelled as *const c_void),
-            ("pressesBegan:withEvent:", bunny_presses_began as *const c_void),
-            ("pressesEnded:withEvent:", bunny_presses_ended as *const c_void),
         ] {
             class_addMethod(view, sel(name), imp, v_id_id.as_ptr());
         }
         class_addMethod(view, sel("layoutSubviews"), bunny_layout_subviews as *const c_void, v.as_ptr());
-        class_addMethod(view, sel("canBecomeFirstResponder"), bunny_yes as *const c_void, bool_.as_ptr());
-        class_addMethod(view, sel("hasText"), bunny_yes as *const c_void, bool_.as_ptr());
-        class_addMethod(view, sel("isSecureTextEntry"), bunny_secure_entry as *const c_void, bool_.as_ptr());
-        let object = CString::new("@@:").expect("type encoding");
-        class_addMethod(view, sel("textContentType"), bunny_content_type as *const c_void, object.as_ptr());
-        class_addMethod(view, sel("insertText:"), bunny_insert_text as *const c_void, v_id.as_ptr());
-        class_addMethod(view, sel("deleteBackward"), bunny_delete_backward as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyClaimKeyboard"), bunny_claim_keyboard as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyDropKeyboard"), bunny_drop_keyboard as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyReloadKeys"), bunny_reload_keys as *const c_void, v.as_ptr());
+        class_addMethod(view, sel("bunnyRenewKeyboard"), bunny_renew_keyboard as *const c_void, v.as_ptr());
+        add_key_input_methods(view);
+        objc_registerClassPair(view);
+
+        // the second door: the keyboard's methods and nothing else — no
+        // layer of its own to draw, no finger to hear
+        let second = objc_allocateClassPair(class("UIView"), c"BunnyKeyInput".as_ptr(), 0);
+        add_key_input_methods(second);
+        objc_registerClassPair(second);
+
+        // the controller: what UIKit tells a controller and not a view
+        let controller = objc_allocateClassPair(
+            class("UIViewController"),
+            CString::new("BunnyViewController").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            controller,
+            sel("viewSafeAreaInsetsDidChange"),
+            bunny_safe_area_changed as *const c_void,
+            v.as_ptr(),
+        );
+        class_addMethod(
+            controller,
+            sel("traitCollectionDidChange:"),
+            bunny_traits_changed as *const c_void,
+            v_id.as_ptr(),
+        );
+        objc_registerClassPair(controller);
+        register_life_classes();
+    });
+}
+
+/// The responder the keyboard types into, on a class still open: the
+/// hardware keys, the traits, `UIKeyInput` and the whole of `UITextInput`,
+/// the main menu's rows. Both doors wear it ([`bunny_renew_keyboard`]).
+unsafe fn add_key_input_methods(class: Id) {
+    unsafe {
+        for (name, imp) in [
+            ("pressesBegan:withEvent:", bunny_presses_began as *const c_void),
+            ("pressesEnded:withEvent:", bunny_presses_ended as *const c_void),
+        ] {
+            class_addMethod(class, sel(name), imp, c"v@:@@".as_ptr());
+        }
+        class_addMethod(class, sel("canBecomeFirstResponder"), bunny_yes as *const c_void, c"c@:".as_ptr());
+        class_addMethod(class, sel("hasText"), bunny_yes as *const c_void, c"c@:".as_ptr());
+        class_addMethod(class, sel("isSecureTextEntry"), bunny_secure_entry as *const c_void, c"c@:".as_ptr());
+        class_addMethod(class, sel("textContentType"), bunny_content_type as *const c_void, c"@@:".as_ptr());
+        class_addMethod(class, sel("insertText:"), bunny_insert_text as *const c_void, c"v@:@".as_ptr());
+        class_addMethod(class, sel("deleteBackward"), bunny_delete_backward as *const c_void, c"v@:".as_ptr());
+        let view = class;
+        let int = c"q@:";
         for name in [
             "autocorrectionType",
             "spellCheckingType",
@@ -1852,27 +2000,18 @@ unsafe fn register_classes() {
             bunny_view_validate as *const c_void,
             bunny_view_can_perform as *const c_void,
         );
-        objc_registerClassPair(view);
+    }
+}
 
-        // the controller: what UIKit tells a controller and not a view
-        let controller = objc_allocateClassPair(
-            class("UIViewController"),
-            CString::new("BunnyViewController").expect("name").as_ptr(),
-            0,
-        );
-        class_addMethod(
-            controller,
-            sel("viewSafeAreaInsetsDidChange"),
-            bunny_safe_area_changed as *const c_void,
-            v.as_ptr(),
-        );
-        class_addMethod(
-            controller,
-            sel("traitCollectionDidChange:"),
-            bunny_traits_changed as *const c_void,
-            v_id.as_ptr(),
-        );
-        objc_registerClassPair(controller);
+/// The application's delegate and the scene's: the launch, the life on
+/// the screen, the clocks, a url handed over.
+unsafe fn register_life_classes() {
+    unsafe {
+        let v_id = c"v@:@";
+        let v_id_id = c"v@:@@";
+        let v_id_id_id = c"v@:@@@";
+        let bool_id_id = c"c@:@@";
+        let id_id_id_id = c"@@:@@@";
 
         // the delegate: the launch, the life, the clocks
         let delegate = objc_allocateClassPair(
@@ -1939,7 +2078,7 @@ unsafe fn register_classes() {
             class_addProtocol(scene, protocol);
         }
         objc_registerClassPair(scene);
-    });
+    }
 }
 
 // MARK: - The main menu (the iPad's menu bar, the ⌘-hold sheet)
