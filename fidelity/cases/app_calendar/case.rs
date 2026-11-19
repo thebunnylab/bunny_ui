@@ -645,7 +645,7 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .padding_length(1.5)
-                    .frame_aligned(13.0, 13.0, Alignment::TopLeading)
+                    .frame_aligned(13.0, 13.0, Alignment::Leading)
                     .background_color(Color::rgb(52, 120, 246))
                     .corner_radius(4.0)
                     .border(Color::rgb(52, 120, 246), 1.5)
@@ -675,7 +675,7 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .padding_length(1.5)
-                    .frame_aligned(13.0, 13.0, Alignment::TopLeading)
+                    .frame_aligned(13.0, 13.0, Alignment::Leading)
                     .background_color(Color::rgb(52, 199, 89))
                     .corner_radius(4.0)
                     .border(Color::rgb(52, 199, 89), 1.5)
@@ -704,7 +704,7 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .padding_length(1.5)
-                    .frame_aligned(13.0, 13.0, Alignment::TopLeading)
+                    .frame_aligned(13.0, 13.0, Alignment::Leading)
                     .background_color(Color::rgb(175, 82, 222))
                     .corner_radius(4.0)
                     .border(Color::rgb(175, 82, 222), 1.5)
@@ -733,7 +733,7 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .padding_length(1.5)
-                    .frame_aligned(13.0, 13.0, Alignment::TopLeading)
+                    .frame_aligned(13.0, 13.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 149, 0))
                     .corner_radius(4.0)
                     .border(Color::rgb(255, 149, 0), 1.5)
@@ -762,7 +762,7 @@ pub fn view() -> impl View {
                 hstack!(
                     spacer()
                     .padding_length(1.5)
-                    .frame_aligned(13.0, 13.0, Alignment::TopLeading)
+                    .frame_aligned(13.0, 13.0, Alignment::Leading)
                     .corner_radius(4.0)
                     .border(Color::rgb(255, 59, 48), 1.5)
                     .test_id("input-83"),
@@ -2598,20 +2598,12 @@ pub fn view() -> impl View {
                     .frame_aligned(163.0, 50.9375, Alignment::TopLeading)
                     .clipped()
                     .test_id("img-276"),
-                    vstack!(
-                        rich_text([run("Up next: Design review").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(29, 29, 31))])
-                        .font_size(10.0)
-                        .foreground_color(Color::rgb(110, 110, 115))
-                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
-                        spacer().frame(0.0, 12.0)
-                        .test_id("br-279")
-                        .padding_edge(Edge::Leading, 112.4922),
-                        text("in 20 min • Room 4")
-                        .font_size(10.0)
-                        .foreground_color(Color::rgb(110, 110, 115))
-                        .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
-                    )
-                    .alignment(HorizontalAlignment::Leading)
+                    rich_text([
+                        run("Up next: Design review").weight(Weight::Bold).font_size(11.0).foreground_color(Color::rgb(29, 29, 31)),
+                        run("\nin 20 min • Room 4"),
+                    ])
+                    .font_size(10.0)
+                    .foreground_color(Color::rgb(110, 110, 115))
                     .padding_edge(Edge::Top, 4.0)
                     .padding_edge(Edge::Trailing, 7.0)
                     .padding_edge(Edge::Bottom, 4.0)

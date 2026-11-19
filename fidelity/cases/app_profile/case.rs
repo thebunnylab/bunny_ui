@@ -38,6 +38,9 @@ pub fn view() -> impl View {
         .test_id("img-2")
         .frame_height_aligned(130.0, Alignment::TopLeading)
         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
+        .overlay(UnitPoint::TOP_LEADING, spacer()
+            .frame_aligned(390.0, 130.0, Alignment::TopLeading)
+            .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 89), Color::rgba(124, 58, 237, 89)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }).stop(0.4, Color::rgba(0, 0, 0, 0)).stop(0.4, Color::rgba(124, 58, 237, 0))))
         .overlay(UnitPoint::TOP_LEADING, hstack!(
                 text("9:41")
                 .font_size(12.0)
@@ -59,9 +62,6 @@ pub fn view() -> impl View {
             .frame_aligned(354.0, 14.5, Alignment::TopLeading)
             .test_id("div.status-3")
             .offset(18.0, 8.0))
-        .overlay(UnitPoint::TOP_LEADING, spacer()
-            .frame_aligned(390.0, 130.0, Alignment::TopLeading)
-            .background_gradient(Gradient::linear(Color::rgba(0, 0, 0, 89), Color::rgba(124, 58, 237, 89)).direction(UnitPoint { x: 0.5, y: 0.0 }, UnitPoint { x: 0.5, y: 1.0 }).stop(0.4, Color::rgba(0, 0, 0, 0)).stop(0.4, Color::rgba(124, 58, 237, 0))))
         .test_id("div.cover-1"),
         hstack!(
             image(picture_avatar_1())
@@ -464,9 +464,6 @@ pub fn view() -> impl View {
                 .clipped()
                 .test_id("img-59")
                 .frame_aligned(108.6641, 108.6641, Alignment::TopLeading)
-                .background_color(Color::rgb(221, 221, 221))
-                .corner_radius(4.0)
-                .clipped()
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .padding_edge(Edge::Top, 10.0)
                     .padding_edge(Edge::Bottom, 10.0)
@@ -492,6 +489,9 @@ pub fn view() -> impl View {
                     .corner_radius(7.0)
                     .test_id("span.dur-61")
                     .offset(72.7422, 90.6641))
+                .background_color(Color::rgb(221, 221, 221))
+                .corner_radius(4.0)
+                .clipped()
                 .test_id("div.t-58")
                 .padding_edge(Edge::Top, 3.0),
             )
@@ -520,8 +520,6 @@ pub fn view() -> impl View {
     )
     .alignment(HorizontalAlignment::Leading)
     .frame_aligned(390.0, 844.0, Alignment::TopLeading)
-    .background_color(Color::rgb(255, 255, 255))
-    .clipped()
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             spacer(),
             spacer()
@@ -568,6 +566,8 @@ pub fn view() -> impl View {
         .overlay(UnitPoint::TOP, spacer().frame_height(1.0).background_color(Color::rgb(238, 238, 238)))
         .test_id("div.nav-67")
         .offset(0.0, 792.0))
+    .background_color(Color::rgb(255, 255, 255))
+    .clipped()
     .test_id("body-0")
     .frame_aligned(390.0, 844.0, Alignment::TopLeading)
     .font_family("Fid Sans")

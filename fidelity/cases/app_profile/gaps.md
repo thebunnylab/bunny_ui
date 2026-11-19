@@ -1,10 +1,9 @@
 # Import gaps — apps/profile.html
 
-63 views named; 19 gaps in 8 features.
+63 views named; 9 gaps in 7 features.
 
 | feature | count | where | what |
 |---|---|---|---|
-| `width: %` | 10 | img-51, img-53, img-55, img-57, … | 100% written as 108.6641 points |
 | `filter: sepia` | 2 | img-51, img-63 | sepia(0.6) |
 | `inline box: padding/radius` | 2 | mark-29, span.code-28 | the run keeps its ground, not its box |
 | `conic-gradient` | 1 | div.ring-8 | not drawn |

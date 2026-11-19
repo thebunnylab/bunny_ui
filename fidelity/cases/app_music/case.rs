@@ -22,8 +22,6 @@ fn picture_photo3_3() -> ImageSource {
 pub fn view() -> impl View {
     spacer()
     .frame_aligned(390.0, 844.0, Alignment::TopLeading)
-    .background_color(Color::rgb(18, 10, 30))
-    .clipped()
     .overlay(UnitPoint::TOP_LEADING, image(picture_album_0())
         .resizable()
         .aspect_ratio(ContentMode::Fill)
@@ -311,8 +309,8 @@ pub fn view() -> impl View {
                 .opacity(0.8)
                 .test_id("span.spk-35"),
                 spacer()
-                .frame_height_aligned(16.0, Alignment::TopLeading)
-                .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
+                .frame_height_aligned(16.0, Alignment::Leading)
+                .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
                 .background_color(Color::rgb(255, 255, 255))
                 .test_id("input-36"),
                 text("64")
@@ -448,6 +446,7 @@ pub fn view() -> impl View {
                         .padding_edge(Edge::Trailing, 6.0)
                         .padding_edge(Edge::Bottom, 1.0)
                         .padding_edge(Edge::Leading, 6.0)
+                        .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                         .frame_max(219.0938, f64::MAX, Alignment::TopLeading)
                         .background_gradient(Gradient::linear(Color::rgb(255, 207, 92), Color::rgb(255, 94, 126)).direction(UnitPoint { x: 0.0, y: 0.5 }, UnitPoint { x: 1.0, y: 0.5 }))
                         .corner_radius(6.0)
@@ -607,6 +606,8 @@ pub fn view() -> impl View {
         .corner_radius(2.5)
         .test_id("div.home-66")
         .offset(130.0, 831.0))
+    .background_color(Color::rgb(18, 10, 30))
+    .clipped()
     .test_id("body-0")
     .frame_aligned(390.0, 844.0, Alignment::TopLeading)
     .font_family("Fid Sans")

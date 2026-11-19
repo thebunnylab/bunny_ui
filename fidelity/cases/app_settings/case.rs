@@ -131,7 +131,7 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 9.0)
                     .padding_edge(Edge::Bottom, 1.0)
                     .padding_edge(Edge::Leading, 9.0)
-                    .frame_aligned(398.0, 22.0, Alignment::TopLeading)
+                    .frame_aligned(398.0, 22.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(6.0)
                     .border(Color::rgb(199, 199, 204), 1.0)
@@ -144,7 +144,7 @@ pub fn view() -> impl View {
                         .padding_edge(Edge::Trailing, 9.0)
                         .padding_edge(Edge::Bottom, 1.0)
                         .padding_edge(Edge::Leading, 9.0)
-                        .frame_aligned(398.0, 22.0, Alignment::TopLeading)
+                        .frame_aligned(398.0, 22.0, Alignment::Leading)
                         .background_color(Color::rgb(255, 245, 244))
                         .corner_radius(6.0)
                         .border(Color::rgb(255, 59, 48), 1.0)
@@ -178,7 +178,7 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 9.0)
                     .padding_edge(Edge::Bottom, 1.0)
                     .padding_edge(Edge::Leading, 9.0)
-                    .frame_aligned(398.0, 22.0, Alignment::TopLeading)
+                    .frame_aligned(398.0, 22.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(6.0)
                     .border(Color::rgb(199, 199, 204), 1.0)
@@ -190,7 +190,7 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 9.0)
                     .padding_edge(Edge::Bottom, 1.0)
                     .padding_edge(Edge::Leading, 9.0)
-                    .frame_aligned(398.0, 22.0, Alignment::TopLeading)
+                    .frame_aligned(398.0, 22.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(6.0)
                     .border(Color::rgb(52, 120, 246), 1.0)
@@ -271,7 +271,7 @@ pub fn view() -> impl View {
                 vstack!(
                     hstack!(
                         spacer()
-                        .frame_aligned(34.0, 20.0, Alignment::TopLeading)
+                        .frame_aligned(34.0, 20.0, Alignment::Leading)
                         .background_color(Color::rgb(52, 199, 89))
                         .corner_radius(10.0)
                         .overlay(UnitPoint::TOP_LEADING, spacer()
@@ -293,7 +293,7 @@ pub fn view() -> impl View {
                     .test_id("div.row-29"),
                     hstack!(
                         spacer()
-                        .frame_aligned(34.0, 20.0, Alignment::TopLeading)
+                        .frame_aligned(34.0, 20.0, Alignment::Leading)
                         .background_color(Color::rgb(209, 209, 214))
                         .corner_radius(10.0)
                         .overlay(UnitPoint::TOP_LEADING, spacer()
@@ -318,7 +318,7 @@ pub fn view() -> impl View {
                         hstack!(
                             spacer()
                             .padding_length(1.5)
-                            .frame_aligned(14.0, 14.0, Alignment::TopLeading)
+                            .frame_aligned(14.0, 14.0, Alignment::Leading)
                             .background_gradient(Gradient::radial(Color::rgb(52, 120, 246), Color::rgba(52, 120, 246, 0)).stop(0.4, Color::rgb(52, 120, 246)).stop(0.45, Color::rgba(52, 120, 246, 0)))
                             .corner_radius(7.0)
                             .border(Color::rgb(52, 120, 246), 1.5)
@@ -333,7 +333,7 @@ pub fn view() -> impl View {
                         hstack!(
                             spacer()
                             .padding_length(1.5)
-                            .frame_aligned(14.0, 14.0, Alignment::TopLeading)
+                            .frame_aligned(14.0, 14.0, Alignment::Leading)
                             .corner_radius(7.0)
                             .border(Color::rgb(142, 142, 147), 1.5)
                             .test_id("input.rd-41"),
@@ -347,7 +347,7 @@ pub fn view() -> impl View {
                         hstack!(
                             spacer()
                             .padding_length(1.5)
-                            .frame_aligned(14.0, 14.0, Alignment::TopLeading)
+                            .frame_aligned(14.0, 14.0, Alignment::Leading)
                             .corner_radius(7.0)
                             .border(Color::rgb(142, 142, 147), 1.5)
                             .test_id("input.rd-43"),
@@ -406,17 +406,17 @@ pub fn view() -> impl View {
                     .background_color(Color::rgb(229, 229, 234))
                     .corner_radius(7.0)
                     .overlay(UnitPoint::TOP_LEADING, spacer()
-                        .frame_aligned(0.0, 0.0, Alignment::TopLeading)
+                        .frame_aligned(0.0, 0.0, Alignment::Leading)
                         .opacity(0.0)
                         .test_id("input-46")
                         .offset(7.0, 5.0))
                     .overlay(UnitPoint::TOP_LEADING, spacer()
-                        .frame_aligned(0.0, 0.0, Alignment::TopLeading)
+                        .frame_aligned(0.0, 0.0, Alignment::Leading)
                         .opacity(0.0)
                         .test_id("input-48")
                         .offset(7.0, 5.0))
                     .overlay(UnitPoint::TOP_LEADING, spacer()
-                        .frame_aligned(0.0, 0.0, Alignment::TopLeading)
+                        .frame_aligned(0.0, 0.0, Alignment::Leading)
                         .opacity(0.0)
                         .test_id("input-50")
                         .offset(7.0, 5.0))
@@ -494,13 +494,13 @@ pub fn view() -> impl View {
                 .padding_edge(Edge::Top, 0.75),
                 vstack!(
                     spacer()
-                    .frame_aligned(398.0, 16.0, Alignment::TopLeading)
+                    .frame_aligned(398.0, 16.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 255, 255))
                     .test_id("input-58"),
                     hstack!(
                         spacer()
                         .padding_length(1.0)
-                        .frame_aligned(34.0, 22.0, Alignment::TopLeading)
+                        .frame_aligned(34.0, 22.0, Alignment::Leading)
                         .corner_radius(6.0)
                         .border(Color::rgb(199, 199, 204), 1.0)
                         .clipped()
@@ -520,7 +520,7 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 9.0)
                     .padding_edge(Edge::Bottom, 1.0)
                     .padding_edge(Edge::Leading, 9.0)
-                    .frame_aligned(130.0, 22.0, Alignment::TopLeading)
+                    .frame_aligned(130.0, 22.0, Alignment::Leading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(6.0)
                     .border(Color::rgb(199, 199, 204), 1.0)
@@ -588,6 +588,7 @@ pub fn view() -> impl View {
                     text_editor("", State::new(String::from("Mathematician, writer, and collector of very small programs.")).binding())
                     .bare()
                     .content_inset(Edges { top: 5.0, trailing: 9.0, bottom: 5.0, leading: 9.0 })
+                    .font_size(12.0)
                     .frame_aligned(398.0, 40.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(6.0)
@@ -829,8 +830,6 @@ pub fn view() -> impl View {
             )
             .spacing(8.0)
             .alignment(VerticalAlignment::Center)
-            .wrapping()
-            .line_spacing(8.0)
             .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading)
             .test_id("div.row-78")
             .padding_edge(Edge::Top, 5.0),
@@ -860,7 +859,7 @@ pub fn view() -> impl View {
             .padding_edge(Edge::Trailing, 406.1094),
             hstack!(
                 spacer()
-                .frame_aligned(34.0, 20.0, Alignment::TopLeading)
+                .frame_aligned(34.0, 20.0, Alignment::Leading)
                 .background_color(Color::rgb(52, 199, 89))
                 .corner_radius(10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()

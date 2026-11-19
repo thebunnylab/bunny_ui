@@ -1,6 +1,6 @@
 # Import gaps — apps/settings.html
 
-100 views named; 22 gaps in 12 features.
+100 views named; 23 gaps in 13 features.
 
 | feature | count | where | what |
 |---|---|---|---|
@@ -16,3 +16,4 @@
 | `radial-gradient: shape` | 1 | input.rd-39 | rgb(52, 120, 246) 0px |
 | `repeating-linear-gradient` | 1 | div.drop-11 | drawn once |
 | `select` | 1 | select-53 | drawn as its label |
+| `white-space: nowrap` | 1 | select-53 | the words may wrap |

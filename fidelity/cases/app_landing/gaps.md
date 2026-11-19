@@ -1,11 +1,12 @@
 # Import gaps — apps/landing.html
 
-85 views named; 23 gaps in 15 features.
+85 views named; 26 gaps in 16 features.
 
 | feature | count | where | what |
 |---|---|---|---|
 | `font-variant` | 6 | span-27, span-28, span-29, span-30, … | small-caps |
 | `content: counter/attr` | 3 | div.feat-34, div.feat-38, div.feat-42 | counter(feat, decimal-leading-zero) |
+| `z-index` | 3 | div.feat-34::before, div.feat-38::before, div.feat-42::before | painted over the flow, part of which the page paints over it |
 | `clip-path` | 2 | div.hero-bg-1, div.ico-39::after | polygon(0px 0px, 100% 0px, 100% 78%, 0px 100%) |
 | `column-count` | 1 | div.article-50 | 2 |
 | `float` | 1 | img-52 | left |

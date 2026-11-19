@@ -332,13 +332,14 @@ pub fn view() -> impl View {
                 text_field("Search orders, customers…", State::new(String::from("")).binding())
                 .bare()
                 .content_inset(Edges { top: 1.0, trailing: 13.0, bottom: 1.0, leading: 35.0 })
-                .frame_aligned(300.0, 34.0, Alignment::TopLeading)
+                .font_size(13.0)
+                .frame_aligned(300.0, 34.0, Alignment::Leading)
                 .background_color(Color::rgb(244, 245, 249))
                 .corner_radius(17.0)
                 .border(Color::rgb(229, 231, 235), 1.0)
                 .clipped()
                 .test_id("input-35")
-                .frame_max(300.0, f64::MAX, Alignment::TopLeading)
+                .frame_width_aligned(300.0, Alignment::TopLeading)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .padding_length(2.0)
                     .frame_aligned(10.0, 10.0, Alignment::TopLeading)
@@ -426,12 +427,6 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Bottom, 13.0)
                     .padding_edge(Edge::Leading, 15.0)
                     .frame_aligned(184.0, 92.0, Alignment::TopLeading)
-                    .background_color(Color::rgb(255, 255, 255))
-                    .corner_radius(12.0)
-                    .border(Color::rgb(229, 231, 235), 1.0)
-                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
-                    .shadow_offset(0.0, 1.0)
-                    .clipped()
                     .overlay(UnitPoint::TOP_LEADING, hstack!(
                             spacer()
                             .frame_height_aligned(11.1953, Alignment::TopLeading)
@@ -488,6 +483,12 @@ pub fn view() -> impl View {
                         .frame_aligned(62.0, 32.0, Alignment::BottomLeading)
                         .test_id("div.spark-45")
                         .offset(109.0, 47.0))
+                    .background_color(Color::rgb(255, 255, 255))
+                    .corner_radius(12.0)
+                    .border(Color::rgb(229, 231, 235), 1.0)
+                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
+                    .shadow_offset(0.0, 1.0)
+                    .clipped()
                     .test_id("div.card-41"),
                     vstack!(
                         text("ORDERS")
@@ -513,12 +514,6 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Bottom, 13.0)
                     .padding_edge(Edge::Leading, 15.0)
                     .frame_aligned(184.0, 92.0, Alignment::TopLeading)
-                    .background_color(Color::rgb(255, 255, 255))
-                    .corner_radius(12.0)
-                    .border(Color::rgb(229, 231, 235), 1.0)
-                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
-                    .shadow_offset(0.0, 1.0)
-                    .clipped()
                     .overlay(UnitPoint::TOP_LEADING, hstack!(
                             spacer()
                             .frame_height_aligned(17.5938, Alignment::TopLeading)
@@ -575,6 +570,12 @@ pub fn view() -> impl View {
                         .frame_aligned(62.0, 32.0, Alignment::BottomLeading)
                         .test_id("div.spark-57")
                         .offset(109.0, 47.0))
+                    .background_color(Color::rgb(255, 255, 255))
+                    .corner_radius(12.0)
+                    .border(Color::rgb(229, 231, 235), 1.0)
+                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
+                    .shadow_offset(0.0, 1.0)
+                    .clipped()
                     .test_id("div.card-53")
                     .padding_edge(Edge::Leading, 12.0),
                     vstack!(
@@ -601,12 +602,6 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Bottom, 13.0)
                     .padding_edge(Edge::Leading, 15.0)
                     .frame_aligned(184.0, 92.0, Alignment::TopLeading)
-                    .background_color(Color::rgb(255, 255, 255))
-                    .corner_radius(12.0)
-                    .border(Color::rgb(229, 231, 235), 1.0)
-                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
-                    .shadow_offset(0.0, 1.0)
-                    .clipped()
                     .overlay(UnitPoint::TOP_LEADING, hstack!(
                             spacer()
                             .frame_height_aligned(28.7969, Alignment::TopLeading)
@@ -663,6 +658,12 @@ pub fn view() -> impl View {
                         .frame_aligned(62.0, 32.0, Alignment::BottomLeading)
                         .test_id("div.spark-69")
                         .offset(109.0, 47.0))
+                    .background_color(Color::rgb(255, 255, 255))
+                    .corner_radius(12.0)
+                    .border(Color::rgb(229, 231, 235), 1.0)
+                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
+                    .shadow_offset(0.0, 1.0)
+                    .clipped()
                     .test_id("div.card-65")
                     .padding_edge(Edge::Leading, 12.0),
                     vstack!(
@@ -689,12 +690,6 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Bottom, 13.0)
                     .padding_edge(Edge::Leading, 15.0)
                     .frame_aligned(184.0, 92.0, Alignment::TopLeading)
-                    .background_color(Color::rgb(255, 255, 255))
-                    .corner_radius(12.0)
-                    .border(Color::rgb(229, 231, 235), 1.0)
-                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
-                    .shadow_offset(0.0, 1.0)
-                    .clipped()
                     .overlay(UnitPoint::TOP_LEADING, hstack!(
                             spacer()
                             .frame_height_aligned(12.7969, Alignment::TopLeading)
@@ -751,6 +746,12 @@ pub fn view() -> impl View {
                         .frame_aligned(62.0, 32.0, Alignment::BottomLeading)
                         .test_id("div.spark-81")
                         .offset(109.0, 47.0))
+                    .background_color(Color::rgb(255, 255, 255))
+                    .corner_radius(12.0)
+                    .border(Color::rgb(229, 231, 235), 1.0)
+                    .shadow_color(2.0, Color::rgba(16, 24, 40, 13))
+                    .shadow_offset(0.0, 1.0)
+                    .clipped()
                     .test_id("div.card-77")
                     .padding_edge(Edge::Leading, 12.0),
                 )
@@ -918,7 +919,7 @@ pub fn view() -> impl View {
                             .padding_edge(Edge::Trailing, 11.5)
                             .padding_edge(Edge::Bottom, 1.5)
                             .padding_edge(Edge::Leading, 11.5)
-                            .frame_height_aligned(24.0, Alignment::Top)
+                            .frame_height_aligned(24.0, Alignment::Center)
                             .corner_radius(6.0)
                             .border(Color::rgb(79, 70, 229), 1.5)
                             .test_id("button.btn-o-114")
@@ -1190,15 +1191,7 @@ pub fn view() -> impl View {
                                     .test_id("b-158"),
                                     rich_text([
                                         run("Total").foreground_color(Color::rgb(156, 163, 175)),
-                                        run(" €78.2k"),
-                                    ])
-                                    .font_size(11.0)
-                                    .foreground_color(Color::rgb(255, 255, 255))
-                                    .frame_max(f64::INFINITY, f64::MAX, Alignment::Leading),
-                                    spacer().frame(0.0, 13.5)
-                                    .test_id("br-160")
-                                    .padding_edge(Edge::Leading, 60.0078),
-                                    rich_text([
+                                        run(" €78.2k\n"),
                                         run("Growth").foreground_color(Color::rgb(156, 163, 175)),
                                         run(" +8.1%"),
                                     ])

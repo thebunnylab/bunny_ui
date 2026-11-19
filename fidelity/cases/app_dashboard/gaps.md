@@ -1,6 +1,6 @@
 # Import gaps — apps/dashboard.html
 
-227 views named; 32 gaps in 14 features.
+226 views named; 32 gaps in 14 features.
 
 | feature | count | where | what |
 |---|---|---|---|
