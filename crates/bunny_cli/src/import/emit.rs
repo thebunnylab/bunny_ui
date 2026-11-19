@@ -428,6 +428,8 @@ impl Writer<'_> {
         // moved off its place — a translation, a relative position — after
         // its name, so the name is found where the box is drawn
         let (mut dx, mut dy) = css::transform(node.css("transform")).ok().flatten().map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f));
+        // a box drawn under its clip at a scrolled position: its content
+        // moved by the scroll (bunny's clip does not scroll)
         if node.css("position") == "relative" {
             dx += node.px("left");
             dy += node.px("top");
@@ -765,7 +767,13 @@ impl Writer<'_> {
             self.block(node, &in_flow, width, height)
         };
         (self.hug, self.container_width) = saved;
-        view
+        match node.attr("scroll").map(|scroll| scroll.split(' ').filter_map(css::number).collect::<Vec<_>>()) {
+            Some(scroll) if scroll.len() == 2 && (scroll[0] != 0.0 || scroll[1] != 0.0) => {
+                self.gap(node, "scroll position", format!("drawn scrolled by {} {}", num(scroll[0]), num(scroll[1])));
+                with_offset(&view, -scroll[0], -scroll[1])
+            }
+            _ => view,
+        }
     }
 
     /// Block flow: the words and inline boxes of a line as one paragraph,
@@ -1010,7 +1018,10 @@ impl Writer<'_> {
             self.gap(node, "white-space: nowrap", "the words may wrap");
         }
         if !node.css("-webkit-line-clamp").is_empty() && node.css("-webkit-line-clamp") != "none" {
-            self.gap(node, "-webkit-line-clamp", node.css("-webkit-line-clamp").to_owned());
+            // the lines that fit the clamped height show, cut there; the
+            // ellipsis the page draws at the end is not drawn
+            self.gap(node, "-webkit-line-clamp", format!("{} lines, cut without an ellipsis", node.css("-webkit-line-clamp")));
+            let _ = write!(view, "\n.frame_height_aligned({}, Alignment::TopLeading)\n.clipped()", num(content_height(node)));
         }
         if !node.css("font-variant").is_empty() && node.css("font-variant") != "normal" {
             self.gap(node, "font-variant", node.css("font-variant").to_owned());
@@ -1105,7 +1116,7 @@ impl Writer<'_> {
             _ => views,
         };
         let mut code = stack(if row { "hstack" } else { "vstack" }, &views);
-        if gap > 0.0 {
+        if gap.abs() > 1e-9 {
             let _ = write!(code, "\n.spacing({})", num(gap));
         }
         let cross = node.css("align-items");

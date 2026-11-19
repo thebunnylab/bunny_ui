@@ -114,6 +114,7 @@ pub fn view() -> impl View {
                 .border(Color::rgb(255, 255, 255), 2.0)
                 .test_id("span.more-11"),
             )
+            .spacing(-9.0)
             .alignment(VerticalAlignment::Center)
             .test_id("div.stack-7"),
             text("Filter")
@@ -258,6 +259,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-27"),
@@ -330,6 +333,7 @@ pub fn view() -> impl View {
                             .clipped()
                             .test_id("img-34"),
                         )
+                        .spacing(-6.0)
                         .alignment(VerticalAlignment::Center)
                         .test_id("div.stack-32"),
                     )
@@ -383,6 +387,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-39"),
@@ -670,6 +676,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-65"),
@@ -752,6 +760,7 @@ pub fn view() -> impl View {
                             .clipped()
                             .test_id("img-73"),
                         )
+                        .spacing(-6.0)
                         .alignment(VerticalAlignment::Center)
                         .test_id("div.stack-70"),
                     )
@@ -819,6 +828,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(43.6508, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-79"),
@@ -1014,6 +1025,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-97"),
@@ -1085,6 +1098,7 @@ pub fn view() -> impl View {
                             .clipped()
                             .test_id("img-104"),
                         )
+                        .spacing(-6.0)
                         .alignment(VerticalAlignment::Center)
                         .test_id("div.stack-102"),
                     )
@@ -1138,6 +1152,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-109"),
@@ -1320,6 +1336,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-126"),
@@ -1407,6 +1425,8 @@ pub fn view() -> impl View {
                     .font_size(12.0)
                     .foreground_color(Color::rgb(107, 114, 128))
                     .line_height(16.2)
+                    .frame_height_aligned(32.3906, Alignment::TopLeading)
+                    .clipped()
                     .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
                     .clipped()
                     .test_id("p.desc-134"),
@@ -1475,6 +1495,7 @@ pub fn view() -> impl View {
         )
         .spacing(14.0)
         .alignment(VerticalAlignment::Top)
+        .offset(-20.0, 0.0)
         .padding_edge(Edge::Top, 16.0)
         .padding_edge(Edge::Trailing, 20.0)
         .padding_edge(Edge::Bottom, 16.0)

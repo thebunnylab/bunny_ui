@@ -9,7 +9,7 @@
 | `filter: hue-rotate` | 2 | img-53, img-65 | hue-rotate(90deg) |
 | `filter: sepia` | 2 | img-51, img-63 | sepia(0.6) |
 | `inline box: padding/radius` | 2 | mark-29, span.code-28 | the run keeps its ground, not its box |
-| `-webkit-line-clamp` | 1 | p.caption-45 | 2 |
+| `-webkit-line-clamp` | 1 | p.caption-45 | 2 lines, cut without an ellipsis |
 | `conic-gradient` | 1 | div.ring-8 | not drawn |
 | `filter: contrast` | 1 | img-55 | contrast(1.3) |
 | `filter: drop-shadow` | 1 | span.play-60 | drop-shadow(rgba(0, 0, 0, 0.5) 0px 1px 3px) |

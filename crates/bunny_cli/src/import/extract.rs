@@ -72,6 +72,9 @@ pub const SCRIPT: &str = r"(() => {
     if (cs.transform !== 'none' && el.offsetWidth !== undefined) node.layout = [el.offsetWidth, el.offsetHeight];
     for (const a of ['src', 'alt', 'type', 'value', 'placeholder', 'href', 'dir', 'checked', 'disabled', 'min', 'max', 'low', 'high', 'open', 'colspan', 'rowspan'])
       if (el.hasAttribute(a)) node.attrs[a] = el.getAttribute(a) || 'true';
+    // a scrolled box: where its content stands at load (a snap, a
+    // remembered position)
+    if (el.scrollLeft || el.scrollTop) node.attrs.scroll = el.scrollLeft + ' ' + el.scrollTop;
     if (tag === 'select') node.attrs.label = el.selectedIndex >= 0 ? el.options[el.selectedIndex].text : '';
     if (tag === 'input' || tag === 'textarea') node.attrs.current = el.value;
     if (tag === 'progress' || tag === 'meter') node.attrs.position = String(el.position !== undefined && el.position >= 0 ? el.position : (el.value - (el.min || 0)) / ((el.max || 1) - (el.min || 0)));

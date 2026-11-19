@@ -338,6 +338,8 @@ pub fn view() -> impl View {
         .font_size(12.0)
         .foreground_color(Color::rgb(85, 85, 92))
         .line_height(16.2)
+        .frame_height_aligned(32.3906, Alignment::TopLeading)
+        .clipped()
         .frame_max(f64::INFINITY, f64::MAX, Alignment::TopLeading)
         .clipped()
         .test_id("p.caption-45")
