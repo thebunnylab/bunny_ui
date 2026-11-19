@@ -109,6 +109,12 @@ function requestFrame() {
 // decoding; null = the browser could not read the bytes (permanent —
 // the engine never re-registers, nothing loops).
 const images = new Map();
+// SVG bytes: the markup's first tag, past a byte order mark, white space,
+// an XML declaration and comments
+function isSvg(bytes) {
+  const head = new TextDecoder().decode(bytes.subarray(0, 1024)).replace(/^\uFEFF/, "");
+  return /^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i.test(head);
+}
 
 function imageKey(hi, lo) {
   // wasm hands u32 arguments through the SIGNED i32 border while the
@@ -335,6 +341,23 @@ const imports = {
     js_image_register(hi, lo, pointer, length) {
       const key = imageKey(hi, lo);
       const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+      if (isSvg(bytes)) {
+        // a bitmap cannot be decoded from SVG bytes: the picture loads as
+        // an image and stays a vector, drawn at whatever size is asked
+        const url = URL.createObjectURL(new Blob([bytes], { type: "image/svg+xml" }));
+        const picture = new Image();
+        picture.onload = () => {
+          URL.revokeObjectURL(url);
+          images.set(key, picture);
+          wasm.bunny_image_ready(hi, lo);
+        };
+        picture.onerror = () => {
+          URL.revokeObjectURL(url);
+          images.set(key, null);
+        };
+        picture.src = url;
+        return;
+      }
       createImageBitmap(new Blob([bytes]))
         .then((bitmap) => {
           images.set(key, bitmap);
@@ -348,8 +371,8 @@ const imports = {
     js_image_size(hi, lo, out) {
       const bitmap = images.get(imageKey(hi, lo));
       const view = new Uint32Array(wasm.memory.buffer, out, 2);
-      view[0] = bitmap ? bitmap.width : 0;
-      view[1] = bitmap ? bitmap.height : 0;
+      view[0] = bitmap ? bitmap.naturalWidth ?? bitmap.width : 0;
+      view[1] = bitmap ? bitmap.naturalHeight ?? bitmap.height : 0;
     },
     // Draws the bitmap at exactly width×height physical px and writes
     // the straight-alpha RGBA back (getImageData is straight by spec).
