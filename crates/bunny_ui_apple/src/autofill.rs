@@ -28,10 +28,16 @@
 //! The controller and the delegate are AUTORELEASED when the answer
 //! arrives, never released: the callback runs inside the controller's
 //! own call, and the run loop's pool frees both once it returns.
+//!
+//! **AuthenticationServices is loaded on the first request, never
+//! linked.** Linking it loads ScreenCaptureKit and the rest of its graph
+//! into every process at launch — an app that never signs anybody in
+//! paid for it, and a test binary that relied on having no screen
+//! capture suddenly had one. The first request `dlopen`s it once.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::null_mut;
 
 use bunny_ui::autofill::{Answer, SavedPassword, SavedPasswordError};
@@ -42,14 +48,27 @@ use crate::ffi::{
     objc_getClass, objc_getProtocol, objc_registerClassPair, sel, text_of,
 };
 
-// The framework rides along — its classes resolve by name at run time,
-// and the link is what loads them.
-#[link(name = "AuthenticationServices", kind = "framework")]
-unsafe extern "C" {}
-
 #[link(name = "System", kind = "dylib")]
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+}
+
+/// `RTLD_LAZY`: bind the framework's symbols as they are first used.
+const RTLD_LAZY: c_int = 0x1;
+
+/// Where the framework lives — the same path on the Mac, the phone and
+/// the simulator, whose dyld resolves it inside the simulated runtime.
+const AUTHENTICATION_SERVICES: &CStr =
+    c"/System/Library/Frameworks/AuthenticationServices.framework/AuthenticationServices";
+
+/// Loads AuthenticationServices once, on the first request — `false` on
+/// a system that cannot. Its classes resolve by name once it is in.
+fn authentication_services() -> bool {
+    static LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: `dlopen` reads a NUL-terminated path of ours; the handle is
+    // kept by the process for its life, as a linked framework would be.
+    *LOADED.get_or_init(|| unsafe { !dlopen(AUTHENTICATION_SERVICES.as_ptr(), RTLD_LAZY).is_null() })
 }
 
 /// `RTLD_DEFAULT` on Darwin: search every image the process loaded.
@@ -191,6 +210,10 @@ thread_local! {
 /// Called on the main thread. `anchor` is null or a live window of the
 /// kit (`NSWindow`, `UIWindow`).
 pub unsafe fn request_saved_password(anchor: Id, answer: Answer) {
+    if !authentication_services() {
+        answer.give(Err(SavedPasswordError::Unsupported));
+        return;
+    }
     unsafe {
         let provider_class = class("ASAuthorizationPasswordProvider");
         let controller_class = class("ASAuthorizationController");
