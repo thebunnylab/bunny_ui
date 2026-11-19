@@ -1400,8 +1400,28 @@ thread_local! {
 /// event the menu consumed never reaches `keyDown:` to clear the mark, and
 /// a later event may be born at the same address.
 unsafe fn first_offer(event: Id) -> bool {
-    let identity = (event as usize, unsafe { msg_f64(event, sel("timestamp")) }.to_bits());
+    let identity = unsafe { event_identity(event) };
     OFFERED.with(|offered| offered.replace(identity)) != identity
+}
+
+unsafe fn event_identity(event: Id) -> (usize, u64) {
+    (event as usize, unsafe { msg_f64(event, sel("timestamp")) }.to_bits())
+}
+
+thread_local! {
+    /// The key event whose press the box holding the keyboard heard — see
+    /// [`tell_press`].
+    static TOLD: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Tells the box holding the keyboard that `event`'s key went down, once:
+/// a chord nobody bound is told before the menu bar has it, and the
+/// `keyDown:` that may follow does not tell it again.
+unsafe fn tell_press(event: Id, composing: bool, taken: bool) {
+    let identity = unsafe { event_identity(event) };
+    if TOLD.with(|told| told.replace(identity)) != identity {
+        dispatch(AppEvent::Physical(unsafe { physical_key(event, KeyPhase::Down, composing, taken) }));
+    }
 }
 
 /// `performKeyEquivalent:` — the keymap hears a stroke before the menu bar
@@ -1447,8 +1467,13 @@ extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> Ob
             chars_bare: bare_characters(event),
         };
         if gate_consumed(&stroke) {
-            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, true)));
+            tell_press(event, false, true);
             return ObjcBool::YES; // the keymap dispatched — the event dies here
+        }
+        // a chord no binding took is the box's before the menu bar's: an
+        // editor hears ⌘Z go down even where the Edit menu then undoes
+        if held.command {
+            tell_press(event, false, false);
         }
         key_equivalent_super(this, event)
     }
@@ -1479,7 +1504,7 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             return;
         }
         if !composing && first_offer(event) && gate_consumed(&stroke) {
-            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, true)));
+            tell_press(event, false, true);
             return; // the keymap dispatched — the event dies here
         }
 
@@ -1490,13 +1515,13 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             let said = interpret_holding(this, event);
             let composed = composing
                 || said.iter().any(|said| matches!(said, AppEvent::ImeMark { .. } | AppEvent::ImeUnmark));
-            dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, composed, false)));
+            tell_press(event, composed, false);
             for said in said {
                 dispatch(said);
             }
             return;
         }
-        dispatch(AppEvent::Physical(physical_key(event, KeyPhase::Down, false, false)));
+        tell_press(event, false, false);
         dispatch(AppEvent::Key {
             code,
             shift: stroke.shift,
