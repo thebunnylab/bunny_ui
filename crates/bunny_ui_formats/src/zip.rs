@@ -1,8 +1,10 @@
-//! Zip archives, written: each file deflated (RFC 1951), or stored when
-//! deflating would not shrink it — what Play Console reads native debug
-//! symbols from, what a Windows app is handed out in.
+//! Zip archives, written and read: each file deflated (RFC 1951), or
+//! stored when deflating would not shrink it — what Play Console reads
+//! native debug symbols from, what a Windows app is handed out in.
 
 use std::io::Write;
+
+pub use crate::zip_read::{Item, read};
 
 /// The CRC-32 of `bytes` (IEEE 802.3, the one zip uses).
 pub fn crc32(bytes: &[u8]) -> u32 {

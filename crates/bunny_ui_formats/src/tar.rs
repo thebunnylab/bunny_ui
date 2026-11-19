@@ -1,6 +1,8 @@
-//! Tar archives (POSIX ustar), written: what a Linux app is handed out
-//! in, gzipped. Each entry keeps its mode, so the binary and the install
-//! script stay executable.
+//! Tar archives (POSIX ustar), written and read: what a Linux app is
+//! handed out in, gzipped. Each entry keeps its mode, so the binary and
+//! the install script stay executable.
+
+pub use crate::tar_read::{Item, Kind, read};
 
 /// One entry: a path inside the archive (`/` between its parts), its
 /// mode, and its bytes — `None` for a folder.
