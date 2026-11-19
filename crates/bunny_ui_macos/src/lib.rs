@@ -2244,7 +2244,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // the shared gate: typing first, then whoever holds the
             // keyboard, a field of many lines, and the keymap — a copy's
             // text reaches the pasteboard through the installed clipboard
-            if runtime.offer_key(Stroke::new(pattern, stroke.typed)) {
+            if runtime.offer_board_key(Stroke::new(pattern, stroke.typed)) {
                 blit(&runtime, &*root, trace::Origin::Input);
                 true
             } else {

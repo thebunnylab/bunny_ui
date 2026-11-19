@@ -416,6 +416,8 @@ pub struct Runtime {
     key_resolver: RefCell<Option<Rc<dyn crate::action::KeyResolver>>>,
     /// How this platform types ([`Runtime::set_key_platform`]).
     key_platform: Cell<crate::action::KeyPlatform>,
+    /// A key of the board is being offered ([`Runtime::offer_board_key`]).
+    board_key: Cell<bool>,
     /// A modifier pressed with nothing else held, while nothing has come
     /// between: let go, it is a stroke of its own.
     modifier_tap: Cell<Option<crate::action::Key>>,
@@ -1973,6 +1975,7 @@ impl Runtime {
             pending: RefCell::new(Vec::new()),
             key_resolver: RefCell::new(None),
             key_platform: Cell::new(crate::action::KeyPlatform::default()),
+            board_key: Cell::new(false),
             modifier_tap: Cell::new(None),
             chord_sink: RefCell::new(None),
             chord_announced: Cell::new(false),
@@ -2673,6 +2676,7 @@ impl Runtime {
             touch: self.touch_modality.get(),
             held_ms: self.press_held_ms(),
             direction: placement.direction,
+            board: self.board_key.get(),
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
@@ -4137,6 +4141,18 @@ impl Runtime {
         let stroke = stroke.into();
         let typing = self.key_platform.get().types(&stroke.pattern);
         self.gate(Held { stroke, typing, fallback: Fallback::Replay }, Door::Platform)
+    }
+
+    /// [`Runtime::offer_key`] for a key of the board the shell reports
+    /// on its own right after: the box that hears the stroke reads
+    /// [`EventCtx::board`](crate::custom::EventCtx::board), and knows its
+    /// [`ElementEvent::Physical`](crate::custom::ElementEvent::Physical)
+    /// follows — a stroke a menu or a replay makes has none.
+    pub fn offer_board_key(&self, stroke: impl Into<Stroke>) -> bool {
+        let was = self.board_key.replace(true);
+        let taken = self.offer_key(stroke);
+        self.board_key.set(was);
+        taken
     }
 
     fn gate(&self, held: Held, door: Door) -> bool {

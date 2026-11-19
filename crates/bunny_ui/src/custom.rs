@@ -1509,6 +1509,13 @@ pub struct EventCtx<'a> {
     /// paint was given ([`PaintCtx::direction`]), so a box that put a
     /// gutter on the leading edge hit-tests it on the same side.
     pub direction: LayoutDirection,
+    /// The [`ElementEvent::Key`] being answered is a key of the board
+    /// whose [`ElementEvent::Physical`] follows
+    /// ([`Runtime::offer_board_key`]); a stroke a menu or a replay makes
+    /// has none.
+    ///
+    /// [`Runtime::offer_board_key`]: crate::runtime::Runtime::offer_board_key
+    pub board: bool,
 }
 
 impl EventCtx<'_> {

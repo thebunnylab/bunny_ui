@@ -364,9 +364,11 @@ fn a_lone_modifier_never_reaches_the_focused_box() {
     assert_eq!(bench.heard.borrow().as_str(), "", "and the box heard nothing");
 }
 
-/// A box that writes down the keys of the board it hears.
+/// A box that writes down the keys of the board it hears, and whether
+/// each stroke it takes says its key follows.
 struct Board {
     heard: Rc<RefCell<Vec<crate::custom::PhysicalKey>>>,
+    strokes: Rc<RefCell<Vec<bool>>>,
 }
 
 impl CustomElement for Board {
@@ -376,24 +378,40 @@ impl CustomElement for Board {
 
     fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
 
-    fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
-        if let ElementEvent::Physical(key) = event {
-            self.heard.borrow_mut().push(*key);
-            return Response::handled();
+    fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
+        match event {
+            ElementEvent::Physical(key) => self.heard.borrow_mut().push(*key),
+            ElementEvent::Key(_) => self.strokes.borrow_mut().push(ctx.board),
+            _ => return Response::ignored(),
         }
-        Response::ignored()
+        Response::handled()
     }
 }
 
 #[derive(Clone)]
 struct Keyboard {
     heard: Rc<RefCell<Vec<crate::custom::PhysicalKey>>>,
+    strokes: Rc<RefCell<Vec<bool>>>,
 }
 
 impl Component for Keyboard {
     fn body(self) -> impl View {
-        vstack!(custom(Board { heard: Rc::clone(&self.heard) }).id("board"))
+        let board = Board { heard: Rc::clone(&self.heard), strokes: Rc::clone(&self.strokes) };
+        vstack!(custom(board).id("board"))
     }
+}
+
+#[test]
+fn a_stroke_offered_from_the_board_says_its_key_follows() {
+    let keyboard = Keyboard { heard: Rc::default(), strokes: Rc::default() };
+    let runtime = Runtime::new();
+    runtime.render_stable(&keyboard);
+    focus_the_box(&runtime, &keyboard);
+    let down = KeyPattern::key(Key::Down);
+    assert!(runtime.offer_board_key(down));
+    assert!(runtime.offer_key(down));
+    assert!(runtime.key_stroke(down).handled);
+    assert_eq!(*keyboard.strokes.borrow(), [true, false, false]);
 }
 
 fn shift_left(phase: crate::custom::KeyPhase) -> crate::custom::PhysicalKey {
@@ -411,7 +429,7 @@ fn shift_left(phase: crate::custom::KeyPhase) -> crate::custom::PhysicalKey {
 
 #[test]
 fn a_key_of_the_board_reaches_the_box_holding_the_keyboard_alone() {
-    let keyboard = Keyboard { heard: Rc::default() };
+    let keyboard = Keyboard { heard: Rc::default(), strokes: Rc::default() };
     let runtime = Runtime::new();
     runtime.render_stable(&keyboard);
     assert!(
