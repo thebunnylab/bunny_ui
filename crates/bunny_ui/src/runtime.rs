@@ -1547,6 +1547,15 @@ impl Runtime {
         true
     }
 
+    /// Opens `items` at `at`, a point of the scene, outside any event: the
+    /// door for a menu whose items are known only later — a page in another
+    /// thread that first asks its own script whether to show one. The same
+    /// menu a box opens from inside an event, with the same manners.
+    pub fn open_menu_at(&self, at: Point, items: Vec<crate::views::MenuItem>) {
+        self.open_menu(at, items.into(), self.layout_direction());
+        self.request_frame();
+    }
+
     /// Opens `items` AT a point of the scene — the one road, whether the
     /// right press found a `.context_menu(…)` region or the app's own
     /// box asked from inside an event ([`crate::custom::EventCtx::open_menu`]).
@@ -9274,3 +9283,7 @@ mod metrics_tests;
 #[cfg(test)]
 #[path = "key_resolution_tests.rs"]
 mod key_resolution_tests;
+
+#[cfg(test)]
+#[path = "runtime_menu_tests.rs"]
+mod menu_tests;
