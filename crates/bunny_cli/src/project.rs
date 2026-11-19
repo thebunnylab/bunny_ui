@@ -8,6 +8,7 @@ use crate::cargo;
 use crate::error::{Error, Result};
 use crate::ids;
 use crate::json::Value;
+use crate::updater;
 
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -29,11 +30,24 @@ pub struct Project {
     pub id: Option<String>,
     /// The build number (`CFBundleVersion`, `versionCode`).
     pub build: u64,
+    /// `[package.metadata.bunny.updater]`, when the app updates itself.
+    pub updater: Option<updater::Config>,
 }
 
 impl Project {
-    /// The project in `dir` (or named by `package`, in a workspace).
+    /// The project in `dir` (or named by `package`, in a workspace),
+    /// with the updater's public keys read: what a build needs.
     pub fn discover(dir: &Path, package: Option<&str>) -> Result<Project> {
+        let mut project = Project::locate(dir, package)?;
+        if let Some(config) = &mut project.updater {
+            config.load_keys()?;
+        }
+        Ok(project)
+    }
+
+    /// The project in `dir`, as [`Project::discover`] finds it, with no
+    /// key file read: for the commands that check the keys or make them.
+    pub fn locate(dir: &Path, package: Option<&str>) -> Result<Project> {
         let metadata = cargo::metadata(dir, None)?;
         let target_dir = PathBuf::from(metadata.str_at(&["target_directory"]).unwrap_or("target"));
         let workspace_root = PathBuf::from(metadata.str_at(&["workspace_root"]).unwrap_or("."));
@@ -91,6 +105,10 @@ impl Project {
             ids::check_app_id(id).map_err(|error| Error::new(format!("Cargo.toml's [package.metadata.bunny] id: {}", error.message)))?;
         }
         let build = bunny.and_then(|table| table.get("build")).and_then(Value::as_u64).unwrap_or(1);
+        let updater = match bunny.and_then(|table| table.get("updater")) {
+            Some(table) => Some(updater::Config::parse(table, &name, &dir)?),
+            None => None,
+        };
         Ok(Project {
             version: package.str_at(&["version"]).unwrap_or("0.1.0").to_string(),
             package: name,
@@ -103,6 +121,7 @@ impl Project {
             name: app_name,
             id,
             build,
+            updater,
         })
     }
 
@@ -143,11 +162,20 @@ impl Project {
     }
 
     /// What every build of the app carries: who it is, read by
-    /// `bunny_ui::app!` at compile time.
+    /// `bunny_ui::app!` at compile time, and, when the app updates
+    /// itself, its feed, its product, its public keys and its channel.
+    ///
+    /// A `BUNNY_CHANNEL` that names no channel is left out here; a
+    /// release build refuses it before it starts.
     pub fn build_env(&self) -> Vec<(String, OsString)> {
         let mut env = vec![(String::from("BUNNY_APP_NAME"), OsString::from(&self.name))];
         if let Some(id) = &self.id {
             env.push((String::from("BUNNY_APP_ID"), OsString::from(id)));
+        }
+        if let Some(config) = &self.updater {
+            let from_env = std::env::var("BUNNY_CHANNEL").ok();
+            let channel = config.channel(from_env.as_deref()).unwrap_or_else(|_| config.channel(None).unwrap_or_default());
+            env.extend(config.env(&channel));
         }
         env
     }
@@ -200,5 +228,24 @@ mod tests {
         assert_eq!(project.build, 1);
         assert!(project.require_id().is_err());
         assert!(!project.has_lib);
+        assert!(project.updater.is_none());
+        assert!(project.build_env().iter().all(|(key, _)| !key.starts_with("BUNNY_UPDATER") && key != "BUNNY_CHANNEL"));
+    }
+
+    #[test]
+    fn the_updater_table_reads_with_the_package() {
+        let project = package(
+            r#"{"name":"notes","version":"0.3.1","manifest_path":"/n/Cargo.toml","targets":[],
+                "metadata":{"bunny":{"updater":{"server":"https://api.example.com","pubkeys":["keys/updater.pub"]}}}}"#,
+        );
+        let config = project.updater.unwrap();
+        assert_eq!(config.product, "notes");
+        assert_eq!(config.pubkey_paths, [PathBuf::from("/n/keys/updater.pub")]);
+        let bad = Project::from_package(
+            &json::parse(r#"{"name":"notes","manifest_path":"/n/Cargo.toml","metadata":{"bunny":{"updater":{"pubkeys":["k.pub"]}}}}"#).unwrap(),
+            PathBuf::from("/w"),
+            PathBuf::from("/t"),
+        );
+        assert!(bad.unwrap_err().message.contains("no `feed` and no `server`"));
     }
 }
