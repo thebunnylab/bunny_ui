@@ -56,3 +56,30 @@ fn the_page_spells_both_offsets() {
     assert!(page.css.contains("box-shadow:2px 6px 5.124px"), "{}", page.css);
     assert!(page.css.contains("translate:-3px 4.5px"), "{}", page.css);
 }
+
+/// A negative padding is SwiftUI's way to overlap: the content moves out
+/// past the box's edge and the box gives the flow that much back — an
+/// avatar pulled up over the cover above it, the row below following.
+#[test]
+fn a_negative_padding_overlaps_the_box_above() {
+    let runtime = Runtime::new();
+    let view = vstack!(
+        rectangle().frame(100.0, 60.0).test_id("cover"),
+        rectangle().frame(40.0, 40.0).test_id("avatar").padding_edge(Edge::Top, -20.0),
+        rectangle().frame(100.0, 10.0).test_id("below"),
+    )
+    .alignment(HorizontalAlignment::Leading);
+    runtime.display_frame(&view, SIZE);
+    assert_eq!(frame(&runtime, "avatar").origin.y, 40.0, "pulled up over the cover");
+    // the avatar takes 40 - 20 in the flow: the next box starts at 80
+    assert_eq!(frame(&runtime, "below").origin.y, 80.0, "and the flow gave back the overlap");
+}
+
+/// CSS has no negative padding: the page writes a negative side as the
+/// negative margin that means the same.
+#[test]
+fn the_page_writes_a_negative_padding_as_a_margin() {
+    let page = bunny_ui::ssr::render(&vstack!(text("pulled").padding_edge(Edge::Top, -20.0), text("below")), SIZE);
+    assert!(page.css.contains("margin-block-start:-20px"), "{}", page.css);
+    assert!(!page.css.contains("padding-block:-20px"), "{}", page.css);
+}

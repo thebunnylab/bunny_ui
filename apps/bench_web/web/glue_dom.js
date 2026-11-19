@@ -623,8 +623,16 @@ function lookRules(selector, kind, flags, style, layout, face) {
     // so are the properties: a right-to-left mount puts the leading inset
     // on the right by itself
     const [top, trailing, bottom, leading] = layout.padding;
-    decl["padding-block"] = `${top}px ${bottom}px`;
-    decl["padding-inline"] = `${leading}px ${trailing}px`;
+    // a negative side is a negative margin: the content moves out and the
+    // box gives the flow that much back, as a negative padding does in
+    // the engine — CSS has no negative padding
+    const inward = (side) => Math.max(side, 0);
+    decl["padding-block"] = `${inward(top)}px ${inward(bottom)}px`;
+    decl["padding-inline"] = `${inward(leading)}px ${inward(trailing)}px`;
+    if (top < 0) decl["margin-block-start"] = `${top}px`;
+    if (bottom < 0) decl["margin-block-end"] = `${bottom}px`;
+    if (leading < 0) decl["margin-inline-start"] = `${leading}px`;
+    if (trailing < 0) decl["margin-inline-end"] = `${trailing}px`;
   }
   if (layout.direction !== null) {
     // an island that reads the other way: the browser orders its rows,

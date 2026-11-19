@@ -1052,8 +1052,17 @@ fn rule_text(
     // the record's sides are logical, and so are the properties: a
     // right-to-left mount puts the leading inset on the right by itself
     if let Some((top, trailing, bottom, leading)) = layout.padding {
-        base.insert("padding-block", format!("{} {}", px(top), px(bottom)));
-        base.insert("padding-inline", format!("{} {}", px(leading), px(trailing)));
+        // a negative side is a negative margin: the content moves out and
+        // the box gives the flow that much back, as a negative padding
+        // does in the engine — CSS has no negative padding
+        let inward = |side: f32| px(side.max(0.0));
+        base.insert("padding-block", format!("{} {}", inward(top), inward(bottom)));
+        base.insert("padding-inline", format!("{} {}", inward(leading), inward(trailing)));
+        for (side, name) in [(top, "margin-block-start"), (bottom, "margin-block-end"), (leading, "margin-inline-start"), (trailing, "margin-inline-end")] {
+            if side < 0.0 {
+                base.insert(name, px(side));
+            }
+        }
     }
     // an island that reads the other way: the browser orders its rows,
     // aligns its `start` and shapes its words that way, isolated from
