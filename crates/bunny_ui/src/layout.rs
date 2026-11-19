@@ -7727,9 +7727,11 @@ impl LayoutNode {
             }
 
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => {
+                // `f64::MAX` is "no ceiling, but not open": unproposed, it
+                // proposes nothing either, or a spacer inside would take it
                 let cap = |proposed: Option<Px>, max: Px| match proposed {
                     Some(length) => Some(length.min(max)),
-                    None if max.is_finite() => Some(max),
+                    None if max.is_finite() && max < Px::MAX => Some(max),
                     None => None,
                 };
                 let (child_size, fit) = child.measure(
