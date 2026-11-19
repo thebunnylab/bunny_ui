@@ -81,6 +81,7 @@ fn a_negative_padding_overlaps_the_box_above() {
 fn the_page_writes_a_negative_padding_as_a_margin() {
     let page = bunny_ui::ssr::render(&vstack!(text("pulled").padding_edge(Edge::Top, -20.0), text("below")), SIZE);
     assert!(page.css.contains("margin-block-start:-20px"), "{}", page.css);
+    assert!(page.css.contains("isolation:isolate"), "painted whole over the box above: {}", page.css);
     assert!(!page.css.contains("padding-block:-20px"), "{}", page.css);
 }
 
@@ -107,10 +108,10 @@ fn the_page_writes_a_negative_spacing_as_margins() {
     runtime.display_frame(&faces, SIZE);
     assert_eq!(frame(&runtime, "third").origin.x, 42.0);
     let page = bunny_ui::ssr::render(&faces, SIZE);
-    assert!(page.css.contains(">*+*{margin-inline-start:-9px}"), "{}", page.css);
+    assert!(page.css.contains(">*+*{margin-inline-start:-9px;isolation:isolate}"), "{}", page.css);
     assert!(!page.css.contains("gap:-9px"), "{}", page.css);
     let column = bunny_ui::ssr::render(&vstack!(text("a"), text("b")).spacing(-4.0), SIZE);
-    assert!(column.css.contains(">*+*{margin-block-start:-4px}"), "{}", column.css);
+    assert!(column.css.contains(">*+*{margin-block-start:-4px;isolation:isolate}"), "{}", column.css);
 }
 
 /// A layer larger than its base keeps its size and overflows the box,

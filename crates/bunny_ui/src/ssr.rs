@@ -1000,7 +1000,8 @@ fn rule_text(
     }
     // a negative spacing overlaps the items, as SwiftUI's does; CSS has
     // no negative gap, so each item after the first is pulled back by a
-    // negative margin along the line instead
+    // negative margin along the line instead, and painted whole over the
+    // one before, as a layer is
     let overlap = layout
         .gap
         .filter(|gap| *gap < 0.0 && layout.wrap.is_none())
@@ -1082,6 +1083,11 @@ fn rule_text(
                 base.insert(name, px(side));
             }
         }
+        // pulled back over the box before it, it is painted whole over
+        // that box, as SwiftUI's later view is, layers and all
+        if top < 0.0 || leading < 0.0 {
+            base.insert("isolation", "isolate".into());
+        }
     }
     // an island that reads the other way: the browser orders its rows,
     // aligns its `start` and shapes its words that way, isolated from
@@ -1121,7 +1127,9 @@ fn rule_text(
     }
     let mut states: Vec<String> = Vec::new();
     // layers: one grid cell, and every child IN it — auto-placement
-    // would give each layer a row of its own
+    // would give each layer a row of its own. Each child paints whole and
+    // in its turn: a moved or positioned box inside a background would
+    // otherwise paint over the base
     if matches!(kind, CreateKind::Layers) {
         match layout.base() {
             // an overlay's cell: the base in the first track, every layer
@@ -1132,14 +1140,14 @@ fn rule_text(
                     crate::dom::LayerBase::First => "first-child",
                     crate::dom::LayerBase::Last => "last-child",
                 };
-                states.push(format!("{selector}>*{{grid-area:1/1/3/3}}"));
+                states.push(format!("{selector}>*{{grid-area:1/1/3/3;z-index:0}}"));
                 states.push(format!("{selector}>:{at}{{grid-area:1/1}}"));
             }
-            None => states.push(format!("{selector}>*{{grid-area:1/1}}")),
+            None => states.push(format!("{selector}>*{{grid-area:1/1;z-index:0}}")),
         }
     }
     if let Some((side, gap)) = overlap {
-        states.push(format!("{selector}>*+*{{{side}:{}}}", px(gap)));
+        states.push(format!("{selector}>*+*{{{side}:{};isolation:isolate}}", px(gap)));
     }
     // a follower hangs its states off the GROUP's pointer: the same
     // rules, hung off the group's selector; a box without one listens
@@ -1730,14 +1738,6 @@ mod tests {
         assert_eq!(pushes.count(), 0, "{css}");
     }
 
-    /// The house halo falls off as (1 − d/r)² and stops at its reach;
-    /// one CSS blur is a Gaussian, lighter close in and longer far out.
-    /// The page stacks two blurred layers fitted to the curve, each a
-    /// spread and a blur in reaches and the ink's opacity raised to its
-    /// own power — the two the glue spells.
-    #[test]
-    fn a_served_shadow_follows_the_house_halo() {
-        #[derive(Clone, Copy)]
     /// A field's chrome is the theme's or none: the browser's own white
     /// box and sunken edge never show, so a bare field shows what is
     /// behind it, and a themed one wears the look's ground over the reset.
@@ -1761,6 +1761,14 @@ mod tests {
         assert!(fields.iter().any(|rule| rule.contains("background-color:")), "the theme's ground: {css}");
     }
 
+    /// The house halo falls off as (1 − d/r)² and stops at its reach;
+    /// one CSS blur is a Gaussian, lighter close in and longer far out.
+    /// The page stacks two blurred layers fitted to the curve, each a
+    /// spread and a blur in reaches and the ink's opacity raised to its
+    /// own power — the two the glue spells.
+    #[test]
+    fn a_served_shadow_follows_the_house_halo() {
+        #[derive(Clone, Copy)]
         struct Lifted;
         impl Component for Lifted {
             fn body(self) -> impl View {
@@ -2166,7 +2174,7 @@ mod tests {
         }
 
         let page = render(&Badge, Size { width: 200.0, height: 200.0 });
-        assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1;z-index:0}"), "{}", page.css);
         assert!(page.css.contains("justify-items:center"), "{}", page.css);
     }
 
@@ -2192,9 +2200,23 @@ mod tests {
         let page = render(&Card, Size { width: 300.0, height: 300.0 });
         assert_eq!(page.css.matches("grid-template-columns:auto 0fr").count(), 2, "{}", page.css);
         assert!(page.css.contains("grid-template-rows:auto 0fr"), "{}", page.css);
-        assert!(page.css.contains(">*{grid-area:1/1/3/3}"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1/3/3;z-index:0}"), "{}", page.css);
         assert!(page.css.contains(">:first-child{grid-area:1/1}"), "the overlay's base comes first: {}", page.css);
         assert!(page.css.contains(">:last-child{grid-area:1/1}"), "the background's, last: {}", page.css);
+    }
+
+    /// A background lies under its base however it is moved, as
+    /// `SwiftUI`'s does: the page moves it with `translate`, which alone
+    /// would paint it over a base nothing moved, so each layer of the cell
+    /// paints whole and in its turn.
+    #[test]
+    fn a_moved_background_stays_under_its_base() {
+        let page = render(
+            &text("over the hills").background(UnitPoint::TOP_LEADING, rectangle().frame(200.0, 40.0).offset(0.0, 30.0)),
+            Size { width: 300.0, height: 300.0 },
+        );
+        assert!(page.css.contains("translate:0px 30px"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1/3/3;z-index:0}"), "{}", page.css);
     }
 
     /// A served picture has no bytes yet: it wears the identity the

@@ -635,10 +635,11 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (layout.relative) { decl.position = "relative"; decl.isolation = "isolate"; }
   // a negative spacing overlaps the items, as SwiftUI's does; CSS has no
   // negative gap, so each item after the first is pulled back by a
-  // negative margin along the line instead
+  // negative margin along the line instead, and painted whole over the
+  // one before, as a layer is
   const overlap =
     layout.gap !== null && layout.gap < 0 && layout.wrap === null && (kind === 9 || kind === 10)
-      ? `${kind === 10 ? "margin-inline-start" : "margin-block-start"}:${layout.gap}px`
+      ? `${kind === 10 ? "margin-inline-start" : "margin-block-start"}:${layout.gap}px;isolation:isolate`
       : null;
   if (layout.gap !== null && overlap === null) decl[kind === 16 ? "column-gap" : "gap"] = `${layout.gap}px`;
   // an overlay's cell: the base in the first track, every layer across
@@ -683,6 +684,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
     if (bottom < 0) decl["margin-block-end"] = `${bottom}px`;
     if (leading < 0) decl["margin-inline-start"] = `${leading}px`;
     if (trailing < 0) decl["margin-inline-end"] = `${trailing}px`;
+    // pulled back over the box before it, it is painted whole over that
+    // box, as SwiftUI's later view is, layers and all
+    if (top < 0 || leading < 0) decl.isolation = "isolate";
   }
   if (layout.direction !== null) {
     // an island that reads the other way: the browser orders its rows,
@@ -840,9 +844,11 @@ function lookRules(selector, kind, flags, style, layout, face) {
     .join(";");
   const rules = [`${selector}{${body}}`];
   // layers: one grid cell, and every child IN it — auto-placement
-  // would give each layer a row of its own
-  if (base !== null) rules.push(`${selector}>*{grid-area:1/1/3/3}`, `${selector}>:${base}{grid-area:1/1}`);
-  else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
+  // would give each layer a row of its own. Each child paints whole and
+  // in its turn, as SwiftUI's layers do: a moved or positioned box
+  // inside a background would otherwise paint over the base
+  if (base !== null) rules.push(`${selector}>*{grid-area:1/1/3/3;z-index:0}`, `${selector}>:${base}{grid-area:1/1}`);
+  else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1;z-index:0}`);
   if (overlap !== null) rules.push(`${selector}>*+*{${overlap}}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
