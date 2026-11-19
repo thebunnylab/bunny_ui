@@ -36,7 +36,9 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 1.5)
                     .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                     .overlay(UnitPoint::TOP, spacer().frame_height(1.5).background_color(Color::rgb(156, 163, 175)))
-                    .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(156, 163, 175))),
+                    .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(156, 163, 175)))
+                    .padding_edge(Edge::Trailing, 12.0)
+                    .padding_edge(Edge::Leading, 10.0),
                     text("Mobile app")
                     .font_size(13.0)
                     .foreground_color(Color::rgb(107, 114, 128)),
@@ -49,7 +51,9 @@ pub fn view() -> impl View {
                     .padding_edge(Edge::Trailing, 1.5)
                     .frame_aligned(6.0, 6.0, Alignment::TopLeading)
                     .overlay(UnitPoint::TOP, spacer().frame_height(1.5).background_color(Color::rgb(156, 163, 175)))
-                    .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(156, 163, 175))),
+                    .overlay(UnitPoint::TRAILING, spacer().frame_width(1.5).background_color(Color::rgb(156, 163, 175)))
+                    .padding_edge(Edge::Trailing, 12.0)
+                    .padding_edge(Edge::Leading, 10.0),
                     text("Sprint 14 board")
                     .font_size(15.0)
                     .font_weight(Weight::ExtraBold),
@@ -292,7 +296,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("4")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -344,6 +349,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(239, 68, 68)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .test_id("article.card-20"),
                 vstack!(
                     hstack!(
@@ -403,7 +409,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("1")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -444,6 +451,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(34, 197, 94)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .test_id("article.card-35"),
                 vstack!(
                     image(picture_photo1_1())
@@ -520,7 +528,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("7")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -545,6 +554,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(59, 130, 246)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .clipped()
                 .test_id("article.card-45")
                 .padding_edge(Edge::Bottom, 2.0),
@@ -563,14 +573,12 @@ pub fn view() -> impl View {
                     .frame_aligned(10.0, 2.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 11.0)
-                    .padding_edge(Edge::Top, 15.0))
+                    .offset(11.0, 15.0))
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(2.0, 10.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 15.0)
-                    .padding_edge(Edge::Top, 11.0))
+                    .offset(15.0, 11.0))
                 .test_id("button.add-54")
                 .on_click(|| {}),
             )
@@ -699,7 +707,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("9")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -762,6 +771,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(245, 158, 11)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .test_id("article.card-60"),
                 hstack!(
                     text("Drop here")
@@ -846,7 +856,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("2")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -887,7 +898,9 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(239, 68, 68)))
                 .shadow_color(1.0, Color::rgba(37, 99, 235, 36))
+                .shadow_offset(10.0, 14.0)
                 .test_id("article.card-75")
+                .offset(5.78, -4.31)
                 .padding_edge(Edge::Bottom, 2.0),
                 text("Add card")
                 .font_size(12.0)
@@ -904,14 +917,12 @@ pub fn view() -> impl View {
                     .frame_aligned(10.0, 2.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 11.0)
-                    .padding_edge(Edge::Top, 15.0))
+                    .offset(11.0, 15.0))
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(2.0, 10.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 15.0)
-                    .padding_edge(Edge::Top, 11.0))
+                    .offset(15.0, 11.0))
                 .test_id("button.add-86")
                 .on_click(|| {}),
             )
@@ -1040,7 +1051,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("3")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -1092,6 +1104,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(34, 197, 94)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .test_id("article.card-92"),
                 vstack!(
                     hstack!(
@@ -1162,7 +1175,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("5")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -1203,6 +1217,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(59, 130, 246)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .test_id("article.card-105")
                 .padding_edge(Edge::Bottom, 2.0),
                 text("Add card")
@@ -1220,14 +1235,12 @@ pub fn view() -> impl View {
                     .frame_aligned(10.0, 2.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 11.0)
-                    .padding_edge(Edge::Top, 15.0))
+                    .offset(11.0, 15.0))
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(2.0, 10.0, Alignment::TopLeading)
                     .background_color(Color::rgb(75, 85, 99))
                     .corner_radius(1.0)
-                    .padding_edge(Edge::Leading, 15.0)
-                    .padding_edge(Edge::Top, 11.0))
+                    .offset(15.0, 11.0))
                 .test_id("button.add-116")
                 .on_click(|| {}),
             )
@@ -1333,7 +1346,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("12")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -1358,6 +1372,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(245, 158, 11)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .opacity(0.6)
                 .test_id("article.card-122"),
                 vstack!(
@@ -1418,7 +1433,8 @@ pub fn view() -> impl View {
                             spacer()
                             .padding_length(1.5)
                             .frame_aligned(11.0, 8.0, Alignment::TopLeading)
-                            .border(Color::rgb(107, 114, 128), 1.5),
+                            .border(Color::rgb(107, 114, 128), 1.5)
+                            .padding_edge(Edge::Bottom, 2.0),
                             text("6")
                             .font_size(11.0)
                             .foreground_color(Color::rgb(107, 114, 128)),
@@ -1443,6 +1459,7 @@ pub fn view() -> impl View {
                 .corner_radius(10.0)
                 .overlay(UnitPoint::LEADING, spacer().frame_width(4.0).background_color(Color::rgb(34, 197, 94)))
                 .shadow_color(2.0, Color::rgba(16, 24, 40, 20))
+                .shadow_offset(0.0, 1.0)
                 .opacity(0.6)
                 .test_id("article.card-130")
                 .padding_edge(Edge::Bottom, 2.0),

@@ -86,6 +86,7 @@ pub fn view() -> impl View {
             .corner_radius(19.0)
             .border(Color::rgb(109, 40, 217), 1.5)
             .shadow_color(12.0, Color::rgba(109, 40, 217, 89))
+            .shadow_offset(0.0, 4.0)
             .test_id("span.btn-11"),
         )
         .spacing(28.0)
@@ -114,7 +115,7 @@ pub fn view() -> impl View {
                     .frame_aligned(100.48, 42.3, Alignment::TopLeading)
                     .background_color(Color::rgb(109, 40, 217))
                     .corner_radius(3.0)
-                    .padding_edge(Edge::Top, 4.0))
+                    .offset(0.0, 4.0))
                 .test_id("span.hl-14")
                 .padding_edge(Edge::Top, 48.3),
                 text("to use.")
@@ -147,6 +148,7 @@ pub fn view() -> impl View {
                 .corner_radius(20.0)
                 .border(Color::rgb(109, 40, 217), 1.5)
                 .shadow_color(12.0, Color::rgba(109, 40, 217, 89))
+                .shadow_offset(0.0, 4.0)
                 .test_id("span.btn-17"),
                 text("Book a demo")
                 .font_size(14.0)
@@ -175,8 +177,7 @@ pub fn view() -> impl View {
         .alignment(HorizontalAlignment::Leading)
         .frame_aligned(470.0, 203.19, Alignment::TopLeading)
         .test_id("section.hero-12")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 64.0))
+        .offset(40.0, 64.0))
     .overlay(UnitPoint::TOP_LEADING, image(picture_cover_0())
         .resizable()
         .aspect_ratio(ContentMode::Fill)
@@ -221,11 +222,11 @@ pub fn view() -> impl View {
             .corner_radius(12.0)
             .border(Color::rgb(29, 29, 31), 1.5)
             .shadow_color(1.0, Color::rgb(29, 29, 31))
+            .shadow_offset(6.0, 6.0)
             .test_id("div.stat-22")
-            .padding_edge(Edge::Top, 118.0))
+            .offset(-20.0, 118.0))
         .test_id("div.visual-20")
-        .padding_edge(Edge::Leading, 540.0)
-        .padding_edge(Edge::Top, 62.0))
+        .offset(540.0, 62.0))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             spacer(),
             text("Northwind")
@@ -275,7 +276,7 @@ pub fn view() -> impl View {
         .frame_aligned(1064.0, 40.0, Alignment::Leading)
         .background_color(Color::rgb(29, 29, 31))
         .test_id("div.banner-26")
-        .padding_edge(Edge::Top, 322.0))
+        .offset(-20.0, 322.0))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             hstack!(
                 spacer()
@@ -286,8 +287,7 @@ pub fn view() -> impl View {
                     .frame_aligned(16.0, 16.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(8.0)
-                    .padding_edge(Edge::Leading, 10.0)
-                    .padding_edge(Edge::Top, 10.0))
+                    .offset(10.0, 10.0))
                 .test_id("div.ico-35"),
                 vstack!(
                     text("Unified signals")
@@ -315,10 +315,10 @@ pub fn view() -> impl View {
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
+            .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
                 .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .padding_edge(Edge::Leading, 266.48)
-                .padding_edge(Edge::Top, 8.0))
+                .offset(266.48, 8.0))
             .test_id("div.feat-34"),
             hstack!(
                 spacer()
@@ -328,8 +328,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(18.0, 16.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .padding_edge(Edge::Leading, 9.0)
-                    .padding_edge(Edge::Top, 9.0))
+                    .offset(9.0, 9.0))
                 .test_id("div.ico-39"),
                 vstack!(
                     text("Smart triage")
@@ -357,10 +356,10 @@ pub fn view() -> impl View {
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
+            .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
                 .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .padding_edge(Edge::Leading, 266.48)
-                .padding_edge(Edge::Top, 8.0))
+                .offset(266.48, 8.0))
             .test_id("div.feat-38")
             .padding_edge(Edge::Leading, 16.0),
             hstack!(
@@ -371,8 +370,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(14.0, 14.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .padding_edge(Edge::Leading, 11.0)
-                    .padding_edge(Edge::Top, 11.0))
+                    .offset(11.0, 11.0))
                 .test_id("div.ico-43"),
                 vstack!(
                     text("Calm reports")
@@ -400,18 +398,17 @@ pub fn view() -> impl View {
             .background_color(Color::rgb(255, 255, 255))
             .corner_radius(12.0)
             .shadow_color(3.0, Color::rgba(0, 0, 0, 26))
+            .shadow_offset(0.0, 1.0)
             .overlay(UnitPoint::TOP_LEADING, spacer()
                 .frame_aligned(25.52, 26.0, Alignment::TopLeading)
-                .padding_edge(Edge::Leading, 266.48)
-                .padding_edge(Edge::Top, 8.0))
+                .offset(266.48, 8.0))
             .test_id("div.feat-42")
             .padding_edge(Edge::Leading, 16.0),
         )
         .alignment(VerticalAlignment::Top)
         .frame_aligned(944.0, 76.39, Alignment::TopLeading)
         .test_id("section.features-33")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 384.0))
+        .offset(40.0, 384.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             text("Lumen cut our alert volume by seventy percent in the first month. Our on-call rotations finally feel humane, and nobody misses the old pager.")
             .font_size(13.0)
@@ -454,10 +451,9 @@ pub fn view() -> impl View {
             .foreground_color(Color::rgb(196, 181, 253))
             .line_height(110.0)
             .frame_aligned(40.81, 110.0, Alignment::TopLeading)
-            .padding_edge(Edge::Leading, 12.0))
+            .offset(12.0, -14.0))
         .test_id("blockquote-46")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 478.0))
+        .offset(40.0, 478.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             image(picture_photo1_2())
             .resizable()
@@ -480,8 +476,7 @@ pub fn view() -> impl View {
         .frame_aligned(480.0, 112.0, Alignment::TopLeading)
         .clipped()
         .test_id("div.article-50")
-        .padding_edge(Edge::Leading, 504.0)
-        .padding_edge(Edge::Top, 478.0))
+        .offset(504.0, 478.0))
     .overlay(UnitPoint::TOP_LEADING, hstack!(
             vstack!(
                 text("STARTER")
@@ -512,8 +507,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-59"),
                     text("7-day history")
                     .font_size(12.0)
@@ -526,8 +520,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-60"),
                     text("Community support")
                     .font_size(12.0)
@@ -540,8 +533,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-61"),
                 )
                 .alignment(HorizontalAlignment::Leading)
@@ -589,8 +581,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-68"),
                     text("1-year history")
                     .font_size(12.0)
@@ -603,8 +594,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-69"),
                     text("Priority support")
                     .font_size(12.0)
@@ -617,8 +607,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(109, 40, 217)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(109, 40, 217)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-70"),
                 )
                 .alignment(HorizontalAlignment::Leading)
@@ -636,6 +625,7 @@ pub fn view() -> impl View {
             .corner_radius(14.0)
             .border(Color::rgb(109, 40, 217), 2.0)
             .shadow_color(24.0, Color::rgba(109, 40, 217, 64))
+            .shadow_offset(0.0, 10.0)
             .clipped()
             .overlay(UnitPoint::TOP_LEADING, text("POPULAR")
                 .font_size(10.0)
@@ -648,8 +638,7 @@ pub fn view() -> impl View {
                 .frame_aligned(110.0, 18.0, Alignment::Top)
                 .background_color(Color::rgb(236, 72, 153))
                 .test_id("span.ribbon-63")
-                .padding_edge(Edge::Leading, 206.55)
-                .padding_edge(Edge::Top, 13.5))
+                .offset(206.55, 13.5))
             .test_id("div.card-62")
             .padding_edge(Edge::Leading, 27.83),
             vstack!(
@@ -681,8 +670,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-76"),
                     text("Custom retention")
                     .font_size(12.0)
@@ -695,8 +683,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-77"),
                     text("Dedicated manager")
                     .font_size(12.0)
@@ -709,8 +696,7 @@ pub fn view() -> impl View {
                         .frame_aligned(9.0, 5.0, Alignment::TopLeading)
                         .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(22, 163, 74)))
                         .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(22, 163, 74)))
-                        .padding_edge(Edge::Leading, 2.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(2.0, 5.0))
                     .test_id("li-78"),
                 )
                 .alignment(HorizontalAlignment::Leading)
@@ -736,8 +722,7 @@ pub fn view() -> impl View {
         .padding_edge(Edge::Leading, 20.0)
         .frame_aligned(944.0, 150.0, Alignment::TopLeading)
         .test_id("section.pricing-53")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 606.0))
+        .offset(40.0, 606.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             hstack!(
                 spacer()
@@ -779,8 +764,7 @@ pub fn view() -> impl View {
         .corner_radius(10.0)
         .border(Color::rgb(229, 225, 245), 1.0)
         .test_id("details-79")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 784.0))
+        .offset(40.0, 784.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             text("Get the quiet newsletter")
             .font_size(14.0)
@@ -810,8 +794,7 @@ pub fn view() -> impl View {
         .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.2, y: 1.93 }, end: UnitPoint { x: 0.8, y: -0.93 }, from: Color::rgb(109, 40, 217), to: Color::rgb(124, 58, 237) })
         .corner_radius(10.0)
         .test_id("div.newsletter-82")
-        .padding_edge(Edge::Leading, 624.0)
-        .padding_edge(Edge::Top, 784.0))
+        .offset(624.0, 784.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             spacer()
             .frame_height_aligned(2.0, Alignment::TopLeading)
@@ -840,8 +823,7 @@ pub fn view() -> impl View {
         .alignment(HorizontalAlignment::Leading)
         .frame_aligned(944.0, 19.5, Alignment::TopLeading)
         .test_id("footer.site-85")
-        .padding_edge(Edge::Leading, 40.0)
-        .padding_edge(Edge::Top, 866.0))
+        .offset(40.0, 866.0))
     .test_id("body-0")
     .frame_aligned(1024.0, 900.0, Alignment::TopLeading)
     .font_family("Fid Sans")

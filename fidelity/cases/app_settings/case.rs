@@ -99,7 +99,7 @@ pub fn view() -> impl View {
                             .overlay(UnitPoint::TOP_LEADING, spacer()
                                 .frame_aligned(2.0, 9.0, Alignment::TopLeading)
                                 .background_color(Color::rgb(110, 110, 115))
-                                .padding_edge(Edge::Leading, 4.0))
+                                .offset(4.0, -8.0))
                             .test_id("i-12"),
                             rich_text([
                                 run("Drop an image or "),
@@ -277,8 +277,8 @@ pub fn view() -> impl View {
                             .background_color(Color::rgb(255, 255, 255))
                             .corner_radius(8.0)
                             .shadow_color(3.0, Color::rgba(0, 0, 0, 89))
-                            .padding_edge(Edge::Leading, 16.0)
-                            .padding_edge(Edge::Top, 2.0))
+                            .shadow_offset(0.0, 1.0)
+                            .offset(16.0, 2.0))
                         .test_id("input.sw-30"),
                         text("Weekly summary, Mondays")
                         .font_size(11.0)
@@ -299,8 +299,8 @@ pub fn view() -> impl View {
                             .background_color(Color::rgb(255, 255, 255))
                             .corner_radius(8.0)
                             .shadow_color(3.0, Color::rgba(0, 0, 0, 89))
-                            .padding_edge(Edge::Leading, 2.0)
-                            .padding_edge(Edge::Top, 2.0))
+                            .shadow_offset(0.0, 1.0)
+                            .offset(2.0, 2.0))
                         .test_id("input.sw-34"),
                         text("Off — may be unstable")
                         .font_size(11.0)
@@ -385,6 +385,7 @@ pub fn view() -> impl View {
                         .background_color(Color::rgb(255, 255, 255))
                         .corner_radius(5.0)
                         .shadow_color(2.0, Color::rgba(0, 0, 0, 64))
+                        .shadow_offset(0.0, 1.0)
                         .test_id("label-49"),
                         text("Dark")
                         .font_size(11.0)
@@ -406,20 +407,17 @@ pub fn view() -> impl View {
                         .frame_aligned(0.0, 0.0, Alignment::TopLeading)
                         .opacity(0.0)
                         .test_id("input-46")
-                        .padding_edge(Edge::Leading, 7.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(7.0, 5.0))
                     .overlay(UnitPoint::TOP_LEADING, spacer()
                         .frame_aligned(0.0, 0.0, Alignment::TopLeading)
                         .opacity(0.0)
                         .test_id("input-48")
-                        .padding_edge(Edge::Leading, 7.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(7.0, 5.0))
                     .overlay(UnitPoint::TOP_LEADING, spacer()
                         .frame_aligned(0.0, 0.0, Alignment::TopLeading)
                         .opacity(0.0)
                         .test_id("input-50")
-                        .padding_edge(Edge::Leading, 7.0)
-                        .padding_edge(Edge::Top, 5.0))
+                        .offset(7.0, 5.0))
                     .test_id("div.seg-45")
                     .padding_edge(Edge::Top, 4.0),
                     text("Europe — Lisbon (UTC+0)")
@@ -653,7 +651,8 @@ pub fn view() -> impl View {
                 .frame_aligned(5.0, 5.0, Alignment::TopLeading)
                 .overlay(UnitPoint::TRAILING, spacer().frame_width(2.0).background_color(Color::rgb(52, 120, 246)))
                 .overlay(UnitPoint::BOTTOM, spacer().frame_height(2.0).background_color(Color::rgb(52, 120, 246)))
-                .on_click(|| {}),
+                .on_click(|| {})
+                .padding_edge(Edge::Trailing, 3.0),
                 text("Advanced")
                 .font_size(12.0)
                 .font_weight(Weight::Bold),
@@ -849,8 +848,8 @@ pub fn view() -> impl View {
                     .background_color(Color::rgb(255, 255, 255))
                     .corner_radius(8.0)
                     .shadow_color(3.0, Color::rgba(0, 0, 0, 89))
-                    .padding_edge(Edge::Leading, 16.0)
-                    .padding_edge(Edge::Top, 2.0))
+                    .shadow_offset(0.0, 1.0)
+                    .offset(16.0, 2.0))
                 .test_id("input.sw-92"),
                 text("Invoices")
                 .font_size(12.0)
@@ -929,6 +928,7 @@ pub fn view() -> impl View {
             .background_color(Color::rgb(255, 59, 48))
             .corner_radius(7.0)
             .shadow_color(1.0, Color::rgb(184, 38, 29))
+            .shadow_offset(0.0, 1.0)
             .test_id("button.btn-red-101")
             .on_click(|| {}),
         )

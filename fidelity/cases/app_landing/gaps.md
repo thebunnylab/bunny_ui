@@ -1,14 +1,12 @@
 # Import gaps — apps/landing.html
 
-86 views named; 48 gaps in 17 features.
+86 views named; 38 gaps in 15 features.
 
 | feature | count | where | what |
 |---|---|---|---|
 | `transform: rotate` | 12 | div.banner-26, li-59::before, li-60::before, li-61::before, … | -2.0deg |
-| `box-shadow: offset` | 7 | div.feat-34, div.feat-38, div.feat-42, div.card-62, … | 0.0 1.0 |
 | `font-variant` | 7 | span-27, span-28, span-29, span-30, … | small-caps |
 | `content: counter/attr` | 3 | div.feat-34, div.feat-38, div.feat-42 | counter(feat, decimal-leading-zero) |
-| `position: negative offset` | 3 | div.stat-22, div.banner-26, blockquote-46::before | -20.0 118.0 |
 | `clip-path` | 2 | div.hero-bg-1, div.ico-39::after | polygon(0px 0px, 100% 0px, 100% 78%, 0px 100%) |
 | `gradient: stops` | 2 | hr-86, div.newsletter-82 | 3 stops drawn as the first and the last |
 | `transform: scale` | 2 | span.hl-14::before, div.card-62 | 1.0 1.02 |

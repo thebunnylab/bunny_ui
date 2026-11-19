@@ -229,18 +229,31 @@ fn node(value: &Value) -> Node {
     let rect = value.get("rect").map(Value::as_array).unwrap_or_default();
     let at = |index: usize| rect.get(index).and_then(as_f64).unwrap_or(0.0);
     let mut rect = Rect { x: at(0), y: at(1), w: at(2), h: at(3) };
+    let style = strings(value.get("style"));
     // a transformed box: its layout size, centred where the transform
-    // left it (the default origin is the centre)
+    // left it (the default origin is the centre), less the translation —
+    // the box the layout gave it, which the view's `.offset` moves again
     if let [w, h] = value.get("layout").map(Value::as_array).unwrap_or_default() {
         let (w, h) = (as_f64(w).unwrap_or(rect.w), as_f64(h).unwrap_or(rect.h));
-        rect = Rect { x: rect.x + (rect.w - w) / 2.0, y: rect.y + (rect.h - h) / 2.0, w, h };
+        let (e, f) = style
+            .get("transform")
+            .and_then(|transform| super::css::transform(transform).ok().flatten())
+            .map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f));
+        rect = Rect { x: rect.x + (rect.w - w) / 2.0 - e, y: rect.y + (rect.h - h) / 2.0 - f, w, h };
+    }
+    // a box moved by `position: relative` stands, in the layout, where it
+    // would have been
+    if style.get("position").is_some_and(|position| position == "relative") {
+        let shift = |key: &str| style.get(key).and_then(|value| super::css::px(value)).unwrap_or(0.0);
+        rect.x -= shift("left");
+        rect.y -= shift("top");
     }
     let mut node = Node {
         kind,
         tag: value.str_at(&["tag"]).unwrap_or_default().to_owned(),
         id: value.str_at(&["id"]).unwrap_or_default().to_owned(),
         rect,
-        style: strings(value.get("style")),
+        style,
         sizes: strings(value.get("sizes")),
         attrs: strings(value.get("attrs")),
         text: value.str_at(&["text"]).unwrap_or_default().to_owned(),

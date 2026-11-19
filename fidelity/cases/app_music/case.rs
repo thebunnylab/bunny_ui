@@ -31,7 +31,8 @@ pub fn view() -> impl View {
         .frame_aligned(510.0, 964.0, Alignment::TopLeading)
         .clipped()
         .blur(30.0)
-        .test_id("img.bg-1"))
+        .test_id("img.bg-1")
+        .offset(-60.0, -60.0))
     .overlay(UnitPoint::TOP_LEADING, spacer()
         .frame_aligned(390.0, 844.0, Alignment::TopLeading)
         .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.5, y: 0.0 }, end: UnitPoint { x: 0.5, y: 1.0 }, from: Color::rgba(10, 6, 24, 89), to: Color::rgba(4, 2, 10, 240) })
@@ -93,6 +94,7 @@ pub fn view() -> impl View {
                 .background_gradient(Gradient::Radial { center: UnitPoint { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: Color::rgba(0, 0, 0, 0), outer: Color::rgba(0, 0, 0, 0) })
                 .corner_radius(98.0)
                 .shadow_color(24.0, Color::rgba(0, 0, 0, 115))
+                .shadow_offset(0.0, 10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(196.0, 196.0, Alignment::TopLeading)
                     .corner_radius(98.0))
@@ -102,11 +104,9 @@ pub fn view() -> impl View {
                     .background_gradient(Gradient::Radial { center: UnitPoint { x: 0.5, y: 0.5 }, start: 0.0, end: None, aspect: 1.0, inner: Color::rgb(11, 11, 11), outer: Color::rgb(179, 38, 30) })
                     .corner_radius(28.0)
                     .border(Color::rgb(0, 0, 0), 2.0)
-                    .padding_edge(Edge::Leading, 70.0)
-                    .padding_edge(Edge::Top, 70.0))
+                    .offset(70.0, 70.0))
                 .test_id("div.vinyl-12")
-                .padding_edge(Edge::Leading, 112.0)
-                .padding_edge(Edge::Top, 6.0))
+                .offset(112.0, 6.0))
             .overlay(UnitPoint::TOP_LEADING, image(picture_album_0())
                 .resizable()
                 .aspect_ratio(ContentMode::Fill)
@@ -116,9 +116,10 @@ pub fn view() -> impl View {
                 .corner_radius(24.0)
                 .border(Color::rgba(255, 255, 255, 102), 0.5)
                 .shadow_color(40.0, Color::rgba(20, 0, 40, 153))
+                .shadow_offset(0.0, 20.0)
                 .clipped()
                 .test_id("img.art-13")
-                .padding_edge(Edge::Leading, 4.0))
+                .offset(4.0, 0.0))
             .test_id("div.stage-11"),
             hstack!(
                 vstack!(
@@ -149,8 +150,7 @@ pub fn view() -> impl View {
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(14.0, 13.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 92, 138))
-                    .padding_edge(Edge::Leading, 7.0)
-                    .padding_edge(Edge::Top, 8.0))
+                    .offset(7.0, 8.0))
                 .test_id("span.heart-18"),
             )
             .spacing(10.0)
@@ -166,20 +166,20 @@ pub fn view() -> impl View {
                 .background_color(Color::rgba(255, 255, 255, 64))
                 .corner_radius(2.0)
                 .test_id("div.track-20")
-                .padding_edge(Edge::Top, 5.0))
+                .offset(0.0, 5.0))
             .overlay(UnitPoint::TOP_LEADING, spacer()
                 .frame_aligned(121.98, 4.0, Alignment::TopLeading)
                 .background_gradient(Gradient::Linear { start: UnitPoint { x: 0.0, y: 0.5 }, end: UnitPoint { x: 1.0, y: 0.5 }, from: Color::rgb(255, 179, 71), to: Color::rgb(92, 123, 255) })
                 .corner_radius(2.0)
                 .shadow_color(8.0, Color::rgba(255, 94, 126, 153))
                 .test_id("div.fill-21")
-                .padding_edge(Edge::Top, 5.0))
+                .offset(0.0, 5.0))
             .overlay(UnitPoint::TOP_LEADING, spacer()
                 .frame_aligned(14.0, 14.0, Alignment::TopLeading)
                 .background_color(Color::rgb(255, 255, 255))
                 .corner_radius(7.0)
                 .test_id("div.knob-22")
-                .padding_edge(Edge::Leading, 114.98))
+                .offset(114.98, 0.0))
             .test_id("div.prog-19")
             .padding_edge(Edge::Top, 16.0),
             hstack!(
@@ -214,8 +214,7 @@ pub fn view() -> impl View {
                     .border(Color::rgb(255, 255, 255), 2.0)
                     .opacity(0.8)
                     .test_id("i-28")
-                    .padding_edge(Edge::Leading, 10.5)
-                    .padding_edge(Edge::Top, 11.5))
+                    .offset(10.5, 11.5))
                 .test_id("span.cbtn-27"),
                 spacer(),
                 spacer()
@@ -232,13 +231,12 @@ pub fn view() -> impl View {
                     .overlay(UnitPoint::TOP, spacer().frame_height(8.0).background_color(Color::rgba(0, 0, 0, 0)))
                     .overlay(UnitPoint::TRAILING, spacer().frame_width(12.0).background_color(Color::rgb(255, 255, 255)))
                     .overlay(UnitPoint::BOTTOM, spacer().frame_height(8.0).background_color(Color::rgba(0, 0, 0, 0)))
-                    .padding_edge(Edge::Leading, 14.0)
-                    .padding_edge(Edge::Top, 14.0))
+                    .offset(14.0, 14.0))
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(3.0, 16.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .padding_edge(Edge::Leading, 13.0)
-                    .padding_edge(Edge::Top, 14.0))
+                    .offset(-3.0, 0.0)
+                    .offset(13.0, 14.0))
                 .test_id("span.cbtn-29"),
                 spacer(),
                 spacer()
@@ -248,11 +246,11 @@ pub fn view() -> impl View {
                 .corner_radius(36.0)
                 .border(Color::rgba(255, 255, 255, 128), 2.0)
                 .shadow_color(24.0, Color::rgba(138, 60, 255, 140))
+                .shadow_offset(0.0, 10.0)
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(26.0, 28.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .padding_edge(Edge::Leading, 27.0)
-                    .padding_edge(Edge::Top, 21.0))
+                    .offset(27.0, 21.0))
                 .test_id("span.play-30"),
                 spacer(),
                 spacer()
@@ -269,13 +267,11 @@ pub fn view() -> impl View {
                     .overlay(UnitPoint::TOP, spacer().frame_height(8.0).background_color(Color::rgba(0, 0, 0, 0)))
                     .overlay(UnitPoint::BOTTOM, spacer().frame_height(8.0).background_color(Color::rgba(0, 0, 0, 0)))
                     .overlay(UnitPoint::LEADING, spacer().frame_width(12.0).background_color(Color::rgb(255, 255, 255)))
-                    .padding_edge(Edge::Leading, 14.0)
-                    .padding_edge(Edge::Top, 14.0))
+                    .offset(14.0, 14.0))
                 .overlay(UnitPoint::TOP_LEADING, spacer()
                     .frame_aligned(3.0, 16.0, Alignment::TopLeading)
                     .background_color(Color::rgb(255, 255, 255))
-                    .padding_edge(Edge::Leading, 27.0)
-                    .padding_edge(Edge::Top, 14.0))
+                    .offset(27.0, 14.0))
                 .test_id("span.cbtn-31"),
                 spacer(),
                 spacer()
@@ -294,8 +290,7 @@ pub fn view() -> impl View {
                     .overlay(UnitPoint::LEADING, spacer().frame_width(2.0).background_color(Color::rgb(255, 255, 255)))
                     .opacity(0.8)
                     .test_id("i-33")
-                    .padding_edge(Edge::Leading, 10.5)
-                    .padding_edge(Edge::Top, 11.5))
+                    .offset(10.5, 11.5))
                 .test_id("span.cbtn-32"),
             )
             .alignment(VerticalAlignment::Center)
@@ -339,11 +334,11 @@ pub fn view() -> impl View {
         .corner_radius(28.0)
         .border(Color::rgba(255, 255, 255, 89), 0.5)
         .shadow_color(50.0, Color::rgba(0, 0, 0, 89))
+        .shadow_offset(0.0, 18.0)
         .clipped()
         .backdrop_blur(20.0)
         .test_id("section.card-10")
-        .padding_edge(Edge::Leading, 16.0)
-        .padding_edge(Edge::Top, 58.0))
+        .offset(16.0, 58.0))
     .overlay(UnitPoint::TOP_LEADING, vstack!(
             hstack!(
                 text("UP NEXT")
@@ -372,6 +367,7 @@ pub fn view() -> impl View {
                     .frame_aligned(40.0, 40.0, Alignment::TopLeading)
                     .corner_radius(8.0)
                     .shadow_color(8.0, Color::rgba(0, 0, 0, 102))
+                    .shadow_offset(0.0, 3.0)
                     .clipped()
                     .test_id("img-43"),
                     vstack!(
@@ -423,6 +419,7 @@ pub fn view() -> impl View {
                     .frame_aligned(40.0, 40.0, Alignment::TopLeading)
                     .corner_radius(8.0)
                     .shadow_color(8.0, Color::rgba(0, 0, 0, 102))
+                    .shadow_offset(0.0, 3.0)
                     .clipped()
                     .test_id("img-49"),
                     vstack!(
@@ -484,6 +481,7 @@ pub fn view() -> impl View {
                     .frame_aligned(40.0, 40.0, Alignment::TopLeading)
                     .corner_radius(8.0)
                     .shadow_color(8.0, Color::rgba(0, 0, 0, 102))
+                    .shadow_offset(0.0, 3.0)
                     .clipped()
                     .test_id("img-55"),
                     vstack!(
@@ -535,6 +533,7 @@ pub fn view() -> impl View {
                     .frame_aligned(40.0, 40.0, Alignment::TopLeading)
                     .corner_radius(8.0)
                     .shadow_color(8.0, Color::rgba(0, 0, 0, 102))
+                    .shadow_offset(0.0, 3.0)
                     .clipped()
                     .test_id("img-61"),
                     vstack!(
@@ -591,15 +590,13 @@ pub fn view() -> impl View {
         .alignment(HorizontalAlignment::Leading)
         .frame_aligned(358.0, 217.5, Alignment::TopLeading)
         .test_id("section.queue-38")
-        .padding_edge(Edge::Leading, 16.0)
-        .padding_edge(Edge::Top, 572.0))
+        .offset(16.0, 572.0))
     .overlay(UnitPoint::TOP_LEADING, spacer()
         .frame_aligned(130.0, 5.0, Alignment::TopLeading)
         .background_color(Color::rgba(255, 255, 255, 179))
         .corner_radius(2.5)
         .test_id("div.home-66")
-        .padding_edge(Edge::Leading, 130.0)
-        .padding_edge(Edge::Top, 831.0))
+        .offset(130.0, 831.0))
     .test_id("body-0")
     .frame_aligned(390.0, 844.0, Alignment::TopLeading)
     .font_family("Fid Sans")

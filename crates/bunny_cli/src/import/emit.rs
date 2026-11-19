@@ -423,6 +423,16 @@ impl Writer<'_> {
             let _ = write!(view, "\n.test_id({})", quote(&node.id));
             self.named.insert(node.id.clone());
         }
+        // moved off its place — a translation, a relative position — after
+        // its name, so the name is found where the box is drawn
+        let (mut dx, mut dy) = css::transform(node.css("transform")).ok().flatten().map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f));
+        if node.css("position") == "relative" {
+            dx += node.px("left");
+            dy += node.px("top");
+        }
+        if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+            view = with_offset(&view, dx, dy);
+        }
         if matches!(node.tag.as_str(), "button" | "a") || node.css("cursor") == "pointer" {
             view.push_str("\n.on_click(|| {})");
         }
@@ -475,13 +485,13 @@ impl Writer<'_> {
                 self.gap(node, "box-shadow: inset", node.css("box-shadow").to_owned());
                 continue;
             }
-            if shadow.x != 0.0 || shadow.y != 0.0 {
-                self.gap(node, "box-shadow: offset", format!("{} {}", num(shadow.x), num(shadow.y)));
-            }
-            if shadow.spread != 0.0 {
+            if shadow.spread.abs() > 1e-9 {
                 self.gap(node, "box-shadow: spread", num(shadow.spread));
             }
             let _ = write!(view, "\n.shadow_color({}, {})", num(shadow.blur.max(1.0)), shadow.color.code());
+            if shadow.x.abs() > 1e-9 || shadow.y.abs() > 1e-9 {
+                let _ = write!(view, "\n.shadow_offset({}, {})", num(shadow.x), num(shadow.y));
+            }
         }
         if css::shadows(node.css("box-shadow")).len() > 1 {
             self.gap(node, "box-shadow: layers", node.css("box-shadow").to_owned());
@@ -646,9 +656,8 @@ impl Writer<'_> {
                 if matrix.shear().abs() > 0.001 {
                     self.gap(node, "transform: skew", node.css("transform").to_owned());
                 }
-                if matrix.e != 0.0 || matrix.f != 0.0 {
-                    self.gap(node, "transform: translate", format!("{} {}", num(matrix.e), num(matrix.f)));
-                }
+                // a translation is the box's `.offset`, written after its
+                // name (`Writer::dressed`)
             }
             Err(text) => self.gap(node, "transform: 3d", text),
         }
@@ -670,9 +679,7 @@ impl Writer<'_> {
         if node.css("position") == "sticky" {
             self.gap(node, "position: sticky", "drawn in the flow");
         }
-        if node.css("position") == "relative" && (node.px("top") != 0.0 || node.px("left") != 0.0) {
-            self.gap(node, "position: relative offset", format!("{} {}", node.css("left"), node.css("top")));
-        }
+
     }
 
     /// The boxes out of the flow — positioned children, and pseudo-boxes
@@ -691,19 +698,15 @@ impl Writer<'_> {
                 Kind::Before | Kind::After => self.pseudo_layer(node, child),
                 _ => continue,
             };
-            let (mut x, mut y) = offset;
-            if x < 0.0 || y < 0.0 {
-                self.gap(child_or(node, child), "position: negative offset", format!("{} {}", num(x), num(y)));
-                x = x.max(0.0);
-                y = y.max(0.0);
-            }
-            let mut placed = layer;
-            if x > 0.0 {
-                let _ = write!(placed, "\n.padding_edge(Edge::Leading, {})", num(x));
-            }
-            if y > 0.0 {
-                let _ = write!(placed, "\n.padding_edge(Edge::Top, {})", num(y));
-            }
+            // the layer sits at its holder's corner, offset to its place:
+            // the offset goes before the name, so the box is found where
+            // it is drawn
+            let (x, y) = offset;
+            let placed = if x.abs() < 1e-9 && y.abs() < 1e-9 {
+                layer
+            } else {
+                with_offset(&layer, x, y)
+            };
             let _ = write!(view, "\n.overlay(UnitPoint::TOP_LEADING, {})", indent(&placed, 1));
         }
     }
@@ -1028,8 +1031,24 @@ impl Writer<'_> {
         if growing.iter().any(|grow| (grow - growing[0]).abs() > 1e-9) {
             self.gap(node, "flex-grow: ratios", format!("{grows:?} drawn as equal shares"));
         }
+        // the same negative margin before every item but the first —
+        // avatars overlapping in a row — is the stack's own spacing
+        let lead = if row { "margin-left" } else { "margin-top" };
+        let overlap = items
+            .iter()
+            .skip(1)
+            .map(|child| child.px(lead))
+            .try_fold(None, |seen: Option<f64>, margin| match seen {
+                _ if margin >= 0.0 => Err(()),
+                Some(previous) if (previous - margin).abs() > 1e-9 => Err(()),
+                _ => Ok(Some(margin)),
+            })
+            .ok()
+            .flatten()
+            .filter(|_| items.len() > 1);
+        let gap = gap + overlap.unwrap_or(0.0);
         let mut views = Vec::new();
-        for child in &items {
+        for (index, child) in items.iter().enumerate() {
             let view = match child.kind {
                 Kind::Element => self.element(child, flow),
                 Kind::Text => {
@@ -1040,8 +1059,8 @@ impl Writer<'_> {
                 Kind::Space => None,
             };
             let Some(mut view) = view else { continue };
-            if child.kind == Kind::Element {
-                view.push_str(&margins(child));
+            if matches!(child.kind, Kind::Element | Kind::Before | Kind::After) {
+                view.push_str(&margins(child, overlap.is_some() && index > 0, row));
             }
             // an `auto` margin takes the line's free room: a spacer
             let (before, after) = if row { ("margin-left", "margin-right") } else { ("margin-top", "margin-bottom") };
@@ -1245,8 +1264,11 @@ impl Writer<'_> {
     }
 }
 
-const fn child_or<'n>(_node: &'n Node, child: &'n Node) -> &'n Node {
-    child
+/// The view with `.offset(x, y)` around it, its name inside: the
+/// offset moves the frame the named view is placed in, so the view is
+/// found where it is drawn, on both roads.
+fn with_offset(view: &str, x: f64, y: f64) -> String {
+    format!("{view}\n.offset({}, {})", num(x), num(y))
 }
 
 /// The child's box; a pseudo-element, which the browser does not report,
@@ -1271,10 +1293,15 @@ fn interleave(views: Vec<String>, around: bool) -> Vec<String> {
     out
 }
 
-/// A flex item's margins, as the padding outside its box.
-fn margins(child: &Node) -> String {
+/// A flex item's margins, as the padding outside its box — but the
+/// leading one when the stack's spacing already took it.
+fn margins(child: &Node, lead_taken: bool, row: bool) -> String {
     let mut code = String::new();
+    let lead = if row { "left" } else { "top" };
     for (side, edge) in [("top", "Top"), ("right", "Trailing"), ("bottom", "Bottom"), ("left", "Leading")] {
+        if lead_taken && side == lead {
+            continue;
+        }
         let margin = child.px(&format!("margin-{side}"));
         if margin > 0.0 && child.sizes.get(&format!("margin-{side}")).is_none_or(|value| value != "auto") {
             let _ = write!(code, "\n.padding_edge(Edge::{edge}, {})", num(margin));
