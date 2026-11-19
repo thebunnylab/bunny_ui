@@ -203,6 +203,32 @@ rule: white, the content at the top-left, the face at 16 px, named
 `page`) and `block` (a filled box of a fixed size). Name each box with
 `.test_id("x")`, the same name the page gave it.
 
+## Imported apps
+
+`fidelity/apps/` holds eight screens written as a web developer would,
+each reaching for as much of HTML and CSS as it can (a music player, a
+chat thread, a dashboard, a kanban board, a landing page, a profile, a
+settings form, a calendar). They are not translated by hand: the bunny
+side is written by the importer.
+
+```sh
+cargo run -p bunny-cli --release -- import html fidelity/apps/music.html --root fidelity --case app_music
+```
+
+`bunny import html` opens the page in the same headless Chrome, reads
+every box it laid out and the style it computed, and writes a module
+with `pub fn view() -> impl View`. With `--case` it writes a case of
+this corpus: `case.rs`, the page again as `case.html` with every box
+the view names carrying a `data-fid`, and `gaps.md` — every CSS
+feature bunny has no word for, element by element. The sweep then holds
+page and view against each other box by box, and the diff pictures show
+where they part.
+
+Re-import after changing the importer or bunny; the generated cases are
+committed so the ratchet sees them move. Without `--case` the importer
+writes `page.rs` beside the page (or `--out FILE`), with
+`use bunny_ui::prelude::*`, for an app of one's own.
+
 ## The test-id hook
 
 `.test_id("x")` is part of bunny-ui, not of the harness: any tool can find
