@@ -20,6 +20,7 @@
 //! - [`run_helper_if_asked`] runs the Windows update helper when this
 //!   launch is one. The app's start calls it first.
 //! - [`UpdateLog`] keeps the reason of each failure on this machine.
+//! - [`ui::update_pill`] is the ready-made control, in sixteen languages.
 //! - [`start`] runs the updater of an app on its UI thread: the checks on
 //!   a schedule, the install on [`click`], the restart. A view reads
 //!   [`state`], an [`UpdateState`]. `bunny_ui::app!` calls [`start`] when
@@ -49,6 +50,7 @@ mod curl;
 mod fetch;
 mod log;
 mod service;
+pub mod ui;
 
 #[cfg(test)]
 mod client_tests;

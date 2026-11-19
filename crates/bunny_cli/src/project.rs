@@ -32,6 +32,10 @@ pub struct Project {
     pub build: u64,
     /// `[package.metadata.bunny.updater]`, when the app updates itself.
     pub updater: Option<updater::Config>,
+    /// Whether the app's `bunny-ui` dependency turns on the `updater`
+    /// feature: without it, the build ships no updater, whatever the
+    /// table says.
+    pub updater_feature: bool,
 }
 
 impl Project {
@@ -109,6 +113,16 @@ impl Project {
             Some(table) => Some(updater::Config::parse(table, &name, &dir)?),
             None => None,
         };
+        // the facade by its package name, under any name the app gives it
+        let updater_feature = package
+            .get("dependencies")
+            .map(Value::as_array)
+            .unwrap_or_default()
+            .iter()
+            .filter(|dependency| dependency.str_at(&["name"]) == Some("bunny-ui"))
+            .flat_map(|dependency| dependency.get("features").map(Value::as_array).unwrap_or_default())
+            .filter_map(Value::as_str)
+            .any(|feature| feature == "updater" || feature == "updater-dalek");
         Ok(Project {
             version: package.str_at(&["version"]).unwrap_or("0.1.0").to_string(),
             package: name,
@@ -122,6 +136,7 @@ impl Project {
             id,
             build,
             updater,
+            updater_feature,
         })
     }
 
@@ -247,5 +262,21 @@ mod tests {
             PathBuf::from("/t"),
         );
         assert!(bad.unwrap_err().message.contains("no `feed` and no `server`"));
+    }
+
+    #[test]
+    fn the_updater_feature_reads_from_the_bunny_ui_dependency() {
+        let with = |dependencies: &str| {
+            package(&format!(
+                r#"{{"name":"notes","version":"1.0.0","manifest_path":"/n/Cargo.toml","targets":[],"dependencies":{dependencies}}}"#
+            ))
+            .updater_feature
+        };
+        assert!(!with("[]"));
+        assert!(!with(r#"[{"name":"bunny-ui","features":[]}]"#));
+        assert!(!with(r#"[{"name":"bunny-ui","features":["svg"]}]"#));
+        assert!(with(r#"[{"name":"bunny-ui","features":["updater"]}]"#));
+        assert!(with(r#"[{"name":"bunny-ui","rename":"ui","features":["updater-dalek"]}]"#));
+        assert!(!with(r#"[{"name":"other","features":["updater"]}]"#), "another crate's feature is not ours");
     }
 }

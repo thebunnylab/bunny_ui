@@ -44,6 +44,12 @@ pub fn prepare(project: &Project, platform: Platform, options: &Options, key_fil
     if !matches!(platform, Platform::Macos | Platform::Windows | Platform::Linux) {
         return Ok(None);
     }
+    if !project.updater_feature {
+        println!(
+            "{}",
+            term::warn("bunny-ui has no `updater` feature: the app built here checks for no update. Add features = [\"updater\"] to its bunny-ui dependency")
+        );
+    }
     let channel = config.channel(std::env::var("BUNNY_CHANNEL").ok().as_deref())?;
     manifest::check_version(&project.version).map_err(|why| {
         Error::new(format!("the updater reads the version as SemVer: {why}")).hint("set it in Cargo.toml, or with --build-name 1.2.0")

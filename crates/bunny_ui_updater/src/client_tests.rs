@@ -449,3 +449,33 @@ fn the_build_settings_make_a_configuration_or_none() {
         assert!(UpdaterConfig::from_build(&wrong).is_err(), "{wrong:?}");
     }
 }
+
+/// Installs nothing, and answers what it is told to.
+struct Answers(Result<bunny_ui_release::Installed, ()>);
+
+impl crate::ApplyStrategy for Answers {
+    fn apply(&self, artifact: &crate::Verified) -> Result<bunny_ui_release::Installed, UpdateError> {
+        assert!(artifact.path().exists(), "the artifact is there while it installs");
+        self.0.clone().map_err(|()| UpdateError::Apply("refused".into()))
+    }
+}
+
+#[test]
+fn an_update_keeps_no_copy_of_its_download_unless_a_helper_needs_it() {
+    use bunny_ui_release::Installed;
+    let bytes = b"the new build".to_vec();
+    let signed = asset(signature(&key(1), &bytes), None, None, "https://dl/x.dmg");
+    for (answer, kept) in [
+        (Ok(Installed::ReadyOnRestart), false),
+        (Ok(Installed::RelaunchAt("/x".into())), false),
+        (Err(()), false),
+        (Ok(Installed::PendingHelper), true),
+    ] {
+        let cache = folder("update-cleanup");
+        let updater = Updater::with_fetch(config(Feed::Server("https://api".into()), &cache), Canned::serving(200, &bytes));
+        let outcome = updater.update_with(&Answers(answer.clone()), &signed, &mut |_| {});
+        assert_eq!(outcome.is_ok(), answer.is_ok());
+        assert_eq!(!staging_files(&cache).is_empty(), kept, "{answer:?}: {:?}", staging_files(&cache));
+        std::fs::remove_dir_all(&cache).unwrap();
+    }
+}

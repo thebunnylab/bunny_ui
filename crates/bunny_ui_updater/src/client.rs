@@ -260,7 +260,15 @@ impl<F: Fetch> Updater<F> {
         strategy.precheck()?;
         let verified = self.download(asset, progress)?;
         progress(InstallProgress::Applying);
-        strategy.apply(&verified)
+        let installed = strategy.apply(&verified);
+        // the download is in place now, or it failed and the next try
+        // downloads again: either way it goes, or a large app keeps a
+        // copy of each update in the cache. The Windows helper still
+        // needs its artifact, and deletes it itself.
+        if !matches!(installed, Ok(Installed::PendingHelper)) {
+            let _ = std::fs::remove_file(verified.path());
+        }
+        installed
     }
 }
 
