@@ -820,6 +820,15 @@ function lookRules(selector, kind, flags, style, layout, face) {
       decl["text-overflow"] = "ellipsis";
       decl["white-space"] = "nowrap";
     }
+    // at most this many lines, the last one closed with an ellipsis
+    // right after its last word: the space a wrap leaves is dropped
+    if (face.lineLimit > 0) {
+      decl.display = "-webkit-box";
+      decl["-webkit-box-orient"] = "vertical";
+      decl["-webkit-line-clamp"] = `${face.lineLimit}`;
+      decl.overflow = "hidden";
+      decl["white-space"] = "pre-line";
+    }
   }
   const body = Object.entries(decl)
     .map(([name, value]) => `${name}:${value}`)
@@ -1345,6 +1354,8 @@ function applyPatches(view, length) {
     const truncation = u8();
     // 1 = the face declared above is this text's: its look names no font
     const inheritsFace = u8();
+    // the most lines it shows, 0 for none
+    const lineLimit = u8();
     return {
       font: cssFont(size, weight, mono, italic, family),
       inheritsFace,
@@ -1353,6 +1364,7 @@ function applyPatches(view, length) {
       align,
       color: inheritsInk ? null : color,
       truncation,
+      lineLimit,
     };
   };
 

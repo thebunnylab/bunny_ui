@@ -93,6 +93,7 @@ pub(crate) struct FlowKey {
     in_ink_scope: bool,
     font: FontSpec,
     line_height: Option<Px>,
+    line_limit: u8,
     text_align: Option<motor::views::TextAlignment>,
     direction: motor::state::LayoutDirection,
     interactive: Option<std::rc::Rc<str>>,
@@ -154,6 +155,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         font: FontSpec::DEFAULT,
         declared: FontSpec::DEFAULT,
         line_height: None,
+        line_limit: 0,
         text_align: None,
         direction: env.direction,
         pending_interactive: None,
@@ -292,6 +294,8 @@ struct Walk<'a> {
     /// The inherited line box, mirroring `font` — the browser steps the
     /// lines by it, the way our own placement does.
     line_height: Option<crate::layout::Px>,
+    /// The inherited line limit, mirroring `line_height`; zero is none.
+    line_limit: u8,
     /// The inherited line alignment, mirroring `line_height`.
     text_align: Option<motor::views::TextAlignment>,
     /// Which way the walk reads here — the root's, or an island's.
@@ -519,6 +523,7 @@ impl Walk<'_> {
             in_ink_scope: !self.ink_scopes.is_empty(),
             font: self.font,
             line_height: self.line_height,
+            line_limit: self.line_limit,
             text_align: self.text_align,
             direction: self.direction,
             interactive: self.pending_interactive.clone(),
@@ -557,6 +562,7 @@ impl Walk<'_> {
             in_ink_scope,
             font,
             line_height,
+            line_limit,
             text_align,
             direction,
             interactive,
@@ -572,6 +578,7 @@ impl Walk<'_> {
             && *unbounded == self.unbounded
             && *direction == self.direction
             && *line_height == self.line_height
+            && *line_limit == self.line_limit
             && *text_align == self.text_align
             && *group == self.groups.last().copied()
             && *in_overlay == (self.overlay_depth > 0)
@@ -1004,10 +1011,12 @@ impl Walk<'_> {
             LayoutNode::Styled { props, child, .. } => {
                 let outer_font = self.font;
                 let outer_line_height = self.line_height;
+                let outer_line_limit = self.line_limit;
                 let outer_text_align = self.text_align;
                 let outer_direction = self.direction;
                 self.font = props.font.apply_over(self.font);
                 self.line_height = props.line_height.or(self.line_height);
+                self.line_limit = props.line_limit.unwrap_or(self.line_limit);
                 self.text_align = props.text_align.or(self.text_align);
                 self.direction = props.direction.unwrap_or(self.direction);
                 // a style that turns the direction opens an ISLAND: its box
@@ -1045,6 +1054,7 @@ impl Walk<'_> {
                     self.ink.pop();
                     self.font = outer_font;
                     self.line_height = outer_line_height;
+                    self.line_limit = outer_line_limit;
                     self.text_align = outer_text_align;
                     self.direction = outer_direction;
                     return;
@@ -1132,6 +1142,7 @@ impl Walk<'_> {
                 self.ink.pop();
                 self.font = outer_font;
                 self.line_height = outer_line_height;
+                self.line_limit = outer_line_limit;
                 self.text_align = outer_text_align;
                 self.direction = outer_direction;
                 Self::stamp_fill(child, &mut boxed.children);
@@ -1153,6 +1164,7 @@ impl Walk<'_> {
                     highlights: highlights.clone(),
                     truncation: *truncation,
                     inherits_face: self.font == self.declared,
+                    line_limit: self.line_limit,
                 })));
                 // under a ramp, a color set nearer the text wins
                 if self.ramps.last().is_some_and(|at| self.inks_set > *at) {
@@ -2498,6 +2510,7 @@ mod tests {
             font: FontSpec::DEFAULT,
             declared: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: env.direction,
             pending_interactive: None,
@@ -2524,12 +2537,13 @@ mod tests {
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
         type WalkChange = (&'static str, fn(&mut Walk));
-        let moves: [WalkChange; 12] = [
+        let moves: [WalkChange; 13] = [
             ("the direction", |walk| walk.direction = motor::state::LayoutDirection::RightToLeft),
             ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
             ("an ink scope", |walk| walk.ink_scopes.push(0)),
             ("the face", |walk| walk.font.size += 3.0),
             ("the line box", |walk| walk.line_height = Some(21.0)),
+            ("the line limit", |walk| walk.line_limit = 2),
             ("the alignment", |walk| walk.text_align = Some(motor::views::TextAlignment::Center)),
             ("a press", |walk| walk.pending_interactive = Some(std::rc::Rc::from("App/#0/button"))),
             ("a transition", |walk| walk.pending_transition = Some((0.3, 0.8))),

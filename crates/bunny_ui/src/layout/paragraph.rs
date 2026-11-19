@@ -346,9 +346,20 @@ impl<'a, 'e> Shape<'a, 'e> {
         LineBox { ascent, descent, advance: self.env.line_height.unwrap_or(ascent + descent) }
     }
 
+    /// The lines a text shows: those its room holds, never more than the
+    /// inherited `.line_limit(…)` — the last one shown then closes with
+    /// an ellipsis, as one cut by its room does.
+    fn rows_that_fit(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
+        let fit = self.rows_in(lines, room);
+        match self.env.line_limit {
+            0 => fit,
+            limit => fit.min(usize::from(limit)),
+        }
+    }
+
     /// How many of `lines` a box `room` tall shows — at least one, the way
     /// a paragraph told how tall it may be answers that and no more.
-    fn rows_that_fit(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
+    fn rows_in(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
         if self.runs.is_none() {
             return rows_that_fit(lines.len(), self.line_box((0, 0)).advance, room);
         }

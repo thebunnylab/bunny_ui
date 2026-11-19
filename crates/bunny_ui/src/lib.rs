@@ -2377,6 +2377,7 @@ mod tests {
                 highlights: None,
                 truncation: None,
                 inherits_face: false,
+                line_limit: 0,
             };
             let bytes = crate::dom::encode(&[look_with(text)]);
             // count(4), op(1), rule(8), kind(1), flags(1), a bare style
@@ -3903,7 +3904,7 @@ mod tests {
             (None, None),
         ]
         .into_iter()
-        .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None })
+        .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None, line_limit: 0 })
         .collect();
         let answer = |_: &crate::layout::LayoutNode| (Size { width: 360.0, height: 42.0 }, Fit::Leaf);
 
@@ -16347,6 +16348,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let with = crate::dom::encode(&[look_with(stepped)]);
         let plain = crate::dom::DomText {
@@ -16359,6 +16361,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let without = crate::dom::encode(&[look_with(plain)]);
 
@@ -16384,6 +16387,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let bytes = crate::dom::encode(&[look_with(leaning)]);
         let upright = crate::dom::DomText {
@@ -16396,6 +16400,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let plain = crate::dom::encode(&[look_with(upright)]);
 

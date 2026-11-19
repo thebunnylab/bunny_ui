@@ -129,6 +129,9 @@ pub enum Modifier {
     /// points. Inherited, and an exception to "props is paint only": it
     /// sets what a paragraph measures.
     LineHeight(f64),
+    /// The most lines the text below shows, the last one closed with an
+    /// ellipsis — `.lineLimit(n)`. Inherited like the font; zero is none.
+    LineLimit(u8),
     /// A weight by NAME — the rest of the font stays.
     FontWeight(crate::text_engine::Weight),
     BackgroundHovered(Color),
@@ -355,6 +358,7 @@ impl Modifier {
             Modifier::FontFamily { .. } => "font_family",
             Modifier::FontSize { .. } => "font_size",
             Modifier::LineHeight { .. } => "line_height",
+            Modifier::LineLimit { .. } => "line_limit",
             Modifier::FontWeight { .. } => "font_weight",
             Modifier::BackgroundHovered { .. } => "background_hovered",
             Modifier::Opacity { .. } => "opacity",
@@ -528,6 +532,7 @@ impl Modifier {
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::LineHeight(height) => format!(" [.lineHeight({height})]"),
+            Modifier::LineLimit(lines) => format!(" [.lineLimit({lines})]"),
             Modifier::FontWeight(weight) => format!(" [.fontWeight(.{weight:?})]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::Opacity(value) => format!(" [.opacity({value})]"),
@@ -1654,6 +1659,11 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { line_height: Some(*height), ..VisualProps::default() },
+        ),
+        Modifier::LineLimit(lines) => wrap_styled(
+            out,
+            mark,
+            VisualProps { line_limit: Some(*lines), ..VisualProps::default() },
         ),
         Modifier::FontWeight(weight) => wrap_styled(
             out,

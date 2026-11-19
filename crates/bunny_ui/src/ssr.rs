@@ -1347,6 +1347,15 @@ fn rule_text(
             base.insert("text-overflow", "ellipsis".into());
             base.insert("white-space", "nowrap".into());
         }
+        // at most this many lines, the last one closed with an ellipsis
+        // right after its last word: the space a wrap leaves is dropped
+        if text.line_limit > 0 {
+            base.insert("display", "-webkit-box".into());
+            base.insert("-webkit-box-orient", "vertical".into());
+            base.insert("-webkit-line-clamp", text.line_limit.to_string());
+            base.insert("overflow", "hidden".into());
+            base.insert("white-space", "pre-line".into());
+        }
     }
     let declarations: Vec<String> = base.iter().map(|(name, value)| format!("{name}:{value}")).collect();
     let mut out = format!("{selector}{{{}}}", declarations.join(";"));
@@ -1811,6 +1820,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let rule = |align| {
             rule_text(

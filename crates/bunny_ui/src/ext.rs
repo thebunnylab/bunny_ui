@@ -135,6 +135,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::LineHeight(height))
     }
 
+    /// `.lineLimit(2)` — the text below shows at most this many lines;
+    /// when its words need more, the last one shown ends with an ellipsis.
+    /// Inherited like the font, the nearer limit wins, and zero is no
+    /// limit — the way to lift one set further out.
+    #[track_caller]
+    fn line_limit(self, lines: u8) -> Modified<Self> {
+        Modified::new(self, Modifier::LineLimit(lines))
+    }
+
     /// `.id("source-control")` — the view takes a NAME in the identity.
     ///
     /// Without it a view is known by its POSITION among siblings

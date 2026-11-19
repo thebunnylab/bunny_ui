@@ -52,6 +52,7 @@ fn place_in(node: &LayoutNode, proposal: Proposal, engine: &dyn TextEngine, font
             scroll_offsets: &offsets,
             font,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,

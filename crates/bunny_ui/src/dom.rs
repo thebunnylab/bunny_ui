@@ -651,6 +651,9 @@ pub struct DomText {
     /// The face is the one declared above: the text names no font of
     /// its own, and the look it wears carries none.
     pub inherits_face: bool,
+    /// The most lines the text shows (`.line_limit`), zero for none —
+    /// the page clamps the element to them.
+    pub line_limit: u8,
 }
 
 /// One text field. Focus, caret and composition stay with the browser;
@@ -2635,6 +2638,10 @@ fn look_hash(node: &DomNode) -> u64 {
         hash_f32(text.line_height, &mut hasher);
         text.text_align.map(|align| align as u8).hash(&mut hasher);
         text.truncation.map(|mode| mode as u8).hash(&mut hasher);
+        // only a limit adds to the hash: a text with none keeps its rule
+        if text.line_limit > 0 {
+            (0x6c69_6d69u64, text.line_limit).hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -2674,6 +2681,7 @@ fn face_only(face: FontSpec) -> DomText {
         highlights: None,
         truncation: None,
         inherits_face: false,
+        line_limit: 0,
     }
 }
 
@@ -3119,6 +3127,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
                 || text.line_height != was.line_height
                 || text.text_align != was.text_align
                 || text.truncation != was.truncation
+                || text.line_limit != was.line_limit
             {
                 return false;
             }
@@ -4571,6 +4580,10 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// its first child alone, or by its last — `grid-template: auto 0fr /
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
+///
+/// The text look's record ends with a u8, the most lines the text shows
+/// (`.line_limit`, 0 for none); the glue clamps the element to them
+/// (`-webkit-line-clamp`).
 pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
@@ -5442,6 +5455,8 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
     });
     // 1 = the face is the one declared above: the look names no font
     out.push(text.inherits_face as u8);
+    // the most lines it shows, 0 for none
+    out.push(text.line_limit);
 }
 
 /// The kind's byte on the wire, shared by the create op and the rule.
@@ -8342,6 +8357,7 @@ mod tests {
             highlights: None,
             truncation: Some(Truncation::End),
             inherits_face: false,
+            line_limit: 0,
         });
         let plain = flow_row("c");
         assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
@@ -8353,6 +8369,11 @@ mod tests {
         boxed.style.set_group_owner(Some(9));
         boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
         assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
+        // a line limit is a look of its own
+        if let DomKind::Text(text) = &mut words.kind {
+            text.line_limit = 2;
+        }
+        assert_ne!(look_hash(&words), 0x80c1_7ab4_826a_edc3);
     }
 
     #[test]
@@ -8569,6 +8590,21 @@ mod tests {
         tail.extend_from_slice(&0f32.to_le_bytes());
         assert!(out.ends_with(&tail), "{out:?}");
         assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 64"), "glue_dom.js reads it");
+    }
+
+    /// A text's line limit ends its look's record: a byte, zero for none.
+    #[test]
+    fn a_line_limit_ends_the_text_look() {
+        let limited = |line_limit| {
+            let mut out = Vec::new();
+            encode_text_look(&mut out, &DomText { line_limit, ..face_only(FontSpec::DEFAULT) });
+            out
+        };
+        let (free, two) = (limited(0), limited(2));
+        assert_eq!(free.len(), two.len());
+        assert_eq!(free.last(), Some(&0), "{free:?}");
+        assert_eq!(two.last(), Some(&2), "{two:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("const lineLimit = u8();"), "glue_dom.js reads it");
     }
 
     #[test]

@@ -649,6 +649,9 @@ pub struct LayoutEnv<'a> {
     /// The inherited line height a paragraph steps by. `None` = the
     /// face's own box; a value overrides it, set by `.line_height(…)`.
     pub line_height: Option<Px>,
+    /// The most lines a text below shows, set by `.line_limit(…)`; the
+    /// last one shown ends with an ellipsis. Zero is no limit.
+    pub line_limit: u8,
     /// Where a wrapped line sits inside its box. `None` = leading.
     pub text_align: Option<motor::views::TextAlignment>,
     /// Which way the leading edge faces. PLACEMENT reads it — a row lays
@@ -1975,6 +1978,7 @@ pub(crate) struct MeasureKey {
     pub proposal: Proposal,
     pub font: FontSpec,
     pub line_height: Option<Px>,
+    pub line_limit: u8,
 }
 
 thread_local! {
@@ -2944,6 +2948,10 @@ pub struct VisualProps {
     /// lines by it and centres the glyphs in the taller box — the CSS
     /// half-leading.
     pub line_height: Option<Px>,
+    /// `.line_limit(…)` — the most lines the text below shows, inherited
+    /// and measured like `line_height`. `Some(0)` lifts a limit set
+    /// further out; `None` inherits.
+    pub line_limit: Option<u8>,
     /// Where each WRAPPED line sits inside the box the text was given.
     /// Inherited beside the font; `None` is leading, which is where every
     /// line has always been placed.
@@ -3063,6 +3071,7 @@ impl VisualProps {
             foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
             line_height: self.line_height.or(outer.line_height),
+            line_limit: self.line_limit.or(outer.line_limit),
             text_align: self.text_align.or(outer.text_align),
             direction: self.direction.or(outer.direction),
             flips: self.flips.or(outer.flips),
@@ -5980,6 +5989,7 @@ pub(crate) fn layout_in(
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction,
             flips: false,
@@ -8220,6 +8230,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    line_limit: props.line_limit.unwrap_or(env.line_limit),
                     text_align: props.text_align.or(env.text_align),
                     direction: props.direction.unwrap_or(env.direction),
                     flips: props.flips.unwrap_or(env.flips),
@@ -8284,7 +8295,7 @@ impl LayoutNode {
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
             LayoutNode::BoundaryRef { path, slot, .. } => {
-                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
+                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height, line_limit: env.line_limit };
                 crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }
         }
@@ -8448,6 +8459,7 @@ impl LayoutNode {
                             highlights: highlights.clone(),
                             truncation: *truncation,
                             inherits_face: false,
+                            line_limit: env.line_limit,
                         }),
                         frame,
                     );
@@ -10115,6 +10127,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    line_limit: props.line_limit.unwrap_or(env.line_limit),
                     text_align: props.text_align.or(env.text_align),
                     direction: props.direction.unwrap_or(env.direction),
                     flips: props.flips.unwrap_or(env.flips),
@@ -13416,6 +13429,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -13454,6 +13468,7 @@ mod tests {
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
                 line_height: None,
+                line_limit: 0,
                 text_align: None,
                 direction: LayoutDirection::LeftToRight,
                 flips: false,
@@ -13517,6 +13532,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -13855,6 +13871,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -13933,6 +13950,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
