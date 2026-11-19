@@ -1182,12 +1182,14 @@ impl Writer<'_> {
         } else if node.css("white-space") == "nowrap" {
             self.gap(node, "white-space: nowrap", "the words may wrap");
         }
-        // the clamped lines show, the last one closed with an ellipsis
+        // the clamped lines show, the last one closed with an ellipsis, in
+        // the height the page gave them: the browser rounds a line's height
+        // to its sixty-fourths, and lines add up
         match node.css("-webkit-line-clamp") {
             "" | "none" => {}
             clamp => match clamp.parse::<u8>() {
                 Ok(lines) => {
-                    let _ = write!(view, "\n.line_limit({lines})");
+                    let _ = write!(view, "\n.line_limit({lines})\n.frame_height_aligned({}, Alignment::TopLeading)", num(content_height(node)));
                 }
                 Err(_) => self.gap(node, "-webkit-line-clamp", format!("{clamp} lines, drawn whole")),
             },
@@ -1889,8 +1891,8 @@ mod tests {
         let mut clamped = Node { id: "p-1".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 300.0, h: 32.0 }, ..Node::default() };
         clamped.style.insert("-webkit-line-clamp".to_owned(), "2".to_owned());
         let view = writer.words_view(&clamped, "words");
-        assert!(view.contains("\n.line_limit(2)"), "{view}");
-        assert!(!view.contains("frame_height") && !view.contains("clipped"), "{view}");
+        assert!(view.contains("\n.line_limit(2)\n.frame_height_aligned(32.0, Alignment::TopLeading)"), "{view}");
+        assert!(!view.contains("clipped"), "{view}");
         assert!(writer.gaps.is_empty(), "{:?}", writer.gaps);
         clamped.style.insert("-webkit-line-clamp".to_owned(), "none".to_owned());
         assert!(!writer.words_view(&clamped, "words").contains("line_limit"));
