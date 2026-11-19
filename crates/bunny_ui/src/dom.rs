@@ -364,6 +364,10 @@ pub struct DomLook {
     /// color again (`-webkit-text-fill-color: currentcolor`), as the
     /// nearer ink wins in `SwiftUI`.
     pub own_ink: bool,
+    /// The box's floor, `(width, height)` — `min-width` and `min-height`,
+    /// zero for none: a `.frame_min` that hugs its content above it, a
+    /// `.frame_flex` that fills its holder and never shrinks past it.
+    pub floor: Option<(Px, Px)>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -451,6 +455,7 @@ impl DomLook {
         rotation: None,
         ink_gradient: None,
         own_ink: false,
+        floor: None,
         transition: None,
         focus_border: None,
         placeholder_color: None,
@@ -486,6 +491,7 @@ impl DomLook {
             rotation: props.rotation.map(|(degrees, anchor)| (degrees, anchor.x, anchor.y)),
             ink_gradient: props.foreground_gradient,
             own_ink: false,
+            floor: None,
             transition: None,
             focus_border: None,
             placeholder_color: None,
@@ -2554,6 +2560,9 @@ fn look_hash(node: &DomNode) -> u64 {
     if style.own_ink {
         5u8.hash(&mut hasher);
     }
+    if let Some((width, height)) = style.floor {
+        (6u8, width.to_bits(), height.to_bits()).hash(&mut hasher);
+    }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
@@ -4557,7 +4566,8 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// the ramp its text paints with (`.foreground_gradient`: the ramp's
 /// record as bit 13 of the first mask carries it, then its stops as bit
 /// 3's), bit 5 a box inside such a ramp that paints its text in its own
-/// ink again — the first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// ink again, bit 6 the box's floor (f32 min width + f32 min height, zero
+/// for none) — the first mask's thirty-two bits were all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
 /// its first child alone, or by its last — `grid-template: auto 0fr /
 /// auto 0fr` with the base in the first track and every layer across
 /// both, so a layer larger than its base never grows the cell.
@@ -5249,7 +5259,8 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         | u8::from(style.rotation.is_some()) << 2
         | u8::from(stops.is_some()) << 3
         | u8::from(style.ink_gradient.is_some()) << 4
-        | u8::from(style.own_ink) << 5;
+        | u8::from(style.own_ink) << 5
+        | u8::from(style.floor.is_some()) << 6;
     out.push(more);
     for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
         push_f32(out, x);
@@ -5266,6 +5277,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if let Some(gradient) = &style.ink_gradient {
         encode_ramp(out, gradient);
         encode_stops(out, gradient.stops());
+    }
+    if let Some((width, height)) = style.floor {
+        push_f32(out, width);
+        push_f32(out, height);
     }
 }
 
@@ -8294,6 +8309,7 @@ mod tests {
             rotation: None,
             ink_gradient: None,
             own_ink: false,
+            floor: None,
             transition: Some((0.4, 0.8)),
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
@@ -8540,6 +8556,19 @@ mod tests {
         assert_eq!(own.last(), Some(&(1 << 5)));
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
         assert!(glue.contains("more & 16") && glue.contains("more & 32"), "glue_dom.js reads both");
+    }
+
+    /// A box's floor rides the second mask (bit 6): two f32, zero for
+    /// none.
+    #[test]
+    fn a_floor_rides_the_second_mask() {
+        let mut out = Vec::new();
+        encode_style(&mut out, &DomLook { floor: Some((18.0, 0.0)), ..DomLook::NONE });
+        let mut tail = vec![1 << 6];
+        tail.extend_from_slice(&18f32.to_le_bytes());
+        tail.extend_from_slice(&0f32.to_le_bytes());
+        assert!(out.ends_with(&tail), "{out:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 64"), "glue_dom.js reads it");
     }
 
     #[test]

@@ -1010,6 +1010,18 @@ pub enum LayoutNode {
         vertical: CrossAlign,
         child: Box<LayoutNode>,
     },
+    /// `.frame(minWidth:minHeight:)` — the box hugs its content, never
+    /// smaller than the floor: the child is offered the proposal raised
+    /// to the floor, and the box answers the child's size held between
+    /// the floor and that offer, as `SwiftUI`'s flexible frame does. A
+    /// floor of zero is none.
+    MinFrame {
+        min_width: Px,
+        min_height: Px,
+        align: CrossAlign,
+        vertical: CrossAlign,
+        child: Box<LayoutNode>,
+    },
     /// Vertical scroll region: answers what it was offered, measures the
     /// content without restriction and keeps the excess to itself (the
     /// shrink contract). `path` is the region's structural identity — the
@@ -1786,6 +1798,7 @@ impl LayoutNode {
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::HoverGroup { child, .. }
@@ -3624,6 +3637,7 @@ impl LayoutNode {
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. }
             | LayoutNode::Styled { child, .. }
             // a target, a tooltip, a menu, a drag and a drop exist only
@@ -7349,7 +7363,9 @@ impl LayoutNode {
             // the layer is invisible to the question: a rule wide
             // enough to cross the box must never make the box flexible
             LayoutNode::Overlay { child, .. } => child.is_flexible(axis, enclosing_main),
+            // a floor hugs: as flexible as what it holds
             LayoutNode::Padding { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Styled { child, .. }
@@ -7479,6 +7495,7 @@ impl LayoutNode {
             | Self::Frame { child, .. }
             | Self::MaxFrame { child, .. }
             | Self::FlexFrame { child, .. }
+            | Self::MinFrame { child, .. }
             | Self::Scroll { child, .. }
             | Self::Hug { child, .. }
             | Self::Styled { child, .. }
@@ -7525,7 +7542,9 @@ impl LayoutNode {
                 child.min_content_width(&env)
             }
             Self::Frame { width: Some(width), .. } => *width,
-            Self::FlexFrame { min_width, child, .. } => child.min_content_width(env).max(*min_width),
+            Self::FlexFrame { min_width, child, .. } | Self::MinFrame { min_width, child, .. } => {
+                child.min_content_width(env).max(*min_width)
+            }
             Self::Padding { edges, child } => child.min_content_width(env) + edges.leading + edges.trailing,
             Self::Stack { axis, spacing, children, .. } => {
                 let floors = children.iter().filter(|child| child.placed_at().is_none()).map(|child| child.min_content_width(env));
@@ -7589,6 +7608,7 @@ impl LayoutNode {
             | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -8085,6 +8105,24 @@ impl LayoutNode {
                 let size = Size {
                     width: offer.width.unwrap_or(child_size.width),
                     height: offer.height.unwrap_or(child_size.height),
+                };
+                (size, Fit::Wrapped(child_size, Box::new(fit)))
+            }
+
+            LayoutNode::MinFrame { min_width, min_height, child, .. } => {
+                // the child is offered the proposal raised to the floor;
+                // unproposed, it answers what it would be
+                let offer = Proposal {
+                    width: proposal.width.map(|length| length.max(*min_width)),
+                    height: proposal.height.map(|length| length.max(*min_height)),
+                };
+                let (child_size, fit) = child.measure(offer, env);
+                // the child's size, held between the floor and the offer: a
+                // child wider than its offer overflows a box of the offer
+                let hold = |offered: Option<Px>, min: Px, child_len: Px| offered.map_or(child_len, |offered| child_len.min(offered)).max(min);
+                let size = Size {
+                    width: hold(offer.width, *min_width, child_size.width),
+                    height: hold(offer.height, *min_height, child_size.height),
                 };
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
@@ -9908,7 +9946,8 @@ impl LayoutNode {
             }
 
             (LayoutNode::MaxFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit))
-            | (LayoutNode::FlexFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            | (LayoutNode::FlexFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit))
+            | (LayoutNode::MinFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = align_x(frame, child_size.width, *align, env.rtl());
                 let y = frame.origin.y + align_offset(frame.size.height, child_size.height, *vertical);
                 child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);

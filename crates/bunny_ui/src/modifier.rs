@@ -48,6 +48,8 @@ pub enum Modifier {
     Tracking(Tracking),
     FrameMax(f64, f64, Alignment),
     FrameFlex(f64, f64, Alignment),
+    /// `.frame(minWidth:minHeight:alignment:)` — hugs above a floor.
+    FrameMin(f64, f64, Alignment),
     HugHeight,
     /// The outer box sits at this point in its enclosing stack.
     Position(crate::layout::Point),
@@ -311,6 +313,7 @@ impl Modifier {
             Modifier::Tracking { .. } => "tracking",
             Modifier::FrameMax { .. } => "frame_max",
             Modifier::FrameFlex { .. } => "frame_flex",
+            Modifier::FrameMin { .. } => "frame_min",
             Modifier::HugHeight => "hug_height",
             Modifier::Position(_) => "position",
             Modifier::Span(_, _) => "span",
@@ -443,6 +446,9 @@ impl Modifier {
             ),
             Modifier::FrameFlex(min_width, min_height, alignment) => format!(
                 " [.frame(flex, minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
+            ),
+            Modifier::FrameMin(min_width, min_height, alignment) => format!(
+                " [.frame(minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
             ),
             Modifier::HugHeight => " [.hugHeight]".into(),
             Modifier::Span(columns, rows) => format!(" [.span({columns}, {rows})]"),
@@ -1397,6 +1403,18 @@ pub(crate) fn apply(
             out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
                 max_width,
                 max_height,
+                align,
+                vertical,
+                child: Box::new(node),
+            });
+        }
+        Modifier::FrameMin(min_width, min_height, alignment) => {
+            let (min_width, min_height) = (*min_width, *min_height);
+            let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::MinFrame {
+                min_width,
+                min_height,
                 align,
                 vertical,
                 child: Box::new(node),

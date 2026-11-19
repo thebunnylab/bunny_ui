@@ -929,20 +929,41 @@ impl Walk<'_> {
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
-            // The flex frame on the web flow: a growing box. Its FLOOR is not
-            // honoured here yet — the flow layout carries no minimum, so a
-            // pane narrower than a table's floors squeezes the lanes on the
-            // web where the desktop scrolls them. Recorded, not hidden.
-            LayoutNode::FlexFrame { align, vertical, child, .. } => {
+            // The flex frame on the web flow: a growing box, never smaller
+            // than its floor — a pane narrower than a table's floors
+            // overflows the lanes, as the desktop does
+            LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.grow = true;
                     layout.align = Some(align_both(*align, *vertical));
                 }
+                if *min_width > 0.0 || *min_height > 0.0 {
+                    container.style.look_mut().floor = Some((*min_width, *min_height));
+                }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
+                Self::fold_table_wrapper(container);
+            }
+            // a box that hugs its content above a floor: its own `min-width`
+            // and `min-height`, the content placed by the alignment
+            LayoutNode::MinFrame { min_width, min_height, align, vertical, child } => {
+                let container = placed(out, node(DomKind::FlexColumn));
+                container.layout.as_mut().expect("flow node").align = Some(align_both(*align, *vertical));
+                if *min_width > 0.0 || *min_height > 0.0 {
+                    container.style.look_mut().floor = Some((*min_width, *min_height));
+                }
+                self.lower_into(child, &mut container.children);
+                Self::stamp_fill(child, &mut container.children);
+                Self::inherit_stretch(container);
+                // it hugs: the hunger inside is all it has
+                let hungry = child.is_flexible(Axis::Horizontal, None) || child.is_flexible(Axis::Vertical, None);
+                if !hungry && let Some(layout) = container.layout.as_mut() {
+                    layout.stretch = false;
+                }
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }

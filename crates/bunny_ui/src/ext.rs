@@ -323,6 +323,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::FrameMax(max_width, max_height, alignment))
     }
 
+    /// `.frame(minWidth: 18, alignment: .center)` — the box hugs its
+    /// content and is never smaller than the floor: a badge as wide as
+    /// its count, but no narrower than a circle; a key cap as wide as its
+    /// word. A floor of zero is none. The content is offered the proposal
+    /// raised to the floor, as `SwiftUI`'s flexible frame offers it, and
+    /// sits by the alignment when the floor is the wider.
+    ///
+    /// Where [`ViewExt::frame_flex`] fills what it is proposed, this keeps
+    /// to its content: it is `SwiftUI`'s `minWidth` with no `maxWidth`.
+    #[track_caller]
+    fn frame_min(self, min_width: f64, min_height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified::new(self, Modifier::FrameMin(min_width, min_height, alignment))
+    }
+
     /// A flexible box with a floor: it fills what it is proposed, never
     /// less than the floor — and unproposed on an axis it IS the floor,
     /// not its content. A floor of zero hugs the content on that axis.

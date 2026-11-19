@@ -732,6 +732,11 @@ function lookRules(selector, kind, flags, style, layout, face) {
   }
   // inside a ramp, a box with its own ink paints its text in it again
   if (style.ownInk) decl["-webkit-text-fill-color"] = "currentcolor";
+  // the box's floor
+  if (style.floor) {
+    if (style.floor[0] > 0) decl["min-width"] = `${style.floor[0]}px`;
+    if (style.floor[1] > 0) decl["min-height"] = `${style.floor[1]}px`;
+  }
   // a line drawn inward over the box and its children: an outline
   // pulled in by its own width paints a CSS border's pixels and lays
   // nothing out, where a border would push the content in
@@ -1281,6 +1286,8 @@ function applyPatches(view, length) {
     // its text in its own ink again
     if (more & 16) style.inkImage = rampImage(readRamp(), readStops());
     if (more & 32) style.ownInk = true;
+    // the box's floor, zero for none
+    if (more & 64) style.floor = [f32(), f32()];
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };

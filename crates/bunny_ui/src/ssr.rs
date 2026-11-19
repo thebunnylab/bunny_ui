@@ -1237,6 +1237,15 @@ fn rule_text(
     if style.own_ink {
         base.insert("-webkit-text-fill-color", "currentcolor".into());
     }
+    // the box's floor
+    if let Some((width, height)) = style.floor {
+        if width > 0.0 {
+            base.insert("min-width", px(width));
+        }
+        if height > 0.0 {
+            base.insert("min-height", px(height));
+        }
+    }
     if style.clip {
         base.insert("overflow", "hidden".into());
     }
