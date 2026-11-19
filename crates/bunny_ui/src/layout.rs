@@ -6751,9 +6751,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                         Rect {
                             origin: Point {
                                 x: room.origin.x
-                                    + align_offset(room.size.width, open.width, CrossAlign::Center),
+                                    + window_offset(room.size.width, open.width, CrossAlign::Center),
                                 y: room.origin.y
-                                    + align_offset(
+                                    + window_offset(
                                         room.size.height,
                                         open.height,
                                         CrossAlign::Center,
@@ -6781,9 +6781,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                     origin: held.map_or_else(
                         || Point {
                             x: room.origin.x
-                                + align_offset(room.size.width, size.width, CrossAlign::Center),
+                                + window_offset(room.size.width, size.width, CrossAlign::Center),
                             y: room.origin.y
-                                + align_offset(room.size.height, size.height, CrossAlign::Center),
+                                + window_offset(room.size.height, size.height, CrossAlign::Center),
                         },
                         |frame| frame.origin,
                     ),
@@ -6809,9 +6809,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             (None, Some(side)) => anchored_frame(queued.anchor, side, size, container),
             (None, None) => Rect {
                 origin: Point {
-                    x: room.origin.x + align_offset(room.size.width, size.width, CrossAlign::Center),
+                    x: room.origin.x + window_offset(room.size.width, size.width, CrossAlign::Center),
                     y: room.origin.y
-                        + align_offset(room.size.height, size.height, CrossAlign::Center),
+                        + window_offset(room.size.height, size.height, CrossAlign::Center),
                 },
                 size,
             },
@@ -10859,26 +10859,27 @@ const ELLIPSIS: &str = "…";
 
 /// Composes the ellipsis version that fits the width — the most content
 /// possible, measured for real (every candidate goes through the cache).
-/// Where a child sits inside the room it was given, on one axis.
-///
-/// An alignment offset is a share of the LEFTOVER, and a child bigger
-/// than the room leaves none: the share goes negative and the content
-/// slides out the LEADING side, behind whatever border is there. A
-/// reader then sees "ttings" where a panel is titled "Settings" — not
-/// a clipped end, a missing beginning — and a `.clipped()` cannot rescue
-/// it, because cutting something centred on its own overflow shows the
-/// middle of it.
-///
-/// So an offset is never negative. Content that does not fit starts at
-/// the leading edge and overflows trailing, which is the one direction
-/// a clip cuts predictably and a reader can still read into.
+/// Where a child sits inside the room it was given, on one axis: its
+/// share of the leftover, as CSS and SwiftUI place it. A child bigger
+/// than its room leaves a negative leftover — centred, it overflows both
+/// sides by half of it; at the end, the leading side. The page lays the
+/// same child out the same way, so the two roads agree. A title that
+/// must read from its first letter in a room too narrow asks for the
+/// leading edge, or for a truncation.
 fn align_offset(room: Px, child: Px, align: CrossAlign) -> Px {
     let leftover = room - child;
     match align {
         CrossAlign::Start | CrossAlign::Baseline => 0.0,
-        CrossAlign::Center => (leftover / 2.0).max(0.0),
-        CrossAlign::End => leftover.max(0.0),
+        CrossAlign::Center => leftover / 2.0,
+        CrossAlign::End => leftover,
     }
+}
+
+/// [`align_offset`] for a window over the scene, which never starts
+/// above or before its room: a sheet taller than the window keeps its
+/// top, and its close button, in reach and overflows down.
+fn window_offset(room: Px, child: Px, align: CrossAlign) -> Px {
+    align_offset(room, child, align).max(0.0)
 }
 
 /// Where a child of `width` that starts `along` from the frame's LEADING
@@ -11155,7 +11156,6 @@ fn place_target(
     out.pointer_hit.pop();
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Each child's first baseline in a row on a shared one — a text by
 /// its ascent, a box without one by its bottom edge, a placed box out
 /// of the line. [`place_stack`] drops each child by its distance to the
@@ -11184,6 +11184,7 @@ fn baseline_extent(children: &[LayoutNode], measured: &[(Size, Fit)], env: &Layo
         .fold(0.0, Px::max)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
     spacing: Px,
@@ -11222,10 +11223,8 @@ fn place_stack(
                 // a vertical stack has no shared baseline: start
                 _ => 0.0,
             },
-            // a squashed window can be narrower than a rigid child, and
-            // the same rule holds there as everywhere: the leftover is
-            // never negative, so the child starts at the leading edge
-            // instead of hanging half of itself off the near side
+            // a child wider than the stack overflows as CSS's does:
+            // centred, by half on each side
             align => align_offset(extent, len, align),
         };
         let origin = match axis {

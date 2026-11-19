@@ -158,7 +158,9 @@ fn a_placed_child_keeps_x_from_the_left_in_rtl() {
 fn a_positioned_child_past_its_stack_is_cut_only_under_clipped() {
     let view = vstack!(text!("a").position(90.0, 70.0)).frame(40.0, 30.0);
     let open = Runtime::new().layout(&view, Proposal::unspecified());
-    assert!(origin_of(&open.display, "a").x >= 90.0);
+    // the stack is as big as what it places, centred in the 40-point
+    // frame by half its overflow: the child still paints past the frame
+    assert!(origin_of(&open.display, "a").x > 40.0);
     assert!(
         !open
             .display

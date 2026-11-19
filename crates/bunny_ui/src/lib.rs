@@ -9631,54 +9631,27 @@ mod tests {
         assert_eq!(end, open.display.len(), "and it is the last thing placed");
     }
 
-    /// Content too wide for its box starts at the LEADING edge. It
-    /// never centres its own overflow.
-    ///
-    /// A centring offset is a share of the LEFTOVER, and when there is
-    /// no leftover the share is negative — so a row wider than the dock
-    /// lane holding it slid half of itself out the left side, behind
-    /// the dock's own border. A reader saw "ttings" where the panel is
-    /// titled "Settings": not a clipped end, a missing beginning.
-    ///
-    /// It is the same defect wrapped text had going up and down, on the
-    /// other axis and for any content. A clip cannot rescue it either:
-    /// cutting something centred on its overflow shows the middle.
+    /// Content too wide for its box overflows both sides, the way CSS
+    /// and SwiftUI centre it: a row of 300 points in a lane of 180
+    /// starts 60 before the lane and ends 60 past it, where the page
+    /// lays the same row out. A header that must read from its first
+    /// letter in a lane too narrow asks for the leading edge, and gets
+    /// it: there it starts where the lane does and runs off the far end.
     #[test]
-    fn content_too_wide_for_its_box_starts_at_the_leading_edge() {
-        use crate::layout::{DrawCommand, Proposal, Size};
-
+    fn content_too_wide_for_its_box_overflows_both_sides() {
         const LANE: f64 = 180.0;
 
-        #[derive(Clone, Copy)]
-        struct Dock;
-        impl Component for Dock {
-            fn body(self) -> impl View {
-                // a header row that needs more than the lane has
-                vstack(
-                    hstack((
-                        text("Settings").frame(150.0, 20.0),
-                        text("New Thread").frame(150.0, 20.0),
-                    ))
-                    .frame(LANE, 20.0),
-                )
-            }
-        }
+        let row_in = |alignment: Alignment| {
+            let runtime = Runtime::new();
+            let lane = hstack((text("Settings").frame(150.0, 20.0), text("New Thread").frame(150.0, 20.0)))
+                .test_id("row")
+                .frame_aligned(LANE, 20.0, alignment);
+            runtime.display_frame(&lane, Size { width: LANE, height: 60.0 });
+            runtime.test_frames().into_iter().find(|(id, _)| &**id == "row").map(|(_, frame)| frame).expect("the row")
+        };
 
-        let runtime = Runtime::new();
-        let result =
-            runtime.settled_layout(&Dock, Proposal::exact(Size { width: LANE, height: 60.0 }));
-        let leftmost = result
-            .display
-            .iter()
-            .filter_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.x),
-                _ => None,
-            })
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            leftmost >= 0.0,
-            "nothing is painted left of the lane; the leftmost glyph sits at {leftmost}",
-        );
+        assert_eq!(row_in(Alignment::Center).origin.x, (LANE - 300.0) / 2.0, "centred, it overflows both sides");
+        assert_eq!(row_in(Alignment::Leading).origin.x, 0.0, "leading, it starts where the lane does");
     }
 
     /// A label that knows how to ELLIPSIZE yields under pressure, and

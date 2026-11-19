@@ -37,8 +37,8 @@ nested	AxB	0	0	0
 nested	AxC	0	0	1677
 nested	BxC	0	0	1677
 overflow	AxB	0	0	0
-overflow	AxC	3	16128	0
-overflow	BxC	3	16128	0
+overflow	AxC	0	0	0
+overflow	BxC	0	0	0
 padding_margin	AxB	0	0	0
 padding_margin	AxC	0	0	0
 padding_margin	BxC	0	0	0
