@@ -301,24 +301,33 @@ fn blend_px(src: u32, dst: u32) -> u32 {
     (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | a
 }
 
+/// Source-over of a PREMULTIPLIED `src` onto `dst`: `out = s + d·(1−sa)`
+/// for every channel, alpha too, rounded as a compositor rounds it —
+/// `s + (d·(255 − sa) + 127) / 255`, which `div255` is. The bytes a GPU
+/// tier's `ONE, ONE_MINUS_SRC_ALPHA` blend leaves in an 8-bit target.
+fn blend_premultiplied_px(src: u32, dst: u32) -> u32 {
+    let sa = src & 0xFF;
+    if sa == 255 {
+        return src;
+    }
+    if src == 0 {
+        return dst;
+    }
+    let inv = 255 - sa;
+    let channel = |shift: u32| {
+        let s = (src >> shift) & 0xFF;
+        let d = (dst >> shift) & 0xFF;
+        (s + div255(d * inv)).min(255) << shift
+    };
+    channel(24) | channel(16) | channel(8) | channel(0)
+}
+
 /// Straight-alpha RGBA from bytes that were blended onto a TRANSPARENT
 /// ground. `blend_px` leaves `rgb = colour x coverage` there, which is
 /// the premultiplied convention; `ImageData` and a canvas blit both
 /// read straight. Wherever alpha is 255 this changes nothing, which is
 /// why only islands ever need it.
-pub fn unpremultiplied(rgba: &[u8]) -> Vec<u8> {
-    let mut out = rgba.to_vec();
-    for pixel in out.as_chunks_mut::<4>().0 {
-        let alpha = pixel[3] as u32;
-        if alpha == 0 || alpha == 255 {
-            continue;
-        }
-        for channel in &mut pixel[..3] {
-            *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
-        }
-    }
-    out
-}
+pub use crate::image_engine::unpremultiplied;
 
 impl Bitmap {
     pub fn new(width: usize, height: usize, background: Color) -> Self {
@@ -408,6 +417,33 @@ impl Bitmap {
         }
         let index = y as usize * self.width + x as usize;
         self.pixels[index] = blend_px(color, self.pixels[index]);
+    }
+
+    /// [`Self::set`] for a premultiplied `color`: a rounded clip scales
+    /// every channel, and the blend is [`blend_premultiplied_px`].
+    #[inline(always)]
+    fn set_premultiplied(&mut self, x: i64, y: i64, color: u32) {
+        if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.top_cut;
+        if x < cx0 || y < cy0 || x >= cx1 || y >= cy1 {
+            return;
+        }
+        let mut color = color;
+        if let Some(round) = &self.top_round {
+            let coverage = round.coverage(x, y);
+            if coverage < 1.0 {
+                let scaled =
+                    |shift: u32| (((color >> shift) & 0xFF) as f64 * coverage).round() as u32;
+                color = scaled(24) << 24 | scaled(16) << 16 | scaled(8) << 8 | scaled(0);
+                if color == 0 {
+                    return;
+                }
+            }
+        }
+        let index = y as usize * self.width + x as usize;
+        self.pixels[index] = blend_premultiplied_px(color, self.pixels[index]);
     }
 
     /// Refreshes the flat mirror after a push or a pop.
@@ -1203,6 +1239,57 @@ impl Bitmap {
         }
     }
 
+    /// A premultiplied raster ([`ImageSource::Premultiplied`]) laid texel
+    /// for texel at the logical origin, snapped once as
+    /// [`Self::composite_rgba`] snaps it, whatever the placement: the GPU
+    /// tiers lay it on the grid too.
+    fn composite_premultiplied(
+        &mut self,
+        origin: Point,
+        scale: usize,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) {
+        let base_x = (origin.x * scale as f64).round() as i64;
+        let base_y = (origin.y * scale as f64).round() as i64;
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        let row_first = (cy0 - base_y).max(0) as usize;
+        let row_last = ((cy1 - base_y).max(0) as usize).min(height);
+        let col_first = (cx0 - base_x).max(0) as usize;
+        let col_last = ((cx1 - base_x).max(0) as usize).min(width);
+        for row in row_first..row_last {
+            for col in col_first..col_last {
+                let index = (row * width + col) * 4;
+                let texel = [rgba[index], rgba[index + 1], rgba[index + 2], rgba[index + 3]];
+                let pixel = u32::from_be_bytes(texel);
+                if pixel == 0 {
+                    continue;
+                }
+                self.set_premultiplied(base_x + col as i64, base_y + row as i64, pixel);
+            }
+        }
+    }
+
+    /// An image of any source by its placement — a premultiplied picture
+    /// by its own blend, every other by the house's straight one.
+    fn composite_source(
+        &mut self,
+        origin: Point,
+        scale: usize,
+        placement: ImagePlacement,
+        (width, height): (usize, usize),
+        source: &crate::image_engine::ImageSource,
+        images: &dyn ImageEngine,
+    ) {
+        if let Some(rgba) = crate::image_engine::premultiplied_pixels(source, width, height) {
+            self.composite_premultiplied(origin, scale, width, height, &rgba);
+        } else if let Some(raster) = raster_source(images, source, width, height) {
+            let (width, height) = (raster.width, raster.height);
+            self.composite_image(origin, scale, placement, width, height, &raster.rgba);
+        }
+    }
+
     /// The source-over blit itself, at a PHYSICAL top-left already snapped.
     fn blit_rgba(&mut self, base_x: i64, base_y: i64, width: usize, height: usize, rgba: &[u8]) {
         // clamp the loop to the clip: a long line under a small damage
@@ -1841,16 +1928,8 @@ fn paint(
                     bitmap.width(),
                     bitmap.height(),
                 );
-                if let Some(raster) = raster_source(images, source, width, height) {
-                    bitmap.composite_image(
-                        rect.origin,
-                        scale,
-                        *placement,
-                        raster.width,
-                        raster.height,
-                        &raster.rgba,
-                    );
-                }
+                let size = (width, height);
+                bitmap.composite_source(rect.origin, scale, *placement, size, source, images);
             }
             DrawCommand::Sprite {
                 rect,
@@ -2367,16 +2446,14 @@ impl Surface {
                     DrawCommand::Image { rect: image_rect, source, placement } => {
                         let width = physical_extent(image_rect.size.width, self.scale);
                         let height = physical_extent(image_rect.size.height, self.scale);
-                        if let Some(raster) = raster_source(images, source, width, height) {
-                            self.bitmap.composite_image(
-                                image_rect.origin,
-                                self.scale,
-                                *placement,
-                                raster.width,
-                                raster.height,
-                                &raster.rgba,
-                            );
-                        }
+                        self.bitmap.composite_source(
+                            image_rect.origin,
+                            self.scale,
+                            *placement,
+                            (width, height),
+                            source,
+                            images,
+                        );
                     }
                     DrawCommand::Sprite {
                         rect: sprite_rect,
@@ -2746,6 +2823,54 @@ mod tests {
         assert_eq!(bitmap.pixel(5, 5), Some(fill), "edge [2,6): 5 is the last one inside");
         assert_eq!(bitmap.pixel(6, 6), Some(white), "6 is already outside");
         assert_eq!(bitmap.pixel(1, 1), Some(white));
+    }
+
+    /// Every premultiplied colour no brighter than its alpha, over every
+    /// ground: the compositor's lowp source-over, integer for integer.
+    #[test]
+    fn a_premultiplied_blend_rounds_as_a_compositor_lays_a_layer() {
+        for a in 0..=255_u32 {
+            for s in 0..=a {
+                for d in 0..=255_u32 {
+                    let src = s << 24 | s << 16 | s << 8 | a;
+                    let dst = d << 24 | (255 - d) << 16 | d << 8 | 255;
+                    let laid = |s: u32, d: u32| s + (d * (255 - a) + 127) / 255;
+                    let expected =
+                        laid(s, d) << 24 | laid(s, 255 - d) << 16 | laid(s, d) << 8 | laid(a, 255);
+                    assert_eq!(blend_premultiplied_px(src, dst), expected, "s {s} a {a} d {d}");
+                }
+            }
+        }
+    }
+
+    fn premultiplied_picture(at: (f64, f64), placement: ImagePlacement) -> DrawCommand {
+        DrawCommand::Image {
+            rect: Rect {
+                origin: Point { x: at.0, y: at.1 },
+                size: crate::layout::Size { width: 2.0, height: 1.0 },
+            },
+            source: crate::image_engine::ImageSource::rgba_premultiplied(
+                1,
+                (2, 1),
+                vec![61, 30, 0, 61, 0, 0, 0, 0],
+            ),
+            placement,
+        }
+    }
+
+    /// A premultiplied picture adds its colour whole, and lands on the
+    /// grid whatever its placement, as every GPU tier lays it.
+    #[test]
+    fn a_premultiplied_picture_lays_its_texels_on_the_grid() {
+        for placement in [ImagePlacement::Pixel, ImagePlacement::Subpixel] {
+            let mut display = DisplayList::default();
+            display.push(premultiplied_picture((1.25, 0.0), placement));
+            let bitmap = rasterize(&display, 4, 1, Color { r: 18, g: 16, b: 13, a: 255 });
+            // 61 + (18·194 + 127) / 255 = 75, 30 + 12 = 42, 0 + 10 = 10
+            assert_eq!(bitmap.pixel(1, 0), Some(0x4B2A_0AFF), "{placement:?}");
+            assert_eq!(bitmap.pixel(2, 0), Some(0x1210_0DFF), "a clear texel leaves the ground");
+            assert_eq!(bitmap.pixel(0, 0), Some(0x1210_0DFF));
+        }
     }
 
     #[test]

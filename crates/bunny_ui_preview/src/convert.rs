@@ -592,6 +592,7 @@ pub fn image_key(source: &ImageSource) -> u64 {
         | ImageSource::Symbol { key, .. }
         | ImageSource::Path { key, .. }
         | ImageSource::Rgba { key, .. }
+        | ImageSource::Premultiplied { key, .. }
         | ImageSource::Native { key, .. }
         | ImageSource::Feed { key, .. }
         | ImageSource::Faded { key, .. }
@@ -638,6 +639,11 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
         }
         },
         ImageSource::Rgba { size, rgba, .. } => ResourceKind::Rgba { size: *size, rgba: rgba.to_vec() },
+        // the wire speaks straight alpha
+        ImageSource::Premultiplied { size, rgba, .. } => ResourceKind::Rgba {
+            size: *size,
+            rgba: bunny_ui_core::image_engine::unpremultiplied(rgba),
+        },
         ImageSource::Feed { generation, size, format, bytes, .. } => {
             let rgba = match format {
                 PixelFormat::I420(yuv) => yuv.to_rgba(bytes, *size),

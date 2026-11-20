@@ -70,6 +70,15 @@ pub enum ImageSource {
     /// it draws any other image. No engine sees this variant either —
     /// there is nothing to decode.
     Rgba { key: u64, size: (u32, u32), rgba: FeedBytes },
+    /// Pixels the app filled itself with every colour already multiplied
+    /// by its alpha — a compositor's tile. A GPU tier uploads them as they
+    /// are and lays them texel for texel on the device grid with
+    /// `s + d·(1 − a)`, which an 8-bit target rounds to exactly
+    /// `s + (d·(255 − a) + 127) / 255`; the raster lays them with the
+    /// same integers. Wherever a pipeline only speaks straight alpha (a
+    /// turned sprite, a veil, a mirror, a platform canvas) it reads them
+    /// unpremultiplied.
+    Premultiplied { key: u64, size: (u32, u32), rgba: FeedBytes },
     /// Immutable GPU frame. The platform imports its owned payload directly;
     /// CPU/headless renderers never download it implicitly. The producer must
     /// publish only completed frames and retain resources through this owner.
@@ -127,6 +136,7 @@ const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
 const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
 const MIRROR_TAG: u64 = 0x62_6e_79_5f_6d_69_72_72; // "bny_mirr"
 const RGBA_TAG: u64 = 0x62_6e_79_5f_72_67_62_61; // "bny_rgba"
+const PREMULTIPLIED_TAG: u64 = 0x62_6e_79_5f_70_72_65_6d; // "bny_prem"
 const FEED_TAG: u64 = 0x626e_795f_6665_6564; // "bny_feed"
 const WORLD_TAG: u64 = 0x626e_795f_776f_726c; // "bny_worl"
 
@@ -182,6 +192,41 @@ impl ImageSource {
             "an RGBA buffer is width × height × 4 bytes"
         );
         ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba: FeedBytes::Shared(rgba) }
+    }
+
+    /// Pixels the app filled ITSELF, premultiplied: `width × height × 4`,
+    /// row major, each colour already multiplied by its alpha (so no
+    /// channel is above it). See [`ImageSource::Premultiplied`]. The
+    /// identity is the app's, as for [`ImageSource::rgba`].
+    pub fn rgba_premultiplied(
+        key: u64,
+        size: (u32, u32),
+        rgba: impl Into<Rc<[u8]>>,
+    ) -> ImageSource {
+        let rgba = rgba.into();
+        debug_assert_eq!(
+            rgba.len(),
+            (size.0 as usize) * (size.1 as usize) * 4,
+            "an RGBA buffer is width × height × 4 bytes"
+        );
+        let key = key ^ PREMULTIPLIED_TAG;
+        ImageSource::Premultiplied { key, size, rgba: FeedBytes::Local(rgba) }
+    }
+
+    /// [`ImageSource::rgba_premultiplied`] with pixels another thread made
+    /// and keeps — a compositor's tile — shared instead of copied.
+    pub fn rgba_shared_premultiplied(
+        key: u64,
+        size: (u32, u32),
+        rgba: std::sync::Arc<[u8]>,
+    ) -> ImageSource {
+        debug_assert_eq!(
+            rgba.len(),
+            (size.0 as usize) * (size.1 as usize) * 4,
+            "an RGBA buffer is width × height × 4 bytes"
+        );
+        let key = key ^ PREMULTIPLIED_TAG;
+        ImageSource::Premultiplied { key, size, rgba: FeedBytes::Shared(rgba) }
     }
 
     /// One frame of a feed, for an app that keeps its own slots and
@@ -478,6 +523,7 @@ impl ImageSource {
             | ImageSource::Path { key, .. }
             | ImageSource::Native { key, .. }
             | ImageSource::Rgba { key, .. }
+            | ImageSource::Premultiplied { key, .. }
             | ImageSource::Feed { key, .. }
             | ImageSource::Faded { key, .. }
             | ImageSource::Mirrored { key, .. }
@@ -547,6 +593,10 @@ impl PartialEq for ImageSource {
                 ImageSource::Rgba { key: other_key, .. },
             )
             | (
+                ImageSource::Premultiplied { key, .. },
+                ImageSource::Premultiplied { key: other_key, .. },
+            )
+            | (
                 ImageSource::Faded { key, .. },
                 ImageSource::Faded { key: other_key, .. },
             )
@@ -597,6 +647,9 @@ impl fmt::Debug for ImageSource {
             ImageSource::Native { key, size, .. } => write!(f, "native(0x{key:016x}, {}×{})", size.0, size.1),
             ImageSource::Rgba { key, size, .. } => {
                 write!(f, "rgba(0x{key:016x}, {}×{})", size.0, size.1)
+            }
+            ImageSource::Premultiplied { key, size, .. } => {
+                write!(f, "premultiplied(0x{key:016x}, {}×{})", size.0, size.1)
             }
             ImageSource::Feed { key, generation, size, .. } => {
                 write!(f, "feed(0x{key:016x}, {}×{} #{generation})", size.0, size.1)
@@ -694,6 +747,42 @@ fn resample_rgba(source: &[u8], (src_w, src_h): (u32, u32), width: usize, height
     rgba
 }
 
+/// Straight-alpha RGBA from premultiplied bytes, each colour divided by
+/// its alpha and rounded. Wherever alpha is 255 or 0 the bytes stay.
+pub fn unpremultiplied(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for pixel in out.as_chunks_mut::<4>().0 {
+        let alpha = pixel[3] as u32;
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+    out
+}
+
+/// A [`ImageSource::Premultiplied`] picture's own bytes at `width`×`height`
+/// physical px, still premultiplied: nearest-neighbour, which keeps every
+/// texel a texel of the picture. `None` for any other source, and for
+/// nothing to paint.
+pub fn premultiplied_pixels(
+    source: &ImageSource,
+    width: usize,
+    height: usize,
+) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let ImageSource::Premultiplied { size, rgba, .. } = source else { return None };
+    if width == 0 || height == 0 || size.0 == 0 || size.1 == 0 {
+        return None;
+    }
+    // at its own size the picture is its own bytes, borrowed
+    if (size.0 as usize, size.1 as usize) == (width, height) && rgba.len() >= width * height * 4 {
+        return Some(std::borrow::Cow::Borrowed(&rgba[..width * height * 4]));
+    }
+    Some(std::borrow::Cow::Owned(resample_rgba(rgba, *size, width, height)))
+}
+
 pub fn raster_source(
     engine: &dyn ImageEngine,
     source: &ImageSource,
@@ -719,6 +808,11 @@ pub fn raster_source(
                 height,
                 rgba: resample_rgba(rgba, *size, width, height),
             }))
+        }
+        // a pipeline that blends straight reads them straight
+        ImageSource::Premultiplied { .. } => {
+            let rgba = premultiplied_pixels(source, width, height)?;
+            Some(Rc::new(ImageRaster { width, height, rgba: unpremultiplied(&rgba) }))
         }
         // a feed scales BILINEAR, like the sampler the GPU tiers read it
         // with, once per generation and size — the damage replay asks
@@ -761,6 +855,7 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         }
         // the app declared its own box when it handed the pixels over
         ImageSource::Rgba { size, .. }
+        | ImageSource::Premultiplied { size, .. }
         | ImageSource::Native { size, .. }
         | ImageSource::Feed { size, .. } => Some(*size),
         // a veil never changes a size, and neither does a mirror
@@ -1388,6 +1483,7 @@ impl ImageEngine for RawImages {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Premultiplied { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
             | ImageSource::Mirrored { .. }
@@ -1423,6 +1519,7 @@ impl ImageEngine for RawImages {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Premultiplied { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
             | ImageSource::Mirrored { .. }

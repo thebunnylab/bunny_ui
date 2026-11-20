@@ -512,8 +512,8 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
 use bunny_ui::gpu::shaders::PRELUDE_330 as SHADER_PRELUDE;
 use bunny_ui::gpu::shaders::{
     BLIT_FRAG, BLUR_FRAG, FULL_VERT, GLASS_FRAG_BODY, GLASS_VERT, LIVE_FRAG_BODY,
-    MASK_FRAG_BODY, MASK_VERT, RECT_FRAG_BODY, RECT_VERT, SHARED_FRAG, SPRITE_FRAG_BODY,
-    SPRITE_VERT, TURNED_FRAG_BODY, TURNED_VERT,
+    MASK_FRAG_BODY, MASK_VERT, PREMULTIPLIED_FRAG_BODY, RECT_FRAG_BODY, RECT_VERT, SHARED_FRAG,
+    SPRITE_FRAG_BODY, SPRITE_VERT, TURNED_FRAG_BODY, TURNED_VERT,
 };
 use bunny_ui::image_engine::PixelFormat;
 
@@ -577,6 +577,9 @@ struct GlStack {
     /// The feeds' program: the sprite vertex over a LINEAR sampler, so a
     /// picture of one size lands in a box of another.
     live_program: u32,
+    /// Premultiplied pictures, texel for texel — [`RunKind::Premultiplied`],
+    /// drawn under `ONE, ONE_MINUS_SRC_ALPHA`.
+    premultiplied_program: u32,
     /// Pictures under an affine map — [`RunKind::Turned`].
     turned_program: u32,
     mask_program: u32,
@@ -839,6 +842,7 @@ impl GlStack {
                 rect_program: 0,
                 sprite_program: 0,
                 live_program: 0,
+                premultiplied_program: 0,
                 turned_program: 0,
                 mask_program: 0,
                 mask_quad: -1,
@@ -899,6 +903,13 @@ impl GlStack {
                 &[c"a_dest", c"a_tex", c"a_clip"],
             )
             .map_err(|log| format!("live pipeline refused: {}", log.trim()))?;
+            self.premultiplied_program = build_program(
+                gl,
+                &[SHADER_PRELUDE, SPRITE_VERT],
+                &[SHADER_PRELUDE, SHARED_FRAG, PREMULTIPLIED_FRAG_BODY],
+                &[c"a_dest", c"a_tex", c"a_clip"],
+            )
+            .map_err(|log| format!("premultiplied pipeline refused: {}", log.trim()))?;
             self.turned_program = build_program(
                 gl,
                 &[SHADER_PRELUDE, TURNED_VERT],
@@ -1106,6 +1117,10 @@ impl GlStack {
                     | RunKind::Texture(_)) => false,
                     (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
                     (
+                        Some(RunKind::Premultiplied | RunKind::PremultipliedTexture(_)),
+                        RunKind::Premultiplied | RunKind::PremultipliedTexture(_),
+                    ) => false,
+                    (
                         Some(RunKind::Turned | RunKind::TurnedTexture(_)),
                         RunKind::Turned | RunKind::TurnedTexture(_),
                     ) => false,
@@ -1127,6 +1142,10 @@ impl GlStack {
                         // the feeds: the same sprites, through the sampler
                         RunKind::Live(_) => {
                             (gl.use_program)(self.live_program);
+                            (gl.bind_vertex_array)(self.vao_sprite);
+                        }
+                        RunKind::Premultiplied | RunKind::PremultipliedTexture(_) => {
+                            (gl.use_program)(self.premultiplied_program);
                             (gl.bind_vertex_array)(self.vao_sprite);
                         }
                         RunKind::Turned | RunKind::TurnedTexture(_) => {
@@ -1155,12 +1174,19 @@ impl GlStack {
                         let base = run.base as usize * std::mem::size_of::<RectInstance>();
                         rect_attribs(gl, base);
                     }
-                    RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => {
+                    RunKind::Sprites
+                    | RunKind::Texture(_)
+                    | RunKind::Live(_)
+                    | RunKind::World(_)
+                    | RunKind::Premultiplied
+                    | RunKind::PremultipliedTexture(_) => {
                         // the shared atlas, the run's own dedicated or
                         // live texture (the walk's handles ARE gl texture
                         // names on this tier), or a world's target
                         let texture = match run.kind {
-                            RunKind::Texture(index) | RunKind::Live(index) => {
+                            RunKind::Texture(index)
+                            | RunKind::Live(index)
+                            | RunKind::PremultipliedTexture(index) => {
                                 textures[index as usize] as u32
                             }
                             RunKind::World(index) => {
@@ -1204,6 +1230,27 @@ impl GlStack {
                         GL_ZERO,
                         GL_ONE_MINUS_SRC_ALPHA,
                         GL_ZERO,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);
+                    (gl.blend_func_separate)(
+                        GL_SRC_ALPHA,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                    );
+                    continue;
+                }
+                let premultiplied =
+                    matches!(run.kind, RunKind::Premultiplied | RunKind::PremultipliedTexture(_));
+                if premultiplied {
+                    // the colour already carries its alpha: source-over
+                    // adds it whole, and the house blend comes back for
+                    // the run that follows
+                    (gl.blend_func_separate)(
+                        GL_ONE,
+                        GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE,
                         GL_ONE_MINUS_SRC_ALPHA,
                     );
                     (gl.draw_arrays_instanced)(GL_TRIANGLES, 0, 6, run.count as i32);

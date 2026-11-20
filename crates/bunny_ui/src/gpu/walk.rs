@@ -13,8 +13,11 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
-use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
+use crate::image_engine::{
+    ImageEngine, ImageRaster, ImageSource, PixelFormat, premultiplied_pixels, raster_source,
+};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, ImagePlacement, Rect};
 use crate::angle::QuarterTurn;
 use crate::raster::{baseline_row, physical_extent, sprite_texels, turn_raster, turned_corner};
@@ -418,6 +421,9 @@ pub struct AtlasFull;
 /// What a moving big draw's live slot is hashed with, apart from every
 /// other slot's identity.
 const MOVING_SLOT_TAG: u64 = 0x626e_795f_6d6f_7665; // "bny_move"
+/// The straight twin of a premultiplied picture keeps a cache slot of its
+/// own: the same identity holds two readings of the bytes.
+const STRAIGHT_TAG: u64 = 0x626e_795f_7374_7261; // "bny_stra"
 
 /// One cached run: the engine's raster uploaded as chunk tiles. The
 /// color sits IN the key — the engine bakes it, which keeps emoji true
@@ -974,7 +980,25 @@ impl RunAtlas {
             };
             return Ok(self.resolve_live(ground, slot, frame, (width, height), PixelFormat::Rgba8, &raster.rgba));
         }
-        let cache_key = (source.key(), width, height);
+        // a picture read whole is read by a shader that blends straight
+        // (turned, or between pixels): a premultiplied one shows its
+        // straight twin there, and its own bytes everywhere else
+        let premultiplied = matches!(source, ImageSource::Premultiplied { .. });
+        let laid_premultiplied = premultiplied && !whole;
+        let identity =
+            if premultiplied && whole { source.key() ^ STRAIGHT_TAG } else { source.key() };
+        let pixels = |source: &ImageSource| -> Option<Rc<ImageRaster>> {
+            if laid_premultiplied {
+                let rgba = premultiplied_pixels(source, width as usize, height as usize)?;
+                return Some(Rc::new(ImageRaster {
+                    width: width as usize,
+                    height: height as usize,
+                    rgba: rgba.into_owned(),
+                }));
+            }
+            raster_source(engine, source, width as usize, height as usize)
+        };
+        let cache_key = (identity, width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {
             entry.walk = walk;
@@ -990,7 +1014,7 @@ impl RunAtlas {
             && !whole
             && let Some(slot) = self.moving_big(cache_key)
         {
-            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+            let Some(raster) = pixels(source) else {
                 return Ok(None);
             };
             let mut generation = motor::hash::FxHasher::default();
@@ -1001,7 +1025,7 @@ impl RunAtlas {
             entry.walk = walk;
             return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
         }
-        let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+        let Some(raster) = pixels(source) else {
             return Ok(None);
         };
         if shelf_size {
@@ -1178,6 +1202,16 @@ pub enum RunKind {
     /// scaled to the destination by the tier's linear sampler. The index
     /// points into the same texture list.
     Live(u16),
+    /// Premultiplied pictures ([`ImageSource::Premultiplied`]) read texel
+    /// for texel from the shared atlas and laid with `ONE,
+    /// ONE_MINUS_SRC_ALPHA`, alpha included: an 8-bit target rounds that
+    /// to `s + (d·(255 − a) + 127) / 255`, a compositor's own bytes. A
+    /// rounded clip's coverage scales all four channels.
+    Premultiplied,
+    /// The same from a dedicated or a live texture — the index points into
+    /// the frame's texture list. A live one is read texel for texel too,
+    /// never through its linear sampler.
+    PremultipliedTexture(u16),
     /// Turned pictures ([`TurnedInstance`]) read from the shared atlas.
     Turned,
     /// Turned pictures read from a dedicated or a live texture — the index
@@ -1223,7 +1257,12 @@ pub struct DrawRun {
 fn list_of(kind: RunKind) -> u8 {
     match kind {
         RunKind::Rects | RunKind::Knockout => 0,
-        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => 1,
+        RunKind::Sprites
+        | RunKind::Texture(_)
+        | RunKind::Live(_)
+        | RunKind::World(_)
+        | RunKind::Premultiplied
+        | RunKind::PremultipliedTexture(_) => 1,
         RunKind::Glass => 2,
         RunKind::Turned | RunKind::TurnedTexture(_) => 3,
     }
@@ -1782,7 +1821,10 @@ pub fn build_frame(
                 // origin keeps its fraction, and the picture covers the
                 // pixels its far edges spill into
                 let exact = (rect.origin.x * factor, rect.origin.y * factor);
+                // a premultiplied picture lands on the grid, as the raster lays it
+                let premultiplied = matches!(source, ImageSource::Premultiplied { .. });
                 let between = *placement == ImagePlacement::Subpixel
+                    && !premultiplied
                     && ground.subpixel()
                     && (exact.0 != exact.0.floor() || exact.1 != exact.1.floor());
                 let reach = if between {
@@ -1872,6 +1914,11 @@ pub fn build_frame(
                             if box_intersect(chunk, clip).is_none() {
                                 continue;
                             }
+                            let kind = if premultiplied {
+                                RunKind::Premultiplied
+                            } else {
+                                RunKind::Sprites
+                            };
                             batches.sprites.push(SpriteInstance {
                                 dest: [
                                     chunk.0 as f32,
@@ -1894,7 +1941,7 @@ pub fn build_frame(
                             });
                             note_run(
                                 &mut batches.runs,
-                                RunKind::Sprites,
+                                kind,
                                 round_of(&clips),
                                 batches.sprites.len() - 1,
                                 sprite_box(&batches.sprites[batches.sprites.len() - 1]),
@@ -1918,9 +1965,14 @@ pub fn build_frame(
                             tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
                             clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                         });
+                        let kind = if premultiplied {
+                            RunKind::PremultipliedTexture(index as u16)
+                        } else {
+                            RunKind::Texture(index as u16)
+                        };
                         note_run(
                             &mut batches.runs,
-                            RunKind::Texture(index as u16),
+                            kind,
                             round_of(&clips),
                             batches.sprites.len() - 1,
                             sprite_box(&batches.sprites[batches.sprites.len() - 1]),
@@ -1941,9 +1993,14 @@ pub fn build_frame(
                             tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
                             clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                         });
+                        let kind = if premultiplied {
+                            RunKind::PremultipliedTexture(index as u16)
+                        } else {
+                            RunKind::Live(index as u16)
+                        };
                         note_run(
                             &mut batches.runs,
-                            RunKind::Live(index as u16),
+                            kind,
                             round_of(&clips),
                             batches.sprites.len() - 1,
                             sprite_box(&batches.sprites[batches.sprites.len() - 1]),
@@ -2742,6 +2799,73 @@ mod tests {
         assert_eq!(sprites.len(), 1, "between pixels a seam would blend twice");
         assert_eq!(ground.dedicated.len(), 1, "so the picture takes a texture of its own");
         assert_eq!(sprites[0].dest[0], 0.5);
+    }
+
+    fn premultiplied(key: u64, size: (u32, u32)) -> ImageSource {
+        let texel = [40, 20, 10, 80];
+        ImageSource::rgba_premultiplied(key, size, texel.repeat((size.0 * size.1) as usize))
+    }
+
+    fn walked(commands: Vec<DrawCommand>) -> (FrameBatches, RecordingGround) {
+        let display = DisplayList::from(commands);
+        let mut ground = RecordingGround { subpixel: true, ..RecordingGround::default() };
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            1,
+            (2000, 2000),
+            &crate::text_engine::PixelFont,
+            &RawImages::default(),
+            &mut atlas,
+            &mut batches,
+            Some(crate::layout::Color::CANVAS),
+        )
+        .expect("the frame walks");
+        (batches, ground)
+    }
+
+    /// A premultiplied picture rides runs of its own, from the shelves or
+    /// from a texture of its own, and on the grid even where its tier
+    /// could place it between pixels.
+    #[test]
+    fn a_premultiplied_picture_rides_runs_of_its_own_on_the_grid() {
+        let (batches, ground) = walked(vec![
+            DrawCommand::Image {
+                rect: at(10.25, 3.5, 16.0, 16.0),
+                source: premultiplied(1, (16, 16)),
+                placement: ImagePlacement::Subpixel,
+            },
+            DrawCommand::Image {
+                rect: at(0.0, 40.0, 600.0, 512.0),
+                source: premultiplied(2, (600, 512)),
+                placement: ImagePlacement::Pixel,
+            },
+        ]);
+        let kinds: Vec<RunKind> = batches.runs.iter().map(|run| run.kind).collect();
+        assert_eq!(kinds, [RunKind::Premultiplied, RunKind::PremultipliedTexture(0)]);
+        assert_eq!(batches.sprites[0].dest, [10.0, 4.0, 26.0, 20.0], "snapped, as the raster lays it");
+        assert_eq!(ground.dedicated.len(), 1);
+    }
+
+    /// Turned, the same picture is read by a shader that blends straight:
+    /// it shows its straight twin there, kept in a slot of its own.
+    #[test]
+    fn a_turned_premultiplied_picture_reads_its_straight_twin() {
+        let source = premultiplied(3, (16, 16));
+        let (batches, ground) = walked(vec![
+            DrawCommand::Image { rect: at(0.0, 0.0, 16.0, 16.0), source: source.clone(), placement: ImagePlacement::Pixel },
+            DrawCommand::Sprite {
+                rect: at(40.0, 0.0, 16.0, 16.0),
+                source,
+                transform: crate::layout::Affine::translation(3.0, 2.0),
+                opacity: 1.0,
+            },
+        ]);
+        let kinds: Vec<RunKind> = batches.runs.iter().map(|run| run.kind).collect();
+        assert_eq!(kinds, [RunKind::Premultiplied, RunKind::Turned]);
+        assert_eq!(ground.uploads.len(), 2, "two readings of one picture, two tiles");
     }
 
     /// One feed over `rect`, as a frame to walk.

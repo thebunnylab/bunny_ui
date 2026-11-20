@@ -247,6 +247,26 @@ void main() {
 }
 "#;
 
+/// A premultiplied picture (`RunKind::Premultiplied`): the pixel's centre
+/// mapped onto its texels, whatever the two sizes, and read as it is.
+/// Every channel already carries its alpha, so the clip's coverage scales
+/// all four, and the tier lays it `ONE, ONE_MINUS_SRC_ALPHA`: an 8-bit
+/// target rounds that to the compositor's own bytes. A live texture is
+/// read this way too, never through its sampler.
+pub const PREMULTIPLIED_FRAG_BODY: &str = r#"
+flat in vec4 v_dest;
+flat in vec4 v_tex;
+out vec4 out_color;
+uniform sampler2D atlas;
+
+void main() {
+    vec2 p = raster_p();
+    vec2 ratio = (v_tex.zw - v_tex.xy) / (v_dest.zw - v_dest.xy);
+    vec4 ink = texelFetch(atlas, ivec2(v_tex.xy + (p - v_dest.xy) * ratio), 0);
+    out_color = ink * clip_cov(p);
+}
+"#;
+
 /// A feed's sprite: the picture is its own size and the box is another,
 /// so the sampler scales — linear — from the pixel's centre in the box
 /// to its place in the picture. `v_tex` is the picture's extent, `v_dest`
@@ -650,13 +670,14 @@ mod tests {
 
     /// Every source a tier concatenates, by name, so a new one cannot
     /// join the set without joining the guards below.
-    const BODIES: [(&str, &str); 15] = [
+    const BODIES: [(&str, &str); 16] = [
         ("SHARED_FRAG", SHARED_FRAG),
         ("RECT_VERT", RECT_VERT),
         ("RECT_FRAG_BODY", RECT_FRAG_BODY),
         ("SPRITE_VERT", SPRITE_VERT),
         ("SPRITE_FRAG_BODY", SPRITE_FRAG_BODY),
         ("LIVE_FRAG_BODY", LIVE_FRAG_BODY),
+        ("PREMULTIPLIED_FRAG_BODY", PREMULTIPLIED_FRAG_BODY),
         ("TURNED_VERT", TURNED_VERT),
         ("TURNED_FRAG_BODY", TURNED_FRAG_BODY),
         ("MASK_VERT", MASK_VERT),

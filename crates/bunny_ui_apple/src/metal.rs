@@ -62,6 +62,8 @@ mod scroll_bands;
 #[cfg(target_os = "macos")]
 mod window;
 #[cfg(test)]
+mod premultiplied_tests;
+#[cfg(test)]
 mod upload_tests;
 mod uploads;
 use uploads::{LiveUpload, poll_uploads};
@@ -652,6 +654,22 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
     return float4(ink.rgb, ink.a * clip_cov(p, round));
 }
 
+// a premultiplied picture (`RunKind::Premultiplied`): texel for texel,
+// every channel already carrying its alpha, so the clip's coverage scales
+// all four and the pipeline lays it ONE over ONE_MINUS_SOURCE_ALPHA. A
+// live texture is read the same way, never through its sampler.
+fragment float4 premultiplied_fragment(SpriteVary in [[stage_in]],
+                                       device const SpriteInstance* sprites [[buffer(0)]],
+                                       constant ClipRound& round [[buffer(1)]],
+                                       constant Uniforms& uniforms [[buffer(2)]],
+                                       texture2d<float, access::read> picture [[texture(0)]]) {
+    SpriteInstance sprite = sprites[in.id];
+    float2 p = in.position.xy + uniforms.origin;
+    float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
+    float2 texel = sprite.tex.xy + (p - sprite.dest.xy) * ratio;
+    return picture.read(uint2(texel)) * clip_cov(p, round);
+}
+
 // a feed's sprite: the picture is its own size and the box is another,
 // so the sampler scales — linear — from the pixel's centre in the box
 // to its place in the picture.
@@ -1112,6 +1130,9 @@ struct MetalStack {
     /// The feeds' pipeline: the sprite vertex over a LINEAR sampler, so
     /// a picture of one size lands in a box of another.
     live_pipeline: Id,
+    /// Premultiplied pictures — [`RunKind::Premultiplied`]: texel for
+    /// texel under [`PassBlend::Premultiplied`].
+    premultiplied_pipeline: Id,
     /// Pictures under an affine map — [`RunKind::Turned`].
     turned_pipeline: Id,
     /// The three pipelines liquid glass adds: the pane itself, one
@@ -1218,6 +1239,14 @@ impl MetalStack {
             let live_pipeline = build_pipeline(
                 device, library, "sprite_vertex", "live_fragment", format, PassBlend::Over,
             )?;
+            let premultiplied_pipeline = build_pipeline(
+                device,
+                library,
+                "sprite_vertex",
+                "premultiplied_fragment",
+                format,
+                PassBlend::Premultiplied,
+            )?;
             let turned_pipeline = build_pipeline(
                 device,
                 library,
@@ -1251,6 +1280,7 @@ impl MetalStack {
                 knockout_pipeline,
                 sprite_pipeline,
                 live_pipeline,
+                premultiplied_pipeline,
                 turned_pipeline,
                 glass_pipeline,
                 blur_pipeline,
@@ -1523,9 +1553,16 @@ impl MetalStack {
                                     0,
                                 );
                             }
-                            RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                            RunKind::Sprites
+                            | RunKind::Texture(_)
+                            | RunKind::Live(_)
+                            | RunKind::Premultiplied
+                            | RunKind::PremultipliedTexture(_) => {
                                 let pipeline = match run.kind {
                                     RunKind::Live(_) => self.live_pipeline,
+                                    RunKind::Premultiplied | RunKind::PremultipliedTexture(_) => {
+                                        self.premultiplied_pipeline
+                                    }
                                     _ => self.sprite_pipeline,
                                 };
                                 msg_void_id(encoder, self.sels.set_pipeline, pipeline);
@@ -1546,7 +1583,9 @@ impl MetalStack {
                                 // the shared atlas, or the run's own
                                 // dedicated or live texture
                                 let texture = match run.kind {
-                                    RunKind::Texture(index) | RunKind::Live(index) => {
+                                    RunKind::Texture(index)
+                                    | RunKind::Live(index)
+                                    | RunKind::PremultipliedTexture(index) => {
                                         frame.textures[index as usize]
                                     }
                                     _ => frame.atlas_texture,
@@ -1934,6 +1973,10 @@ enum PassBlend {
     /// that alpha is 1, every scene an opaque window paints, this is
     /// [`PassBlend::Over`].
     Pane,
+    /// Source-over of a premultiplied output: `s + d·(1 − sa)` for colour
+    /// and alpha alike — `ONE, ONE_MINUS_SOURCE_ALPHA`, which an 8-bit
+    /// target rounds to the raster's `blend_premultiplied_px`.
+    Premultiplied,
 }
 
 unsafe fn build_pipeline(
@@ -1973,6 +2016,7 @@ unsafe fn build_pipeline(
             PassBlend::Erase => (BLEND_ZERO, BLEND_ZERO),
             PassBlend::Pane => (BLEND_SOURCE_ALPHA, BLEND_SOURCE1_ALPHA),
             PassBlend::Off | PassBlend::Over => (BLEND_SOURCE_ALPHA, BLEND_ONE),
+            PassBlend::Premultiplied => (BLEND_ONE, BLEND_ONE),
         };
         msg_void_bool(attachment, sel("setBlendingEnabled:"), i8::from(blend != PassBlend::Off));
         msg_void_u64(attachment, sel("setSourceRGBBlendFactor:"), source_rgb);

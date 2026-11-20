@@ -276,6 +276,7 @@ impl CoreGraphicsImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Premultiplied { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
             | ImageSource::Mirrored { .. }
@@ -338,6 +339,7 @@ impl ImageEngine for CoreGraphicsImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Premultiplied { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
             | ImageSource::Mirrored { .. }

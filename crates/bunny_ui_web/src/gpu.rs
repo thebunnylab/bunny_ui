@@ -252,6 +252,9 @@ struct Pipelines {
     sprite: u32,
     /// The feeds' program: the sprite vertex over a LINEAR sampler.
     live: u32,
+    /// Premultiplied pictures, texel for texel — [`RunKind::Premultiplied`],
+    /// drawn under `ONE, ONE_MINUS_SRC_ALPHA`.
+    premultiplied: u32,
     /// Pictures under an affine map — [`RunKind::Turned`].
     turned: u32,
     glass: u32,
@@ -467,6 +470,11 @@ impl Pipelines {
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::LIVE_FRAG_BODY),
             &["a_dest", "a_tex", "a_clip"],
         )?;
+        let premultiplied = program(
+            &format!("{}{}", PRELUDE_300ES, src::SPRITE_VERT),
+            &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::PREMULTIPLIED_FRAG_BODY),
+            &["a_dest", "a_tex", "a_clip"],
+        )?;
         let turned = program(
             &format!("{}{}", PRELUDE_300ES, src::TURNED_VERT),
             &format!(
@@ -504,6 +512,7 @@ impl Pipelines {
         };
         sampler(sprite, "atlas");
         sampler(live, "atlas");
+        sampler(premultiplied, "atlas");
         sampler(glass, "pyramid");
         sampler(blur, "source");
         sampler(blit, "source");
@@ -521,6 +530,7 @@ impl Pipelines {
                 rect,
                 sprite,
                 live,
+                premultiplied,
                 turned,
                 glass,
                 blur,
@@ -1262,9 +1272,16 @@ pub(crate) fn present_window(
                     }
                     rect_attribs(run.base as usize * std::mem::size_of::<RectInstance>());
                 }
-                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                RunKind::Sprites
+                | RunKind::Texture(_)
+                | RunKind::Live(_)
+                | RunKind::Premultiplied
+                | RunKind::PremultipliedTexture(_) => {
                     let wanted = match run.kind {
                         RunKind::Live(_) => tier.pipelines.live,
+                        RunKind::Premultiplied | RunKind::PremultipliedTexture(_) => {
+                            tier.pipelines.premultiplied
+                        }
                         _ => tier.pipelines.sprite,
                     };
                     if program != wanted {
@@ -1287,6 +1304,19 @@ pub(crate) fn present_window(
                             .textures
                             .get(index as usize)
                             .and_then(|handle| tier.ground.live.get(handle).copied())
+                            .unwrap_or(0),
+                        // a texture of its own, or a live one: the handle says which
+                        RunKind::PremultipliedTexture(index) => tier
+                            .batches
+                            .textures
+                            .get(index as usize)
+                            .and_then(|handle| {
+                                tier.ground
+                                    .dedicated
+                                    .get(handle)
+                                    .or_else(|| tier.ground.live.get(handle))
+                                    .copied()
+                            })
                             .unwrap_or(0),
                         _ => tier.ground.shared.unwrap_or(0),
                     };
@@ -1383,6 +1413,8 @@ pub(crate) fn present_window(
                 }
             }
             let erase = run.kind == RunKind::Knockout;
+            let premultiplied =
+                matches!(run.kind, RunKind::Premultiplied | RunKind::PremultipliedTexture(_));
             if erase {
                 // the target keeps `1 - alpha` of itself, colour and alpha
                 // alike, and nothing is painted
@@ -1390,8 +1422,14 @@ pub(crate) fn present_window(
                     gl_blend_func_separate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
                 }
             }
+            if premultiplied {
+                // the colour already carries its alpha: it adds whole
+                unsafe {
+                    gl_blend_func_separate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                }
+            }
             unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
-            if erase {
+            if erase || premultiplied {
                 // the house blend, for every run after it
                 unsafe {
                     gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);

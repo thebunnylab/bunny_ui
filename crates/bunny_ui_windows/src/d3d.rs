@@ -1249,6 +1249,19 @@ float4 sprite_fragment(SpriteVary vary) : SV_Target {
     return float4(ink.rgb, ink.a * clip_cov(vary.position.xy));
 }
 
+// a premultiplied picture (`RunKind::Premultiplied`): the pixel's centre
+// mapped onto its texels, whatever the two sizes, read as it is. Every
+// channel already carries its alpha, so the clip scales all four, and the
+// premultiplied blend lays it ONE over INV_SRC_ALPHA. A live texture is
+// read this way too, never through the sampler.
+float4 premultiplied_fragment(SpriteVary vary) : SV_Target {
+    SpriteInstance sprite = sprites[vary.id];
+    float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
+    float2 texel = sprite.tex.xy + (vary.position.xy - sprite.dest.xy) * ratio;
+    float4 ink = atlas.Load(int3(int2(texel), 0));
+    return ink * clip_cov(vary.position.xy);
+}
+
 // a feed's sprite: the picture is its own size and the box is another,
 // so the sampler scales — linear, the one sampler this stack binds —
 // from the pixel's centre in the box to its place in the picture
@@ -1585,6 +1598,9 @@ struct D3dStack {
     sprite_ps: Com<PixelShader>,
     /// The feeds' pixel shader, over the sprite vertex shader.
     live_ps: Com<PixelShader>,
+    /// Premultiplied pictures, texel for texel, over the sprite vertex
+    /// shader and under [`D3dStack::premultiplied`].
+    premultiplied_ps: Com<PixelShader>,
     /// Pictures under an affine map — [`RunKind::Turned`].
     turned_vs: Com<VertexShader>,
     turned_ps: Com<PixelShader>,
@@ -1605,6 +1621,10 @@ struct D3dStack {
     /// raster's `Bitmap::set_replaced`. Where that alpha is 1, every
     /// scene an opaque window paints, this is the house blend.
     pane: Com<BlendState>,
+    /// The blend a [`RunKind::Premultiplied`] run is drawn with: the
+    /// colour already carries its alpha, so it adds whole — `ONE,
+    /// INV_SRC_ALPHA` for colour and alpha alike.
+    premultiplied: Com<BlendState>,
     rasterizer: Com<RasterizerState>,
     sampler: Com<SamplerState>,
     /// 16 bytes per draw: the viewport and the run's base index.
@@ -1814,6 +1834,8 @@ impl D3dStack {
             let sprite_vs = make_vs(&shader("sprite_vertex", "vs_5_0")?, "sprite_vertex")?;
             let sprite_ps = make_ps(&shader("sprite_fragment", "ps_5_0")?, "sprite_fragment")?;
             let live_ps = make_ps(&shader("live_fragment", "ps_5_0")?, "live_fragment")?;
+            let premultiplied_ps =
+                make_ps(&shader("premultiplied_fragment", "ps_5_0")?, "premultiplied_fragment")?;
             let turned_vs = make_vs(&shader("turned_vertex", "vs_5_0")?, "turned_vertex")?;
             let turned_ps = make_ps(&shader("turned_fragment", "ps_5_0")?, "turned_fragment")?;
             let blit_vs = make_vs(&shader("blit_vertex", "vs_5_0")?, "blit_vertex")?;
@@ -1884,6 +1906,23 @@ impl D3dStack {
             }
             let pane = Com::from_raw(pane).ok_or("null pane blend state")?;
 
+            // Source-over of a premultiplied colour: rgb = s + d·(1−sa);
+            // a = sa + da·(1−sa). An 8-bit target rounds it to the
+            // compositor's own bytes.
+            let premultiplied_target = RenderTargetBlendDesc { src_blend: BLEND_ONE, ..target };
+            let premultiplied_desc = BlendDesc {
+                alpha_to_coverage: 0,
+                independent_blend: 0,
+                render_target: [premultiplied_target; 8],
+            };
+            let mut premultiplied: *mut BlendState = null_mut();
+            let made = ((*(*d).vtbl).create_blend_state)(d, &premultiplied_desc, &mut premultiplied);
+            if !com_ok(made) {
+                return Err("premultiplied blend state refused".to_string());
+            }
+            let premultiplied =
+                Com::from_raw(premultiplied).ok_or("null premultiplied blend state")?;
+
             let rasterizer_desc = RasterizerDesc {
                 fill_mode: FILL_SOLID,
                 cull_mode: CULL_NONE,
@@ -1932,6 +1971,7 @@ impl D3dStack {
                 sprite_vs,
                 sprite_ps,
                 live_ps,
+                premultiplied_ps,
                 turned_vs,
                 turned_ps,
                 blit_vs,
@@ -1942,6 +1982,7 @@ impl D3dStack {
                 blend,
                 erase,
                 pane,
+                premultiplied,
                 rasterizer,
                 sampler,
                 frame_cb,
@@ -2043,10 +2084,18 @@ impl D3dStack {
             // the erase blend is bound: the next run of another kind
             // puts the house blend back before it draws
             let mut erasing = false;
+            // the same for the premultiplied blend
+            let mut premultiplying = false;
             for run in runs {
                 if erasing && run.kind != RunKind::Knockout {
                     (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
                     erasing = false;
+                }
+                let premultiplied =
+                    matches!(run.kind, RunKind::Premultiplied | RunKind::PremultipliedTexture(_));
+                if premultiplying && !premultiplied {
+                    (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
+                    premultiplying = false;
                 }
                 if run.kind == RunKind::Glass {
                     // the pyramid, from the scene as it stands, and then
@@ -2097,11 +2146,27 @@ impl D3dStack {
                                 erasing = true;
                             }
                         }
-                        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                        RunKind::Sprites
+                        | RunKind::Texture(_)
+                        | RunKind::Live(_)
+                        | RunKind::Premultiplied
+                        | RunKind::PremultipliedTexture(_) => {
                             let pixel = match run.kind {
                                 RunKind::Live(_) => self.live_ps.as_ptr(),
+                                RunKind::Premultiplied | RunKind::PremultipliedTexture(_) => {
+                                    self.premultiplied_ps.as_ptr()
+                                }
                                 _ => self.sprite_ps.as_ptr(),
                             };
+                            if premultiplied {
+                                (vtbl.om_set_blend_state)(
+                                    context,
+                                    self.premultiplied.as_ptr(),
+                                    null(),
+                                    0xFFFF_FFFF,
+                                );
+                                premultiplying = true;
+                            }
                             (vtbl.vs_set_shader)(context, self.sprite_vs.as_ptr(), null(), 0);
                             (vtbl.ps_set_shader)(context, pixel, null(), 0);
                             (vtbl.vs_set_shader_resources)(context, 0, 1, &sprite_srv);
@@ -2109,9 +2174,9 @@ impl D3dStack {
                             // the shared atlas, or the run's own
                             // dedicated or live texture
                             let texture = match run.kind {
-                                RunKind::Texture(index) | RunKind::Live(index) => {
-                                    textures[index as usize]
-                                }
+                                RunKind::Texture(index)
+                                | RunKind::Live(index)
+                                | RunKind::PremultipliedTexture(index) => textures[index as usize],
                                 _ => atlas_srv,
                             };
                             (vtbl.ps_set_shader_resources)(context, 1, 1, &texture);
@@ -2157,9 +2222,10 @@ impl D3dStack {
                 self.write_constants(frame_cb, &frame);
                 (vtbl.draw_instanced)(context, 6, run.count, 0, 0);
             }
-            if erasing {
+            if erasing || premultiplying {
                 // a frame that ends on a knockout does not leave the erase
-                // bound for whatever draws next
+                // bound for whatever draws next, nor one that ends on a
+                // premultiplied picture its blend
                 (vtbl.om_set_blend_state)(context, self.blend.as_ptr(), null(), 0xFFFF_FFFF);
             }
             // the scene, onto the target the caller actually presents

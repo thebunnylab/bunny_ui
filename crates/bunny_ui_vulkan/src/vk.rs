@@ -78,6 +78,8 @@ const SPRITE_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite.frag.spv");
 // a feed's sprite: the picture's own size, scaled into the box by the
 // linear sampler
 const LIVE_FRAG_SPV: &[u8] = include_bytes!("shaders/live.frag.spv");
+// the sprite source again, under `-DPREMULTIPLIED` (`RunKind::Premultiplied`)
+const SPRITE_PREMULTIPLIED_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite_premultiplied.frag.spv");
 const TURNED_VERT_SPV: &[u8] = include_bytes!("shaders/turned.vert.spv");
 const TURNED_FRAG_SPV: &[u8] = include_bytes!("shaders/turned.frag.spv");
 const MASK_VERT_SPV: &[u8] = include_bytes!("shaders/mask.vert.spv");
@@ -1583,6 +1585,9 @@ struct VkStack {
     sprite_pipeline: Pipeline,
     /// The feeds' pipeline: the sprite vertex over the LINEAR sampler.
     live_pipeline: Pipeline,
+    /// Premultiplied pictures, texel for texel, laid `ONE,
+    /// ONE_MINUS_SRC_ALPHA` — [`RunKind::Premultiplied`].
+    premultiplied_pipeline: Pipeline,
     /// Pictures under an affine map — [`RunKind::Turned`].
     turned_pipeline: Pipeline,
     mask_pipeline: Pipeline,
@@ -2091,6 +2096,7 @@ impl VkStack {
                 rect_pipeline: 0,
                 sprite_pipeline: 0,
                 live_pipeline: 0,
+                premultiplied_pipeline: 0,
                 turned_pipeline: 0,
                 mask_pipeline: 0,
                 erase_pipeline: 0,
@@ -2318,11 +2324,15 @@ impl VkStack {
             alpha_op: BLEND_OP_ADD,
             write_mask: 0xF,
         };
+        // source-over of a premultiplied output, colour and alpha alike:
+        // an 8-bit target rounds it to the compositor's own bytes
+        let premultiplied_over = ColorBlendAttachment { src_color: BLEND_FACTOR_ONE, ..source_over };
         let rect_vert = self.shader(RECT_VERT_SPV)?;
         let rect_frag = self.shader(RECT_FRAG_SPV)?;
         let sprite_vert = self.shader(SPRITE_VERT_SPV)?;
         let sprite_frag = self.shader(SPRITE_FRAG_SPV)?;
         let live_frag = self.shader(LIVE_FRAG_SPV)?;
+        let premultiplied_frag = self.shader(SPRITE_PREMULTIPLIED_FRAG_SPV)?;
         let turned_vert = self.shader(TURNED_VERT_SPV)?;
         let turned_frag = self.shader(TURNED_FRAG_SPV)?;
         let mask_vert = self.shader(MASK_VERT_SPV)?;
@@ -2356,6 +2366,7 @@ impl VkStack {
         ];
         // the feeds ride the sprite's lattice, through another fragment
         let live_binding = VertexInputBinding { ..sprite_binding };
+        let premultiplied_binding = VertexInputBinding { ..sprite_binding };
         // a turned picture: four vec4, the 64-byte lattice every tier shares
         let turned_binding = VertexInputBinding {
             binding: 0,
@@ -2440,6 +2451,14 @@ impl VkStack {
             &[live_binding],
             &sprite_attributes,
             source_over,
+            self.render_pass,
+        )?;
+        self.premultiplied_pipeline = self.pipeline(
+            sprite_vert,
+            premultiplied_frag,
+            &[premultiplied_binding],
+            &sprite_attributes,
+            premultiplied_over,
             self.render_pass,
         )?;
         self.turned_pipeline = self.pipeline(
@@ -2688,6 +2707,7 @@ impl Drop for VkStack {
                 self.rect_pipeline,
                 self.sprite_pipeline,
                 self.live_pipeline,
+                self.premultiplied_pipeline,
                 self.turned_pipeline,
                 self.mask_pipeline,
                 // 0 where it was never built, which the destroy ignores
@@ -3461,6 +3481,10 @@ fn draw_runs(
                 | RunKind::Texture(_)) => false,
                 (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
                 (
+                    Some(RunKind::Premultiplied | RunKind::PremultipliedTexture(_)),
+                    RunKind::Premultiplied | RunKind::PremultipliedTexture(_),
+                ) => false,
+                (
                     Some(RunKind::Turned | RunKind::TurnedTexture(_)),
                     RunKind::Turned | RunKind::TurnedTexture(_),
                 ) => false,
@@ -3472,6 +3496,9 @@ fn draw_runs(
                     // the rects again, taken away instead of painted
                     RunKind::Knockout => stack.erase_pipeline,
                     RunKind::Live(_) => stack.live_pipeline,
+                    RunKind::Premultiplied | RunKind::PremultipliedTexture(_) => {
+                        stack.premultiplied_pipeline
+                    }
                     RunKind::Turned | RunKind::TurnedTexture(_) => stack.turned_pipeline,
                     // the sprite's road, through the composite's fragment
                     RunKind::World(_) => worlds.0,
@@ -3493,6 +3520,8 @@ fn draw_runs(
                 | RunKind::Texture(_)
                 | RunKind::Live(_)
                 | RunKind::World(_)
+                | RunKind::Premultiplied
+                | RunKind::PremultipliedTexture(_)
                 | RunKind::Turned
                 | RunKind::TurnedTexture(_) => {
                     let turned = matches!(run.kind, RunKind::Turned | RunKind::TurnedTexture(_));
@@ -3506,6 +3535,7 @@ fn draw_runs(
                     let set = match run.kind {
                         RunKind::Texture(index)
                         | RunKind::Live(index)
+                        | RunKind::PremultipliedTexture(index)
                         | RunKind::TurnedTexture(index) => batches
                             .textures
                             .get(index as usize)
@@ -6103,6 +6133,7 @@ mod tests {
         }
         // the pane's fragment is the glass source again, under its define
         bake("glass.frag", Some("PANE"), "glass_pane.frag.spv");
+        bake("sprite.frag", Some("PREMULTIPLIED"), "sprite_premultiplied.frag.spv");
     }
 
     /// The pane's module is not the other glass fragment under a second

@@ -45,7 +45,17 @@ float clip_cov(vec2 p) {
 
 void main() {
     vec2 p = gl_FragCoord.xy;
+#ifdef PREMULTIPLIED
+    // a premultiplied picture, baked with `-DPREMULTIPLIED`: the pixel's
+    // centre mapped onto its texels, whatever the two sizes, and every
+    // channel already carrying its alpha, so the clip scales all four
+    // and the pipeline lays it ONE over ONE_MINUS_SRC_ALPHA
+    vec2 ratio = (v_tex.zw - v_tex.xy) / (v_dest.zw - v_dest.xy);
+    vec4 ink = texelFetch(atlas, ivec2(v_tex.xy + (p - v_dest.xy) * ratio), 0);
+    out_color = ink * clip_cov(p);
+#else
     vec2 texel = v_tex.xy + (floor(p) - floor(v_dest.xy));
     vec4 ink = texelFetch(atlas, ivec2(texel), 0);
     out_color = vec4(ink.rgb, ink.a * clip_cov(p));
+#endif
 }
