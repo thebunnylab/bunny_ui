@@ -32,6 +32,7 @@ pub mod template;
 pub mod templates;
 pub mod term;
 pub mod toolchains;
+pub mod updater;
 pub mod wasm;
 
 pub use cli::main;

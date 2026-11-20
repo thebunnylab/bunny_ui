@@ -93,6 +93,10 @@ pub(crate) fn install() {
         bunny_ui_apple::notifications::install_delegate(delegate);
     }
     bunny_ui::app::install_notifier(bunny_ui_apple::notifications::notify);
+    // the saved-password sheet hangs from the window the person is in
+    bunny_ui::autofill::install_requester(|answer| unsafe {
+        bunny_ui_apple::autofill::request_saved_password(crate::ffi::sheet_window(), answer);
+    });
 }
 
 /// `applicationShouldHandleReopen:hasVisibleWindows:` — the Dock icon,

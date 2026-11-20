@@ -52,6 +52,22 @@ pub const COMMANDS: &[Command] = &[
         run: commands::build::run,
     },
     Command {
+        name: "signer",
+        summary: commands::signer::SUMMARY,
+        usage: commands::signer::USAGE,
+        about: commands::signer::ABOUT,
+        options: commands::signer::OPTIONS,
+        run: commands::signer::run,
+    },
+    Command {
+        name: "updater",
+        summary: commands::updater::SUMMARY,
+        usage: commands::updater::USAGE,
+        about: commands::updater::ABOUT,
+        options: commands::updater::OPTIONS,
+        run: commands::updater::run,
+    },
+    Command {
         name: "upgrade",
         summary: commands::upgrade::SUMMARY,
         usage: commands::upgrade::USAGE,

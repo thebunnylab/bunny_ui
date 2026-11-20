@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::formats::{deflate, inflate, zip};
+use crate::formats::inflate::adler32;
 
 /// The eight bytes every PNG starts with.
 pub const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
@@ -136,20 +137,6 @@ fn paeth(left: u8, up: u8, up_left: u8) -> u8 {
     }
 }
 
-/// Adler-32 (RFC 1950), what a zlib stream ends with.
-pub(crate) fn adler32(bytes: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    // 5552 bytes fit before the sums can overflow a u32
-    for run in bytes.chunks(5552) {
-        for &byte in run {
-            a += u32::from(byte);
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    (b << 16) | a
-}
 
 #[cfg(test)]
 mod tests {

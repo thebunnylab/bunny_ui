@@ -692,7 +692,7 @@ fn resample_rgba(source: &[u8], (src_w, src_h): (u32, u32), width: usize, height
             continue;
         }
         let line = &source[sy * src_w * 4..];
-        for (pixel, &from) in out.chunks_exact_mut(4).zip(&columns) {
+        for (pixel, &from) in out.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
             pixel.copy_from_slice(&line[from..from + 4]);
         }
         above = Some(sy);

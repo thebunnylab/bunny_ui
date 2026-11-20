@@ -32,6 +32,7 @@
 pub use crate::line_chart::{
     ChartDomain, ChartError, LineChart, LineSample, LineSeries, line_chart,
 };
+pub use crate::progress::{ProgressView, progress_view};
 #[cfg(feature = "canvas")]
 pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
 #[cfg(feature = "canvas")]
@@ -46,7 +47,7 @@ use motor::state::{Binding, Context};
 use motor::view::RenderNode;
 
 use crate::layout::{
-    Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
+    Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit,
     VisualProps,
 };
 use crate::reconciler::LastRun;
@@ -798,7 +799,9 @@ impl TextField {
     /// The element lowering writes it as the input's `autocomplete`
     /// attribute; a field that says nothing leaves the choice with the
     /// browser, and [`Autocomplete::Off`] asks for no suggestion at all.
-    /// The pixel shells own no native field to fill, and ignore it.
+    /// The macOS and iOS shells hand it to their input system with the
+    /// focus, so Passwords fills the box in place; the other pixel shells
+    /// have no input system that asks, and ignore it.
     ///
     /// A sign-in form says both halves, and names each box for a reader
     /// that cannot see the words beside it:
@@ -1357,25 +1360,6 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         summon: None,
         autocomplete: None,
     }
-}
-
-/// `ProgressView()`
-#[derive(Clone, Copy, Default)]
-pub struct ProgressView;
-
-impl View for ProgressView {
-    type Arity = Single;
-
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(crate::view::print_label("ProgressView")));
-        out.push_layout(LayoutNode::Leaf {
-            size: LayoutSize { width: 20.0, height: 20.0 },
-        });
-    }
-}
-
-pub fn progress_view() -> ProgressView {
-    ProgressView
 }
 
 /// `Spacer()`

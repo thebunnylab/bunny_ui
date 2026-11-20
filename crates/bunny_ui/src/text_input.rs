@@ -83,6 +83,15 @@ pub enum EditCommand {
     },
     /// Ends the composition, committing the marked text as it stands.
     Unmark,
+    /// The input system placed the selection: `utf16` = (location,
+    /// length) over the WHOLE text, in UTF-16 — the platform's
+    /// vocabulary (UIKit's `setSelectedTextRange:`, the range a keyboard
+    /// is about to replace). The anchor lands at the start and the caret
+    /// at the end; a zero length is a caret alone. Like any move, it
+    /// commits a live composition as it stands.
+    SetSelection {
+        utf16: (usize, usize),
+    },
 }
 
 /// The previous char boundary (or 0).
@@ -393,6 +402,15 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             state.anchor = Some(0);
             state.caret = text.len();
         }
+        EditCommand::SetSelection { utf16: (location, length) } => {
+            // an offset past the end, or one inside a surrogate pair,
+            // lands on the boundary the conversion finds — never outside
+            // the text, never inside a character
+            let start = utf16_to_byte(text, location);
+            let end = utf16_to_byte(text, location.saturating_add(length)).max(start);
+            state.anchor = (end > start).then_some(start);
+            state.caret = end;
+        }
         // the runtime answered these before the command got here: they
         // need the wrap, and the wrap is not in this file
         EditCommand::Newline | EditCommand::Up(_) | EditCommand::Down(_) => {}
@@ -571,8 +589,12 @@ pub enum KeyboardType {
 /// a new one. Nothing here changes what the field shows or how it edits.
 ///
 /// The element lowering says it as the input's `autocomplete` attribute,
-/// in the HTML standard's own tokens ([`Autocomplete::token`]). The pixel
-/// shells own no native field for an autofill to fill, and say nothing.
+/// in the HTML standard's own tokens ([`Autocomplete::token`]). The macOS
+/// and iOS shells say it to their input system as the focused view's
+/// content type, which is what Passwords reads to fill the box in place;
+/// the other pixel shells own no input system that asks, and say nothing.
+/// Asking the system for a saved account before anything is typed is
+/// [`crate::autofill::saved_password`].
 ///
 /// ```ignore
 /// text_field("", password).secret(true).autocomplete(Autocomplete::CurrentPassword)
@@ -906,6 +928,39 @@ mod tests {
         apply(&mut text, &mut state, EditCommand::Left(false));
         assert_eq!(state.marked, None);
         assert!(text.contains('y'), "committed as it was: {text}");
+    }
+
+    #[test]
+    fn the_input_system_places_the_selection_in_utf16() {
+        // the crab is two UTF-16 units and four bytes
+        let mut text = String::from("a🦀b");
+        let mut state = state(0);
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (1, 2) });
+        assert_eq!(state.selection(), Some((1, 5)));
+        assert_eq!(state.caret, 5, "the caret stands at the end");
+
+        // a zero length is a caret alone
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (3, 0) });
+        assert_eq!((state.selection(), state.caret), (None, 5));
+
+        // inside the surrogate pair: the next character's start, never
+        // half a crab
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (2, 0) });
+        assert_eq!(state.caret, 5);
+
+        // past the end: the end
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (9, 9) });
+        assert_eq!((state.selection(), state.caret), (None, text.len()));
+
+        // a live composition is committed as it stands, like any move
+        apply(&mut text, &mut state, EditCommand::SetMarked { text: "ｎ".into(), caret_utf16: (1, 0) });
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (0, 0) });
+        assert_eq!((state.marked, text.as_str()), (None, "a🦀bｎ"));
+
+        // and a keyboard's replacement is the selection, then the insert
+        apply(&mut text, &mut state, EditCommand::SetSelection { utf16: (1, 2) });
+        apply(&mut text, &mut state, EditCommand::Insert("é".into()));
+        assert_eq!(text, "aébｎ");
     }
 
     #[test]

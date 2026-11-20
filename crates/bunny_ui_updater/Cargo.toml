@@ -1,0 +1,27 @@
+[package]
+name = "bunny-ui-updater"
+version.workspace = true
+edition.workspace = true
+description = "The self-updater of bunny-ui apps: check a feed, download, verify the Ed25519 signature, put the new build in place"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "updater", "self-update", "ed25519", "release"]
+categories = ["gui"]
+
+[features]
+default = ["curl"]
+# The network through the `curl` command that every Mac, every Linux
+# desktop and Windows 10 and later has. Off, the app gives its own
+# `Fetch`.
+curl = []
+# Ed25519 from ed25519-dalek instead of bunny-ui-formats' own.
+dalek = ["bunny-ui-formats/dalek"]
+
+[dependencies]
+# the state a view reads, the UI thread's tasks and the app's events;
+# `canvas` as every desktop shell has it
+bunny-ui-core = { workspace = true, features = ["canvas"] }
+bunny-ui-release = { workspace = true }
+bunny-ui-formats = { workspace = true }
+serde_json = { workspace = true }
