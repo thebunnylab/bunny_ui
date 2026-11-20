@@ -203,11 +203,49 @@ fn a_download_fills_the_pill_itself_and_the_pill_keeps_its_size() {
     crate::service::stop();
 }
 
+/// The words drawn when the pill sits in a row of `width` beside a title
+/// that can give way, as in a title bar.
+fn in_a_row(pill: super::UpdatePill, width: f64) -> Vec<String> {
+    let runtime = Runtime::new().theme(Theme::light());
+    let row = bunny_ui_core::hstack!(
+        bunny_ui_core::views::text("A window title that can give way").truncation_mode(bunny_ui_core::layout::Truncation::End),
+        pill
+    );
+    let laid = runtime.layout(&row, Proposal { width: Some(width), height: None });
+    let display: Vec<DrawCommand> = laid.display.iter().cloned().collect();
+    words_drawn(&display).into_iter().map(|(words, _)| words).collect()
+}
+
 #[test]
-fn a_squeezed_pill_ends_in_an_ellipsis_on_one_line() {
+fn in_a_row_short_of_room_the_pill_keeps_its_words_and_the_others_give_way() {
+    with_service(UpdateState::Retired { minimum: "1.0.1".parse().unwrap(), upgrade: Some(Box::new(offer())) });
+    let label = "Update to 1.0.1 or later to keep working";
+    let roomy = in_a_row(update_pill(), 2000.0);
+    assert_eq!(roomy, ["A window title that can give way", label]);
+    // too narrow for both: the title gives way, the pill keeps its words.
+    // A pill that shrinks to "…" looks broken, and a container that sees
+    // it keep its width can move or fold what is around it instead
+    // the row's natural width, less 30 points
+    let runtime = Runtime::new().theme(Theme::light());
+    let pill_width = runtime.layout(&update_pill(), Proposal { width: None, height: None }).size.width;
+    let title_width = runtime
+        .layout(&bunny_ui_core::views::text("A window title that can give way"), Proposal { width: None, height: None })
+        .size
+        .width;
+    let tight = in_a_row(update_pill(), pill_width + title_width - 30.0);
+    assert_eq!(tight[1], label, "{tight:?}");
+    assert!(tight[0].ends_with('…'), "{tight:?}");
+    // a truncating pill gives way too
+    let both = in_a_row(update_pill().truncating(), pill_width / 2.0);
+    assert!(both[1].ends_with('…'), "{both:?}");
+    crate::service::stop();
+}
+
+#[test]
+fn a_truncating_pill_ends_in_an_ellipsis_on_one_line() {
     with_service(UpdateState::Retired { minimum: "1.0.1".parse().unwrap(), upgrade: Some(Box::new(offer())) });
     let runtime = Runtime::new().theme(Theme::light());
-    let laid = runtime.layout(&update_pill().frame_width(120.0), Proposal { width: Some(120.0), height: None });
+    let laid = runtime.layout(&update_pill().truncating().frame_width(120.0), Proposal { width: Some(120.0), height: None });
     let display: Vec<DrawCommand> = laid.display.iter().cloned().collect();
     let lines = words_drawn(&display);
     assert_eq!(lines.len(), 1, "one line: {lines:?}");
