@@ -770,11 +770,12 @@ pub fn start_with(
         // the hosts first, as the desktops do: the page's elements over
         // the canvas follow the layout the list was built from
         sync_hosts(runtime);
+        // the same display list, no Surface in the path — the frame IS
+        // the drawable. A tier that could not take the frame went, and
+        // the CPU takes it below
         #[cfg(feature = "gpu")]
-        if tier::active() {
-            // the same display list, no Surface in the path — the frame
-            // IS the drawable
-            tier::present_window(
+        if tier::active()
+            && tier::present_window(
                 None,
                 &display,
                 size,
@@ -782,7 +783,8 @@ pub fn start_with(
                 canvas,
                 &*runtime.text(),
                 &*runtime.images(),
-            );
+            )
+        {
             note_presented();
             if runtime.wants_frame() {
                 unsafe { js_request_frame() };
@@ -1991,6 +1993,15 @@ pub extern "C" fn bunny_gpu_restored(width: u32, height: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_gpu_forced() {
     gpu::force();
+}
+
+/// Whether the GPU tier presents the page — what a harness asks, since
+/// the element cannot say: a page taller than the device draws shows the
+/// tier's bands on a 2D surface.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_presenting() -> u32 {
+    u32::from(gpu::active())
 }
 
 /// Clears the drawable to one colour and reads the middle pixel back,

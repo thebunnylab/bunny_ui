@@ -146,8 +146,9 @@ const fn geometry_script(kind: Kind) -> &'static str {
   const len = wasm.bunny_test_frames_json() >>> 0;
   const ptr = wasm.bunny_probe_ptr() >>> 0;
   const answer = JSON.parse(new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
-  const canvas = document.querySelector('#app canvas');
-  answer.gpu = !!(canvas && canvas.getContext('webgl2'));
+  // the tier says whether it presents: a page taller than the device
+  // draws shows its bands on a 2D surface
+  answer.gpu = wasm.bunny_gpu_presenting() === 1;
   return JSON.stringify(answer);
 })()"
         }

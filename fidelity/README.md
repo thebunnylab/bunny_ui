@@ -115,6 +115,11 @@ Nothing is compared before it is repeatable:
   Chrome 150 has no WebGL2 at all under `--disable-gpu` otherwise.
   bunny's GPU tier refuses a software context on its own pages
   (`failIfMajorPerformanceCaveat`); `?present=gpu` forces it.
+- SwiftShader draws no more than 8192 rows. A page taller than that
+  (`app_hop`, 11382 rows at 2×) is drawn by the GPU tier in bands on a
+  canvas of its own, each copied into the page's 2D surface; the capture
+  asks the page whether the tier presents (`bunny_gpu_presenting`), not
+  the canvas.
 - The pixel ratio is the device's, 2, from `--force-device-scale-factor`:
   Chrome then lays out and snaps boxes in device pixels, as on a HiDPI
   screen. The ratio `Emulation.setDeviceMetricsOverride` emulates lays
