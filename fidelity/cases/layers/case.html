@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=340" />
+    <title>Layers and overlays</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 340px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 24px; }
+      .stack { display: grid; justify-items: end; align-items: end; }
+      .plate { display: grid; justify-items: center; align-items: center; }
+      .stack > *, .plate > * { grid-area: 1 / 1; }
+      .hosted { position: relative; }
+      .badge { position: absolute; top: 0; right: 0; width: 16px; height: 16px; background: #af52de; }
+      .rule { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: #3478f6; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="stack" data-fid="stack">
+          <div style="width: 160px; height: 100px; background: #3478f6" data-fid="back"></div>
+          <div style="width: 40px; height: 40px; background: #ff9500" data-fid="front"></div>
+        </div>
+        <div class="plate" data-fid="plate-stack">
+          <div style="width: 160px; height: 60px; background: #34c759" data-fid="plate"></div>
+          <span data-fid="plate-text">Centered</span>
+        </div>
+        <div class="hosted" style="width: 120px; height: 60px; background: #e8f0fe" data-fid="card">
+          <div class="badge" data-fid="badge"></div>
+        </div>
+        <div class="hosted" style="width: 120px; height: 40px; background: #c7c7cc" data-fid="tab">
+          <div class="rule" data-fid="rule"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

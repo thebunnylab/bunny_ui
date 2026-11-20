@@ -35,7 +35,8 @@ sheet.sheet.insertRule("a[href][href]{cursor:pointer;pointer-events:auto}", 1);
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}", 2);
 // a control the keyboard reached shows where the keyboard is. At no
 // specificity, so a page that draws its own ring only has to say so
-sheet.sheet.insertRule(":where(#app [role][tabindex]):focus-visible{outline:2px solid Highlight;outline-offset:2px}", 3);
+const FOCUS_RING = "outline:2px solid Highlight;outline-offset:2px";
+sheet.sheet.insertRule(`:where(#app [role][tabindex]):focus-visible{${FOCUS_RING}}`, 3);
 sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}", 3);
 sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
 sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
@@ -71,7 +72,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 26;
+const EXPECTED_ABI = 28;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -534,14 +535,15 @@ const KIND_BASE = [
   // 0 group, 1 box: a wrapper is a COLUMN, not a block — the engine
   // proposes its box to the child, and only a flex line can hand the
   // offer down (width by the stretch default, height by the fill flag)
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:column;box-sizing:border-box",
+  "display:flex;flex-direction:column;box-sizing:border-box",
   // 2 text: the browser breaks the lines in this mode — pre-wrap keeps
   // the engine's explicit newlines and wraps the rest
-  "box-sizing:border-box;min-width:0;min-height:0;white-space:pre-wrap;cursor:default",
+  "box-sizing:border-box;white-space:pre-wrap;cursor:default",
   // 3 field: the padding mirrors the engine's FIELD_PAD; every color
-  // and border arrives through the look — the theme owns the chrome
-  "box-sizing:border-box;padding:5px 8px;outline:none",
+  // and border arrives through the look — the theme owns the chrome, and
+  // the browser's own box never shows
+  "box-sizing:border-box;padding:5px 8px;outline:none;border:0;background:transparent",
   // 4 scroll
   "box-sizing:border-box;min-width:0;min-height:0;overflow:auto;scroll-behavior:smooth",
   // 5 content: hosts virtual rows at absolute slots
@@ -553,25 +555,59 @@ const KIND_BASE = [
   "pointer-events:none",
   // 9 flex column, 10 flex row: FLOW containers, the browser lays
   // their children out
-  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
-  "display:flex;flex-direction:row;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:column;box-sizing:border-box",
+  "display:flex;flex-direction:row;box-sizing:border-box",
   // 11 layers: one grid cell, everyone in it
-  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  "display:grid;box-sizing:border-box",
   // 12 popover: absolute under the root; the glue positions it from
   // the anchor's real box once the placement round lands
   "position:absolute;left:0;top:0;box-sizing:border-box",
   // 13 editor: the field of MANY lines
-  "box-sizing:border-box;padding:5px 8px;outline:none;resize:none;font:inherit",
+  "box-sizing:border-box;padding:5px 8px;outline:none;border:0;background:transparent;resize:none;font:inherit",
   // 14 iframe: the native host's page, pointer events ON
   "border:0;box-sizing:border-box;min-width:0;min-height:0",
   // 15 video: the video host's stream, the box underneath owns the clicks
   "display:block;pointer-events:none;box-sizing:border-box;min-width:0;min-height:0",
   // 16 grid: sparse cells in equal-width tracks
-  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  "display:grid;box-sizing:border-box",
   // 17 rectangle, 18 ellipse: independent axes, inherited hover/press ink
-  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor",
-  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor;border-radius:50%",
+  "box-sizing:border-box;background:currentColor",
+  "box-sizing:border-box;background:currentColor;border-radius:50%",
 ];
+
+// A ramp's CSS: the engine's geometry, each color between the ends at
+// its place along the ramp. The twin of the serializer's `css_gradient`.
+function rampImage({ kind, a, b, c, d, aspect, near, far }, stops) {
+  const between = (at) => stops.map(([location, color]) => `, ${color} ${at(location)}`).join("");
+  if (kind === 0 && aspect !== 1 && d > 0) {
+    // the ellipse: X radius on the wire, Y is X times the aspect
+    const inner = c / d;
+    return (
+      `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
+      `${a * 100}% ${b * 100}%, ${near} ${(inner * 100).toFixed(2)}%` +
+      between((t) => `${((inner + t * (1 - inner)) * 100).toFixed(2)}%`) +
+      `, ${far} 100%)`
+    );
+  }
+  if (kind === 0) {
+    const reach = d < 0 ? "farthest-corner" : `${d}px`;
+    const stop = d < 0 ? "100%" : `${d}px`;
+    const inside =
+      d < 0
+        ? between((t) => `calc(${((1 - t) * c).toFixed(2)}px + ${(t * 100).toFixed(2)}%)`)
+        : between((t) => `${(c + t * (d - c)).toFixed(2)}px`);
+    return `radial-gradient(circle ${reach} at ${a * 100}% ${b * 100}%, ${near} ${c}px${inside}, ${far} ${stop})`;
+  }
+  // CSS runs its line through the centre: the angle carries the
+  // direction (0deg points up, clockwise)
+  const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
+  if (stops.length === 0) return `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
+  return (
+    `linear-gradient(${degrees.toFixed(2)}deg, ${near} 0%` +
+    between((t) => `${(t * 100).toFixed(2)}%`) +
+    `, ${far} 100%)`
+  );
+}
 
 // The rules of one look: the base, then one per state. The twin of the
 // serializer's `rule_text` — a served page must agree with a mounted one.
@@ -597,7 +633,23 @@ function lookRules(selector, kind, flags, style, layout, face) {
     delete decl["flex-direction"];
   }
   if (layout.relative) { decl.position = "relative"; decl.isolation = "isolate"; }
-  if (layout.gap !== null) decl[kind === 16 ? "column-gap" : "gap"] = `${layout.gap}px`;
+  // a negative spacing overlaps the items, as SwiftUI's does; CSS has no
+  // negative gap, so each item after the first is pulled back by a
+  // negative margin along the line instead, and painted whole over the
+  // one before, as a layer is
+  const overlap =
+    layout.gap !== null && layout.gap < 0 && layout.wrap === null && (kind === 9 || kind === 10)
+      ? `${kind === 10 ? "margin-inline-start" : "margin-block-start"}:${layout.gap}px;isolation:isolate`
+      : null;
+  if (layout.gap !== null && overlap === null) decl[kind === 16 ? "column-gap" : "gap"] = `${layout.gap}px`;
+  // an overlay's cell: the base in the first track, every layer across
+  // it and a second track that is always empty, so no layer grows the
+  // cell
+  const base = kind === 11 ? (flags & 2 ? "first-child" : flags & 4 ? "last-child" : null) : null;
+  if (base !== null) {
+    decl["grid-template-columns"] = "auto 0fr";
+    decl["grid-template-rows"] = "auto 0fr";
+  }
   if (layout.columns !== null) {
     decl["grid-template-columns"] = `repeat(${layout.columns},minmax(0,1fr))`;
     decl["align-items"] = "center";
@@ -622,8 +674,19 @@ function lookRules(selector, kind, flags, style, layout, face) {
     // so are the properties: a right-to-left mount puts the leading inset
     // on the right by itself
     const [top, trailing, bottom, leading] = layout.padding;
-    decl["padding-block"] = `${top}px ${bottom}px`;
-    decl["padding-inline"] = `${leading}px ${trailing}px`;
+    // a negative side is a negative margin: the content moves out and the
+    // box gives the flow that much back, as a negative padding does in
+    // the engine — CSS has no negative padding
+    const inward = (side) => Math.max(side, 0);
+    decl["padding-block"] = `${inward(top)}px ${inward(bottom)}px`;
+    decl["padding-inline"] = `${inward(leading)}px ${inward(trailing)}px`;
+    if (top < 0) decl["margin-block-start"] = `${top}px`;
+    if (bottom < 0) decl["margin-block-end"] = `${bottom}px`;
+    if (leading < 0) decl["margin-inline-start"] = `${leading}px`;
+    if (trailing < 0) decl["margin-inline-end"] = `${trailing}px`;
+    // pulled back over the box before it, it is painted whole over that
+    // box, as SwiftUI's later view is, layers and all
+    if (top < 0 || leading < 0) decl.isolation = "isolate";
   }
   if (layout.direction !== null) {
     // an island that reads the other way: the browser orders its rows,
@@ -648,6 +711,12 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl.flex = "1 1 auto";
     decl["min-width"] = "0";
     decl["min-height"] = "0";
+    // in a grid cell the grow means nothing: the box stretches across
+    decl["justify-self"] = "stretch";
+    // a resizable picture takes its frame across as well: a width left
+    // to the ratio spills a contained picture past its frame and crops
+    // a covering one from one side
+    if (kind === 7) decl["align-self"] = "stretch";
   }
   if (layout.wrap !== null) {
     // a row that wraps: its lines break where its items' widths say
@@ -657,11 +726,41 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.background) decl["background-color"] = style.background;
   // background-image sits OVER the flat background
   if (style.image) decl["background-image"] = style.image;
-  if (style.border) decl.border = style.border;
+  if (style.inkImage) {
+    // the ramp the text paints with: the top layer, cut to the text;
+    // what the box paints under it keeps its own box
+    decl["background-image"] = `${style.inkImage}, ${style.image || "none"}`;
+    const clips = ["text", ...Array(Math.max(style.imageLayers, 1)).fill("border-box")].join(", ");
+    decl["-webkit-background-clip"] = clips;
+    decl["background-clip"] = clips;
+    decl["-webkit-text-fill-color"] = "transparent";
+  }
+  // inside a ramp, a box with its own ink paints its text in it again
+  if (style.ownInk) decl["-webkit-text-fill-color"] = "currentcolor";
+  // the box's floor
+  if (style.floor) {
+    if (style.floor[0] > 0) decl["min-width"] = `${style.floor[0]}px`;
+    if (style.floor[1] > 0) decl["min-height"] = `${style.floor[1]}px`;
+  }
+  // a line drawn inward over the box and its children: an outline
+  // pulled in by its own width paints a CSS border's pixels and lays
+  // nothing out, where a border would push the content in
+  if (style.border) {
+    decl.outline = style.border;
+    decl["outline-offset"] = `${-style.borderWidth}px`;
+  }
   if (style.radius) decl["border-radius"] = style.radius;
   // the halo and the glass rim share one property
   if (style.shadows.length) decl["box-shadow"] = style.shadows.join(",");
   if (style.transition) decl.transition = style.transition;
+  // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
+  if (style.offset) decl.translate = `${style.offset[0]}px ${style.offset[1]}px`;
+  // `.rotation_effect`: drawn turned about its pivot, the layout unmoved
+  if (style.rotation) {
+    const [degrees, x, y] = style.rotation;
+    decl.rotate = `${degrees}deg`;
+    decl["transform-origin"] = `${x * 100}% ${y * 100}%`;
+  }
   // the ink the subtree INHERITS: the text below sets no color of its
   // own, so the hover and active rules flip the box at once
   if (style.ink) decl.color = style.ink;
@@ -678,7 +777,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // `.hidden()`: the box keeps its place in the flow and shows nothing —
   // visibility, never display, or the sibling would move up
   if (style.hidden) decl.visibility = "hidden";
-  if (style.blur !== null) decl.filter = `blur(${style.blur}px)`;
+  // the color filters in their order, then the blur
+  const filters = style.blur !== null ? [...style.filters, `blur(${style.blur}px)`] : style.filters;
+  if (filters.length !== 0) decl.filter = filters.join(" ");
   // the turn rides `rotate` and `translate`, which compose with the
   // `transform` that positions the element instead of replacing it
   if (style.turn !== null) {
@@ -708,6 +809,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
       // the shorthand leaves the spacing alone; the face's own advance
       // rides beside it
       if (face.tracking) decl["letter-spacing"] = `${face.tracking}px`;
+      // after the shorthand, which resets it
+      if (face.tabular) decl["font-variant-numeric"] = "tabular-nums";
     }
     // AFTER the font shorthand, which resets line-height: 0 means the
     // face's own box
@@ -726,14 +829,27 @@ function lookRules(selector, kind, flags, style, layout, face) {
       decl["text-overflow"] = "ellipsis";
       decl["white-space"] = "nowrap";
     }
+    // at most this many lines, the last one closed with an ellipsis
+    // right after its last word: the space a wrap leaves is dropped
+    if (face.lineLimit > 0) {
+      decl.display = "-webkit-box";
+      decl["-webkit-box-orient"] = "vertical";
+      decl["-webkit-line-clamp"] = `${face.lineLimit}`;
+      decl.overflow = "hidden";
+      decl["white-space"] = "pre-line";
+    }
   }
   const body = Object.entries(decl)
     .map(([name, value]) => `${name}:${value}`)
     .join(";");
   const rules = [`${selector}{${body}}`];
   // layers: one grid cell, and every child IN it — auto-placement
-  // would give each layer a row of its own
-  if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
+  // would give each layer a row of its own. Each child paints whole and
+  // in its turn, as SwiftUI's layers do: a moved or positioned box
+  // inside a background would otherwise paint over the base
+  if (base !== null) rules.push(`${selector}>*{grid-area:1/1/3/3;z-index:0}`, `${selector}>:${base}{grid-area:1/1}`);
+  else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1;z-index:0}`);
+  if (overlap !== null) rules.push(`${selector}>*+*{${overlap}}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
   // the hover and a group frame costs no patch; a box without one
@@ -747,9 +863,17 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.hoverFade !== null) rules.push(`${on("hover")}{opacity:${style.hoverFade}}`);
   if (style.pressedFade !== null) rules.push(`${on("active")}{opacity:${style.pressedFade}}`);
   if (style.focus) {
-    rules.push(`${selector}:focus{border-color:${style.focus};caret-color:${style.focus}}`);
+    rules.push(`${selector}:focus{outline-color:${style.focus};caret-color:${style.focus}}`);
   }
   if (style.placeholder) rules.push(`${selector}::placeholder{color:${style.placeholder}}`);
+  // the keyboard's ring is an outline as well: while it shows on a
+  // control, the ring takes the outline and the line moves beneath it
+  // as an inset shadow — the box keeps its line
+  if (style.border) {
+    const line = `inset 0 0 0 ${style.borderWidth}px ${style.borderColor}`;
+    const shadows = [...style.shadows, line].join(",");
+    rules.push(`${selector}[role][tabindex]:focus-visible{${FOCUS_RING};box-shadow:${shadows}}`);
+  }
   return rules;
 }
 
@@ -848,6 +972,34 @@ function cssFont(size, weight, mono, italic, named) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
+// Sets one line's face on the ink and answers the scale it is set at and
+// the line's width in CSS px. The page shapes its text at the device's
+// size and takes a variable face's optical size from the CSS one; a canvas
+// sets one size for both. A face that draws the same at either size is
+// set at the device's, where the page shapes it. One whose cut follows the
+// size (an optical-size axis: Inter set at twice its size is its display
+// cut, 7% narrower than the page's) is set at the page's own size, and a
+// raster scales it to the device's.
+function setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) {
+  // kerning as the page's own text has it: a canvas left at "auto"
+  // measures a line with spaces wider than the element that shows it,
+  // and breaks a paragraph a word early
+  ink.fontKerning = "normal";
+  // `.tracking`: the letters spread as the page spreads them
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  const page = ink.measureText(text).width;
+  ink.font = cssFont(size * ratio, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking * ratio}px`;
+  const device = ink.measureText(text).width / ratio;
+  if (Math.abs(page - device) <= Math.max(page, device) * 1e-4) {
+    return { set: ratio, width: device };
+  }
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  return { set: 1, width: page };
+}
+
 const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900, 100, 200, 300];
 
 function rgba(packed) {
@@ -856,6 +1008,31 @@ function rgba(packed) {
   const b = (packed >>> 8) & 0xff;
   const a = packed & 0xff;
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
+}
+
+// The house halo falls off as (1 - d/r)² from the edge and stops at its
+// reach; one CSS blur is a Gaussian. Two blurred layers — a spread and a
+// blur in reaches, and an exponent on the ink's opacity — follow the
+// curve within 4/255 for the opacities a shadow wears, fitted against
+// Chrome's own blur (σ ≈ 0.52 × the blur radius). The serializer spells
+// the same two (ssr::halo).
+const HALO_LAYERS = [
+  [0.3262, 0.5124, 0.8489],
+  [0.0738, 0.1164, 0.3444],
+];
+
+function halo(radius, packed, [x, y] = [0, 0]) {
+  const reach = Math.max(radius, 1);
+  const r = (packed >>> 24) & 0xff;
+  const g = (packed >>> 16) & 0xff;
+  const b = (packed >>> 8) & 0xff;
+  const opacity = (packed & 0xff) / 255;
+  const decimal = (value, places) => Number(value.toFixed(places));
+  return HALO_LAYERS.map(([spread, blur, weight]) => {
+    const alpha = 1 - Math.pow(1 - opacity, weight);
+    return `${decimal(x, 3)}px ${decimal(y, 3)}px ${decimal(blur * reach, 3)}px ${decimal(spread * reach, 3)}px ` +
+      `rgba(${r}, ${g}, ${b}, ${decimal(alpha, 4)})`;
+  });
 }
 
 // The input's editing dance — shared by creation and hydration.
@@ -990,6 +1167,32 @@ function applyPatches(view, length) {
 
   // the three records a look is made of, decoded with no element in
   // hand: a look is defined once (op 21), then worn by class (op 22)
+  // a ramp's shape and its two ends, and the colors between them
+  const readRamp = () => {
+    const kind = u8();
+    const [a, b, c, d] = [f32(), f32(), f32(), f32()];
+    const aspect = kind === 0 ? f32() : 1;
+    return { kind, a, b, c, d, aspect, near: rgba(u32()), far: rgba(u32()) };
+  };
+  const readStops = () => {
+    const stops = [];
+    for (let n = u8(); n > 0; n--) stops.push([f32(), rgba(u32())]);
+    return stops;
+  };
+  // the color filters, in the order they apply: a kind and an amount
+  // each. A negative contrast is an inversion and the contrast it keeps,
+  // which CSS reads as one and refuses to write
+  const readFilters = () => {
+    const filters = [];
+    for (let n = u8(); n > 0; n--) {
+      const kind = u8();
+      const amount = f32();
+      if (kind === 2 && amount < 0) filters.push(`invert(1) contrast(${-amount})`);
+      else if (kind === 3) filters.push(`hue-rotate(${amount}deg)`);
+      else filters.push(`${["grayscale", "saturate", "contrast", "", "invert"][kind]}(${amount})`);
+    }
+    return filters;
+  };
   const readStyle = () => {
     // the mask carries twenty-five bits, so it crosses as a u32
     const mask = u32();
@@ -998,6 +1201,8 @@ function applyPatches(view, length) {
       hover: null,
       pressed: null,
       border: null,
+      borderWidth: 0,
+      borderColor: null,
       radius: null,
       shadows: [],
       transition: null,
@@ -1016,8 +1221,12 @@ function applyPatches(view, length) {
       hidden: false,
       filter: null,
       blur: null,
+      filters: [],
       turn: null,
       scrollbar: null,
+      halo: null,
+      offset: null,
+      rotation: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -1026,20 +1235,20 @@ function applyPatches(view, length) {
       const borderColor = u32();
       const borderWidth = f32();
       style.border = `${borderWidth}px solid ${rgba(borderColor)}`;
+      style.borderWidth = borderWidth;
+      style.borderColor = rgba(borderColor);
     }
     // bit 4 is the one radius every corner shares; bit 22 below is the
     // four, and a box sends one or the other, never both
     if (mask & 16) style.radius = `${f32()}px`;
-    if (mask & 32) {
-      const radius = f32();
-      style.shadows.push(`0 0 ${radius}px ${rgba(u32())}`);
-    }
+    // the halo waits for its offset, which rides the second mask
+    if (mask & 32) style.halo = [f32(), u32()];
     if (mask & 64) {
       const response = f32();
       f32(); // damping — the CSS side keeps the duration
       // every colour the engine's springs move — the fill, the ink,
       // the border, the halo — and the transform
-      style.transition = ["background-color", "color", "border-color", "box-shadow", "transform"]
+      style.transition = ["background-color", "color", "outline-color", "box-shadow", "transform"]
         .map((property) => `${property} ${response}s ease-out`)
         .join(", ");
     }
@@ -1052,32 +1261,9 @@ function applyPatches(view, length) {
     if (mask & 1024) style.ink = rgba(u32());
     if (mask & 2048) style.hoverInk = rgba(u32());
     if (mask & 4096) style.pressedInk = rgba(u32());
-    // a two-stop ramp: the geometry is the engine's, the pixels are
-    // the browser's
-    if (mask & 8192) {
-      const kind = u8();
-      const [a, b, c, d] = [f32(), f32(), f32(), f32()];
-      const aspect = kind === 0 ? f32() : 1;
-      const near = rgba(u32());
-      const far = rgba(u32());
-      if (kind === 0 && aspect !== 1 && d > 0) {
-        // the ellipse: X radius on the wire, Y is X times the aspect
-        style.image =
-          `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
-          `${a * 100}% ${b * 100}%, ${near} ${((c / d) * 100).toFixed(2)}%, ${far} 100%)`;
-      } else if (kind === 0) {
-        const reach = d < 0 ? "farthest-corner" : `${d}px`;
-        const stop = d < 0 ? "100%" : `${d}px`;
-        style.image =
-          `radial-gradient(circle ${reach} at ` +
-          `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`;
-      } else {
-        // CSS runs its line through the centre: the angle carries the
-        // direction (0deg points up, clockwise)
-        const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
-        style.image = `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
-      }
-    }
+    // a ramp: the geometry is the engine's, the pixels are the
+    // browser's. The colors between its ends come with the second mask
+    if (mask & 8192) style.ramp = readRamp();
     if (mask & 16384) style.clip = true;
     if (mask & 32768) text(u16());
     if (mask & 65536) style.fade = f32();
@@ -1140,7 +1326,7 @@ function applyPatches(view, length) {
       const bands =
         `repeating-linear-gradient(${angle}deg, ${ink} 0 ${width}px, ` +
         `transparent ${width}px ${period}px)`;
-      style.image = style.image ? `${bands}, ${style.image}` : bands;
+      style.bands = bands;
     }
     // bit 30: a quarter turn — about the box's own corner where the
     // engine placed the children (0–2), the flow's writing-mode where
@@ -1148,6 +1334,25 @@ function applyPatches(view, length) {
     if (mask & 1073741824) style.turn = u8();
     // bit 31: a viewport that keeps its thumb to itself
     if (mask >>> 31) style.scrollbar = u8() === 1 ? "none" : "thin";
+    // the first mask is full: a second one, a byte — bit 0 the halo's
+    // offset, bit 1 the box's own (`translate`)
+    const more = u8();
+    const shadowOffset = more & 1 ? [f32(), f32()] : [0, 0];
+    if (more & 2) style.offset = [f32(), f32()];
+    if (more & 4) style.rotation = [f32(), f32(), f32()];
+    const stops = more & 8 ? readStops() : [];
+    // the bands lie over the ramp
+    const layers = [style.bands, style.ramp && rampImage(style.ramp, stops)].filter(Boolean);
+    if (layers.length !== 0) style.image = layers.join(", ");
+    style.imageLayers = layers.length;
+    // the ramp the text paints with, and a box inside one that paints
+    // its text in its own ink again
+    if (more & 16) style.inkImage = rampImage(readRamp(), readStops());
+    if (more & 32) style.ownInk = true;
+    // the box's floor, zero for none
+    if (more & 64) style.floor = [f32(), f32()];
+    if (more & 128) style.filters = readFilters();
+    if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
     return style;
   };
   const readLayout = () => {
@@ -1204,14 +1409,20 @@ function applyPatches(view, length) {
     const truncation = u8();
     // 1 = the face declared above is this text's: its look names no font
     const inheritsFace = u8();
+    // the most lines it shows, 0 for none
+    const lineLimit = u8();
+    // bit 0: the figures take one advance each
+    const figures = u8();
     return {
       font: cssFont(size, weight, mono, italic, family),
       inheritsFace,
+      tabular: figures & 1,
       lineHeight,
       tracking,
       align,
       color: inheritsInk ? null : color,
       truncation,
+      lineLimit,
     };
   };
 
@@ -1310,6 +1521,7 @@ function applyPatches(view, length) {
       const control = u8();
       const voice = u8();
       const label = text(u16());
+      const testId = text(u16());
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1318,6 +1530,7 @@ function applyPatches(view, length) {
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
       if (href) el.setAttribute("href", href);
+      if (testId) el.setAttribute("data-testid", testId);
       if (control || voice || label) applyControl(el, control, voice, label);
       if (kind === 4) {
         wireScroll(el, id);
@@ -1600,16 +1813,18 @@ function applyPatches(view, length) {
     } else if (op === 9) {
       const hi = u32();
       const lo = u32();
-      const cover = u8();
+      const fit = u8();
       const el = lookup(id);
       const entry = images.get(imageKey(hi, lo));
-      if (el) el.dataset.img = imageKey(hi, lo);
-      if (el && entry) {
-        el.src = entry.url;
-        // false: our frame IS the rect (contain and stretch resolve in
-        // the engine's geometry) — the element just fills it
-        el.style.objectFit = cover ? "cover" : "fill";
+      if (el) {
+        el.dataset.img = imageKey(hi, lo);
+        // 0: our frame IS the rect (the engine's geometry resolved the
+        // fit) — the element just fills it; 1 covers and clips; 2 holds
+        // the whole box and letterboxes the picture in its middle. The
+        // fit holds whether the bytes are here yet or arrive later
+        el.style.objectFit = fit === 1 ? "cover" : fit === 2 ? "contain" : "fill";
       }
+      if (el && entry) el.src = entry.url;
     } else if (op === 10) {
       u32(); // the symbol identity rides for the debugger's eyes
       u32();
@@ -1678,10 +1893,12 @@ function applyPatches(view, length) {
       if (el) {
         const style = el.style;
         const dressed = style.length !== 0;
-        if (width !== null) style.width = `${width}px`;
-        else if (dressed) style.width = "";
-        if (height !== null) style.height = `${height}px`;
-        else if (dressed) style.height = "";
+        // a pinned size is a floor too: a flex line never shrinks a box
+        // below its minimum, whichever its axis
+        if (width !== null) style.width = style.minWidth = `${width}px`;
+        else if (dressed) style.width = style.minWidth = "";
+        if (height !== null) style.height = style.minHeight = `${height}px`;
+        else if (dressed) style.height = style.minHeight = "";
         if (maxWidth !== null) style.maxWidth = `${maxWidth}px`;
         else if (dressed) style.maxWidth = "";
         if (maxHeight !== null) style.maxHeight = `${maxHeight}px`;
@@ -1755,13 +1972,15 @@ function applyPatches(view, length) {
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
       // live hints: class, id, href, what a control publishes, the
-      // element's voice and its name re-attribute in place
+      // element's voice, its name and the harness's name re-attribute
+      // in place
       const cls = text(u8());
       const domId = text(u8());
       const href = text(u16());
       const control = u8();
       const voice = u8();
       const label = text(u16());
+      const testId = text(u16());
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1776,6 +1995,11 @@ function applyPatches(view, length) {
           el.setAttribute("href", href);
         } else {
           el.removeAttribute("href");
+        }
+        if (testId) {
+          el.setAttribute("data-testid", testId);
+        } else {
+          el.removeAttribute("data-testid");
         }
         applyControl(el, control, voice, label);
       }
@@ -2008,7 +2232,7 @@ function bunnyGlStubsOrNothing() {
 }
 
 const GPU_VERBS = [
-  "gl_init", "gl_log", "gl_island_blit", "gl_now", "gl_teardown", "gl_resize",
+  "gl_init", "gl_log", "gl_island_blit", "gl_page_blit", "gl_now", "gl_teardown", "gl_resize",
   "gl_viewport", "gl_scissor", "gl_clear_color", "gl_clear", "gl_enable", "gl_disable",
   "gl_blend_func_separate", "gl_pixel_storei", "gl_finish", "gl_flush",
   "gl_compile_shader", "gl_link_program", "gl_bind_attrib_location", "gl_use_program",
@@ -2117,7 +2341,10 @@ const imports = {
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
       ink.imageSmoothingEnabled = true;
-      ink.imageSmoothingQuality = "high";
+      // the filter the page's own <img> is drawn with — bilinear, the
+      // browser's "low": "high" resamples an enlarged picture with a
+      // cubic, and every pixel of it lands one step from the page's
+      ink.imageSmoothingQuality = "low";
       ink.drawImage(entry.probe, 0, 0, width, height);
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
@@ -2169,21 +2396,21 @@ const imports = {
       familyPointer,
       familyLength,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(bytesAt(pointer, length));
+      const ratio = globalThis.devicePixelRatio || 1;
+      const family = familyOf(familyPointer, familyLength);
       const ink = inkSurface();
-      ink.font = cssFont(
-        size,
-        weight,
-        mono,
-        italic,
-        familyOf(familyPointer, familyLength),
-      );
+      const line = text ? setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) : null;
+      // the ascent and descent at the device's size, as the page lays
+      // text out on a HiDPI screen: they round there
+      ink.font = cssFont(size * ratio, weight, mono, italic, family);
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(memory.buffer, out, 3);
-      metrics[0] = text ? probe.width : 0;
-      metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
-      metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
+      metrics[0] = line ? line.width : 0;
+      metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
+      metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
     },
     // canvas islands raster their text through the engine — the same
     // contract as the full-canvas mode
@@ -2202,26 +2429,22 @@ const imports = {
       descent,
       color,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(bytesAt(pointer, length));
       const ink = inkSurface(width, height);
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
-      ink.setTransform(scale, 0, 0, scale, 0, 0);
-      ink.font = cssFont(
-        size,
-        weight,
-        mono,
-        italic,
-        familyOf(familyPointer, familyLength),
-      );
+      const line = setLine(ink, text, size, weight, mono, italic, familyOf(familyPointer, familyLength), tracking, scale);
+      // a face set at the page's size is scaled to the device's
+      ink.setTransform(scale / line.set, 0, 0, scale / line.set, 0, 0);
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
       const b = (color >>> 8) & 0xff;
       const a = color & 0xff;
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-      ink.fillText(text, 0, height / scale - descent);
+      ink.fillText(text, 0, (height - descent * scale) / (scale / line.set));
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(memory.buffer, out, width * height * 4).set(pixels);
     },

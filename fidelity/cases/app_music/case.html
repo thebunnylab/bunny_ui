@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en"><head><base href="/apps/">
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=390, height=844">
+    <title>Music Player</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; width: 390px; height: 844px; overflow: hidden; position: relative; background: #120a1e; }
+
+      /* full-bleed blurred backdrop: filter blur + saturate on an oversized image */
+      .bg { position: absolute; left: -60px; top: -60px; width: 510px; height: 964px; object-fit: cover; filter: blur(30px) saturate(1.4); }
+      /* multi-stop scrim gradient */
+      .scrim { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(10,6,24,.35) 0%, rgba(12,8,30,.55) 35%, rgba(8,4,18,.8) 70%, rgba(4,2,10,.94) 100%); }
+
+      .top { position: absolute; left: 0; right: 0; top: 0; height: 54px; display: flex; align-items: flex-end; justify-content: space-between; padding: 0 20px 6px; color: #fff; }
+      .top .eyebrow { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .2em; opacity: .85; /* letter-spacing + uppercase */ }
+      .chev { width: 12px; height: 12px; border-right: 2.5px solid #fff; border-bottom: 2.5px solid #fff; transform: rotate(45deg); margin-bottom: 6px; border-radius: 1px; }
+      .dots { display: flex; gap: 3px; margin-bottom: 8px; }
+      .dots i { width: 4px; height: 4px; border-radius: 50%; background: #fff; }
+
+      /* glass card: backdrop-filter, rgba bg, hairline border */
+      .card { position: absolute; left: 16px; right: 16px; top: 58px; height: 500px; border-radius: 28px; padding: 16px 18px; background: linear-gradient(160deg, rgba(255,255,255,.22), rgba(255,255,255,.07)); border: .5px solid rgba(255,255,255,.35); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); box-shadow: 0 18px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.3); color: #fff; overflow: hidden; display: flex; flex-direction: column; }
+
+      .stage { position: relative; height: 212px; flex: none; }
+      /* vinyl: conic-gradient grooves, rotated, radial label */
+      .vinyl { position: absolute; left: 112px; top: 6px; width: 196px; height: 196px; border-radius: 50%; transform: rotate(12deg);
+        background: radial-gradient(circle, transparent 0 22%, rgba(0,0,0,.0) 22%),
+          repeating-radial-gradient(circle at 50% 50%, #111 0 2px, #222 2px 3px),
+          conic-gradient(from 0deg, rgba(255,255,255,.0), rgba(255,255,255,.25) 12%, rgba(255,255,255,0) 25%, rgba(255,255,255,.25) 62%, rgba(255,255,255,0) 75%);
+        background-blend-mode: normal, normal, normal;
+        box-shadow: 0 10px 24px rgba(0,0,0,.45); }
+      .vinyl::before { content: ""; position: absolute; inset: 0; border-radius: 50%; background: conic-gradient(from 20deg, rgba(255,255,255,0) 0 10%, rgba(255,255,255,.22) 15%, rgba(255,255,255,0) 22% 55%, rgba(255,255,255,.22) 65%, rgba(255,255,255,0) 72%); }
+      .vinyl::after { content: ""; position: absolute; left: 70px; top: 70px; width: 56px; height: 56px; border-radius: 50%; background: radial-gradient(circle at 50% 50%, #0b0b0b 0 4px, #f3d9a0 5px, #e8742c 45%, #b3261e 100%); border: 2px solid #000; }
+      .art { position: absolute; left: 4px; top: 0; width: 208px; height: 208px; border-radius: 24px; object-fit: cover; display: block; box-shadow: 0 20px 40px rgba(20,0,40,.6) /* offset shadow */, 0 2px 6px rgba(0,0,0,.3); border: .5px solid rgba(255,255,255,.4); }
+
+      .meta { margin-top: 14px; display: flex; align-items: center; gap: 10px; }
+      .meta .txt { flex: 1; min-width: 0; }
+      .title { display: block; font-size: 22px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 2px 10px rgba(0,0,0,.55), 0 0 1px rgba(255,255,255,.4); /* text-shadow + ellipsis */ }
+      .artist { margin-top: 2px; font-size: 14px; opacity: .7; }
+      .heart { width: 30px; height: 30px; flex: none; border-radius: 50%; border: 1.5px solid rgba(255,255,255,.5); position: relative; }
+      /* heart drawn with clip-path polygon */
+      .heart::after { content: ""; position: absolute; left: 7px; top: 8px; width: 14px; height: 13px; background: #ff5c8a; clip-path: polygon(50% 100%, 0 40%, 8% 10%, 30% 0, 50% 22%, 70% 0, 92% 10%, 100% 40%); }
+
+      .prog { margin-top: 16px; position: relative; height: 14px; }
+      /* 4-stop linear-gradient progress fill */
+      .prog .track { position: absolute; left: 0; right: 0; top: 5px; height: 4px; border-radius: 2px; background: rgba(255,255,255,.25); }
+      .prog .fill { position: absolute; left: 0; top: 5px; height: 4px; width: 38%; border-radius: 2px; background: linear-gradient(90deg, #ffb347 0%, #ff5e7e 40%, #b05cff 75%, #5c7bff 100%); box-shadow: 0 0 8px rgba(255,94,126,.6); }
+      .prog .knob { position: absolute; left: calc(38% - 7px); top: 0; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: inset 0 -2px 3px rgba(0,0,0,.3), inset 0 1px 1px #fff, 0 2px 6px rgba(0,0,0,.4); }
+      .times { display: flex; justify-content: space-between; margin-top: 4px; font-size: 12px; opacity: .75; font-variant-numeric: tabular-nums; /* tabular-nums */ }
+
+      .ctrl { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; padding: 0 6px; }
+      .cbtn { width: 46px; height: 46px; border-radius: 50%; border: 2px solid rgba(255,255,255,.4); background: rgba(255,255,255,.08); position: relative; flex: none; }
+      /* skip icons via borders: bar + triangle */
+      .cbtn.prev::before, .cbtn.next::before { content: ""; position: absolute; top: 14px; width: 0; height: 0; border-top: 8px solid transparent; border-bottom: 8px solid transparent; }
+      .cbtn.next::before { left: 14px; border-left: 12px solid #fff; }
+      .cbtn.next::after { content: ""; position: absolute; left: 27px; top: 14px; width: 3px; height: 16px; background: #fff; }
+      .cbtn.prev::before { left: 14px; border-right: 12px solid #fff; }
+      .cbtn.prev::after { content: ""; position: absolute; left: 13px; top: 14px; width: 3px; height: 16px; background: #fff; transform: translateX(-3px); }
+      .cbtn.sm { width: 36px; height: 36px; border-width: 1.5px; border-color: rgba(255,255,255,.25); }
+      .cbtn.sm i { position: absolute; left: 9px; top: 10px; width: 16px; height: 12px; border: 2px solid #fff; border-radius: 4px; opacity: .8; }
+      .cbtn.sm.rep i { border-radius: 8px; border-style: solid solid dashed solid; }
+      .play { width: 72px; height: 72px; border-radius: 50%; flex: none; position: relative; background: radial-gradient(circle at 30% 25%, #ffd08a 0%, #ff6b8b 45%, #8a3cff 100%); box-shadow: 0 10px 24px rgba(138,60,255,.55), inset 0 2px 3px rgba(255,255,255,.6), inset 0 -4px 8px rgba(60,0,120,.4); border: 2px solid rgba(255,255,255,.5); }
+      /* play triangle via clip-path polygon */
+      .play::after { content: ""; position: absolute; left: 27px; top: 21px; width: 26px; height: 28px; background: #fff; clip-path: polygon(0 0, 100% 50%, 0 100%); filter: drop-shadow(0 1px 2px rgba(0,0,0,.4)); }
+
+      .vol { margin-top: 12px; display: flex; align-items: center; gap: 10px; }
+      .spk { width: 14px; height: 12px; background: #fff; clip-path: polygon(0 30%, 35% 30%, 100% 0, 100% 100%, 35% 70%, 0 70%); opacity: .8; }
+      .vol input[type=range] { flex: 1; height: 16px; margin: 0; accent-color: #ff6b8b; /* accent-color on range */ }
+      .vol .pct { font-size: 12px; width: 28px; text-align: right; opacity: .75; font-variant-numeric: tabular-nums; }
+
+      .queue { position: absolute; left: 16px; right: 16px; top: 572px; color: #fff; }
+      .queue h2 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .2em; opacity: .7; display: flex; justify-content: space-between; }
+      .queue h2 span { letter-spacing: 0; text-transform: none; font-weight: 700; color: #ffb347; opacity: 1; }
+      .queue ol { list-style: none; margin: 0; padding: 0; counter-reset: q; /* counter-reset */ border-radius: 16px; overflow: hidden; border: .5px solid rgba(255,255,255,.18); }
+      .queue li { counter-increment: q; display: grid; grid-template-columns: 22px 40px 1fr auto; align-items: center; gap: 10px; height: 49px; padding: 0 12px 0 10px; position: relative; }
+      .queue li:nth-child(odd) { background: rgba(255,255,255,.09); /* odd row tint */ }
+      .queue li:nth-child(even) { background: rgba(255,255,255,.03); }
+      .queue li::before { content: counter(q, decimal-leading-zero); font-size: 11px; opacity: .55; font-variant-numeric: tabular-nums; }
+      .queue img { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; display: block; box-shadow: 0 3px 8px rgba(0,0,0,.4); }
+      .queue .n { font-size: 14px; font-weight: 700; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .queue .a { font-size: 11px; opacity: .6; }
+      .queue .lyric { display: block; font-size: 11px; font-style: italic; color: #fff; mix-blend-mode: overlay; /* blend mode */ background: linear-gradient(90deg, #ffcf5c, #ff5e7e); padding: 1px 6px; border-radius: 6px; margin-top: 2px; width: max-content; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .queue .d { font-size: 12px; opacity: .75; text-align: right; font-variant-numeric: tabular-nums; }
+      .queue li > div { min-width: 0; }
+
+      .home { position: absolute; left: 130px; right: 130px; bottom: 8px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.7); }
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <img class="bg" src="/assets/album.png" alt="" data-fid="img.bg-1">
+    <div class="scrim" data-fid="div.scrim-2"></div>
+
+    <div class="top" data-fid="div.top-3">
+      <span class="chev" data-fid="span.chev-4"></span>
+      <span class="eyebrow" data-fid="span.eyebrow-5">Now playing</span>
+      <span class="dots" data-fid="span.dots-6"><i data-fid="i-7"></i><i data-fid="i-8"></i><i data-fid="i-9"></i></span>
+    </div>
+
+    <section class="card" data-fid="section.card-10">
+      <div class="stage" data-fid="div.stage-11">
+        <div class="vinyl" data-fid="div.vinyl-12"></div>
+        <img class="art" src="/assets/album.png" alt="" data-fid="img.art-13">
+      </div>
+      <div class="meta" data-fid="div.meta-14">
+        <div class="txt" data-fid="div.txt-15">
+          <span class="title" data-fid="span.title-16">Concentric Rings of a Midnight Summer Drive Home</span>
+          <div class="artist" data-fid="div.artist-17">The Velvet Orbits • Deluxe Edition</div>
+        </div>
+        <span class="heart" data-fid="span.heart-18"></span>
+      </div>
+      <div class="prog" data-fid="div.prog-19"><div class="track" data-fid="div.track-20"></div><div class="fill" data-fid="div.fill-21"></div><div class="knob" data-fid="div.knob-22"></div></div>
+      <div class="times" data-fid="div.times-23"><span data-fid="span-24">1:24</span><span data-fid="span-25">–2:17</span></div>
+      <div class="ctrl" data-fid="div.ctrl-26">
+        <span class="cbtn sm" data-fid="span.cbtn-27"><i data-fid="i-28"></i></span>
+        <span class="cbtn prev" data-fid="span.cbtn-29"></span>
+        <span class="play" data-fid="span.play-30"></span>
+        <span class="cbtn next" data-fid="span.cbtn-31"></span>
+        <span class="cbtn sm rep" data-fid="span.cbtn-32"><i data-fid="i-33"></i></span>
+      </div>
+      <div class="vol" data-fid="div.vol-34">
+        <span class="spk" data-fid="span.spk-35"></span>
+        <input type="range" min="0" max="100" value="64" data-fid="input-36">
+        <span class="pct" data-fid="span.pct-37">64</span>
+      </div>
+    </section>
+
+    <section class="queue" data-fid="section.queue-38">
+      <h2 data-fid="h2-39">Up next <span data-fid="span-40">Clear</span></h2>
+      <ol data-fid="ol-41">
+        <li data-fid="li-42"><img src="/assets/photo1.png" alt="" data-fid="img-43"><div data-fid="div-44"><div class="n" data-fid="div.n-45">Paper Lanterns</div><div class="a" data-fid="div.a-46">Mira Hollis</div></div><span class="d" data-fid="span.d-47">3:42</span></li>
+        <li data-fid="li-48"><img src="/assets/photo2.png" alt="" data-fid="img-49"><div data-fid="div-50"><div class="n" data-fid="div.n-51">Static Bloom</div><span class="lyric" data-fid="span.lyric-52">“hold the light a little longer…”</span></div><span class="d" data-fid="span.d-53">4:05</span></li>
+        <li data-fid="li-54"><img src="/assets/photo3.png" alt="" data-fid="img-55"><div data-fid="div-56"><div class="n" data-fid="div.n-57">Harbour Lights at Dawn — Extended</div><div class="a" data-fid="div.a-58">North Atlas</div></div><span class="d" data-fid="span.d-59">6:18</span></li>
+        <li data-fid="li-60"><img src="/assets/photo1.png" alt="" data-fid="img-61"><div data-fid="div-62"><div class="n" data-fid="div.n-63">Glass Afternoon</div><div class="a" data-fid="div.a-64">Juno &amp; the Tides</div></div><span class="d" data-fid="span.d-65">2:59</span></li>
+      </ol>
+    </section>
+    <div class="home" data-fid="div.home-66"></div>
+  
+
+</body></html>

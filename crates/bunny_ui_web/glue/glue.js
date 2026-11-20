@@ -20,7 +20,7 @@ function painter() {
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; boot compares the two and refuses a
 // pairing this mirror was not written for.
-const EXPECTED_ABI = 26;
+const EXPECTED_ABI = 28;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it).
@@ -73,6 +73,34 @@ function cssFont(size, weight, mono, italic, named) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
+// Sets one line's face on the ink and answers the scale it is set at and
+// the line's width in CSS px. The page shapes its text at the device's
+// size and takes a variable face's optical size from the CSS one; a canvas
+// sets one size for both. A face that draws the same at either size is
+// set at the device's, where the page shapes it. One whose cut follows the
+// size (an optical-size axis: Inter set at twice its size is its display
+// cut, 7% narrower than the page's) is set at the page's own size, and a
+// raster scales it to the device's.
+function setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) {
+  // kerning as the page's own text has it: a canvas left at "auto"
+  // measures a line with spaces wider than the element that shows it,
+  // and breaks a paragraph a word early
+  ink.fontKerning = "normal";
+  // `.tracking`: the letters spread as the page spreads them
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  const page = ink.measureText(text).width;
+  ink.font = cssFont(size * ratio, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking * ratio}px`;
+  const device = ink.measureText(text).width / ratio;
+  if (Math.abs(page - device) <= Math.max(page, device) * 1e-4) {
+    return { set: ratio, width: device };
+  }
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  return { set: 1, width: page };
+}
+
 // The engine names a key by what it types with NO modifier — so a
 // chord on shifted punctuation is spellable at all. `event.key` has the
 // shift APPLIED (shift and backslash arrives as a pipe), so the chord
@@ -109,6 +137,12 @@ function requestFrame() {
 // decoding; null = the browser could not read the bytes (permanent —
 // the engine never re-registers, nothing loops).
 const images = new Map();
+// SVG bytes: the markup's first tag, past a byte order mark, white space,
+// an XML declaration and comments
+function isSvg(bytes) {
+  const head = new TextDecoder().decode(bytes.subarray(0, 1024)).replace(/^\uFEFF/, "");
+  return /^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i.test(head);
+}
 
 function imageKey(hi, lo) {
   // wasm hands u32 arguments through the SIGNED i32 border while the
@@ -167,7 +201,7 @@ function bunnyGlStubsOrNothing() {
 }
 
 const GPU_VERBS = [
-  "gl_init", "gl_log", "gl_island_blit", "gl_now", "gl_teardown", "gl_resize",
+  "gl_init", "gl_log", "gl_island_blit", "gl_page_blit", "gl_now", "gl_teardown", "gl_resize",
   "gl_viewport", "gl_scissor", "gl_clear_color", "gl_clear", "gl_enable", "gl_disable",
   "gl_blend_func_separate", "gl_pixel_storei", "gl_finish", "gl_flush",
   "gl_compile_shader", "gl_link_program", "gl_bind_attrib_location", "gl_use_program",
@@ -335,6 +369,23 @@ const imports = {
     js_image_register(hi, lo, pointer, length) {
       const key = imageKey(hi, lo);
       const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+      if (isSvg(bytes)) {
+        // a bitmap cannot be decoded from SVG bytes: the picture loads as
+        // an image and stays a vector, drawn at whatever size is asked
+        const url = URL.createObjectURL(new Blob([bytes], { type: "image/svg+xml" }));
+        const picture = new Image();
+        picture.onload = () => {
+          URL.revokeObjectURL(url);
+          images.set(key, picture);
+          wasm.bunny_image_ready(hi, lo);
+        };
+        picture.onerror = () => {
+          URL.revokeObjectURL(url);
+          images.set(key, null);
+        };
+        picture.src = url;
+        return;
+      }
       createImageBitmap(new Blob([bytes]))
         .then((bitmap) => {
           images.set(key, bitmap);
@@ -348,8 +399,8 @@ const imports = {
     js_image_size(hi, lo, out) {
       const bitmap = images.get(imageKey(hi, lo));
       const view = new Uint32Array(wasm.memory.buffer, out, 2);
-      view[0] = bitmap ? bitmap.width : 0;
-      view[1] = bitmap ? bitmap.height : 0;
+      view[0] = bitmap ? bitmap.naturalWidth ?? bitmap.width : 0;
+      view[1] = bitmap ? bitmap.naturalHeight ?? bitmap.height : 0;
     },
     // Draws the bitmap at exactly width×height physical px and writes
     // the straight-alpha RGBA back (getImageData is straight by spec).
@@ -360,7 +411,10 @@ const imports = {
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
       ink.imageSmoothingEnabled = true;
-      ink.imageSmoothingQuality = "high";
+      // the filter the page's own <img> is drawn with — bilinear, the
+      // browser's "low": "high" resamples an enlarged picture with a
+      // cubic, and every pixel of it lands one step from the page's
+      ink.imageSmoothingQuality = "low";
       ink.drawImage(bitmap, 0, 0, width, height);
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
@@ -378,17 +432,23 @@ const imports = {
       familyPointer,
       familyLength,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
       );
+      const ratio = globalThis.devicePixelRatio || 1;
+      const family = familyOf(familyPointer, familyLength);
       const ink = inkSurface(1, 1);
-      ink.font = cssFont(size, weight, mono, italic, familyOf(familyPointer, familyLength));
+      const line = text ? setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) : null;
+      // the ascent and descent at the device's size, as the page lays
+      // text out on a HiDPI screen: they round there
+      ink.font = cssFont(size * ratio, weight, mono, italic, family);
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(wasm.memory.buffer, out, 3);
-      metrics[0] = text ? probe.width : 0;
-      metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
-      metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
+      metrics[0] = line ? line.width : 0;
+      metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
+      metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
     },
     // Draws one line into a width×height physical rectangle and copies
     // the RGBA into wasm memory at `out`. getImageData hands back
@@ -408,6 +468,7 @@ const imports = {
       descent,
       color,
       out,
+      tracking = 0,
     ) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
@@ -415,8 +476,9 @@ const imports = {
       const ink = inkSurface(width, height);
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
-      ink.setTransform(scale, 0, 0, scale, 0, 0);
-      ink.font = cssFont(size, weight, mono, italic, familyOf(familyPointer, familyLength));
+      const line = setLine(ink, text, size, weight, mono, italic, familyOf(familyPointer, familyLength), tracking, scale);
+      // a face set at the page's size is scaled to the device's
+      ink.setTransform(scale / line.set, 0, 0, scale / line.set, 0, 0);
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
@@ -425,7 +487,7 @@ const imports = {
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
       // baseline sits `descent` above the box bottom — the ceil slack
       // stays on top, mirroring the desktop engine
-      ink.fillText(text, 0, height / scale - descent);
+      ink.fillText(text, 0, (height - descent * scale) / (scale / line.set));
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
     },

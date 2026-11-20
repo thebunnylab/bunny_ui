@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en"><head><base href="/apps/">
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=390, height=844">
+    <title>Chat Thread</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; width: 390px; height: 844px; overflow: hidden; display: flex; flex-direction: column; background: #eef1f6; }
+
+      header { flex: none; height: 92px; padding: 40px 14px 0 14px; display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,.96); border-bottom: .5px solid rgba(0,0,0,.12); box-shadow: 0 1px 8px rgba(0,0,0,.05); }
+      .back { position: relative; width: 28px; height: 32px; flex: none; }
+      /* chevron from rotated borders */
+      .back::before { content: ""; position: absolute; left: 10px; top: 9px; width: 12px; height: 12px; border-left: 2.5px solid #2b6cff; border-bottom: 2.5px solid #2b6cff; transform: rotate(45deg); border-radius: 1px; }
+      /* unread badge pill: min-width + padding */
+      .badge { position: absolute; left: 16px; top: -2px; min-width: 18px; height: 18px; padding: 0 6px; border-radius: 9px; background: #ff3b30; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; box-shadow: 0 0 0 2px #fff; }
+      .av { position: relative; width: 42px; height: 42px; flex: none; }
+      .av img { width: 42px; height: 42px; object-fit: cover; border-radius: 50%; display: block; outline: 3px solid #34c759; outline-offset: 2px; /* status ring via outline */ }
+      .av .on { position: absolute; right: -3px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: #34c759; border: 2px solid #fff; }
+      .who { flex: 1; min-width: 0; margin-left: 4px; }
+      .who b { display: block; font-size: 16px; font-weight: 800; line-height: 1.15; }
+      .who span { font-size: 12px; color: #34a853; }
+      .ib { width: 36px; height: 36px; border-radius: 50%; background: #eef2fb; position: relative; flex: none; }
+      /* phone icon: rounded rect w/ borders; video icon: rect + clip-path lens */
+      .ib.call::before { content: ""; position: absolute; left: 11px; top: 8px; width: 14px; height: 20px; border: 2.5px solid #2b6cff; border-radius: 5px 5px 8px 8px; transform: rotate(-35deg); border-top-width: 3px; }
+      .ib.vid::before { content: ""; position: absolute; left: 7px; top: 11px; width: 15px; height: 14px; background: #2b6cff; border-radius: 3px; }
+      .ib.vid::after { content: ""; position: absolute; left: 23px; top: 12px; width: 7px; height: 12px; background: #2b6cff; clip-path: polygon(0 35%, 100% 0, 100% 100%, 0 65%); }
+
+      main { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 8px 12px 6px; gap: 7px; overflow: hidden; background: linear-gradient(180deg, #f3f5fa, #e8ecf4); }
+
+      /* date separator: flex row with pseudo hairlines */
+      .sep { display: flex; align-items: center; gap: 10px; font-size: 11px; color: #8a8f9c; text-transform: uppercase; letter-spacing: .12em; margin: 2px 0; }
+      .sep::before, .sep::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, transparent, rgba(0,0,0,.18)); }
+      .sep::after { background: linear-gradient(270deg, transparent, rgba(0,0,0,.18)); }
+
+      .m { position: relative; max-width: 75%; padding: 8px 12px; font-size: 15px; line-height: 1.3; }
+      .in { align-self: flex-start; background: #fff; border-radius: 18px 18px 18px 4px; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+      .out { align-self: flex-end; color: #fff; border-radius: 18px 18px 4px 18px; background: linear-gradient(135deg, #3b82ff, #6a4cff 60%, #9b4dff); box-shadow: 0 2px 6px rgba(70,80,255,.3); }
+      /* tails via ::after clip-path */
+      .in::after { content: ""; position: absolute; left: -5px; bottom: 0; width: 10px; height: 10px; background: #fff; clip-path: polygon(100% 0, 100% 100%, 0 100%); }
+      .out::after { content: ""; position: absolute; right: -5px; bottom: 0; width: 10px; height: 10px; background: #9b4dff; clip-path: polygon(0 0, 100% 100%, 0 100%); }
+      .t { display: block; text-align: right; font-size: 10px; opacity: .55; margin-top: 1px; font-variant-numeric: tabular-nums; }
+
+      .rich a { color: #2b6cff; text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; text-decoration-color: rgba(43,108,255,.5); }
+      .rich code { font-family: inherit; /* same font, tinted bg */ font-size: 13px; background: rgba(43,108,255,.12); color: #1c3f9e; padding: 1px 5px; border-radius: 5px; border: .5px solid rgba(43,108,255,.25); }
+      .rich mark { background: linear-gradient(180deg, transparent 40%, #ffe066 40%); color: inherit; padding: 0 2px; }
+      .rich em { color: #7a3cff; }
+
+      .pic { padding: 4px; width: 75%; max-width: 75%; }
+      .pic .ph { position: relative; border-radius: 15px 15px 15px 4px; overflow: hidden; }
+      .pic img { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; /* aspect-ratio + object-fit */ }
+      .pic .cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 10px 7px; color: #fff; font-size: 12px; background: linear-gradient(180deg, rgba(0,0,0,0), rgba(0,0,0,.7)); text-shadow: 0 1px 2px rgba(0,0,0,.5); }
+
+      /* reaction pill overlapping corner: absolute + translate */
+      .react { position: absolute; right: 10px; bottom: 0; transform: translate(6px, 60%); display: flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px; background: #fff; border-radius: 11px; box-shadow: 0 1px 4px rgba(0,0,0,.2); font-size: 11px; color: #555; border: 1px solid #eef; z-index: 2; }
+      .react i { width: 10px; height: 9px; background: #ff3b5c; clip-path: polygon(50% 100%, 0 40%, 8% 10%, 30% 0, 50% 22%, 70% 0, 92% 10%, 100% 40%); display: block; }
+      .seen { align-self: flex-end; font-size: 10px; color: #8a8f9c; margin: -3px 4px 0 0; letter-spacing: .04em; }
+
+      .rtl { direction: rtl; /* rtl bubble */ align-self: flex-start; background: #fff7e0; border-radius: 18px 18px 4px 18px; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+      .rtl::after { display: none; }
+
+      .typing { align-self: flex-start; display: flex; gap: 5px; align-items: center; padding: 11px 14px; background: #fff; border-radius: 18px 18px 18px 4px; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+      .typing i { width: 8px; height: 8px; border-radius: 50%; background: #9aa1b2; }
+      .typing i:nth-child(2) { opacity: .65; transform: translateY(-1px); }
+      .typing i:nth-child(3) { opacity: .35; }
+
+      footer { flex: none; height: 84px; padding: 10px 12px 0; display: flex; align-items: flex-start; gap: 8px; background: rgba(255,255,255,.97); border-top: .5px solid rgba(0,0,0,.12); position: relative; }
+      footer::after { content: ""; position: absolute; left: 130px; right: 130px; bottom: 8px; height: 5px; border-radius: 3px; background: #1d1d1f; opacity: .85; }
+      .clip { width: 40px; height: 40px; border-radius: 50%; flex: none; position: relative; }
+      /* attachment icon: rotated rounded rect outline */
+      .clip::before { content: ""; position: absolute; left: 15px; top: 8px; width: 10px; height: 22px; border: 2.5px solid #8a8f9c; border-radius: 6px; transform: rotate(25deg); }
+      .field { flex: 1; min-width: 0; height: 40px; border: 1px solid #d5d9e3; border-radius: 20px; padding: 0 16px; font: 15px "Fid Sans"; background: #f5f7fb; outline: none; color: #1d1d1f; }
+      .field::placeholder { color: #a3a9b8; /* placeholder color */ }
+      .send { width: 40px; height: 40px; border-radius: 50%; flex: none; position: relative; background: linear-gradient(135deg, #3b82ff, #9b4dff); box-shadow: 0 4px 10px rgba(80,80,255,.4); }
+      /* arrow: shaft + rotated head from borders */
+      .send::before { content: ""; position: absolute; left: 19px; top: 11px; width: 2.5px; height: 18px; background: #fff; border-radius: 1px; }
+      .send::after { content: ""; position: absolute; left: 14px; top: 12px; width: 11px; height: 11px; border-left: 2.5px solid #fff; border-top: 2.5px solid #fff; transform: rotate(45deg); transform-origin: 50% 50%; }
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <header data-fid="header-1">
+      <span class="back" data-fid="span.back-2"><span class="badge" data-fid="span.badge-3">3</span></span>
+      <span class="av" data-fid="span.av-4"><img src="/assets/avatar.png" alt="" data-fid="img-5"><span class="on" data-fid="span.on-6"></span></span>
+      <div class="who" data-fid="div.who-7"><b data-fid="b-8">Alex Rivera</b><span>online</span></div>
+      <span class="ib call" data-fid="span.ib-10"></span>
+      <span class="ib vid" data-fid="span.ib-11"></span>
+    </header>
+
+    <main data-fid="main-12">
+      <div class="sep" data-fid="div.sep-13">Today</div>
+
+      <div class="m in" data-fid="div.m-14">Hey! Did you see the photos from the lake trip? <span class="t" data-fid="span.t-15">9:41</span></div>
+
+      <div class="m out" data-fid="div.m-16">Just opened them — wow. <span class="t" data-fid="span.t-17">9:42</span></div>
+
+      <div class="m in rich" data-fid="div.m-18">Check the <strong>itinerary</strong>, it’s <em>really</em> packed: <a>trip-plan.pdf</a>, run <code>pack --light</code> and note <mark>Saturday 7:30</mark> sharp. <span class="t" data-fid="span.t-24">9:43</span></div>
+
+      <div class="m in pic" data-fid="div.m-25">
+        <div class="ph" data-fid="div.ph-26"><img src="/assets/photo2.png" alt="" data-fid="img-27"><div class="cap" data-fid="div.cap-28">Lake Aurelia, 6:12 a.m.</div></div>
+        <span class="react" data-fid="span.react-29"><i data-fid="i-30"></i>2</span>
+      </div>
+
+      <div class="m out" style="margin-top: 8px;" data-fid="div.m-31">Gorgeous. Booking the cabin now. <span class="t" data-fid="span.t-32">9:45</span></div>
+      <div class="seen" data-fid="div.seen-33">Seen 9:46</div>
+
+      <div class="m rtl" data-fid="div.m-34">Latin text set right to left, ok! <span class="t" style="text-align:left" data-fid="span.t-35">9:47</span></div>
+
+      <div class="typing" data-fid="div.typing-36"><i data-fid="i-37"></i><i data-fid="i-38"></i><i data-fid="i-39"></i></div>
+    </main>
+
+    <footer data-fid="footer-40">
+      <span class="clip" data-fid="span.clip-41"></span>
+      <input class="field" type="text" placeholder="Message Alex…" data-fid="input.field-42">
+      <span class="send" data-fid="span.send-43"></span>
+    </footer>
+  
+
+</body></html>

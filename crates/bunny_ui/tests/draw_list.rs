@@ -23,7 +23,7 @@ fn list() -> DisplayList {
             content: "hi".into(),
             range: (0, 2),
             color: Color { r: 1, g: 1, b: 1, a: 255 },
-            font: FontSpec { size: 13.0, weight: Weight::Regular, design: FontDesign::Default, slant: Slant::Upright, family: Family::SYSTEM, tracking: 0.0 },
+            font: FontSpec { size: 13.0, weight: Weight::Regular, design: FontDesign::Default, slant: Slant::Upright, family: Family::SYSTEM, tracking: 0.0, monospaced_digits: false },
         },
         DrawCommand::PopClip,
     ])

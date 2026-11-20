@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Baseline alignment</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 24px; padding: 24px; }
+      .row { display: flex; align-items: baseline; gap: 8px; background: #f2f2f7; }
+      .lines { display: flex; align-items: baseline; gap: 12px; background: #f2f2f7; }
+      .pair { display: flex; flex-direction: column; align-items: flex-start; }
+      .box { width: 24px; height: 24px; background: #3478f6; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="row" data-fid="row">
+          <span style="font-size: 32px" data-fid="big">Big</span>
+          <span style="font-size: 18px" data-fid="medium">medium</span>
+          <span style="font-size: 12px" data-fid="small">small</span>
+          <div class="box" data-fid="box"></div>
+        </div>
+        <div class="lines" data-fid="lines">
+          <span style="font-size: 24px" data-fid="label">Label</span>
+          <div class="pair" data-fid="pair">
+            <span data-fid="first">first line</span>
+            <span style="font-size: 12px" data-fid="second">second line</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

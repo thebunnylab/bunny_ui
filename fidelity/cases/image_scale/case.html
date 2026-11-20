@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Pictures, scaled</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+      .row { display: flex; align-items: flex-start; gap: 12px; }
+      img { display: block; }
+      .fit { width: 96px; height: 96px; object-fit: contain; }
+      .fill { width: 96px; height: 96px; object-fit: cover; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="row">
+          <img src="/assets/pattern.png" width="64" height="48" alt="" data-fid="down" />
+          <img src="/assets/pattern.png" class="fit" alt="" data-fid="fit" />
+          <img src="/assets/pattern.png" class="fill" alt="" data-fid="fill" />
+        </div>
+        <img src="/assets/pattern.png" width="200" height="150" alt="" data-fid="up" />
+      </div>
+    </div>
+  </body>
+</html>

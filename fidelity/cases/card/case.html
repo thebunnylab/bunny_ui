@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=380" />
+    <title>A card</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 380px; display: flex; flex-direction: column; align-items: flex-start; background: #f2f2f7; }
+      .page { padding: 24px; }
+      .card { width: 320px; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 0 16px rgba(0, 0, 0, 0.18); }
+      .card img { display: block; width: 320px; height: 140px; object-fit: cover; }
+      .body { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 16px; }
+      h2 { margin: 0; font-size: 20px; font-weight: 600; }
+      p { margin: 0; width: 288px; font-size: 14px; color: #8e8e93; }
+      .actions { display: flex; gap: 8px; }
+      .action { width: 88px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-size: 15px; }
+      .share { border: 1px solid #3478f6; color: #3478f6; }
+      .open { background: #3478f6; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="card" data-fid="card">
+        <img src="/assets/pattern.png" alt="" data-fid="card-image" />
+        <div class="body" data-fid="card-body">
+          <h2 data-fid="card-title">Weekend in the hills</h2>
+          <p data-fid="card-text">Two days, three trails, and a cabin with a view of the valley. Pack light; the weather turns fast.</p>
+          <div class="actions">
+            <div class="action share" data-fid="share"><span data-fid="share-label">Share</span></div>
+            <div class="action open" data-fid="open"><span data-fid="open-label">Open</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

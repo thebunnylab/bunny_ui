@@ -25,12 +25,12 @@ use std::cell::{Cell, RefCell};
 
 use bunny_ui::gpu::shaders::PRELUDE_300ES;
 use bunny_ui::gpu::walk::{
-    build_frame, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
-    SpriteInstance, TurnedInstance, GLASS_MAX_LEVEL,
+    build_part, AtlasGround, FrameBatches, FrameCursor, GlassInstance, RectInstance, RunAtlas, RunKind,
+    SpriteInstance, TurnedInstance, Walked, ATLAS_MAX_SIZE, GLASS_MAX_LEVEL,
 };
 use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageEngine;
-use bunny_ui::layout::{Color, DisplayList, Size};
+use bunny_ui::layout::{Color, DisplayList, DrawCommand, Size};
 use bunny_ui::text_engine::TextEngine;
 
 #[cfg(feature = "3d")]
@@ -47,7 +47,12 @@ unsafe extern "C" {
     /// The page's own clock, for a line that must say what it timed.
     pub(crate) fn gl_now() -> f64;
     fn gl_teardown();
-    fn gl_resize(width: u32, height: u32);
+    /// 1 when the drawable holds the size, 0 when the device keeps a
+    /// smaller one.
+    fn gl_resize(width: u32, height: u32) -> u32;
+    /// The drawable's top `height` rows into the page's own surface at
+    /// row `top`, the surface `rows` tall.
+    fn gl_page_blit(top: u32, width: u32, height: u32, rows: u32);
 
     fn gl_viewport(x: i32, y: i32, width: i32, height: i32);
     fn gl_clear_color(r: f32, g: f32, b: f32, a: f32);
@@ -987,6 +992,10 @@ struct Tier {
     max_texture: u32,
     /// The physical size the drawable currently holds.
     physical: (u32, u32),
+    /// The rows a band holds, for a page taller than the device draws:
+    /// the tier draws it band by band on a canvas of its own and copies
+    /// each into the page's surface. `None`: the drawable is the page.
+    band: Option<u32>,
     pipelines: Pipelines,
     ground: WebGround,
     atlas: RunAtlas,
@@ -1005,7 +1014,7 @@ thread_local! {
 /// Brings the tier up for `kind` at a physical size. False means the
 /// page presents by CPU — which is not a failure, it is the floor.
 pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
-    let max_texture = unsafe { gl_init(kind, physical.0, physical.1) };
+    let mut max_texture = unsafe { gl_init(kind, physical.0, physical.1) };
     // below two thousand the shelf atlas cannot even open at its
     // starting size, and a tier that loses its text is worse than no
     // tier — the CPU road draws the same scene and keeps it
@@ -1014,6 +1023,30 @@ pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
             unsafe { gl_teardown() };
         }
         return false;
+    }
+    // a device draws no larger than its limits — SwiftShader stops at
+    // 8192 rows — and a drawable smaller than the page would squeeze
+    // every frame into it. A page that tall is drawn in bands, on a
+    // canvas of the tier's own, as tall as the device allows
+    let mut band = None;
+    if unsafe { gl_resize(physical.0, physical.1) } == 0 {
+        unsafe { gl_teardown() };
+        if kind != 0 {
+            return false;
+        }
+        max_texture = unsafe { gl_init(KIND_BANDS, physical.0, 1) };
+        let mut rows = physical.1.min(max_texture);
+        while rows >= 256 && unsafe { gl_resize(physical.0, rows) } == 0 {
+            rows /= 2;
+        }
+        // a page wider than the device draws has no band that holds it
+        if max_texture < 2048 || rows < 256 {
+            if max_texture != 0 {
+                unsafe { gl_teardown() };
+            }
+            return false;
+        }
+        band = Some(rows);
     }
     unsafe {
         // fixed for the life of the context, exactly as the desktop
@@ -1039,7 +1072,8 @@ pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
     TIER.with(|slot| {
         *slot.borrow_mut() = Some(Tier {
             max_texture,
-            physical,
+            physical: band.map_or(physical, |rows| (physical.0, rows)),
+            band,
             pipelines,
             ground: WebGround::default(),
             atlas: RunAtlas::new(),
@@ -1100,8 +1134,13 @@ pub(crate) fn restored(physical: (u32, u32)) -> bool {
     try_install(0, physical)
 }
 
+/// The tier's own canvas for a page taller than the device draws.
+const KIND_BANDS: u32 = 2;
+
 /// Presents one display list. The frame IS the drawable: no `Surface`
-/// is allocated on this road, and the CPU bitmap is never built.
+/// is allocated on this road, and the CPU bitmap is never built. False
+/// means nothing was presented: there is no tier, or the window grew past
+/// what the device draws and the tier went — the CPU takes this frame.
 pub(crate) fn present_window(
     island: Option<(u32, (u32, u32))>,
     display: &DisplayList,
@@ -1110,304 +1149,392 @@ pub(crate) fn present_window(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> bool {
     let physical = island.map(|(_, box4)| box4).unwrap_or((
         ((size.width.round() as usize) * scale).max(1) as u32,
         ((size.height.round() as usize) * scale).max(1) as u32,
     ));
     TIER.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(tier) = slot.as_mut() else { return };
-        if tier.physical != physical {
-            tier.physical = physical;
-            unsafe { gl_resize(physical.0, physical.1) };
-        }
-        // the walk, and the copying collector behind it: a full atlas
-        // drains, resets (growing once to the cap the device allows)
-        // and walks the frame again
-        let target = (physical.0 as usize, physical.1 as usize);
-        let mut walked = false;
-        for attempt in 0..3 {
-            let Tier { ground, atlas, batches, .. } = tier;
-            // the page is opaque and an island clears to nothing: the one
-            // rule the raster asks answers both
-            let floor = bunny_ui::raster::solid_floor(canvas);
-            match build_frame(ground, display, scale, target, text, images, atlas, batches, floor) {
-                Ok(()) => {
-                    walked = true;
-                    break;
-                }
-                Err(_) => {
-                    let grow = attempt == 0 && tier.max_texture >= 4096;
-                    let Tier { ground, atlas, .. } = tier;
-                    atlas.reset(ground, grow);
-                }
+        let Some(tier) = slot.as_mut() else { return false };
+        // a band is whole logical rows: the list moves up by whole points
+        // and every edge snaps where it snapped on the page
+        let band = tier.band.map(|rows| (rows - rows % scale as u32).max(scale as u32));
+        let drawable = band.map_or(physical, |rows| (physical.0, rows));
+        if tier.physical != drawable {
+            tier.physical = drawable;
+            // a drawable smaller than the window squeezes every frame
+            // into it and cuts each clip where the rows are not
+            if unsafe { gl_resize(drawable.0, drawable.1) } == 0 {
+                say("bunny gl: the window is larger than the device draws - the page presents by CPU");
+                *slot = None;
+                unsafe { gl_teardown() };
+                return false;
             }
         }
-        if !walked {
-            say("bunny gl: the atlas overflowed twice - the frame is short");
-            return;
-        }
-        // the worlds that moved, each into its own target, before the 2D
-        // pass samples them
-        #[cfg(feature = "3d")]
-        {
-            let Tier { ground, atlas, batches, .. } = tier;
-            if !batches.worlds.is_empty() {
-                ground.world.encode(&batches.worlds);
-                atlas.worlds.drawn();
-            }
-        }
-
-        // a pane READS what is under it, so a frame that holds one
-        // cannot draw at the drawable: the drawable is write-only. It
-        // goes to a texture and comes back at the end.
-        let wants_glass = tier.batches.runs.iter().any(|run| run.kind == RunKind::Glass);
-        if wants_glass {
-            let stale = tier.glass.as_ref().is_none_or(|targets| targets.size != physical);
-            if stale {
-                if let Some(old) = tier.glass.take() {
-                    old.release();
-                }
-                tier.glass = GlassTargets::new(physical);
-            }
-        }
-        let scene_fbo = match (wants_glass, tier.glass.as_ref()) {
-            (true, Some(targets)) => targets.fbo,
-            // no pane, or the targets refused: straight at the drawable,
-            // and a refused pane paints without its blur rather than
-            // failing to present
-            _ => 0,
-        };
-        unsafe {
-            gl_bind_framebuffer(GL_FRAMEBUFFER, scene_fbo);
-            gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
-            // the canvas colour goes on STRAIGHT, the way the
-            // rasterizer fills its bitmap with it — nothing has
-            // blended yet
-            gl_clear_color(
-                canvas.r as f32 / 255.0,
-                canvas.g as f32 / 255.0,
-                canvas.b as f32 / 255.0,
-                canvas.a as f32 / 255.0,
-            );
-            gl_clear(GL_COLOR_BUFFER_BIT);
-        }
-
-        let viewport = [physical.0 as f32, physical.1 as f32, 0.0, 0.0];
-        unsafe {
-            gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.frame_ubo);
-            gl_buffer_sub_data(
-                GL_UNIFORM_BUFFER,
-                0,
-                viewport.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(&viewport),
-            );
-        }
-        upload(
-            tier.pipelines.rects,
-            &mut tier.pipelines.rect_cap,
-            instance_bytes(&tier.batches.rects),
-        );
-        upload(
-            tier.pipelines.sprites,
-            &mut tier.pipelines.sprite_cap,
-            instance_bytes(&tier.batches.sprites),
-        );
-        upload(
-            tier.pipelines.glass_buffer,
-            &mut tier.pipelines.glass_cap,
-            instance_bytes(&tier.batches.glass),
-        );
-        upload(
-            tier.pipelines.turned_buffer,
-            &mut tier.pipelines.turned_cap,
-            instance_bytes(&tier.batches.turned),
-        );
-
-        // the runs, in paint order — the display list IS the order, and
-        // nothing here sorts or batches across it
-        let mut round = u32::MAX;
-        let mut program = 0u32;
-        for run in &tier.batches.runs {
-            if run.round != round {
-                round = run.round;
-                let curve = tier.batches.rounds[round as usize];
-                let block = [
-                    curve.box4[0], curve.box4[1], curve.box4[2], curve.box4[3],
-                    curve.radii[0], curve.radii[1], curve.radii[2], curve.radii[3],
-                ];
-                unsafe {
-                    gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.round_ubo);
-                    gl_buffer_sub_data(
-                        GL_UNIFORM_BUFFER,
-                        0,
-                        block.as_ptr().cast::<u8>(),
-                        std::mem::size_of_val(&block),
-                    );
+        match band {
+            None => {
+                if present_frame(tier, display, physical, scale, canvas, text, images)
+                    && let Some((id, _)) = island
+                {
+                    // the shared surface holds this island's pixels: hand
+                    // them to its own element before the next island
+                    // overwrites them
+                    unsafe { gl_island_blit(id, physical.0, physical.1) };
                 }
             }
-            match run.kind {
-                // a knockout over a clear ground, which on this tier is
-                // an island over nothing: the rect program, and the erase
-                // blend around its draw below
-                RunKind::Rects | RunKind::Knockout => {
-                    if program != tier.pipelines.rect {
-                        program = tier.pipelines.rect;
-                        unsafe {
-                            gl_use_program(program);
-                            gl_bind_vertex_array(tier.pipelines.vao_rect);
-                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.rects);
-                        }
+            Some(rows) => {
+                let mut top = 0;
+                while top < physical.1 {
+                    let shifted = display.translated_slice((0, display.len()), 0.0, -f64::from(top) / scale as f64);
+                    if present_frame(tier, &shifted, drawable, scale, canvas, text, images) {
+                        unsafe { gl_page_blit(top, physical.0, rows.min(physical.1 - top), physical.1) };
                     }
-                    rect_attribs(run.base as usize * std::mem::size_of::<RectInstance>());
-                }
-                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
-                    let wanted = match run.kind {
-                        RunKind::Live(_) => tier.pipelines.live,
-                        _ => tier.pipelines.sprite,
-                    };
-                    if program != wanted {
-                        program = wanted;
-                        unsafe {
-                            gl_use_program(program);
-                            gl_bind_vertex_array(tier.pipelines.vao_sprite);
-                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
-                        }
-                    }
-                    let texture = match run.kind {
-                        RunKind::Texture(index) => tier
-                            .batches
-                            .textures
-                            .get(index as usize)
-                            .and_then(|handle| tier.ground.dedicated.get(handle).copied())
-                            .unwrap_or(0),
-                        RunKind::Live(index) => tier
-                            .batches
-                            .textures
-                            .get(index as usize)
-                            .and_then(|handle| tier.ground.live.get(handle).copied())
-                            .unwrap_or(0),
-                        _ => tier.ground.shared.unwrap_or(0),
-                    };
-                    unsafe {
-                        gl_active_texture(GL_TEXTURE0);
-                        gl_bind_texture(GL_TEXTURE_2D, texture);
-                    }
-                    sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
-                }
-                RunKind::Turned | RunKind::TurnedTexture(_) => {
-                    if program != tier.pipelines.turned {
-                        program = tier.pipelines.turned;
-                        unsafe {
-                            gl_use_program(program);
-                            gl_bind_vertex_array(tier.pipelines.vao_turned);
-                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.turned_buffer);
-                        }
-                    }
-                    let texture = match run.kind {
-                        RunKind::TurnedTexture(index) => tier
-                            .batches
-                            .textures
-                            .get(index as usize)
-                            .and_then(|handle| {
-                                tier.ground
-                                    .dedicated
-                                    .get(handle)
-                                    .or_else(|| tier.ground.live.get(handle))
-                                    .copied()
-                            })
-                            .unwrap_or(0),
-                        _ => tier.ground.shared.unwrap_or(0),
-                    };
-                    unsafe {
-                        gl_active_texture(GL_TEXTURE0);
-                        gl_bind_texture(GL_TEXTURE_2D, texture);
-                    }
-                    turned_attribs(run.base as usize * std::mem::size_of::<TurnedInstance>());
-                }
-                // a world's target, composited with the box's veil
-                #[cfg(feature = "3d")]
-                RunKind::World(index) => {
-                    let Some((wanted, texture)) = tier
-                        .batches
-                        .world_targets
-                        .get(index as usize)
-                        .and_then(|handle| tier.ground.world.composite(*handle))
-                    else {
-                        continue;
-                    };
-                    if program != wanted {
-                        program = wanted;
-                        unsafe {
-                            gl_use_program(program);
-                            gl_bind_vertex_array(tier.pipelines.vao_sprite);
-                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
-                        }
-                    }
-                    unsafe {
-                        gl_active_texture(GL_TEXTURE0);
-                        gl_bind_texture(GL_TEXTURE_2D, texture);
-                    }
-                    sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
-                }
-                // without the world pass the walk makes no world run
-                #[cfg(not(feature = "3d"))]
-                RunKind::World(_) => continue,
-                RunKind::Glass => {
-                    let Some(targets) = tier.glass.as_ref() else { continue };
-                    // the pyramid is blurred out of the scene AS DRAWN
-                    // SO FAR — everything below this pane, and nothing
-                    // above it. A batch that shares reads the one the
-                    // pane around it had built
-                    if !run.reuse {
-                        build_pyramid(&tier.pipelines, targets, run.levels);
-                    }
-                    program = tier.pipelines.glass;
-                    unsafe {
-                        // the pyramid re-pointed the shared framebuffer
-                        // at its own levels; the scene has to be put
-                        // back before the pane draws into it
-                        gl_bind_framebuffer(GL_FRAMEBUFFER, targets.fbo);
-                        gl_framebuffer_texture_2d(
-                            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets.scene, 0,
-                        );
-                        gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
-                        gl_use_program(program);
-                        gl_bind_vertex_array(tier.pipelines.vao_glass);
-                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.glass_buffer);
-                        gl_active_texture(GL_TEXTURE0);
-                        gl_bind_texture(GL_TEXTURE_2D, targets.ping);
-                    }
-                    glass_attribs(run.base as usize * std::mem::size_of::<GlassInstance>());
+                    top += rows;
                 }
             }
-            let erase = run.kind == RunKind::Knockout;
-            if erase {
-                // the target keeps `1 - alpha` of itself, colour and alpha
-                // alike, and nothing is painted
-                unsafe {
-                    gl_blend_func_separate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
-                }
-            }
-            unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
-            if erase {
-                // the house blend, for every run after it
-                unsafe {
-                    gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-                }
-            }
-        }
-        if let (true, Some(targets)) = (wants_glass, tier.glass.as_ref()) {
-            blit_scene(&tier.pipelines, targets, physical);
-        }
-        if let Some((id, _)) = island {
-            // the shared surface holds this island's pixels: hand them
-            // to its own element before the next island overwrites them
-            unsafe { gl_island_blit(id, physical.0, physical.1) };
         }
         unsafe { gl_flush() };
-    });
+        true
+    })
+}
+
+/// Draws one frame into the drawable, `physical` big. The walk, and the
+/// copying collector behind it: an atlas full of what earlier frames
+/// left resets (growing to the cap the device allows) and the part is
+/// walked again; one full of this frame's own tiles ends a part, which
+/// draws before the atlas resets and the walk goes on where it stopped.
+/// False when nothing was drawn.
+fn present_frame(
+    tier: &mut Tier,
+    display: &DisplayList,
+    physical: (u32, u32),
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) -> bool {
+    let target = (physical.0 as usize, physical.1 as usize);
+    // the page is opaque and an island clears to nothing: the one rule
+    // the raster asks answers both
+    let floor = bunny_ui::raster::solid_floor(canvas);
+    let mut cursor = FrameCursor::default();
+    let mut refused = 0;
+    // the target the parts draw into, once the first opened it
+    let mut scene: Option<u32> = None;
+    loop {
+        let walked = {
+            let Tier { ground, atlas, batches, .. } = &mut *tier;
+            build_part(ground, display, scale, target, text, images, atlas, batches, floor, &mut cursor)
+        };
+        let walked = match walked {
+            Ok(walked) => walked,
+            Err(_) if refused < 2 => {
+                refused += 1;
+                let grow = tier.max_texture >= ATLAS_MAX_SIZE;
+                let Tier { ground, atlas, .. } = &mut *tier;
+                atlas.reset(ground, grow);
+                continue;
+            }
+            Err(_) => {
+                say("bunny gl: the atlas overflowed thrice - the frame is short");
+                if scene.is_none() {
+                    return false;
+                }
+                break;
+            }
+        };
+        refused = 0;
+        draw_part(tier, display, physical, canvas, walked, &mut scene);
+        if walked == Walked::Whole {
+            break;
+        }
+        let Tier { ground, atlas, .. } = &mut *tier;
+        atlas.reset(ground, false);
+    }
+    if let (Some(fbo), Some(targets)) = (scene, tier.glass.as_ref())
+        && fbo == targets.fbo
+    {
+        blit_scene(&tier.pipelines, targets, physical);
+    }
+    true
+}
+
+/// Draws the part the batches hold over the target. The first part
+/// opens the target: the drawable, or — when a pane will read what lies
+/// under it — a texture that comes back at the end, cleared to the
+/// canvas colour. Every later part draws over what the earlier ones did.
+fn draw_part(
+    tier: &mut Tier,
+    display: &DisplayList,
+    physical: (u32, u32),
+    canvas: Color,
+    walked: Walked,
+    scene: &mut Option<u32>,
+) {
+    // the worlds that moved, each into its own target, before the 2D
+    // pass samples them
+    #[cfg(feature = "3d")]
+    {
+        let Tier { ground, atlas, batches, .. } = tier;
+        if !batches.worlds.is_empty() {
+            ground.world.encode(&batches.worlds);
+            atlas.worlds.drawn();
+        }
+    }
+    match *scene {
+        Some(fbo) => unsafe {
+            gl_bind_framebuffer(GL_FRAMEBUFFER, fbo);
+            gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+        },
+        None => *scene = Some(open_scene(tier, display, physical, canvas, walked)),
+    }
+    let viewport = [physical.0 as f32, physical.1 as f32, 0.0, 0.0];
+    unsafe {
+        gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.frame_ubo);
+        gl_buffer_sub_data(
+            GL_UNIFORM_BUFFER,
+            0,
+            viewport.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&viewport),
+        );
+    }
+    upload(
+        tier.pipelines.rects,
+        &mut tier.pipelines.rect_cap,
+        instance_bytes(&tier.batches.rects),
+    );
+    upload(
+        tier.pipelines.sprites,
+        &mut tier.pipelines.sprite_cap,
+        instance_bytes(&tier.batches.sprites),
+    );
+    upload(
+        tier.pipelines.glass_buffer,
+        &mut tier.pipelines.glass_cap,
+        instance_bytes(&tier.batches.glass),
+    );
+    upload(
+        tier.pipelines.turned_buffer,
+        &mut tier.pipelines.turned_cap,
+        instance_bytes(&tier.batches.turned),
+    );
+
+    // the runs, in paint order — the display list IS the order, and
+    // nothing here sorts or batches across it
+    let mut round = u32::MAX;
+    let mut program = 0u32;
+    for run in &tier.batches.runs {
+        if run.round != round {
+            round = run.round;
+            let curve = tier.batches.rounds[round as usize];
+            let block = [
+                curve.box4[0], curve.box4[1], curve.box4[2], curve.box4[3],
+                curve.radii[0], curve.radii[1], curve.radii[2], curve.radii[3],
+            ];
+            unsafe {
+                gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.round_ubo);
+                gl_buffer_sub_data(
+                    GL_UNIFORM_BUFFER,
+                    0,
+                    block.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&block),
+                );
+            }
+        }
+        match run.kind {
+            // a knockout over a clear ground, which on this tier is
+            // an island over nothing: the rect program, and the erase
+            // blend around its draw below
+            RunKind::Rects | RunKind::Knockout => {
+                if program != tier.pipelines.rect {
+                    program = tier.pipelines.rect;
+                    unsafe {
+                        gl_use_program(program);
+                        gl_bind_vertex_array(tier.pipelines.vao_rect);
+                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.rects);
+                    }
+                }
+                rect_attribs(run.base as usize * std::mem::size_of::<RectInstance>());
+            }
+            RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                let wanted = match run.kind {
+                    RunKind::Live(_) => tier.pipelines.live,
+                    _ => tier.pipelines.sprite,
+                };
+                if program != wanted {
+                    program = wanted;
+                    unsafe {
+                        gl_use_program(program);
+                        gl_bind_vertex_array(tier.pipelines.vao_sprite);
+                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
+                    }
+                }
+                let texture = match run.kind {
+                    RunKind::Texture(index) => tier
+                        .batches
+                        .textures
+                        .get(index as usize)
+                        .and_then(|handle| tier.ground.dedicated.get(handle).copied())
+                        .unwrap_or(0),
+                    RunKind::Live(index) => tier
+                        .batches
+                        .textures
+                        .get(index as usize)
+                        .and_then(|handle| tier.ground.live.get(handle).copied())
+                        .unwrap_or(0),
+                    _ => tier.ground.shared.unwrap_or(0),
+                };
+                unsafe {
+                    gl_active_texture(GL_TEXTURE0);
+                    gl_bind_texture(GL_TEXTURE_2D, texture);
+                }
+                sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
+            }
+            RunKind::Turned | RunKind::TurnedTexture(_) => {
+                if program != tier.pipelines.turned {
+                    program = tier.pipelines.turned;
+                    unsafe {
+                        gl_use_program(program);
+                        gl_bind_vertex_array(tier.pipelines.vao_turned);
+                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.turned_buffer);
+                    }
+                }
+                let texture = match run.kind {
+                    RunKind::TurnedTexture(index) => tier
+                        .batches
+                        .textures
+                        .get(index as usize)
+                        .and_then(|handle| {
+                            tier.ground
+                                .dedicated
+                                .get(handle)
+                                .or_else(|| tier.ground.live.get(handle))
+                                .copied()
+                        })
+                        .unwrap_or(0),
+                    _ => tier.ground.shared.unwrap_or(0),
+                };
+                unsafe {
+                    gl_active_texture(GL_TEXTURE0);
+                    gl_bind_texture(GL_TEXTURE_2D, texture);
+                }
+                turned_attribs(run.base as usize * std::mem::size_of::<TurnedInstance>());
+            }
+            // a world's target, composited with the box's veil
+            #[cfg(feature = "3d")]
+            RunKind::World(index) => {
+                let Some((wanted, texture)) = tier
+                    .batches
+                    .world_targets
+                    .get(index as usize)
+                    .and_then(|handle| tier.ground.world.composite(*handle))
+                else {
+                    continue;
+                };
+                if program != wanted {
+                    program = wanted;
+                    unsafe {
+                        gl_use_program(program);
+                        gl_bind_vertex_array(tier.pipelines.vao_sprite);
+                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
+                    }
+                }
+                unsafe {
+                    gl_active_texture(GL_TEXTURE0);
+                    gl_bind_texture(GL_TEXTURE_2D, texture);
+                }
+                sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
+            }
+            // without the world pass the walk makes no world run
+            #[cfg(not(feature = "3d"))]
+            RunKind::World(_) => continue,
+            RunKind::Glass => {
+                let Some(targets) = tier.glass.as_ref() else { continue };
+                // the pyramid is blurred out of the scene AS DRAWN
+                // SO FAR — everything below this pane, and nothing
+                // above it. A batch that shares reads the one the
+                // pane around it had built
+                if !run.reuse {
+                    build_pyramid(&tier.pipelines, targets, run.levels);
+                }
+                program = tier.pipelines.glass;
+                unsafe {
+                    // the pyramid re-pointed the shared framebuffer
+                    // at its own levels; the scene has to be put
+                    // back before the pane draws into it
+                    gl_bind_framebuffer(GL_FRAMEBUFFER, targets.fbo);
+                    gl_framebuffer_texture_2d(
+                        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets.scene, 0,
+                    );
+                    gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+                    gl_use_program(program);
+                    gl_bind_vertex_array(tier.pipelines.vao_glass);
+                    gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.glass_buffer);
+                    gl_active_texture(GL_TEXTURE0);
+                    gl_bind_texture(GL_TEXTURE_2D, targets.ping);
+                }
+                glass_attribs(run.base as usize * std::mem::size_of::<GlassInstance>());
+            }
+        }
+        let erase = run.kind == RunKind::Knockout;
+        if erase {
+            // the target keeps `1 - alpha` of itself, colour and alpha
+            // alike, and nothing is painted
+            unsafe {
+                gl_blend_func_separate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+            }
+        }
+        unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
+        if erase {
+            // the house blend, for every run after it
+            unsafe {
+                gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            }
+        }
+    }
+}
+
+/// The frame's target, bound and cleared. A pane READS what is under it,
+/// so a frame that holds one cannot draw at the drawable: the drawable is
+/// write-only. It goes to a texture and comes back at the end. A frame
+/// in parts may hold its panes in a later part: there the list says.
+fn open_scene(tier: &mut Tier, display: &DisplayList, physical: (u32, u32), canvas: Color, walked: Walked) -> u32 {
+    let wants_glass = match walked {
+        Walked::Whole => tier.batches.runs.iter().any(|run| run.kind == RunKind::Glass),
+        Walked::Part => display.iter().any(|command| matches!(command, DrawCommand::Backdrop { .. })),
+    };
+    if wants_glass {
+        let stale = tier.glass.as_ref().is_none_or(|targets| targets.size != physical);
+        if stale {
+            if let Some(old) = tier.glass.take() {
+                old.release();
+            }
+            tier.glass = GlassTargets::new(physical);
+        }
+    }
+    let scene_fbo = match (wants_glass, tier.glass.as_ref()) {
+        (true, Some(targets)) => targets.fbo,
+        // no pane, or the targets refused: straight at the drawable,
+        // and a refused pane paints without its blur rather than
+        // failing to present
+        _ => 0,
+    };
+    unsafe {
+        gl_bind_framebuffer(GL_FRAMEBUFFER, scene_fbo);
+        gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+        // the canvas colour goes on STRAIGHT, the way the
+        // rasterizer fills its bitmap with it — nothing has
+        // blended yet
+        gl_clear_color(
+            canvas.r as f32 / 255.0,
+            canvas.g as f32 / 255.0,
+            canvas.b as f32 / 255.0,
+            canvas.a as f32 / 255.0,
+        );
+        gl_clear(GL_COLOR_BUFFER_BIT);
+    }
+    scene_fbo
 }
 
 pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;

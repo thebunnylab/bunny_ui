@@ -286,6 +286,9 @@ impl Tree {
         if let Some(href) = hints.href() {
             element.attrs.insert("href", href.to_string());
         }
+        if let Some(test_id) = hints.test_id() {
+            element.attrs.insert("data-testid", test_id.to_string());
+        }
         write_control(&mut element, hints.control());
         write_voice(&mut element, hints.voice(), hints.label());
         self.elements.insert(id, element);
@@ -473,9 +476,13 @@ impl Tree {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
+                // a pinned size is a floor too: a flex line never
+                // shrinks a box below its minimum, whichever its axis
                 for (name, value) in [
                     ("width", width),
+                    ("min-width", width),
                     ("height", height),
+                    ("min-height", height),
                     ("max-width", max_width),
                     ("max-height", max_height),
                 ] {
@@ -645,6 +652,7 @@ impl Tree {
                 let address = address.as_deref();
                 let dom_id = address.and_then(|address| address.dom_id.as_ref());
                 let href = address.and_then(|address| address.href.as_ref());
+                let test_id = address.and_then(|address| address.test_id.as_ref());
                 if let Some(element) = self.elements.get_mut(id) {
                     match class {
                         Some(class) => element.attrs.insert("class", class.to_string()),
@@ -657,6 +665,10 @@ impl Tree {
                     match href {
                         Some(href) => element.attrs.insert("href", href.to_string()),
                         None => element.attrs.remove("href"),
+                    };
+                    match test_id {
+                        Some(test_id) => element.attrs.insert("data-testid", test_id.to_string()),
+                        None => element.attrs.remove("data-testid"),
                     };
                     write_control(
                         element,
@@ -700,6 +712,8 @@ impl Tree {
                         .insert("data-img", format!("{}:{}", key >> 32, key as u32));
                     if image.cover {
                         element.style.insert("object-fit", "cover".into());
+                    } else if image.contain {
+                        element.style.insert("object-fit", "contain".into());
                     }
                 }
             }
@@ -812,6 +826,8 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("box-sizing", "border-box"),
                 ("padding", "5px 8px"),
                 ("outline", "none"),
+                ("border", "0"),
+                ("background", "transparent"),
             ],
         ),
         CreateKind::Editor => (
@@ -820,6 +836,8 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("box-sizing", "border-box"),
                 ("padding", "5px 8px"),
                 ("outline", "none"),
+                ("border", "0"),
+                ("background", "transparent"),
                 ("resize", "none"),
                 ("font", "inherit"),
             ],
@@ -830,8 +848,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "column"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::FlexRow => (
@@ -840,8 +856,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "row"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::Layers | CreateKind::Grid => (
@@ -849,8 +863,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
             &[
                 ("display", "grid"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
         CreateKind::Popover => (
@@ -866,8 +878,6 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
             "div",
             &[
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
                 ("white-space", "pre-wrap"),
                 ("cursor", "default"),
             ],
@@ -897,12 +907,12 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
         // fill flag)
         CreateKind::Rectangle => (
             "div",
-            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+            &[("box-sizing", "border-box"),
               ("background", "currentColor")],
         ),
         CreateKind::Ellipse => (
             "div",
-            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+            &[("box-sizing", "border-box"),
               ("background", "currentColor"), ("border-radius", "50%")],
         ),
         CreateKind::Group | CreateKind::Box => (
@@ -911,12 +921,49 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("display", "flex"),
                 ("flex-direction", "column"),
                 ("box-sizing", "border-box"),
-                ("min-width", "0"),
-                ("min-height", "0"),
             ],
         ),
     }
 }
+
+/// The house halo falls off as (1 − d/r)² from the edge and stops at
+/// its reach; one CSS blur is a Gaussian. Two blurred layers — a spread
+/// and a blur in reaches, and an exponent on the ink's opacity — follow
+/// the curve within 4/255 for the opacities a shadow wears, fitted
+/// against Chrome's own blur (σ ≈ 0.52 × the blur radius). The glue
+/// spells the same two.
+const HALO_LAYERS: [(f64, f64, f64); 2] = [(0.3262, 0.5124, 0.8489), (0.0738, 0.1164, 0.3444)];
+
+fn halo(radius: f64, ink: Color, (x, y): (f64, f64)) -> impl Iterator<Item = String> {
+    let reach = radius.max(1.0);
+    let opacity = f64::from(ink.a) / 255.0;
+    HALO_LAYERS.iter().map(move |&(spread, blur, weight)| {
+        let alpha = 1.0 - (1.0 - opacity).powf(weight);
+        format!(
+            "{}px {}px {}px {}px rgba({}, {}, {}, {})",
+            decimal(x, 3),
+            decimal(y, 3),
+            decimal(blur * reach, 3),
+            decimal(spread * reach, 3),
+            ink.r,
+            ink.g,
+            ink.b,
+            decimal(alpha, 4),
+        )
+    })
+}
+
+/// A number rounded to `places` and written without trailing zeros — the
+/// glue's `Number(value.toFixed(places))`.
+fn decimal(value: f64, places: usize) -> String {
+    let text = format!("{value:.places$}");
+    let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.') } else { &text };
+    if text == "-0" { "0".to_string() } else { text.to_string() }
+}
+
+/// The ring a control the keyboard reached wears — the glue's sheet
+/// spells the same one.
+const FOCUS_RING: &str = "outline:2px solid Highlight;outline-offset:2px";
 
 /// The look's rule: the kind's defaults, the flow record, the style,
 /// the text's face — and its states, one rule each. The twin of the
@@ -951,7 +998,19 @@ fn rule_text(
         base.insert("position", "relative".into());
         base.insert("isolation", "isolate".into());
     }
-    if let Some(gap) = layout.gap {
+    // a negative spacing overlaps the items, as SwiftUI's does; CSS has
+    // no negative gap, so each item after the first is pulled back by a
+    // negative margin along the line instead, and painted whole over the
+    // one before, as a layer is
+    let overlap = layout
+        .gap
+        .filter(|gap| *gap < 0.0 && layout.wrap.is_none())
+        .and_then(|gap| match kind {
+            CreateKind::FlexRow => Some(("margin-inline-start", gap)),
+            CreateKind::FlexColumn => Some(("margin-block-start", gap)),
+            _ => None,
+        });
+    if let Some(gap) = layout.gap.filter(|_| overlap.is_none()) {
         base.insert(
             if matches!(kind, CreateKind::Grid) {
                 "column-gap"
@@ -961,7 +1020,11 @@ fn rule_text(
             px(gap),
         );
     }
-    if let Some(columns) = layout.columns {
+    if matches!(kind, CreateKind::Layers) && layout.base().is_some() {
+        base.insert("grid-template-columns", "auto 0fr".into());
+        base.insert("grid-template-rows", "auto 0fr".into());
+    }
+    if let Some(columns) = layout.columns() {
         base.insert(
             "grid-template-columns",
             format!("repeat({columns},minmax(0,1fr))"),
@@ -1009,8 +1072,22 @@ fn rule_text(
     // the record's sides are logical, and so are the properties: a
     // right-to-left mount puts the leading inset on the right by itself
     if let Some((top, trailing, bottom, leading)) = layout.padding {
-        base.insert("padding-block", format!("{} {}", px(top), px(bottom)));
-        base.insert("padding-inline", format!("{} {}", px(leading), px(trailing)));
+        // a negative side is a negative margin: the content moves out and
+        // the box gives the flow that much back, as a negative padding
+        // does in the engine — CSS has no negative padding
+        let inward = |side: f32| px(side.max(0.0));
+        base.insert("padding-block", format!("{} {}", inward(top), inward(bottom)));
+        base.insert("padding-inline", format!("{} {}", inward(leading), inward(trailing)));
+        for (side, name) in [(top, "margin-block-start"), (bottom, "margin-block-end"), (leading, "margin-inline-start"), (trailing, "margin-inline-end")] {
+            if side < 0.0 {
+                base.insert(name, px(side));
+            }
+        }
+        // pulled back over the box before it, it is painted whole over
+        // that box, as SwiftUI's later view is, layers and all
+        if top < 0.0 || leading < 0.0 {
+            base.insert("isolation", "isolate".into());
+        }
     }
     // an island that reads the other way: the browser orders its rows,
     // aligns its `start` and shapes its words that way, isolated from
@@ -1034,6 +1111,13 @@ fn rule_text(
         base.insert("flex", "1 1 auto".into());
         base.insert("min-width", "0".into());
         base.insert("min-height", "0".into());
+        // in a grid cell the grow means nothing: the box stretches across
+        base.insert("justify-self", "stretch".into());
+        // a resizable picture takes its frame across as well (the glue's
+        // `lookRules` says why)
+        if matches!(kind, CreateKind::Image) {
+            base.insert("align-self", "stretch".into());
+        }
     }
     if let Some(line_gap) = layout.wrap {
         if !matches!(kind, CreateKind::Grid) {
@@ -1043,9 +1127,27 @@ fn rule_text(
     }
     let mut states: Vec<String> = Vec::new();
     // layers: one grid cell, and every child IN it — auto-placement
-    // would give each layer a row of its own
+    // would give each layer a row of its own. Each child paints whole and
+    // in its turn: a moved or positioned box inside a background would
+    // otherwise paint over the base
     if matches!(kind, CreateKind::Layers) {
-        states.push(format!("{selector}>*{{grid-area:1/1}}"));
+        match layout.base() {
+            // an overlay's cell: the base in the first track, every layer
+            // across it and a second track that is always empty, so no
+            // layer grows the cell
+            Some(base) => {
+                let at = match base {
+                    crate::dom::LayerBase::First => "first-child",
+                    crate::dom::LayerBase::Last => "last-child",
+                };
+                states.push(format!("{selector}>*{{grid-area:1/1/3/3;z-index:0}}"));
+                states.push(format!("{selector}>:{at}{{grid-area:1/1}}"));
+            }
+            None => states.push(format!("{selector}>*{{grid-area:1/1;z-index:0}}")),
+        }
+    }
+    if let Some((side, gap)) = overlap {
+        states.push(format!("{selector}>*+*{{{side}:{};isolation:isolate}}", px(gap)));
     }
     // a follower hangs its states off the GROUP's pointer: the same
     // rules, hung off the group's selector; a box without one listens
@@ -1064,7 +1166,12 @@ fn rule_text(
         states.push(format!("{}{{background-color:{}}}", on("active"), color(pressed)));
     }
     if let Some((border, width)) = style.border {
-        base.insert("border", format!("{} solid {}", px(width), color(border)));
+        // a line drawn inward over the box and its children: an outline
+        // pulled in by its own width paints a CSS border's pixels and
+        // lays nothing out, where a border would push the content in
+        let line = style.border_style.map_or("solid", crate::shapes::BorderStyle::css);
+        base.insert("outline", format!("{} {line} {}", px(width), color(border)));
+        base.insert("outline-offset", px(-width));
     }
     if let Some(radii) = style.corner_radius {
         // one number when every corner shares it, four in the CSS
@@ -1088,19 +1195,31 @@ fn rule_text(
     // the halo and the glass rim share one property
     let mut shadows: Vec<String> = Vec::new();
     if let Some((radius, shadow)) = style.shadow {
-        shadows.push(format!("0 0 {} {}", px(radius), color(shadow)));
+        shadows.extend(halo(radius, shadow, style.shadow_offset.unwrap_or_default()));
+    }
+    // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
+    if let Some((x, y)) = style.offset {
+        base.insert("translate", format!("{} {}", px(x), px(y)));
+    }
+    // `.rotation_effect`: drawn turned about its pivot, the layout unmoved
+    if let Some((degrees, x, y)) = style.rotation {
+        // the f32 the wire carries, as the glue writes it
+        #[allow(clippy::cast_possible_truncation, reason = "the wire's own precision")]
+        let degrees = f64::from(degrees as f32);
+        base.insert("rotate", format!("{degrees}deg"));
+        base.insert("transform-origin", format!("{}% {}%", x * 100.0, y * 100.0));
     }
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
         // the border, the halo — and the transform
-        let eased: Vec<String> = ["background-color", "color", "border-color", "box-shadow", "transform"]
+        let eased: Vec<String> = ["background-color", "color", "outline-color", "box-shadow", "transform"]
             .iter()
             .map(|property| format!("{property} {response}s ease-out"))
             .collect();
         base.insert("transition", eased.join(", "));
     }
     if let Some(focus) = style.focus_border {
-        states.push(format!("{selector}:focus{{border-color:{c};caret-color:{c}}}", c = color(focus)));
+        states.push(format!("{selector}:focus{{outline-color:{c};caret-color:{c}}}", c = color(focus)));
     }
     if let Some(placeholder) = style.placeholder_color {
         states.push(format!("{selector}::placeholder{{color:{}}}", color(placeholder)));
@@ -1116,6 +1235,28 @@ fn rule_text(
     }
     if let Some(gradient) = &style.gradient {
         base.insert("background-image", css_gradient(gradient));
+    }
+    // the ramp the text paints with: the top layer, cut to the text;
+    // what the box paints under it keeps its own box
+    if let Some(ink) = &style.ink_gradient {
+        let under = base.remove("background-image").unwrap_or_else(|| "none".into());
+        base.insert("background-image", format!("{}, {under}", css_gradient(ink)));
+        base.insert("-webkit-background-clip", "text, border-box".into());
+        base.insert("background-clip", "text, border-box".into());
+        base.insert("-webkit-text-fill-color", "transparent".into());
+    }
+    // inside a ramp, a box with its own ink paints its text in it again
+    if style.own_ink {
+        base.insert("-webkit-text-fill-color", "currentcolor".into());
+    }
+    // the box's floor
+    if let Some((width, height)) = style.floor {
+        if width > 0.0 {
+            base.insert("min-width", px(width));
+        }
+        if height > 0.0 {
+            base.insert("min-height", px(height));
+        }
     }
     if style.clip {
         base.insert("overflow", "hidden".into());
@@ -1146,12 +1287,17 @@ fn rule_text(
     if style.pass_through {
         base.insert("pointer-events", "none".into());
     }
+    // the color filters in their order, then the blur
+    let mut filters: Vec<String> = style.filters.iter().map(css_filter).collect();
+    if let Some(blur) = style.blur {
+        filters.push(format!("blur({blur}px)"));
+    }
+    if !filters.is_empty() {
+        base.insert("filter", filters.join(" "));
+    }
     // liquid glass, the half a browser owns: one native filter over
     // what is behind the element, and the rim as two inset shadows
     // along the lit diagonals
-    if let Some(blur) = style.blur {
-        base.insert("filter", format!("blur({blur}px)"));
-    }
     if let Some(glass) = style.glass {
         let filter = format!(
             "blur({}px) saturate({}) brightness({})",
@@ -1170,6 +1316,13 @@ fn rule_text(
     if !shadows.is_empty() {
         base.insert("box-shadow", shadows.join(","));
     }
+    // the keyboard's ring is an outline as well (the glue's sheet): while
+    // it shows on a control, the ring takes the outline and the line
+    // moves beneath it as an inset shadow — the box keeps its line
+    if let Some((border, width)) = style.border {
+        shadows.push(format!("inset 0 0 0 {} {}", px(width), color(border)));
+        states.push(format!("{selector}[role][tabindex]:focus-visible{{{FOCUS_RING};box-shadow:{}}}", shadows.join(",")));
+    }
     if let Some(text) = text {
         // a text with the face declared above it names none of its own
         if !text.inherits_face {
@@ -1178,6 +1331,9 @@ fn rule_text(
             // advance rides beside it
             if text.font.tracking != 0.0 {
                 base.insert("letter-spacing", format!("{}px", text.font.tracking));
+            }
+            if text.font.monospaced_digits {
+                base.insert("font-variant-numeric", "tabular-nums".into());
             }
         }
         // after the font shorthand, which resets it — the served page
@@ -1210,6 +1366,15 @@ fn rule_text(
             base.insert("overflow", "hidden".into());
             base.insert("text-overflow", "ellipsis".into());
             base.insert("white-space", "nowrap".into());
+        }
+        // at most this many lines, the last one closed with an ellipsis
+        // right after its last word: the space a wrap leaves is dropped
+        if text.line_limit > 0 {
+            base.insert("display", "-webkit-box".into());
+            base.insert("-webkit-box-orient", "vertical".into());
+            base.insert("-webkit-line-clamp", text.line_limit.to_string());
+            base.insert("overflow", "hidden".into());
+            base.insert("white-space", "pre-line".into());
         }
     }
     let declarations: Vec<String> = base.iter().map(|(name, value)| format!("{name}:{value}")).collect();
@@ -1315,11 +1480,36 @@ fn css_font(font: &crate::text_engine::FontSpec) -> String {
     format!("{lean}{weight} {}px {family}", font.size)
 }
 
+/// The glue's color filter, mirrored: its CSS function at the f32 the
+/// wire carries. A negative contrast is an inversion and the contrast
+/// it keeps, which CSS reads as one and refuses to write.
+fn css_filter(filter: crate::color_filter::ColorFilter) -> String {
+    use crate::color_filter::ColorFilter;
+    #[allow(clippy::cast_possible_truncation, reason = "the wire's own precision")]
+    let amount = f64::from(filter.wire().1 as f32);
+    match filter {
+        ColorFilter::Grayscale(_) => format!("grayscale({amount})"),
+        ColorFilter::Saturation(_) => format!("saturate({amount})"),
+        ColorFilter::Contrast(_) if amount < 0.0 => format!("invert(1) contrast({})", -amount),
+        ColorFilter::Contrast(_) => format!("contrast({amount})"),
+        ColorFilter::HueRotation(_) => format!("hue-rotate({amount}deg)"),
+        ColorFilter::Invert => "invert(1)".into(),
+    }
+}
+
 /// The glue's gradient lowering, mirrored: a proportional centre or
 /// line, a reach that spells farthest-corner when the box decides it.
 fn css_gradient(gradient: &crate::layout::Gradient) -> String {
+    // the colors between the two ends, each at the place `at` names for
+    // its location along the ramp
+    let between = |at: &dyn Fn(f64) -> String| -> String {
+        gradient.stops().iter().fold(String::new(), |mut out, (location, ink)| {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!(", {} {}", color(ink), at(location)));
+            out
+        })
+    };
     match gradient {
-        crate::layout::Gradient::Radial { center, start, end, inner, outer, aspect } => {
+        crate::layout::Gradient::Radial { center, start, end, inner, outer, aspect, stops } => {
             let reach = match end {
                 Some(radius) => px(*radius),
                 None => "farthest-corner".to_string(),
@@ -1331,30 +1521,51 @@ fn css_gradient(gradient: &crate::layout::Gradient) -> String {
             match end {
                 // the ellipse: the X radius is on the wire and the Y
                 // radius is that times the aspect
-                Some(radius) if *aspect != 1.0 && *radius > 0.0 => format!(
-                    "radial-gradient(ellipse {} {} at {}% {}%, {} {:.2}%, {} 100%)",
-                    px(*radius),
-                    px(radius * aspect),
-                    center.x * 100.0,
-                    center.y * 100.0,
-                    color(*inner),
-                    (start / radius) * 100.0,
-                    color(*outer),
-                ),
-                _ => format!(
-                    "radial-gradient(circle {reach} at {}% {}%, {} {}, {} {stop})",
-                    center.x * 100.0,
-                    center.y * 100.0,
-                    color(*inner),
-                    px(*start),
-                    color(*outer),
-                ),
+                Some(radius) if *aspect != 1.0 && *radius > 0.0 => {
+                    let near = start / radius;
+                    format!(
+                        "radial-gradient(ellipse {} {} at {}% {}%, {} {:.2}%{}, {} 100%)",
+                        px(*radius),
+                        px(radius * aspect),
+                        center.x * 100.0,
+                        center.y * 100.0,
+                        color(*inner),
+                        near * 100.0,
+                        between(&|location| format!("{:.2}%", (near + location * (1.0 - near)) * 100.0)),
+                        color(*outer),
+                    )
+                }
+                _ => {
+                    let inside = match end {
+                        Some(radius) if !stops.is_empty() => {
+                            between(&|location| format!("{:.2}px", (radius - start).mul_add(location, *start)))
+                        }
+                        _ => between(&|location| format!("calc({:.2}px + {:.2}%)", (1.0 - location) * start, location * 100.0)),
+                    };
+                    format!(
+                        "radial-gradient(circle {reach} at {}% {}%, {} {}{inside}, {} {stop})",
+                        center.x * 100.0,
+                        center.y * 100.0,
+                        color(*inner),
+                        px(*start),
+                        color(*outer),
+                    )
+                }
             }
         }
-        crate::layout::Gradient::Linear { start, end, from, to } => {
+        crate::layout::Gradient::Linear { start, end, from, to, stops } => {
             let degrees =
                 ((end.x - start.x).atan2(-(end.y - start.y))).to_degrees();
-            format!("linear-gradient({degrees:.2}deg, {}, {})", color(*from), color(*to))
+            if stops.is_empty() {
+                format!("linear-gradient({degrees:.2}deg, {}, {})", color(*from), color(*to))
+            } else {
+                format!(
+                    "linear-gradient({degrees:.2}deg, {} 0%{}, {} 100%)",
+                    color(*from),
+                    between(&|location| format!("{:.2}%", location * 100.0)),
+                    color(*to)
+                )
+            }
         }
     }
 }
@@ -1494,6 +1705,131 @@ mod tests {
         assert!(!rule.contains("padding:"), "no physical padding: {rule}");
     }
 
+    /// A border is a line drawn inward over the box and its children,
+    /// laying nothing out: the page draws it as an outline pulled in by
+    /// its own width — which paints a CSS border's very pixels — never
+    /// as a CSS border, which would push the content in. A broken line
+    /// keeps its dashes, and a field's focus colors the same line.
+    #[test]
+    fn a_served_border_is_drawn_inward_and_lays_nothing_out() {
+        #[derive(Clone)]
+        struct Bordered(State<String>);
+        impl Component for Bordered {
+            fn body(self) -> impl View {
+                vstack!(
+                    text("solid").border(Color::rgb(1, 2, 3), 2.0),
+                    text("dashed").border(Color::rgb(1, 2, 3), 1.5).border_style(BorderStyle::Dashed),
+                    text_field("name", self.0.binding()),
+                )
+            }
+        }
+
+        let page = render(&Bordered(State::new(String::new())), Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        assert!(css.contains("outline:2px solid rgba(1, 2, 3, 1);outline-offset:-2px"), "{css}");
+        assert!(css.contains("outline:1.5px dashed rgba(1, 2, 3, 1);outline-offset:-1.5px"), "{css}");
+        assert!(css.contains(":focus{outline-color:"), "{css}");
+        // the keyboard's ring takes the outline, the line moves beneath it
+        assert!(
+            css.contains("[role][tabindex]:focus-visible{outline:2px solid Highlight;outline-offset:2px;box-shadow:inset 0 0 0 2px rgba(1, 2, 3, 1)}"),
+            "{css}"
+        );
+        let pushes = css.split(['{', ';']).filter(|declaration| declaration.starts_with("border:") && *declaration != "border:0");
+        assert_eq!(pushes.count(), 0, "{css}");
+    }
+
+    /// A field's chrome is the theme's or none: the browser's own white
+    /// box and sunken edge never show, so a bare field shows what is
+    /// behind it, and a themed one wears the look's ground over the reset.
+    #[test]
+    fn a_served_field_never_wears_the_browsers_box() {
+        #[derive(Clone)]
+        struct Fields(State<String>);
+        impl Component for Fields {
+            fn body(self) -> impl View {
+                vstack!(text_field("bare", self.0.binding()).bare(), text_field("themed", self.0.binding()))
+            }
+        }
+
+        let page = render(&Fields(State::new(String::new())), Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        let fields: Vec<&str> = css.lines().filter(|rule| rule.contains("padding:5px 8px")).collect();
+        assert_eq!(fields.len(), 2, "{css}");
+        for rule in &fields {
+            assert!(rule.contains("background:transparent;") && rule.contains("border:0;"), "{rule}");
+        }
+        assert!(fields.iter().any(|rule| rule.contains("background-color:")), "the theme's ground: {css}");
+    }
+
+    /// The house halo falls off as (1 − d/r)² and stops at its reach;
+    /// one CSS blur is a Gaussian, lighter close in and longer far out.
+    /// The page stacks two blurred layers fitted to the curve, each a
+    /// spread and a blur in reaches and the ink's opacity raised to its
+    /// own power — the two the glue spells.
+    #[test]
+    fn a_served_shadow_follows_the_house_halo() {
+        #[derive(Clone, Copy)]
+        struct Lifted;
+        impl Component for Lifted {
+            fn body(self) -> impl View {
+                text("lifted").shadow_color(10.0, Color::rgba(0, 0, 0, 128))
+            }
+        }
+
+        let page = render(&Lifted, Size { width: 240.0, height: 120.0 });
+        assert!(
+            page.css.contains("box-shadow:0px 0px 5.124px 3.262px rgba(0, 0, 0, 0.4466),0px 0px 1.164px 0.738px rgba(0, 0, 0, 0.2134)"),
+            "{}",
+            page.css
+        );
+    }
+
+    /// A frame pins what it names: a child that fills the width stops at
+    /// the frame, and the box around the frame — its background — hugs
+    /// the frame instead of stretching to whatever holds it.
+    #[test]
+    fn a_box_around_an_exact_frame_hugs_the_frame() {
+        #[derive(Clone, Copy)]
+        struct Column;
+        impl Component for Column {
+            fn body(self) -> impl View {
+                vstack!(text("wide").frame_max(f64::INFINITY, f64::MAX, Alignment::Leading))
+                    .frame_width_aligned(300.0, Alignment::Leading)
+                    .background_color(Color::rgb(1, 2, 3))
+            }
+        }
+
+        let page = render(&Column, Size { width: 400.0, height: 120.0 });
+        let painted = page.css.lines().find(|rule| rule.contains("background-color:rgba(1, 2, 3, 1)")).expect("the background's rule");
+        assert!(!painted.contains("align-self:stretch"), "{}", page.css);
+    }
+
+    /// A layer meets its box at its point: the cell places it by the
+    /// point — the box is the cell's own size and stays put — and a
+    /// layer that takes the width stretches across the cell.
+    #[test]
+    fn an_overlay_is_placed_by_its_point() {
+        #[derive(Clone, Copy)]
+        struct Badged;
+        impl Component for Badged {
+            fn body(self) -> impl View {
+                vstack!(
+                    rectangle().frame(120.0, 60.0).overlay(UnitPoint::TOP_TRAILING, rectangle().frame(16.0, 16.0)),
+                    rectangle()
+                        .frame(120.0, 40.0)
+                        .overlay(UnitPoint::BOTTOM, spacer().frame_height(3.0).background_color(Color::rgb(4, 5, 6))),
+                )
+            }
+        }
+
+        let page = render(&Badged, Size { width: 400.0, height: 200.0 });
+        let cells: Vec<&str> = page.css.lines().filter(|rule| rule.contains("display:grid")).collect();
+        assert!(cells.iter().any(|cell| cell.contains("align-items:flex-start") && cell.contains("justify-items:flex-end")), "{}", page.css);
+        assert!(cells.iter().any(|cell| cell.contains("align-items:flex-end") && cell.contains("justify-items:center")), "{}", page.css);
+        let band = page.css.lines().find(|rule| rule.contains("background-color:rgba(4, 5, 6, 1)")).expect("the band's rule");
+        assert!(band.contains("justify-self:stretch"), "{}", page.css);
+    }
+
     /// A served field says what the mounted one says — the glue's op 7,
     /// mirrored: a secret is a password box, what it holds is the
     /// autofill's token, its name is `aria-label`, and a field that said
@@ -1544,6 +1880,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let rule = |align| {
             rule_text(
@@ -1807,8 +2144,10 @@ mod tests {
 
         let page = render(&Placed, Size { width: 200.0, height: 200.0 });
         for served in [
-            // the flow's wrapper: a pinned box, at the wire's precision
-            "style=\"height:60.70000076293945px;width:120.30000305175781px\"",
+            // the flow's wrapper: a pinned box, at the wire's precision,
+            // and a floor of the same size the flex line cannot shrink
+            "style=\"height:60.70000076293945px;min-height:60.70000076293945px;\
+             min-width:120.30000305175781px;width:120.30000305175781px\"",
             // the interior: the engine's own numbers
             "style=\"height:16px;left:0;position:absolute;top:0;\
              transform:translate(36.15px, 6.550000000000001px);width:48px\"",
@@ -1835,8 +2174,49 @@ mod tests {
         }
 
         let page = render(&Badge, Size { width: 200.0, height: 200.0 });
-        assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1;z-index:0}"), "{}", page.css);
         assert!(page.css.contains("justify-items:center"), "{}", page.css);
+    }
+
+    /// An overlay's cell is its base's size, as `SwiftUI`'s is: a layer
+    /// larger than the box — a glow behind a button, a ribbon past a
+    /// card's edge — overflows it and never grows it. The base takes
+    /// the first track and every layer spans an empty second one,
+    /// which takes no room.
+    #[test]
+    fn an_overlay_never_grows_its_base() {
+        #[derive(Clone, Copy)]
+        struct Card;
+
+        impl Component for Card {
+            fn body(self) -> impl View {
+                crate::vstack!(
+                    rectangle().frame(100.0, 40.0).overlay(UnitPoint::TOP_LEADING, rectangle().frame(140.0, 10.0)),
+                    text("glow").background(UnitPoint::CENTER, rectangle().frame(200.0, 200.0)),
+                )
+            }
+        }
+
+        let page = render(&Card, Size { width: 300.0, height: 300.0 });
+        assert_eq!(page.css.matches("grid-template-columns:auto 0fr").count(), 2, "{}", page.css);
+        assert!(page.css.contains("grid-template-rows:auto 0fr"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1/3/3;z-index:0}"), "{}", page.css);
+        assert!(page.css.contains(">:first-child{grid-area:1/1}"), "the overlay's base comes first: {}", page.css);
+        assert!(page.css.contains(">:last-child{grid-area:1/1}"), "the background's, last: {}", page.css);
+    }
+
+    /// A background lies under its base however it is moved, as
+    /// `SwiftUI`'s does: the page moves it with `translate`, which alone
+    /// would paint it over a base nothing moved, so each layer of the cell
+    /// paints whole and in its turn.
+    #[test]
+    fn a_moved_background_stays_under_its_base() {
+        let page = render(
+            &text("over the hills").background(UnitPoint::TOP_LEADING, rectangle().frame(200.0, 40.0).offset(0.0, 30.0)),
+            Size { width: 300.0, height: 300.0 },
+        );
+        assert!(page.css.contains("translate:0px 30px"), "{}", page.css);
+        assert!(page.css.contains(">*{grid-area:1/1/3/3;z-index:0}"), "{}", page.css);
     }
 
     /// A served picture has no bytes yet: it wears the identity the
@@ -1858,6 +2238,9 @@ mod tests {
         );
         let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
         assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
+        // and it takes its frame on both axes, as the layout sizes it: a
+        // width left to the ratio would spill a contained picture
+        assert!(page.css.contains("flex:1 1 auto") && page.css.contains("align-self:stretch"), "{}", page.css);
     }
 
     /// A served control says what it is before any script runs: the
@@ -1956,6 +2339,17 @@ mod tests {
         assert!(page.html.contains("href=\"#top\""), "{}", page.html);
         assert!(page.html.contains("id=\"back\""), "{}", page.html);
         assert_eq!(page.html.matches("<a ").count(), 2, "{}", page.html);
+    }
+
+    /// The harness's name is served as the glue writes it.
+    #[test]
+    fn a_test_id_is_served_as_data_testid() {
+        let page = render(
+            &crate::vstack!(text("a").test_id("word")).test_id("column"),
+            Size { width: 200.0, height: 200.0 },
+        );
+        assert!(page.html.contains("data-testid=\"word\""), "{}", page.html);
+        assert!(page.html.contains("data-testid=\"column\""), "{}", page.html);
     }
 
     /// Tracking is the face's own advance: an eyebrow's wide spacing

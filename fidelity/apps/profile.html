@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=390, height=844" />
+    <title>Profile — Nora Vale</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; width: 390px; height: 844px; overflow: hidden; position: relative; background: #fff; }
+      :root { --accent: #7c3aed; }
+
+      .cover { position: relative; height: 130px; }
+      .cover img { width: 100%; height: 130px; object-fit: cover; object-position: center 30%; display: block; } /* object-fit/position */
+      .cover::after { content: ""; position: absolute; inset: 0; background: linear-gradient(to bottom, rgba(0,0,0,.35), rgba(0,0,0,0) 40%, rgba(124,58,237,.35)); } /* gradient overlay */
+      .status { position: absolute; top: 8px; left: 18px; right: 18px; z-index: 2; display: flex; justify-content: space-between; color: #fff; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+      .head { display: flex; align-items: flex-end; padding: 0 18px; gap: 12px; }
+      .avatar { width: 92px; height: 92px; border-radius: 50%; border: 4px solid #fff; margin-top: -48px; box-shadow: 0 4px 14px rgba(0,0,0,.25); object-fit: cover; position: relative; z-index: 3; }
+      /* story ring: conic-gradient + padding */
+      .ring { width: 40px; height: 40px; padding: 3px; border-radius: 50%; background: conic-gradient(from 200deg, #f59e0b, #ec4899, #7c3aed, #f59e0b); margin-bottom: 4px; }
+      .ring img { width: 100%; height: 100%; border-radius: 50%; border: 2px solid #fff; object-fit: cover; display: block; }
+      .head .sp { flex: 1; }
+
+      .actions { display: flex; gap: 8px; padding-bottom: 4px; }
+      .b { height: 34px; border-radius: 17px; padding: 0 16px; display: flex; align-items: center; font-size: 13px; font-weight: 700; }
+      .follow { background: linear-gradient(135deg, #7c3aed, #ec4899); color: #fff; box-shadow: 0 3px 8px rgba(124,58,237,.35); }
+      .msg { border: 1.5px solid #7c3aed; color: #7c3aed; }
+      .icon { width: 34px; padding: 0; justify-content: center; border: 1.5px solid #d4d4d8; gap: 3px; }
+      .icon i { width: 4px; height: 4px; border-radius: 50%; background: #55555c; display: block; }
+
+      .id { padding: 6px 18px 0; }
+      .name { display: flex; align-items: center; gap: 6px; font-size: 20px; font-weight: 900; letter-spacing: -0.02em; }
+      .badge { width: 16px; height: 16px; border-radius: 50%; background: #2563eb; position: relative; display: inline-block; }
+      .badge::after { content: ""; position: absolute; left: 4.5px; top: 3.5px; width: 7px; height: 4px; border-left: 2px solid #fff; border-bottom: 2px solid #fff; transform: rotate(-45deg); } /* rotated-border check */
+      .handle { font-size: 13px; color: #6b6b73; }
+      .bio { margin: 6px 0 0; font-size: 13px; line-height: 1.45; color: #2b2b30; }
+      .bio a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+      .bio .tag { color: var(--accent); font-weight: 700; }
+      .bio .code { background: #f1f0f5; border-radius: 4px; padding: 0 4px; font-size: 12px; color: #be185d; }
+      .bio mark { background: #fde68a; padding: 0 2px; border-radius: 2px; }
+
+      .stats { display: flex; margin: 10px 18px 0; padding: 8px 0; border-top: 1px solid #eee; border-bottom: 1px solid #eee; }
+      .stats div { flex: 1; text-align: center; }
+      .stats div:not(:last-child) { border-right: 1px solid #e4e4e7; } /* dividers via :not(:last-child) */
+      .stats b { display: block; font-size: 17px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+      .stats span { font-size: 11px; color: #6b6b73; }
+
+      .tabs { display: flex; margin-top: 4px; padding: 0 18px; }
+      .tab { flex: 1; text-align: center; padding: 9px 0; font-size: 13px; font-weight: 700; color: #8a8a93; position: relative; }
+      .tab.on { color: #1d1d1f; }
+      .tab.on::after { content: ""; position: absolute; left: 25%; right: 25%; bottom: 0; height: 3px; border-radius: 3px 3px 0 0; background: var(--accent); } /* active underline bar */
+
+      .caption { margin: 6px 18px 6px 18px; font-size: 12px; line-height: 1.35; color: #55555c;
+        display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; } /* 2-line clamp */
+
+      .gridwrap { position: relative; margin: 0 18px 0 18px; padding-right: 22px; }
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; }
+      .t { aspect-ratio: 1; position: relative; overflow: hidden; border-radius: 4px; background: #ddd; } /* aspect-ratio */
+      .t img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .t.big { grid-column: span 2; grid-row: span 2; }
+      .f1 img { filter: sepia(.6); } .f2 img { filter: hue-rotate(90deg); } .f3 img { filter: contrast(1.3); } .f4 img { filter: grayscale(1); } /* CSS filters */
+      .play { position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%); width: 0; height: 0; border-top: 10px solid transparent; border-bottom: 10px solid transparent; border-left: 16px solid rgba(255,255,255,.95); filter: drop-shadow(0 1px 3px rgba(0,0,0,.5)); }
+      .dur { position: absolute; right: 4px; bottom: 4px; background: rgba(0,0,0,.65); color: #fff; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 999px; font-variant-numeric: tabular-nums; }
+      .rail { position: absolute; right: 0; top: 0; bottom: 0; width: 18px; writing-mode: vertical-rl; text-align: center; font-size: 10px; letter-spacing: .25em; text-transform: uppercase; color: #8a8a93; background: #f6f5fa; border-radius: 9px; } /* vertical writing mode */
+
+      .nav { position: absolute; left: 0; right: 0; bottom: 0; height: 52px; border-top: 1px solid #eee; background: #fff; display: flex; justify-content: space-around; align-items: center; }
+      .nav i { width: 22px; height: 22px; border: 2px solid #8a8a93; border-radius: 6px; display: block; }
+      .nav i.on { border-color: var(--accent); background: var(--accent); }
+      .nav i.r { border-radius: 50%; }
+    </style>
+  </head>
+  <body>
+    <div class="cover">
+      <img src="/assets/cover.png" alt="" />
+      <div class="status"><span>9:41</span><span>5G  100%</span></div>
+    </div>
+
+    <div class="head">
+      <img class="avatar" src="/assets/avatar.png" alt="" />
+      <div class="ring"><img src="/assets/photo2.png" alt="" /></div>
+      <div class="sp"></div>
+      <div class="actions">
+        <span class="b follow">Follow</span>
+        <span class="b msg">Message</span>
+        <span class="b icon"><i></i><i></i><i></i></span>
+      </div>
+    </div>
+
+    <div class="id">
+      <div class="name">Nora Vale <span class="badge"></span></div>
+      <div class="handle">@noravale • Lisbon, PT</div>
+      <p class="bio">Photographer &amp; <strong>visual storyteller</strong>. Chasing <em>golden hour</em> since 2014. Prints at <a>noravale.studio</a> <span class="tag">#analog</span> <span class="tag">#travel</span> — shot with <span class="code">35mm f/1.4</span>. <mark>Open for commissions</mark> this autumn.</p>
+    </div>
+
+    <div class="stats">
+      <div><b>1,284</b><span>Posts</span></div>
+      <div><b>48.2K</b><span>Followers</span></div>
+      <div><b>612</b><span>Following</span></div>
+    </div>
+
+    <div class="tabs"><span class="tab on">Photos</span><span class="tab">Reels</span><span class="tab">Tagged</span><span class="tab">Saved</span></div>
+
+    <p class="caption">Latest series: “Salt &amp; Light” — twelve frames from a month along the Atlantic coast, developed by hand in a small darkroom and scanned on a drum scanner for extra grain and depth.</p>
+
+    <div class="gridwrap">
+      <div class="grid">
+        <div class="t big"><img src="/assets/photo1.png" alt="" /></div>
+        <div class="t f1"><img src="/assets/photo2.png" alt="" /></div>
+        <div class="t f2"><img src="/assets/photo3.png" alt="" /></div>
+        <div class="t f3"><img src="/assets/album.png" alt="" /></div>
+        <div class="t f4"><img src="/assets/photo1.png" alt="" /></div>
+        <div class="t"><img src="/assets/photo2.png" alt="" /><span class="play"></span><span class="dur">0:24</span></div>
+        <div class="t f1"><img src="/assets/photo3.png" alt="" /></div>
+        <div class="t f2"><img src="/assets/album.png" alt="" /></div>
+      </div>
+      <div class="rail">Portfolio 2026</div>
+    </div>
+
+    <div class="nav"><i class="on"></i><i class="r"></i><i></i><i class="r"></i><i></i></div>
+  </body>
+</html>

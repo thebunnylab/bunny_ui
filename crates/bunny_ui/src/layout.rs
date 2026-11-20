@@ -649,6 +649,9 @@ pub struct LayoutEnv<'a> {
     /// The inherited line height a paragraph steps by. `None` = the
     /// face's own box; a value overrides it, set by `.line_height(…)`.
     pub line_height: Option<Px>,
+    /// The most lines a text below shows, set by `.line_limit(…)`; the
+    /// last one shown ends with an ellipsis. Zero is no limit.
+    pub line_limit: u8,
     /// Where a wrapped line sits inside its box. `None` = leading.
     pub text_align: Option<motor::views::TextAlignment>,
     /// Which way the leading edge faces. PLACEMENT reads it — a row lays
@@ -1011,6 +1014,18 @@ pub enum LayoutNode {
         vertical: CrossAlign,
         child: Box<LayoutNode>,
     },
+    /// `.frame(minWidth:minHeight:)` — the box hugs its content, never
+    /// smaller than the floor: the child is offered the proposal raised
+    /// to the floor, and the box answers the child's size held between
+    /// the floor and that offer, as `SwiftUI`'s flexible frame does. A
+    /// floor of zero is none.
+    MinFrame {
+        min_width: Px,
+        min_height: Px,
+        align: CrossAlign,
+        vertical: CrossAlign,
+        child: Box<LayoutNode>,
+    },
     /// Vertical scroll region: answers what it was offered, measures the
     /// content without restriction and keeps the excess to itself (the
     /// shrink contract). `path` is the region's structural identity — the
@@ -1357,6 +1372,7 @@ pub enum LayoutNode {
         class: Option<std::rc::Rc<str>>,
         dom_id: Option<std::rc::Rc<str>>,
         href: Option<std::rc::Rc<str>>,
+        test_id: Option<std::rc::Rc<str>>,
         child: Box<LayoutNode>,
     },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
@@ -1577,6 +1593,9 @@ impl ElementHints {
     pub(crate) fn group(&self) -> Option<GroupSpec> {
         self.address.as_ref().and_then(|address| address.group)
     }
+    pub(crate) fn test_id(&self) -> Option<&Rc<str>> {
+        self.address.as_ref().and_then(|address| address.test_id.as_ref())
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
     }
@@ -1597,6 +1616,10 @@ pub struct Address {
     pub(crate) group: Option<GroupSpec>,
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
+    /// The name a harness finds the view by (`.test_id(…)`): the
+    /// page's `data-testid`, and an entry of the frame table the pixel
+    /// pipelines keep ([`LayoutResult::test_frames`]).
+    pub test_id: Option<Rc<str>>,
 }
 
 thread_local! {
@@ -1631,6 +1654,16 @@ impl Address {
             address.href.clone_from(href);
         }
         Some(Address::shared(address))
+    }
+
+    /// `base` answering to `test_id` — the outer name wins, as the
+    /// outer id does.
+    #[must_use]
+    pub fn tested(base: &Option<Rc<Self>>, test_id: Option<&Rc<str>>) -> Option<Rc<Self>> {
+        let Some(test_id) = test_id else { return base.clone() };
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        address.test_id = Some(Rc::clone(test_id));
+        Some(Self::shared(address))
     }
 
     /// `base` with what the control under it IS written over it. The
@@ -1692,6 +1725,17 @@ impl LayoutNode {
             | LayoutNode::Text { hints, .. }
             | LayoutNode::Styled { hints, .. } => Some(hints),
             _ => None,
+        }
+    }
+
+    /// The harness's name for this node (`.test_id(…)`), wherever the
+    /// modifier left it: on the node, on a reference to a retained
+    /// boundary, or on the wrapper around a node that holds no hints.
+    fn test_id(&self) -> Option<&Rc<str>> {
+        match self {
+            Self::Hinted { test_id, .. } => test_id.as_ref(),
+            Self::BoundaryRef { hints, .. } => hints.test_id(),
+            node => node.carried_hints().and_then(ElementHints::test_id),
         }
     }
 
@@ -1759,6 +1803,7 @@ impl LayoutNode {
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::HoverGroup { child, .. }
@@ -1935,6 +1980,7 @@ pub(crate) struct MeasureKey {
     pub proposal: Proposal,
     pub font: FontSpec,
     pub line_height: Option<Px>,
+    pub line_limit: u8,
 }
 
 thread_local! {
@@ -2069,13 +2115,14 @@ impl UnitPoint {
     }
 }
 
-/// A two-stop paint ramp behind a view — the glow of a hero panel, the
-/// sheen of a bar.
+/// A paint ramp behind a view — the glow of a hero panel, the sheen of a
+/// bar.
 ///
 /// Declared in the box's own proportions (a [`UnitPoint`] centre, a
 /// direction) so it survives a resize, and resolved to px once the
-/// frame is known. Deliberately TWO stops: what a UI paints is a ramp,
-/// and two colors keep every backend's wire format fixed.
+/// frame is known. It runs from one color to another, through the
+/// [`Stops`] between them: `Gradient::linear(red, blue).stop(0.5,
+/// green)` is `SwiftUI`'s `Gradient(stops:)` with three.
 ///
 /// A ramp that fades out must fade to the SAME color with no alpha
 /// ([`Color::fade`]): interpolation is straight, so fading to a
@@ -2095,9 +2142,147 @@ pub enum Gradient {
         aspect: f64,
         inner: Color,
         outer: Color,
+        stops: Stops,
     },
     /// A ramp along the line from `start` to `end`.
-    Linear { start: UnitPoint, end: UnitPoint, from: Color, to: Color },
+    Linear { start: UnitPoint, end: UnitPoint, from: Color, to: Color, stops: Stops },
+}
+
+/// The colors a ramp passes through between its two ends — `SwiftUI`'s
+/// `Gradient.Stop`s other than the first and the last — each at its
+/// location along the ramp, 0 its start and 1 its end, in order.
+///
+/// A ramp holds [`Stops::MOST`] of them, inline, so a gradient stays a
+/// plain value that every backend paints with the colors it already
+/// mixes two at a time. One more drops the stop whose loss changes the
+/// ramp least.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Stops {
+    count: u8,
+    locations: [f32; Stops::MOST],
+    colors: [Color; Stops::MOST],
+}
+
+impl Default for Stops {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Stops {
+    /// How many stops a ramp holds between its ends: a rainbow's seven
+    /// colors fit, with one to spare.
+    pub const MOST: usize = 6;
+    /// A ramp straight from one end to the other.
+    pub const NONE: Stops = Stops {
+        count: 0,
+        locations: [0.0; Stops::MOST],
+        colors: [Color { r: 0, g: 0, b: 0, a: 0 }; Stops::MOST],
+    };
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Each stop's location and color, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (f64, Color)> + '_ {
+        self.locations[..self.len()].iter().zip(&self.colors[..self.len()]).map(|(at, color)| (f64::from(*at), *color))
+    }
+
+    /// One more stop between `from` and `to`, after any stop already at
+    /// its location (two stops at one place draw a hard edge).
+    #[must_use]
+    pub fn with(self, location: f64, color: Color, from: Color, to: Color) -> Stops {
+        #[allow(clippy::cast_possible_truncation, reason = "a fraction of the ramp")]
+        let location = location.clamp(0.0, 1.0) as f32;
+        let mut stops: Vec<(f32, Color)> = self.locations[..self.len()].iter().copied().zip(self.colors[..self.len()].iter().copied()).collect();
+        let at = stops.iter().position(|(other, _)| *other > location).unwrap_or(stops.len());
+        stops.insert(at, (location, color));
+        while stops.len() > Self::MOST {
+            // the stop the ramp misses least: its color closest to what
+            // its neighbours would mix at its place without it
+            let miss = |index: usize| {
+                let (before, after) = (
+                    if index == 0 { (0.0, from) } else { stops[index - 1] },
+                    stops.get(index + 1).copied().unwrap_or((1.0, to)),
+                );
+                let (location, color) = stops[index];
+                let span = after.0 - before.0;
+                let mixed = if span > 0.0 { mix(before.1, after.1, f64::from((location - before.0) / span)) } else { color };
+                [mixed.r.abs_diff(color.r), mixed.g.abs_diff(color.g), mixed.b.abs_diff(color.b), mixed.a.abs_diff(color.a)].into_iter().max().unwrap_or(0)
+            };
+            let least = (0..stops.len()).min_by_key(|index| miss(*index)).unwrap_or(0);
+            stops.remove(least);
+        }
+        let mut out = Self::NONE;
+        #[allow(clippy::cast_possible_truncation, reason = "at most MOST")]
+        let count = stops.len() as u8;
+        out.count = count;
+        for (index, (location, color)) in stops.into_iter().enumerate() {
+            out.locations[index] = location;
+            out.colors[index] = color;
+        }
+        out
+    }
+}
+
+/// One two-color piece of a ramp, which paints its own stretch alone.
+///
+/// It mixes `from` into `to` between their locations: a painter that
+/// mixes two colors at a time paints the whole ramp piece by piece.
+/// Each piece owns its start and not its end, as
+/// [`GradientPaint::at`] reads them; the first owns everything before
+/// it and the last everything after.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RampPiece {
+    pub from: (f64, Color),
+    pub to: (f64, Color),
+    /// Paints nothing before its start.
+    pub cuts_below: bool,
+    /// Paints nothing at its end and past it.
+    pub cuts_above: bool,
+}
+
+/// The pieces of the ramp `from` → `stops` → `to`; a stretch of no
+/// length (a hard edge) is no piece.
+#[must_use]
+pub fn ramp_pieces(from: Color, to: Color, stops: &Stops) -> Vec<RampPiece> {
+    let points: Vec<(f64, Color)> = std::iter::once((0.0, from)).chain(stops.iter()).chain(std::iter::once((1.0, to))).collect();
+    let mut pieces: Vec<RampPiece> = points
+        .windows(2)
+        .filter(|pair| pair[1].0 > pair[0].0)
+        .map(|pair| RampPiece { from: pair[0], to: pair[1], cuts_below: true, cuts_above: true })
+        .collect();
+    if pieces.is_empty() {
+        // every stop at one place: the last color, everywhere
+        pieces.push(RampPiece { from: (0.0, to), to: (1.0, to), cuts_below: false, cuts_above: false });
+    }
+    if let Some(first) = pieces.first_mut() {
+        first.cuts_below = false;
+    }
+    if let Some(last) = pieces.last_mut() {
+        last.cuts_above = false;
+    }
+    pieces
+}
+
+/// The color at `t` (in 0…1) of the ramp `from` → `stops` → `to`.
+fn ramp(from: Color, to: Color, stops: &Stops, t: f64) -> Color {
+    let mut lower = (0.0, from);
+    for (location, color) in stops.iter().chain(std::iter::once((1.0, to))) {
+        if t < location {
+            let span = location - lower.0;
+            return if span > 0.0 { mix(lower.1, color, (t - lower.0) / span) } else { color };
+        }
+        lower = (location, color);
+    }
+    to
 }
 
 impl Gradient {
@@ -2106,16 +2291,17 @@ impl Gradient {
     /// wash named from its leading corner. The colours stay.
     pub fn flipped(self) -> Gradient {
         match self {
-            Gradient::Radial { center, start, end, aspect, inner, outer } => Gradient::Radial {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => Gradient::Radial {
                 center: center.flipped(),
                 start,
                 end,
                 aspect,
                 inner,
                 outer,
+                stops,
             },
-            Gradient::Linear { start, end, from, to } => {
-                Gradient::Linear { start: start.flipped(), end: end.flipped(), from, to }
+            Gradient::Linear { start, end, from, to, stops } => {
+                Gradient::Linear { start: start.flipped(), end: end.flipped(), from, to, stops }
             }
         }
     }
@@ -2129,19 +2315,50 @@ impl Gradient {
             aspect: 1.0,
             inner,
             outer,
+            stops: Stops::NONE,
         }
     }
 
     /// A ramp from the top edge to the bottom one.
     pub fn linear(from: Color, to: Color) -> Gradient {
-        Gradient::Linear { start: UnitPoint::TOP, end: UnitPoint::BOTTOM, from, to }
+        Gradient::Linear { start: UnitPoint::TOP, end: UnitPoint::BOTTOM, from, to, stops: Stops::NONE }
+    }
+
+    /// `Gradient.Stop(color:location:)` — one more color the ramp passes
+    /// through, at `location` along it (0 the start, 1 the end):
+    /// `Gradient::linear(red, blue).stop(0.5, green)`. A stop at the
+    /// place of another draws a hard edge between them.
+    #[must_use]
+    pub fn stop(self, location: f64, color: Color) -> Gradient {
+        match self {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => Gradient::Radial {
+                center,
+                start,
+                end,
+                aspect,
+                inner,
+                outer,
+                stops: stops.with(location, color, inner, outer),
+            },
+            Gradient::Linear { start, end, from, to, stops } => {
+                Gradient::Linear { start, end, from, to, stops: stops.with(location, color, from, to) }
+            }
+        }
+    }
+
+    /// The stops between the ramp's two ends.
+    #[must_use]
+    pub const fn stops(&self) -> &Stops {
+        match self {
+            Gradient::Radial { stops, .. } | Gradient::Linear { stops, .. } => stops,
+        }
     }
 
     /// Moves a radial gradient's centre (a linear one keeps its line).
     pub fn center(self, center: UnitPoint) -> Gradient {
         match self {
-            Gradient::Radial { start, end, aspect, inner, outer, .. } => {
-                Gradient::Radial { center, start, end, aspect, inner, outer }
+            Gradient::Radial { start, end, aspect, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2150,8 +2367,8 @@ impl Gradient {
     /// The two radii of a radial gradient, in px.
     pub fn radius(self, start: Px, end: Px) -> Gradient {
         match self {
-            Gradient::Radial { center, aspect, inner, outer, .. } => {
-                Gradient::Radial { center, start, end: Some(end), aspect, inner, outer }
+            Gradient::Radial { center, aspect, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end: Some(end), aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2166,8 +2383,8 @@ impl Gradient {
     /// through `.clipped()`, which cuts every paint anyway.
     pub fn aspect(self, aspect: f64) -> Gradient {
         match self {
-            Gradient::Radial { center, start, end, inner, outer, .. } => {
-                Gradient::Radial { center, start, end, aspect, inner, outer }
+            Gradient::Radial { center, start, end, inner, outer, stops, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer, stops }
             }
             other => other,
         }
@@ -2177,7 +2394,7 @@ impl Gradient {
     /// rings).
     pub fn direction(self, start: UnitPoint, end: UnitPoint) -> Gradient {
         match self {
-            Gradient::Linear { from, to, .. } => Gradient::Linear { start, end, from, to },
+            Gradient::Linear { from, to, stops, .. } => Gradient::Linear { start, end, from, to, stops },
             other => other,
         }
     }
@@ -2187,7 +2404,7 @@ impl Gradient {
     /// only evaluate).
     pub fn resolve(self, rect: Rect) -> GradientPaint {
         match self {
-            Gradient::Radial { center, start, end, aspect, inner, outer } => {
+            Gradient::Radial { center, start, end, aspect, inner, outer, stops } => {
                 let center = center.resolve(rect);
                 let reach = end.unwrap_or_else(|| corner_reach(center, rect));
                 GradientPaint::Radial {
@@ -2197,13 +2414,15 @@ impl Gradient {
                     aspect: if aspect > 0.0 { aspect } else { 1.0 },
                     inner,
                     outer,
+                    stops,
                 }
             }
-            Gradient::Linear { start, end, from, to } => GradientPaint::Linear {
+            Gradient::Linear { start, end, from, to, stops } => GradientPaint::Linear {
                 start: start.resolve(rect),
                 end: end.resolve(rect),
                 from,
                 to,
+                stops,
             },
         }
     }
@@ -2220,31 +2439,39 @@ fn corner_reach(center: Point, rect: Rect) -> Px {
 /// carries.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum GradientPaint {
-    Radial { center: Point, start: Px, end: Px, aspect: f64, inner: Color, outer: Color },
-    Linear { start: Point, end: Point, from: Color, to: Color },
+    Radial { center: Point, start: Px, end: Px, aspect: f64, inner: Color, outer: Color, stops: Stops },
+    Linear { start: Point, end: Point, from: Color, to: Color, stops: Stops },
 }
 
 impl GradientPaint {
     /// The color at a point, straight sRGB — the one formula, which the
-    /// shaders repeat.
+    /// shaders repeat piece by piece ([`ramp_pieces`]).
     pub fn at(&self, point: Point) -> Color {
         match *self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, ref stops } => {
                 // the ellipse is a circle in a Y-scaled space: at the
                 // point (0, end·aspect) the division lands on `end`
                 let distance =
                     (point.x - center.x).hypot((point.y - center.y) / aspect);
-                mix(inner, outer, ((distance - start) / (end - start)).clamp(0.0, 1.0))
+                ramp(inner, outer, stops, ((distance - start) / (end - start)).clamp(0.0, 1.0))
             }
-            GradientPaint::Linear { start, end, from, to } => {
+            GradientPaint::Linear { start, end, from, to, ref stops } => {
                 let (dx, dy) = (end.x - start.x, end.y - start.y);
                 let length = dx * dx + dy * dy;
                 if length <= 0.0 {
                     return to;
                 }
                 let along = ((point.x - start.x) * dx + (point.y - start.y) * dy) / length;
-                mix(from, to, along.clamp(0.0, 1.0))
+                ramp(from, to, stops, along.clamp(0.0, 1.0))
             }
+        }
+    }
+
+    /// The stops between the ramp's two ends.
+    #[must_use]
+    pub const fn stops(&self) -> &Stops {
+        match self {
+            GradientPaint::Radial { stops, .. } | GradientPaint::Linear { stops, .. } => stops,
         }
     }
 
@@ -2252,7 +2479,7 @@ impl GradientPaint {
     pub fn scaled(self, factor: f64) -> GradientPaint {
         let scale = |point: Point| Point { x: point.x * factor, y: point.y * factor };
         match self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
                 GradientPaint::Radial {
                     center: scale(center),
                     start: start * factor,
@@ -2260,10 +2487,11 @@ impl GradientPaint {
                     aspect,
                     inner,
                     outer,
+                    stops,
                 }
             }
-            GradientPaint::Linear { start, end, from, to } => {
-                GradientPaint::Linear { start: scale(start), end: scale(end), from, to }
+            GradientPaint::Linear { start, end, from, to, stops } => {
+                GradientPaint::Linear { start: scale(start), end: scale(end), from, to, stops }
             }
         }
     }
@@ -2272,11 +2500,11 @@ impl GradientPaint {
     pub(crate) fn shifted(self, dx: Px, dy: Px) -> GradientPaint {
         let shift = |point: Point| Point { x: point.x + dx, y: point.y + dy };
         match self {
-            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                GradientPaint::Radial { center: shift(center), start, end, aspect, inner, outer }
+            GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                GradientPaint::Radial { center: shift(center), start, end, aspect, inner, outer, stops }
             }
-            GradientPaint::Linear { start, end, from, to } => {
-                GradientPaint::Linear { start: shift(start), end: shift(end), from, to }
+            GradientPaint::Linear { start, end, from, to, stops } => {
+                GradientPaint::Linear { start: shift(start), end: shift(end), from, to, stops }
             }
         }
     }
@@ -2691,6 +2919,10 @@ pub struct VisualProps {
     pub glass: Option<Glass>,
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
+    /// `.foreground_gradient(…)` — the text below paints with this ramp,
+    /// laid across this box, as `SwiftUI`'s `.foregroundStyle(gradient)`.
+    /// A foreground color set further in wins, as in `SwiftUI`.
+    pub foreground_gradient: Option<Gradient>,
     pub border: Option<(Color, Px)>,
     /// How the border's line is drawn — `None` is the solid ring.
     pub border_style: Option<crate::shapes::BorderStyle>,
@@ -2718,6 +2950,10 @@ pub struct VisualProps {
     /// lines by it and centres the glyphs in the taller box — the CSS
     /// half-leading.
     pub line_height: Option<Px>,
+    /// `.line_limit(…)` — the most lines the text below shows, inherited
+    /// and measured like `line_height`. `Some(0)` lifts a limit set
+    /// further out; `None` inherits.
+    pub line_limit: Option<u8>,
     /// Where each WRAPPED line sits inside the box the text was given.
     /// Inherited beside the font; `None` is leading, which is where every
     /// line has always been placed.
@@ -2736,6 +2972,18 @@ pub struct VisualProps {
     /// corner radius — including the notch behind a rounded corner,
     /// which belongs to the shadow, not to the backdrop.
     pub shadow: Option<(Px, Color)>,
+    /// `.shadow_offset(x, y)` — where the halo sits from the box: SwiftUI's
+    /// `.shadow(…, x:, y:)`, CSS's offset. `None` is under the box.
+    pub shadow_offset: Option<(Px, Px)>,
+    /// `.offset(x, y)` — the box and everything in it drawn this far from
+    /// where the layout put it, as SwiftUI's `.offset`: paint and pointer
+    /// move, the layout around it never hears of it.
+    pub offset: Option<(Px, Px)>,
+    /// `.rotation_effect(…)` — the box and everything in it drawn turned
+    /// this many degrees, clockwise, about this point of the box, as
+    /// `SwiftUI`'s `.rotationEffect`: paint only, the layout never hears of
+    /// it. The pixel pipelines turn the subtree's picture as one sprite.
+    pub rotation: Option<(f64, UnitPoint)>,
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one. Paint
     /// only, like everything here: the measure never hears about it.
@@ -2752,6 +3000,12 @@ pub struct VisualProps {
     pub opacity: Option<f64>,
     /// Foreground blur in logical pixels. A compositing boundary: styles never fold across it.
     pub blur: Option<Px>,
+    /// `.grayscale(…)`, `.saturation(…)`, `.contrast(…)`,
+    /// `.hue_rotation(…)`, `.color_invert()` — the colors of everything
+    /// the box and its subtree paint go through these, in order. Nothing
+    /// set further out folds in: a ground laid around a filtered view
+    /// keeps its color, as in `SwiftUI`.
+    pub filters: crate::color_filter::ColorFilters,
     /// The same fade under hover and pressed, so a mark can appear
     /// under the pointer without the scene changing what it CONTAINS
     /// (the LAW: hover swaps paint, never content).
@@ -2808,6 +3062,13 @@ impl VisualProps {
             },
             clip: self.clip || outer.clip,
             foreground: self.foreground.or(outer.foreground),
+            // the ink nearer the view wins: a color set inside drops a
+            // ramp set outside
+            foreground_gradient: if self.foreground.is_some() {
+                self.foreground_gradient
+            } else {
+                self.foreground_gradient.or(outer.foreground_gradient)
+            },
             border: self.border.or(outer.border),
             border_style: self.border_style.or(outer.border_style),
             stripes: self.stripes.or(outer.stripes),
@@ -2818,12 +3079,27 @@ impl VisualProps {
             foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
             line_height: self.line_height.or(outer.line_height),
+            line_limit: self.line_limit.or(outer.line_limit),
             text_align: self.text_align.or(outer.text_align),
             direction: self.direction.or(outer.direction),
             flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
+            shadow_offset: self.shadow_offset.or(outer.shadow_offset),
+            // two offsets add up, as SwiftUI's do: `.offset(x: 1).offset(x: 2)`
+            // is three
+            offset: match (self.offset, outer.offset) {
+                (Some((x, y)), Some((outer_x, outer_y))) => Some((x + outer_x, y + outer_y)),
+                (inner, outer) => inner.or(outer),
+            },
+            // two turns about one point add up; the inner one names it
+            rotation: match (self.rotation, outer.rotation) {
+                (Some((degrees, anchor)), Some((outer_degrees, _))) => Some((degrees + outer_degrees, anchor)),
+                (inner, outer) => inner.or(outer),
+            },
             opacity: self.opacity.or(outer.opacity),
             blur: self.blur.or(outer.blur),
+            // the inner ones first; a chain too long for one stays nested
+            filters: self.filters.then(outer.filters).unwrap_or(self.filters),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
             hidden: self.hidden || outer.hidden,
@@ -3380,6 +3656,7 @@ impl LayoutNode {
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. }
             | LayoutNode::Styled { child, .. }
             // a target, a tooltip, a menu, a drag and a drop exist only
@@ -3907,11 +4184,11 @@ impl DisplayList {
                 DrawCommand::Gradient { rect: r, paint, corner_radius } => DrawCommand::Gradient {
                     rect: rect(r),
                     paint: match paint {
-                        GradientPaint::Linear { start, end, from, to } => {
-                            GradientPaint::Linear { start: point(start), end: point(end), from, to }
+                        GradientPaint::Linear { start, end, from, to, stops } => {
+                            GradientPaint::Linear { start: point(start), end: point(end), from, to, stops }
                         }
-                        GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
-                            GradientPaint::Radial { center: point(center), start, end, aspect, inner, outer }
+                        GradientPaint::Radial { center, start, end, aspect, inner, outer, stops } => {
+                            GradientPaint::Radial { center: point(center), start, end, aspect, inner, outer, stops }
                         }
                     },
                     corner_radius: corners(corner_radius),
@@ -4926,6 +5203,39 @@ pub struct HostPlacement {
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
+/// A line of text a ramp inks: where it stands in the display list, the
+/// ramp, and how opaque the line was drawn — what a fade does to it
+/// later scales the ink.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy, Debug)]
+struct Inked {
+    index: usize,
+    ramp: GradientPaint,
+    alpha: u8,
+}
+
+/// A turned subtree, open: where its commands, its named boxes and its
+/// texts begin, and the turn — degrees clockwise about a point of the box.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct TurnScope {
+    degrees: f64,
+    anchor: UnitPoint,
+    display: usize,
+    tests: usize,
+    texts: usize,
+}
+
+/// A filtered subtree, open: where its commands and its custom boxes
+/// begin, and the filters its colors go through.
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct FilterScope {
+    filters: crate::color_filter::ColorFilters,
+    display: usize,
+    customs: usize,
+}
+
 #[cfg(feature = "canvas")]
 #[derive(Clone, Copy)]
 struct BlurScope {
@@ -4958,6 +5268,11 @@ pub struct Placement {
     accessibility_surface: Option<Rc<str>>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
+    /// Every view a `.test_id(…)` names, with its frame, in placement
+    /// order.
+    pub(crate) test_frames: Vec<(Rc<str>, Rect)>,
+    /// Every text's frame, while [`record_text_frames`] is on.
+    pub(crate) text_frames: Vec<Rect>,
     pub display: DisplayList,
     /// A Dom frame with no live island skips the display list — the
     /// clip stack still runs, only the command collection sleeps.
@@ -4984,6 +5299,15 @@ pub struct Placement {
     panes: Vec<usize>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
+    /// Stack of the open foreground ramps, each with the depth of the
+    /// foreground stack it was opened at: a ramp inks the text drawn
+    /// while no color has been set since.
+    ramps: Vec<(usize, GradientPaint)>,
+    /// The lines a ramp inks, in paint order: each turns into its
+    /// picture when its ramp closes, or sooner, when a picture of the
+    /// subtree around it is taken first.
+    #[cfg(feature = "canvas")]
+    inked: Vec<Inked>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
     /// `Styled` picks its background by it.
     pointer: Vec<(bool, bool)>,
@@ -5007,6 +5331,14 @@ pub struct Placement {
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
     clip: Vec<Rect>,
+    /// What each open clip's command carries, beside `clip`: the same cut
+    /// intersected only with the clips opened since the innermost blurred
+    /// picture began at [`Placement::picture_floor`]. A blur spreads the
+    /// whole picture and the clips around it cut the result, as CSS and
+    /// SwiftUI do; a picture cut first fades at a border nobody drew.
+    drawn_clip: Vec<Rect>,
+    /// The depth of `clip` where the innermost blurred picture opened.
+    picture_floor: usize,
     /// Stack of scroll CONTENT origins — animated origins anchor here,
     /// so scrolling moves content 1:1 and never bends a spring.
     anchors: Vec<Point>,
@@ -5193,13 +5525,94 @@ impl Placement {
             crate::stats::note_unseen();
             return;
         }
+        #[cfg(feature = "canvas")]
+        if let Some((depth, ramp)) = self.ramps.last()
+            && *depth == self.foreground.len()
+            && let DrawCommand::TextLine { color, .. } | DrawCommand::TurnedText { color, .. } = &command
+        {
+            self.inked.push(Inked { index: self.display.len(), ramp: *ramp, alpha: color.a });
+        }
         self.display.push(command);
+    }
+
+    #[cfg(feature = "canvas")]
+    /// Closes a turned subtree: its commands become one picture laid on
+    /// the scene turned about its pivot, and its named boxes and texts
+    /// report the box they cover once turned, as the page's
+    /// `getBoundingClientRect` does.
+    fn turn_from(&mut self, scope: TurnScope, frame: Rect, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
+        let pivot = Point {
+            x: frame.size.width.mul_add(scope.anchor.x, frame.origin.x),
+            y: frame.size.height.mul_add(scope.anchor.y, frame.origin.y),
+        };
+        let map = crate::turn::about(scope.degrees, pivot);
+        for (_, rect) in &mut self.test_frames[scope.tests..] {
+            *rect = crate::turn::bounds_of(*rect, map);
+        }
+        for rect in &mut self.text_frames[scope.texts..] {
+            *rect = crate::turn::bounds_of(*rect, map);
+        }
+        let layer = DisplayList { commands: self.display.commands.split_off(scope.display) };
+        let slot = crate::image_engine::FeedKey::effect(self.effects);
+        self.effects += 1;
+        if let Some(sprite) = crate::turn::paint(&layer, map, env, slot) {
+            self.draw(sprite);
+        }
+    }
+
+    /// Closes a filtered subtree: its commands become one picture, its
+    /// colors through the filters, laid where they were. A custom box
+    /// inside paints in that picture now.
+    #[cfg(feature = "canvas")]
+    fn filter_from(&mut self, scope: FilterScope, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
+        let layer = DisplayList { commands: self.display.commands.split_off(scope.display) };
+        let slot = crate::image_engine::FeedKey::effect(self.effects);
+        self.effects += 1;
+        if let Some(sprite) = crate::color_filter::paint(&layer, &scope.filters, env, slot) {
+            self.draw(sprite);
+        }
+        for custom in &mut self.customs[scope.customs..] {
+            custom.slice = (scope.display, self.display.len());
+        }
+    }
+
+    /// Turns the lines a ramp inks, from the `mark`-th on, into their
+    /// pictures, in place.
+    #[cfg(feature = "canvas")]
+    fn ink_from(&mut self, mark: usize, env: &LayoutEnv<'_>) {
+        for inked in self.inked.split_off(mark.min(self.inked.len())) {
+            let Some(command) = self.display.commands.get(inked.index) else { continue };
+            let alpha = match command {
+                DrawCommand::TextLine { color, .. } | DrawCommand::TurnedText { color, .. } if inked.alpha > 0 => {
+                    f64::from(color.a) / f64::from(inked.alpha)
+                }
+                _ => continue,
+            };
+            let slot = crate::image_engine::FeedKey::effect(self.effects);
+            self.effects += 1;
+            // a line with no ink (white space) has no picture, and paints
+            // nothing as it is
+            if let Some(picture) = crate::ink::paint(command, &inked.ramp, alpha, env, slot) {
+                self.display.commands[inked.index] = picture;
+            }
+        }
+    }
+
+    /// Inks the lines at or past `display` before a picture of the
+    /// subtree there is taken.
+    #[cfg(feature = "canvas")]
+    fn ink_since(&mut self, display: usize, env: &LayoutEnv<'_>) {
+        let mark = self.inked.partition_point(|inked| inked.index < display);
+        self.ink_from(mark, env);
     }
 
     /// Replace framework paint with its composite and rebind dependent ranges.
     /// Native hosts are paint barriers: each side stays on its original layer.
     #[cfg(feature = "canvas")]
     fn blur_from(&mut self, scope: BlurScope, viewport: Rect, env: &LayoutEnv<'_>) {
+        self.ink_since(scope.display, env);
         let original = DisplayList {
             commands: self.display.commands.split_off(scope.display),
         };
@@ -5314,12 +5727,15 @@ impl Placement {
     /// on the same integers either way; emitting the intersection is
     /// strictly narrowing, never a second semantics.
     fn push_clip(&mut self, rect: Rect, corner_radius: impl Into<Corners>) {
-        let clipped = match self.clip.last() {
+        let cut = |top: Option<&Rect>| match top {
             Some(top) => rect
                 .intersection(*top)
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
+        let clipped = cut(self.clip.last());
+        let drawn = cut(self.drawn_clip.last().filter(|_| self.drawn_clip.len() > self.picture_floor));
+        self.drawn_clip.push(drawn);
         // an EMPTY clip shows nothing, and says so once: everything under
         // it is muted, its own pair of commands included
         if !self.keep_unseen && clipped.is_empty() {
@@ -5329,7 +5745,7 @@ impl Placement {
         }
         if !self.skip_display && self.muted == 0 {
             self.display.push(DrawCommand::PushClip {
-                rect: clipped,
+                rect: drawn,
                 corner_radius: corner_radius.into(),
             });
         }
@@ -5337,6 +5753,7 @@ impl Placement {
     }
 
     fn pop_clip(&mut self) {
+        self.drawn_clip.pop();
         let closed = self.clip.pop();
         if !self.keep_unseen && closed.is_some_and(|clip| clip.is_empty()) {
             self.muted = self.muted.saturating_sub(1);
@@ -5433,6 +5850,23 @@ pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 /// and each keeps its own address.
 pub(crate) const FRAME_SEGMENT: &str = "/#frame";
 
+thread_local! {
+    /// Does the placement keep every text's frame? Off, a text costs
+    /// what it always did.
+    static TEXT_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep every text's frame from the next pass on
+/// ([`LayoutResult::text_frames`]) — a harness that tells the glyphs'
+/// pixels from the rest turns it on before the first frame.
+pub fn record_text_frames(on: bool) {
+    TEXT_FRAMES.with(|flag| flag.set(on));
+}
+
+fn recording_text_frames() -> bool {
+    TEXT_FRAMES.with(std::cell::Cell::get)
+}
+
 /// The absolute frames the placement pass produces, addressable by the
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
@@ -5516,6 +5950,12 @@ pub struct LayoutResult {
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub size: Size,
     pub frames: Frames,
+    /// Every view a `.test_id(…)` names, with its frame in the window's
+    /// coordinates — what a harness compares against another renderer.
+    pub test_frames: Vec<(Rc<str>, Rect)>,
+    /// Every text's frame, while [`record_text_frames`] is on — where a
+    /// harness tells a glyph's pixels from the rest.
+    pub text_frames: Vec<Rect>,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
@@ -5603,6 +6043,7 @@ pub(crate) fn layout_in(
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction,
             flips: false,
@@ -5747,6 +6188,8 @@ pub(crate) fn layout_placing(
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
         focus_groups: out.focus_groups,
         frames: out.frames,
+        test_frames: out.test_frames,
+        text_frames: out.text_frames,
         display: out.display,
         hits: out.hits,
         scrolls: out.scrolls,
@@ -6250,6 +6693,8 @@ pub fn layout_dom(
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
             focus_groups: out.focus_groups,
             frames: out.frames,
+            test_frames: out.test_frames,
+            text_frames: out.text_frames,
             display: out.display,
             hits: out.hits,
             scrolls: out.scrolls,
@@ -6697,9 +7142,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                         Rect {
                             origin: Point {
                                 x: room.origin.x
-                                    + align_offset(room.size.width, open.width, CrossAlign::Center),
+                                    + window_offset(room.size.width, open.width, CrossAlign::Center),
                                 y: room.origin.y
-                                    + align_offset(
+                                    + window_offset(
                                         room.size.height,
                                         open.height,
                                         CrossAlign::Center,
@@ -6727,9 +7172,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                     origin: held.map_or_else(
                         || Point {
                             x: room.origin.x
-                                + align_offset(room.size.width, size.width, CrossAlign::Center),
+                                + window_offset(room.size.width, size.width, CrossAlign::Center),
                             y: room.origin.y
-                                + align_offset(room.size.height, size.height, CrossAlign::Center),
+                                + window_offset(room.size.height, size.height, CrossAlign::Center),
                         },
                         |frame| frame.origin,
                     ),
@@ -6755,9 +7200,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             (None, Some(side)) => anchored_frame(queued.anchor, side, size, container),
             (None, None) => Rect {
                 origin: Point {
-                    x: room.origin.x + align_offset(room.size.width, size.width, CrossAlign::Center),
+                    x: room.origin.x + window_offset(room.size.width, size.width, CrossAlign::Center),
                     y: room.origin.y
-                        + align_offset(room.size.height, size.height, CrossAlign::Center),
+                        + window_offset(room.size.height, size.height, CrossAlign::Center),
                 },
                 size,
             },
@@ -6982,7 +7427,9 @@ impl LayoutNode {
             // the layer is invisible to the question: a rule wide
             // enough to cross the box must never make the box flexible
             LayoutNode::Overlay { child, .. } => child.is_flexible(axis, enclosing_main),
+            // a floor hugs: as flexible as what it holds
             LayoutNode::Padding { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Styled { child, .. }
@@ -7112,6 +7559,7 @@ impl LayoutNode {
             | Self::Frame { child, .. }
             | Self::MaxFrame { child, .. }
             | Self::FlexFrame { child, .. }
+            | Self::MinFrame { child, .. }
             | Self::Scroll { child, .. }
             | Self::Hug { child, .. }
             | Self::Styled { child, .. }
@@ -7136,6 +7584,45 @@ impl LayoutNode {
             | Self::Spanned { child, .. } => Some(child),
             Self::Boundary { children, .. } if children.len() == 1 => children.first(),
             _ => None,
+        }
+    }
+
+    /// The narrowest this subtree gets without breaking a word — the
+    /// CSS min-content width a flex line floors a shrinking child at: a
+    /// text's widest word, a frame's own width, a row's floors and its
+    /// spacing side by side, a column's widest floor. What has no such
+    /// floor answers its natural width: it does not shrink.
+    pub(crate) fn min_content_width(&self, env: &LayoutEnv<'_>) -> Px {
+        match self {
+            Self::Text { content, highlights, truncation, .. } => {
+                paragraph::min_content(&content.get(), highlights.as_deref(), *truncation, env)
+            }
+            Self::Styled { props, child, .. } => {
+                let env = LayoutEnv {
+                    font: props.font.apply_over(env.font),
+                    line_height: props.line_height.or(env.line_height),
+                    ..*env
+                };
+                child.min_content_width(&env)
+            }
+            Self::Frame { width: Some(width), .. } => *width,
+            Self::FlexFrame { min_width, child, .. } | Self::MinFrame { min_width, child, .. } => {
+                child.min_content_width(env).max(*min_width)
+            }
+            Self::Padding { edges, child } => child.min_content_width(env) + edges.leading + edges.trailing,
+            Self::Stack { axis, spacing, children, .. } => {
+                let floors = children.iter().filter(|child| child.placed_at().is_none()).map(|child| child.min_content_width(env));
+                match axis {
+                    Axis::Horizontal => floors
+                        .enumerate()
+                        .fold(0.0, |sum, (index, floor)| if index == 0 { floor } else { sum + *spacing + floor }),
+                    Axis::Vertical => floors.fold(0.0, Px::max),
+                }
+            }
+            _ => self.only_child().map_or_else(
+                || self.measure(Proposal { width: None, height: None }, env).0.width,
+                |child| child.min_content_width(env),
+            ),
         }
     }
 
@@ -7185,6 +7672,7 @@ impl LayoutNode {
             | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::MinFrame { child, .. }
             | LayoutNode::Hug { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -7403,8 +7891,17 @@ impl LayoutNode {
                 (size, Fit::Wrapped(upright, Box::new(fit)))
             }
 
-            LayoutNode::Stack { axis, spacing, children, .. } => {
-                measure_stack(*axis, *spacing, children, proposal, env)
+            LayoutNode::Stack { axis, spacing, align, children, .. } => {
+                let (size, fit) = measure_stack(*axis, *spacing, children, proposal, env);
+                // a row on a shared baseline drops each child to it, and
+                // holds the lowest bottom that drop reaches
+                match (&fit, axis, align) {
+                    (Fit::Children(measured), Axis::Horizontal, CrossAlign::Baseline) => {
+                        let height = size.height.max(baseline_extent(children, measured, env));
+                        (Size { height, ..size }, fit)
+                    }
+                    _ => (size, fit),
+                }
             }
 
             LayoutNode::Grid { columns, spacing, row_spacing, align, vertical, children } => {
@@ -7627,9 +8124,11 @@ impl LayoutNode {
             }
 
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => {
+                // `f64::MAX` is "no ceiling, but not open": unproposed, it
+                // proposes nothing either, or a spacer inside would take it
                 let cap = |proposed: Option<Px>, max: Px| match proposed {
                     Some(length) => Some(length.min(max)),
-                    None if max.is_finite() => Some(max),
+                    None if max.is_finite() && max < Px::MAX => Some(max),
                     None => None,
                 };
                 let (child_size, fit) = child.measure(
@@ -7670,6 +8169,24 @@ impl LayoutNode {
                 let size = Size {
                     width: offer.width.unwrap_or(child_size.width),
                     height: offer.height.unwrap_or(child_size.height),
+                };
+                (size, Fit::Wrapped(child_size, Box::new(fit)))
+            }
+
+            LayoutNode::MinFrame { min_width, min_height, child, .. } => {
+                // the child is offered the proposal raised to the floor;
+                // unproposed, it answers what it would be
+                let offer = Proposal {
+                    width: proposal.width.map(|length| length.max(*min_width)),
+                    height: proposal.height.map(|length| length.max(*min_height)),
+                };
+                let (child_size, fit) = child.measure(offer, env);
+                // the child's size, held between the floor and the offer: a
+                // child wider than its offer overflows a box of the offer
+                let hold = |offered: Option<Px>, min: Px, child_len: Px| offered.map_or(child_len, |offered| child_len.min(offered)).max(min);
+                let size = Size {
+                    width: hold(offer.width, *min_width, child_size.width),
+                    height: hold(offer.height, *min_height, child_size.height),
                 };
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
@@ -7767,6 +8284,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    line_limit: props.line_limit.unwrap_or(env.line_limit),
                     text_align: props.text_align.or(env.text_align),
                     direction: props.direction.unwrap_or(env.direction),
                     flips: props.flips.unwrap_or(env.flips),
@@ -7831,7 +8349,7 @@ impl LayoutNode {
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
             LayoutNode::BoundaryRef { path, slot, .. } => {
-                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
+                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height, line_limit: env.line_limit };
                 crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }
         }
@@ -7852,6 +8370,9 @@ impl LayoutNode {
         };
         let stuck = shift > 0.0;
         let frame = Rect { origin: Point { x: frame.origin.x, y: frame.origin.y + shift }, size: frame.size };
+        if let Some(id) = self.test_id() {
+            out.test_frames.push((Rc::clone(id), frame));
+        }
         if stuck {
             // springs below anchor to the box that moved: the stick
             // carries them 1:1, as scrolling does, and never flies them
@@ -7969,8 +8490,13 @@ impl LayoutNode {
             }
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
+                if recording_text_frames() {
+                    out.text_frames.push(frame);
+                }
                 let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
+                // under a ramp, a color set nearer the text wins
+                let own_ink = out.ramps.last().is_some_and(|(depth, _)| *depth < out.foreground.len());
                 if let Some(dom) = out.dom.as_mut() {
                     // the WHOLE content, unwrapped: the browser re-breaks
                     // lines inside the same box with the same measures
@@ -7987,9 +8513,13 @@ impl LayoutNode {
                             highlights: highlights.clone(),
                             truncation: *truncation,
                             inherits_face: false,
+                            line_limit: env.line_limit,
                         }),
                         frame,
                     );
+                    if own_ink {
+                        dom.own_ink();
+                    }
                 }
                 paragraph::place_text(
                     &content,
@@ -8028,6 +8558,7 @@ impl LayoutNode {
                             crate::dom::DomKind::Image(crate::dom::DomImage {
                                 key: source.key(),
                                 cover: false,
+                                contain: false,
                             }),
                             frame,
                         );
@@ -9174,6 +9705,7 @@ impl LayoutNode {
                             crate::dom::DomKind::Image(crate::dom::DomImage {
                                 key: source.key(),
                                 cover,
+                                contain: false,
                             }),
                             frame,
                         );
@@ -9371,9 +9903,10 @@ impl LayoutNode {
                 // a layer that FILLED the measured box follows the real
                 // frame instead: the parent may have handed the base
                 // more room than it asked for, and a rule that crossed
-                // the box must still cross it
+                // the box must still cross it. A layer larger than the
+                // box keeps its size and overflows it, as SwiftUI's does
                 let stretch = |axis_layer: Px, axis_base: Px, axis_frame: Px| {
-                    if axis_layer >= axis_base { axis_frame } else { axis_layer }
+                    if (axis_layer - axis_base).abs() <= 1e-9 { axis_frame } else { axis_layer }
                 };
                 let size = Size {
                     width: stretch(layer_size.width, base_size.width, frame.size.width),
@@ -9480,7 +10013,8 @@ impl LayoutNode {
             }
 
             (LayoutNode::MaxFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit))
-            | (LayoutNode::FlexFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            | (LayoutNode::FlexFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit))
+            | (LayoutNode::MinFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = align_x(frame, child_size.width, *align, env.rtl());
                 let y = frame.origin.y + align_offset(frame.size.height, child_size.height, *vertical);
                 child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
@@ -9635,6 +10169,12 @@ impl LayoutNode {
             }
 
             (LayoutNode::Styled { props, child, .. }, fit) => {
+                // `.offset(x, y)`: the box is drawn — and found by the
+                // pointer — this far from where the layout put it
+                let frame = props.offset.map_or(frame, |(x, y)| Rect {
+                    origin: Point { x: frame.origin.x + x, y: frame.origin.y + y },
+                    size: frame.size,
+                });
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -9642,6 +10182,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    line_limit: props.line_limit.unwrap_or(env.line_limit),
                     text_align: props.text_align.or(env.text_align),
                     direction: props.direction.unwrap_or(env.direction),
                     flips: props.flips.unwrap_or(env.flips),
@@ -9706,18 +10247,52 @@ impl LayoutNode {
                     .map(|radius| BlurScope { radius, display: fade_from, customs: out.customs.len(), hosts: out.hosts.len() });
                 #[cfg(not(feature = "canvas"))]
                 let blur: Option<()> = None;
+                // a turned box paints its subtree once, upright, and turns
+                // the picture: the same compositing boundary as a blur
+                #[cfg(feature = "canvas")]
+                let turn = props
+                    .rotation
+                    .filter(|(degrees, _)| degrees.rem_euclid(360.0).abs() > 1e-9)
+                    .filter(|_| out.dom.as_ref().is_none_or(crate::dom::DomCapture::in_canvas))
+                    .map(|(degrees, anchor)| TurnScope {
+                        degrees,
+                        anchor,
+                        display: fade_from,
+                        tests: out.test_frames.len(),
+                        texts: out.text_frames.len(),
+                    });
+                #[cfg(not(feature = "canvas"))]
+                let turn: Option<()> = None;
+                // a filtered box paints its subtree once and filters the
+                // picture's colors: the same boundary again
+                #[cfg(feature = "canvas")]
+                let filtered = Some(props.filters)
+                    .filter(|filters| !filters.is_identity())
+                    .filter(|_| out.dom.as_ref().is_none_or(crate::dom::DomCapture::in_canvas))
+                    .map(|filters| FilterScope { filters, display: fade_from, customs: out.customs.len() });
+                #[cfg(not(feature = "canvas"))]
+                let filtered: Option<()> = None;
                 let old_thumbs = out.thumb_layers;
                 let old_keep = out.keep_unseen;
+                let old_floor = out.picture_floor;
+                if turn.is_some() {
+                    out.compositing += 1;
+                }
+                if filtered.is_some() {
+                    out.compositing += 1;
+                }
                 if blur.is_some() {
                     out.compositing += 1;
                     out.thumb_layers = false;
                     // Paint outside an ancestor clip can blur back into it.
                     out.keep_unseen = true;
+                    out.picture_floor = out.clip.len();
                 }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
+                    let (dx, dy) = props.shadow_offset.unwrap_or_default();
                     out.draw(DrawCommand::Shadow {
-                        rect: frame,
+                        rect: Rect { origin: Point { x: frame.origin.x + dx, y: frame.origin.y + dy }, size: frame.size },
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
                         corner_radius: props.corner_radius.unwrap_or_default(),
@@ -9838,6 +10413,20 @@ impl LayoutNode {
                     let color = animated(crate::anim::Channel::Foreground, color);
                     out.foreground.push(color);
                 }
+                // a ramp inks the text below, laid across this box; the
+                // page clips it to the text itself
+                let ramp = props
+                    .foreground_gradient
+                    .map(|gradient| {
+                        // its anchors are named from the leading side
+                        let gradient = if env.rtl() { gradient.flipped() } else { gradient };
+                        out.ramps.push((out.foreground.len(), gradient.resolve(frame)));
+                        #[cfg(feature = "canvas")]
+                        let mark = out.inked.len();
+                        #[cfg(not(feature = "canvas"))]
+                        let mark = 0;
+                        mark
+                    });
                 // the background IS the shape, so it paints before the
                 // cut; the border paints after, over the cut child — a
                 // ring blended once, never twice
@@ -9853,6 +10442,13 @@ impl LayoutNode {
                 }
                 if ink.is_some() {
                     out.foreground.pop();
+                }
+                if let Some(mark) = ramp {
+                    out.ramps.pop();
+                    #[cfg(feature = "canvas")]
+                    out.ink_from(mark, &env);
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = mark;
                 }
                 if let Some((color, width)) = props.border {
                     let color = animated(crate::anim::Channel::Border, color);
@@ -9882,15 +10478,32 @@ impl LayoutNode {
                         out.display.fade_from(fade_from, opacity.max(0.0));
                     }
                 }
+                // the colors are filtered before a blur spreads them, as
+                // the page's `filter` list writes them
+                if let Some(scope) = filtered {
+                    out.compositing -= 1;
+                    #[cfg(feature = "canvas")]
+                    out.filter_from(scope, &env);
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = scope;
+                }
                 if let Some(scope) = blur {
                     out.compositing -= 1;
                     out.thumb_layers = old_thumbs;
                     out.keep_unseen = old_keep;
+                    out.picture_floor = old_floor;
                     #[cfg(feature = "canvas")]
                     {
                         let viewport = env.overlay_bounds.or(out.accessibility_viewport).unwrap_or(frame);
                         out.blur_from(scope, viewport, &env);
                     }
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = scope;
+                }
+                if let Some(scope) = turn {
+                    out.compositing -= 1;
+                    #[cfg(feature = "canvas")]
+                    out.turn_from(scope, frame, &env);
                     #[cfg(not(feature = "canvas"))]
                     let _ = scope;
                 }
@@ -10432,6 +11045,14 @@ fn measure_stack(
         .map(|(index, _)| index)
         .collect();
 
+    // phase 1½: a row that does not fit shrinks what can shrink, as a
+    // flex line does — text wraps, a fixed frame does not
+    if axis == Axis::Horizontal
+        && let Some(total) = proposed_main
+    {
+        shrink_row(children, &flexible, &mut measured, total - spacing_total, proposal, env);
+    }
+
     // phase 2: only the flexibles re-measure — the waterfall. Offer equal
     // shares; a child that takes less than its offer is satisfied and its
     // leftover re-splits among the rest, until a round leaves nothing.
@@ -10618,6 +11239,65 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
+/// A row whose children's naturals pass its width shrinks them the way
+/// a CSS flex line does, so the page and the pixels agree: each child
+/// that is not flexible gives up width in proportion to its natural,
+/// never past its floor — what it measures offered nothing, the longest
+/// word of a text, a fixed frame's own width. A child that reaches its
+/// floor keeps it and the rest pay for it, round by round. Each shrunk
+/// child is measured again at the width it was left, and takes that
+/// width: a text wraps inside it. When the floors alone pass the width
+/// the row overflows at its floors.
+fn shrink_row(
+    children: &[LayoutNode],
+    flexible: &[usize],
+    measured: &mut [(Size, Fit)],
+    room: Px,
+    proposal: Proposal,
+    env: &LayoutEnv<'_>,
+) {
+    let in_line = |index: &usize| children[*index].placed_at().is_none() && !flexible.contains(index);
+    let lined: Vec<usize> = (0..children.len()).filter(in_line).collect();
+    let natural: Px = lined.iter().map(|&index| measured[index].0.width).sum();
+    if natural <= room + SETTLED {
+        return;
+    }
+    let offer = |width: Option<Px>| Proposal { width, height: proposal.height };
+    let floors: Vec<(usize, Px, Px)> = lined
+        .iter()
+        .map(|&index| {
+            let width = measured[index].0.width;
+            (index, width, children[index].min_content_width(env).min(width))
+        })
+        .collect();
+    let mut target: Vec<Option<Px>> = vec![None; children.len()];
+    let mut open: Vec<(usize, Px, Px)> = floors.iter().copied().filter(|(_, width, floor)| floor < width).collect();
+    let mut kept: Px = floors.iter().filter(|(_, width, floor)| floor >= width).map(|(_, width, _)| width).sum();
+    while !open.is_empty() {
+        let basis: Px = open.iter().map(|(_, width, _)| width).sum();
+        let deficit = room - kept - basis;
+        let mut floored = Vec::new();
+        for &(index, width, floor) in &open {
+            let wants = width + deficit * width / basis;
+            target[index] = Some(wants.max(floor));
+            if wants < floor {
+                floored.push(index);
+            }
+        }
+        if floored.is_empty() || deficit >= 0.0 {
+            break;
+        }
+        kept += open.iter().filter(|(index, _, _)| floored.contains(index)).map(|(_, _, floor)| floor).sum::<Px>();
+        open.retain(|(index, _, _)| !floored.contains(index));
+    }
+    for (index, width) in target.into_iter().enumerate() {
+        if let Some(width) = width.filter(|width| *width < measured[index].0.width - SETTLED) {
+            let (size, fit) = children[index].measure(offer(Some(width)), env);
+            measured[index] = (Size { width, ..size }, fit);
+        }
+    }
+}
+
 /// The flow's measure: every child at its own size, lines broken where
 /// the next child would pass the width offered. Unproposed, the width is
 /// endless and the flow is one line, which is what a row is.
@@ -10789,26 +11469,27 @@ const ELLIPSIS: &str = "…";
 
 /// Composes the ellipsis version that fits the width — the most content
 /// possible, measured for real (every candidate goes through the cache).
-/// Where a child sits inside the room it was given, on one axis.
-///
-/// An alignment offset is a share of the LEFTOVER, and a child bigger
-/// than the room leaves none: the share goes negative and the content
-/// slides out the LEADING side, behind whatever border is there. A
-/// reader then sees "ttings" where a panel is titled "Settings" — not
-/// a clipped end, a missing beginning — and a `.clipped()` cannot rescue
-/// it, because cutting something centred on its own overflow shows the
-/// middle of it.
-///
-/// So an offset is never negative. Content that does not fit starts at
-/// the leading edge and overflows trailing, which is the one direction
-/// a clip cuts predictably and a reader can still read into.
+/// Where a child sits inside the room it was given, on one axis: its
+/// share of the leftover, as CSS and SwiftUI place it. A child bigger
+/// than its room leaves a negative leftover — centred, it overflows both
+/// sides by half of it; at the end, the leading side. The page lays the
+/// same child out the same way, so the two roads agree. A title that
+/// must read from its first letter in a room too narrow asks for the
+/// leading edge, or for a truncation.
 fn align_offset(room: Px, child: Px, align: CrossAlign) -> Px {
     let leftover = room - child;
     match align {
         CrossAlign::Start | CrossAlign::Baseline => 0.0,
-        CrossAlign::Center => (leftover / 2.0).max(0.0),
-        CrossAlign::End => leftover.max(0.0),
+        CrossAlign::Center => leftover / 2.0,
+        CrossAlign::End => leftover,
     }
+}
+
+/// [`align_offset`] for a window over the scene, which never starts
+/// above or before its room: a sheet taller than the window keeps its
+/// top, and its close button, in reach and overflows down.
+fn window_offset(room: Px, child: Px, align: CrossAlign) -> Px {
+    align_offset(room, child, align).max(0.0)
 }
 
 /// Where a child of `width` that starts `along` from the frame's LEADING
@@ -11085,6 +11766,34 @@ fn place_target(
     out.pointer_hit.pop();
 }
 
+/// Each child's first baseline in a row on a shared one — a text by
+/// its ascent, a box without one by its bottom edge, a placed box out
+/// of the line. [`place_stack`] drops each child by its distance to the
+/// deepest.
+fn row_baselines(children: &[LayoutNode], sizes: impl Iterator<Item = Size>, env: &LayoutEnv<'_>) -> Vec<Px> {
+    children
+        .iter()
+        .zip(sizes)
+        .map(|(child, size)| {
+            if child.placed_at().is_some() { 0.0 } else { child.first_baseline(env).unwrap_or(size.height) }
+        })
+        .collect()
+}
+
+/// The height a row on a shared baseline reaches: every child in the
+/// line dropped to the deepest baseline, as [`place_stack`] places it.
+fn baseline_extent(children: &[LayoutNode], measured: &[(Size, Fit)], env: &LayoutEnv<'_>) -> Px {
+    let baselines = row_baselines(children, measured.iter().map(|(size, _)| *size), env);
+    let shared = baselines.iter().fold(0.0_f64, |acc, baseline| acc.max(*baseline));
+    children
+        .iter()
+        .zip(measured)
+        .zip(&baselines)
+        .filter(|((child, _), _)| child.placed_at().is_none())
+        .map(|((_, (size, _)), baseline)| shared - baseline + size.height)
+        .fold(0.0, Px::max)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
@@ -11110,19 +11819,7 @@ fn place_stack(
     // only when asked; the other alignments pay nothing.
     let baselines: Option<Vec<Px>> = (align == CrossAlign::Baseline
         && axis == Axis::Horizontal)
-        .then(|| {
-            children
-                .iter()
-                .zip(fits)
-                .map(|(child, (size, _))| {
-                    if child.placed_at().is_some() {
-                        0.0
-                    } else {
-                        child.first_baseline(env).unwrap_or(size.height)
-                    }
-                })
-                .collect()
-        });
+        .then(|| row_baselines(children, fits.iter().map(|(size, _)| *size), env));
     let shared = baselines
         .as_ref()
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
@@ -11136,10 +11833,8 @@ fn place_stack(
                 // a vertical stack has no shared baseline: start
                 _ => 0.0,
             },
-            // a squashed window can be narrower than a rigid child, and
-            // the same rule holds there as everywhere: the leftover is
-            // never negative, so the child starts at the leading edge
-            // instead of hanging half of itself off the near side
+            // a child wider than the stack overflows as CSS's does:
+            // centred, by half on each side
             align => align_offset(extent, len, align),
         };
         let origin = match axis {
@@ -11748,6 +12443,7 @@ mod tests {
             end: UnitPoint::TRAILING,
             from: Color::WHITE,
             to: Color::BLACK,
+            stops: crate::layout::Stops::NONE,
         };
         let Gradient::Linear { start, end, .. } = ramp.flipped() else { panic!("a ramp stays a ramp") };
         assert_eq!((start, end), (UnitPoint::TRAILING, UnitPoint::LEADING));
@@ -12812,6 +13508,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -12850,6 +13547,7 @@ mod tests {
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
                 line_height: None,
+                line_limit: 0,
                 text_align: None,
                 direction: LayoutDirection::LeftToRight,
                 flips: false,
@@ -12913,6 +13611,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -13251,6 +13950,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,
@@ -13329,6 +14029,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: LayoutDirection::LeftToRight,
             flips: false,

@@ -50,6 +50,12 @@ pub mod anim;
 pub mod beat;
 pub mod bind;
 mod blur;
+pub mod color_filter;
+#[cfg(feature = "canvas")]
+mod ink;
+#[cfg(feature = "canvas")]
+mod picture;
+pub mod turn;
 pub mod calendar;
 pub mod catalog;
 pub mod choice;
@@ -62,6 +68,7 @@ mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod figures;
 pub mod font_file;
 pub mod form;
 pub mod glass;
@@ -269,7 +276,7 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        AlertSpec, BackgroundBlend, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction,
+        AlertSpec, BackgroundBlend, Color, Corners, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction,
         Glass, Gradient,
         OverlaySurface, Point, Proposal, Px, Rect, Rendering, ScrollIndicators, Side, Size,
         Truncation, UnitPoint, VisualProps,
@@ -2374,12 +2381,14 @@ mod tests {
                 highlights: None,
                 truncation: None,
                 inherits_face: false,
+                line_limit: 0,
             };
             let bytes = crate::dom::encode(&[look_with(text)]);
             // count(4), op(1), rule(8), kind(1), flags(1), a bare style
-            // mask(4), a bare flow mask(2), the text flag(1) — then the
-            // face: color(4), inherits(1), size(4), and the weight
-            bytes[4 + 1 + 8 + 1 + 1 + 4 + 2 + 1 + 4 + 1 + 4]
+            // mask(4) and its second byte (ABI 28), a bare flow mask(2),
+            // the text flag(1) — then the face: color(4), inherits(1),
+            // size(4), and the weight
+            bytes[4 + 1 + 8 + 1 + 1 + 4 + 1 + 2 + 1 + 4 + 1 + 4]
         };
         let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
         assert_eq!(codes, vec![6, 7, 8, 0, 1, 2, 3, 4, 5]);
@@ -3899,7 +3908,7 @@ mod tests {
             (None, None),
         ]
         .into_iter()
-        .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None })
+        .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None, line_limit: 0 })
         .collect();
         let answer = |_: &crate::layout::LayoutNode| (Size { width: 360.0, height: 42.0 }, Fit::Leaf);
 
@@ -9633,54 +9642,27 @@ mod tests {
         assert_eq!(end, open.display.len(), "and it is the last thing placed");
     }
 
-    /// Content too wide for its box starts at the LEADING edge. It
-    /// never centres its own overflow.
-    ///
-    /// A centring offset is a share of the LEFTOVER, and when there is
-    /// no leftover the share is negative — so a row wider than the dock
-    /// lane holding it slid half of itself out the left side, behind
-    /// the dock's own border. A reader saw "ttings" where the panel is
-    /// titled "Settings": not a clipped end, a missing beginning.
-    ///
-    /// It is the same defect wrapped text had going up and down, on the
-    /// other axis and for any content. A clip cannot rescue it either:
-    /// cutting something centred on its overflow shows the middle.
+    /// Content too wide for its box overflows both sides, the way CSS
+    /// and SwiftUI centre it: a row of 300 points in a lane of 180
+    /// starts 60 before the lane and ends 60 past it, where the page
+    /// lays the same row out. A header that must read from its first
+    /// letter in a lane too narrow asks for the leading edge, and gets
+    /// it: there it starts where the lane does and runs off the far end.
     #[test]
-    fn content_too_wide_for_its_box_starts_at_the_leading_edge() {
-        use crate::layout::{DrawCommand, Proposal, Size};
-
+    fn content_too_wide_for_its_box_overflows_both_sides() {
         const LANE: f64 = 180.0;
 
-        #[derive(Clone, Copy)]
-        struct Dock;
-        impl Component for Dock {
-            fn body(self) -> impl View {
-                // a header row that needs more than the lane has
-                vstack(
-                    hstack((
-                        text("Settings").frame(150.0, 20.0),
-                        text("New Thread").frame(150.0, 20.0),
-                    ))
-                    .frame(LANE, 20.0),
-                )
-            }
-        }
+        let row_in = |alignment: Alignment| {
+            let runtime = Runtime::new();
+            let lane = hstack((text("Settings").frame(150.0, 20.0), text("New Thread").frame(150.0, 20.0)))
+                .test_id("row")
+                .frame_aligned(LANE, 20.0, alignment);
+            runtime.display_frame(&lane, Size { width: LANE, height: 60.0 });
+            runtime.test_frames().into_iter().find(|(id, _)| &**id == "row").map(|(_, frame)| frame).expect("the row")
+        };
 
-        let runtime = Runtime::new();
-        let result =
-            runtime.settled_layout(&Dock, Proposal::exact(Size { width: LANE, height: 60.0 }));
-        let leftmost = result
-            .display
-            .iter()
-            .filter_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.x),
-                _ => None,
-            })
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            leftmost >= 0.0,
-            "nothing is painted left of the lane; the leftmost glyph sits at {leftmost}",
-        );
+        assert_eq!(row_in(Alignment::Center).origin.x, (LANE - 300.0) / 2.0, "centred, it overflows both sides");
+        assert_eq!(row_in(Alignment::Leading).origin.x, 0.0, "leading, it starts where the lane does");
     }
 
     /// A label that knows how to ELLIPSIZE yields under pressure, and
@@ -16536,6 +16518,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let with = crate::dom::encode(&[look_with(stepped)]);
         let plain = crate::dom::DomText {
@@ -16548,6 +16531,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let without = crate::dom::encode(&[look_with(plain)]);
 
@@ -16573,6 +16557,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let bytes = crate::dom::encode(&[look_with(leaning)]);
         let upright = crate::dom::DomText {
@@ -16585,6 +16570,7 @@ mod tests {
             highlights: None,
             truncation: None,
             inherits_face: false,
+            line_limit: 0,
         };
         let plain = crate::dom::encode(&[look_with(upright)]);
 

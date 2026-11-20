@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Rounded corners and borders</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+      .row { display: flex; align-items: flex-start; gap: 12px; }
+      .r8 { width: 120px; height: 48px; background: #e8f0fe; border-radius: 8px; border: 1px solid #8e8e93; }
+      .pill { width: 120px; height: 40px; background: #3478f6; border-radius: 20px; }
+      .circle { width: 64px; height: 64px; background: #ff9500; border-radius: 32px; border: 2px solid #1d1d1f; }
+      .square { width: 120px; height: 48px; border: 2px solid #1d1d1f; }
+      .r12 { width: 100px; height: 48px; background: #e8f0fe; border-radius: 12px; border: 3px solid #3478f6; }
+      .r6 { width: 80px; height: 48px; background: #34c759; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="row">
+          <div class="r8" data-fid="r8"></div>
+          <div class="pill" data-fid="pill"></div>
+          <div class="circle" data-fid="circle"></div>
+        </div>
+        <div class="row">
+          <div class="square" data-fid="square"></div>
+          <div class="r12" data-fid="r12"></div>
+          <div class="r6" data-fid="r6"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

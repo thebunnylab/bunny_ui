@@ -57,15 +57,24 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
-/// The pixels of a PNG `bunny` wrote, or one like it: eight-bit RGBA,
-/// not interlaced. Anything else is refused by name — a golden is made
-/// by `bunny preview --snapshot`, not edited by hand.
+/// The pixels of a PNG `bunny` wrote, or one like it, as RGBA.
+///
+/// Eight-bit RGBA or RGB, not interlaced: a browser's screenshot of an
+/// opaque page comes without its alpha.
+///
+/// # Errors
+///
+/// Anything else is refused by name — a golden is made by `bunny preview
+/// --snapshot`, not edited by hand — and so is a stream that does not
+/// inflate or a row with no PNG filter.
 pub fn decode(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let (width, height) = size(png).ok_or_else(|| Error::new("not a PNG"))?;
     let (depth, color, interlace) = (png[24], png[25], png[28]);
-    if depth != 8 || color != 6 || interlace != 0 {
-        return Err(Error::new(format!("a {depth}-bit PNG of color type {color}{}: bunny reads back only the eight-bit RGBA pictures it writes", if interlace != 0 { ", interlaced" } else { "" })));
-    }
+    let channels = match (depth, color, interlace) {
+        (8, 6, 0) => 4,
+        (8, 2, 0) => 3,
+        _ => return Err(Error::new(format!("a {depth}-bit PNG of color type {color}{}: bunny reads back only eight-bit RGBA and RGB pictures", if interlace != 0 { ", interlaced" } else { "" }))),
+    };
     let mut compressed = Vec::new();
     let mut at = 8;
     while at + 8 <= png.len() {
@@ -81,32 +90,36 @@ pub fn decode(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     }
     let raw = inflate::inflate_zlib(&compressed).ok_or_else(|| Error::new("the PNG's pixel stream does not inflate"))?;
     let (w, h) = (width as usize, height as usize);
-    let stride = w * 4;
+    let stride = w * channels;
     if raw.len() != (stride + 1) * h {
-        return Err(Error::new(format!("{} bytes of rows are not {width}×{height} RGBA", raw.len())));
+        return Err(Error::new(format!("{} bytes of rows are not {width}×{height} pixels of {channels} bytes", raw.len())));
     }
-    let mut rgba = vec![0u8; stride * h];
+    let mut pixels = vec![0u8; stride * h];
     for y in 0..h {
         let filter = raw[y * (stride + 1)];
         let line = &raw[y * (stride + 1) + 1..(y + 1) * (stride + 1)];
-        let (done, current) = rgba.split_at_mut(y * stride);
+        let (done, current) = pixels.split_at_mut(y * stride);
         let above = done.get(y.saturating_sub(1) * stride..y.saturating_sub(1) * stride + stride).filter(|_| y > 0);
         let current = &mut current[..stride];
         for x in 0..stride {
-            let left = if x >= 4 { current[x - 4] } else { 0 };
+            let left = if x >= channels { current[x - channels] } else { 0 };
             let up = above.map_or(0, |row| row[x]);
-            let up_left = if x >= 4 { above.map_or(0, |row| row[x - 4]) } else { 0 };
+            let up_left = if x >= channels { above.map_or(0, |row| row[x - channels]) } else { 0 };
             let predicted = match filter {
                 0 => 0,
                 1 => left,
                 2 => up,
-                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                3 => u16::midpoint(u16::from(left), u16::from(up)).to_le_bytes()[0],
                 4 => paeth(left, up, up_left),
                 other => return Err(Error::new(format!("row {y} uses filter {other}, which is not a PNG filter"))),
             };
             current[x] = line[x].wrapping_add(predicted);
         }
     }
+    if channels == 4 {
+        return Ok((width, height, pixels));
+    }
+    let rgba = pixels.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect();
     Ok((width, height, rgba))
 }
 
@@ -196,5 +209,31 @@ mod tests {
         gray[25] = 0;
         assert!(decode(&gray).unwrap_err().message.contains("color type 0"));
         assert!(decode(b"not a png").is_err());
+    }
+
+    /// An opaque picture written without its alpha reads back as RGBA,
+    /// every pixel opaque — a filtered row undone three bytes at a time.
+    #[test]
+    fn an_rgb_picture_reads_back_opaque() {
+        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let mut raw = vec![1u8];
+        raw.extend((0..6).map(|x| rgb[x].wrapping_sub(if x >= 3 { rgb[x - 3] } else { 0 })));
+        raw.push(2);
+        raw.extend((6..12).map(|x| rgb[x].wrapping_sub(rgb[x - 6])));
+        let mut zlib = vec![0x78, 0x01];
+        zlib.extend(deflate::deflate(&raw));
+        zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+        let mut png = Vec::new();
+        png.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib);
+        chunk(&mut png, b"IEND", &[]);
+        let (width, height, rgba) = decode(&png).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rgba, [10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255]);
     }
 }

@@ -1163,7 +1163,9 @@ RectVary rect_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
 float4 rect_fragment(RectVary vary) : SV_Target {
     RectInstance rect = rects[vary.id];
     float2 p = vary.position.xy;
-    float kind = rect.params.z;
+    // a piece of a longer ramp carries its stretch in the kind's tens
+    float band = floor(rect.params.z / 10.0);
+    float kind = rect.params.z - band * 10.0;
     float coverage;
     if (kind == 0.0) {
         // fill: the cpu corner ramp, clamp(radius - d + 0.5, 0, 1)
@@ -1195,23 +1197,29 @@ float4 rect_fragment(RectVary vary) : SV_Target {
         // a ramp from rect.xy to point2. The cpu resolved every number
         // in f64 — this only mixes.
         coverage = rect_cov(p, rect.rect, rect.radii);
-        float t;
+        float raw;
         if (kind == 3.0) {
             float dist = length(p - rect.point2);
-            t = saturate((dist - rect.params.y) / (rect.params.w - rect.params.y));
+            raw = (dist - rect.params.y) / (rect.params.w - rect.params.y);
         } else if (kind == 5.0) {
             // the ellipse is a circle in a Y-scaled space; params.x
             // carries the aspect, so the cover is the plain box
             coverage = rect_cov(p, rect.rect, float4(0.0, 0.0, 0.0, 0.0));
             float2 away = p - rect.point2;
             float dist = length(float2(away.x, away.y / rect.params.x));
-            t = saturate((dist - rect.params.y) / (rect.params.w - rect.params.y));
+            raw = (dist - rect.params.y) / (rect.params.w - rect.params.y);
         } else {
             float2 origin = float2(rect.params.y, rect.params.w);
             float2 axis = rect.point2 - origin;
             float length2 = dot(axis, axis);
-            t = length2 > 0.0 ? saturate(dot(p - origin, axis) / length2) : 1.0;
+            raw = length2 > 0.0 ? dot(p - origin, axis) / length2 : 1.0;
         }
+        // a piece paints its own stretch of the ramp alone: from its
+        // start, short of its end — the next piece owns that line
+        if (((band == 1.0 || band == 3.0) && raw < 0.0) || (band >= 2.0 && raw >= 1.0)) {
+            coverage = 0.0;
+        }
+        float t = saturate(raw);
         // the cpu rounds the mixed color to bytes before blending;
         // rounding here keeps the two within one step
         float4 near = unpack(rect.color);

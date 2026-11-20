@@ -124,8 +124,9 @@ function gpuLoseContext() {
   gl = null;
 }
 
-// `kind` 0 is the page's own surface, 1 the islands' backing canvas.
-// 0 back means refused — no WebGL2, a shader that would not compile,
+// `kind` 0 is the page's own surface, 1 the islands' backing canvas, 2
+// the canvas a page taller than the device draws is drawn on, in bands,
+// each copied into the page's surface. 0 back means refused — no WebGL2, a shader that would not compile,
 // `?present=cpu`, or a page that has not attached yet. Non-zero is
 // MAX_TEXTURE_SIZE, which the atlas needs before it decides how far it
 // may grow.
@@ -165,7 +166,7 @@ export function gl_init(kind, width, height) {
   );
   gl = target.getContext("webgl2", {
     // the page is opaque, so the compositor never blends the canvas
-    alpha: kind !== 0,
+    alpha: kind === 1,
     // what the framebuffer HOLDS after the house blend is premultiplied
     // by construction: over a transparent clear a half-covered pixel
     // lands as (0.5c, 0.5). Measured, not assumed.
@@ -181,8 +182,10 @@ export function gl_init(kind, width, height) {
     // a software context is refused: SwiftShader rasterizes through a
     // general driver with no damage knowledge, and the rasterizer this
     // tier falls back to is specialized and repaints partially. Our own
-    // floor is the better floor.
-    failIfMajorPerformanceCaveat: true,
+    // floor is the better floor — unless the page asked for this tier
+    // by name (`?present=gpu`), as a harness on a machine without a
+    // GPU does.
+    failIfMajorPerformanceCaveat: forced !== "gpu",
   });
   if (!gl) return 0;
   glKind = kind;
@@ -214,6 +217,22 @@ export function gl_island_blit(id, width, height) {
   into.drawImage(gl.canvas, 0, 0, width >>> 0, height >>> 0, 0, 0, width >>> 0, height >>> 0);
 }
 
+// One band of a page taller than the device draws, copied out of the
+// tier's own canvas into the page's surface at row `top`; the surface is
+// `rows` tall. The canvas is opaque, so the band simply lands.
+export function gl_page_blit(top, width, height, rows) {
+  if (!gl || !glSurface) return;
+  const page = glSurface("2d");
+  if (page.width !== (width >>> 0) || page.height !== (rows >>> 0)) {
+    page.width = width >>> 0;
+    page.height = rows >>> 0;
+  }
+  const into = page.getContext("2d");
+  if (!into) return;
+  into.globalCompositeOperation = "source-over";
+  into.drawImage(gl.canvas, 0, 0, width >>> 0, height >>> 0, 0, top >>> 0, width >>> 0, height >>> 0);
+}
+
 export function gl_now() {
   return performance.now();
 }
@@ -222,13 +241,16 @@ export function gl_teardown() {
   gpuLoseContext();
 }
 
+// Sizes the drawable, and says whether it holds the size: 1 it does,
+// 0 the device keeps a smaller one (SwiftShader stops at 8192 rows)
 export function gl_resize(width, height) {
-  if (!gl) return;
+  if (!gl) return 0;
   const target = gl.canvas;
   if (target.width !== (width >>> 0) || target.height !== (height >>> 0)) {
     target.width = width >>> 0;
     target.height = height >>> 0;
   }
+  return gl.drawingBufferWidth === (width >>> 0) && gl.drawingBufferHeight === (height >>> 0) ? 1 : 0;
 }
 
 // MARK: - Fixed state

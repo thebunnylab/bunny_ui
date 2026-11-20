@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Single words, measured</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <span data-fid="w16">Typography</span>
+        <span style="font-size: 24px" data-fid="w24">Hamburgefonstiv</span>
+        <span style="font-size: 20px" data-fid="kern">AVATAR Wave</span>
+        <span data-fid="figures">1,234.56 office</span>
+        <span style="font-size: 13px" data-fid="w13">Word</span>
+        <span style="font-size: 32px; font-weight: 700" data-fid="w32">Bold?</span>
+      </div>
+    </div>
+  </body>
+</html>

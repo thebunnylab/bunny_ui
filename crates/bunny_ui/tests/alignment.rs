@@ -105,7 +105,7 @@ fn a_grid_cell_holds_a_short_child_against_the_edge_it_names() {
 }
 
 #[test]
-fn served_alignment_names_its_vertical_edge_only_when_it_has_one() {
+fn served_alignment_names_its_vertical_edge() {
     let css = |view: &dyn Fn() -> bunny_ui::ssr::SsrPage| view().css;
     let page = |alignment| {
         move || {
@@ -115,9 +115,11 @@ fn served_alignment_names_its_vertical_edge_only_when_it_has_one() {
             )
         }
     };
-    // the middle row lowers as it always did: the flow's own placement
+    // the middle row centres, as the layout places it (`Leading` puts
+    // the mark 25 points down a 60-point frame): a flex column's own
+    // placement would put it on top
     let middle = css(&page(Alignment::Leading));
-    assert!(!middle.contains("justify-content"), "{middle}");
+    assert!(middle.contains("justify-content:center"), "{middle}");
     let bottom = css(&page(Alignment::BottomTrailing));
     assert!(bottom.contains("justify-content:flex-end"), "{bottom}");
     let top = css(&page(Alignment::Top));

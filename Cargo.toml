@@ -27,6 +27,7 @@ members = [
     "apps/bench_web",
     "apps/landing_web",
     "apps/signin_web",
+    "fidelity/corpus",
 ]
 
 [workspace.package]

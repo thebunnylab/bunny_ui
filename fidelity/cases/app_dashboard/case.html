@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en"><head><base href="/apps/">
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=1024, height=700">
+    <title>Dashboard</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 14px "Fid Sans"; color: #1d1d1f; width: 1024px; height: 700px; overflow: hidden; }
+
+      /* custom properties theme */
+      :root {
+        --accent: #4f46e5;
+        --accent-tint: rgba(79, 70, 229, 0.10);
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --bg: #f4f5f9;
+        --card: #ffffff;
+        --good: #15803d;
+        --good-bg: #dcfce7;
+        --bad: #b91c1c;
+        --bad-bg: #fee2e2;
+        --c1: #4f46e5; --c2: #06b6d4; --c3: #f59e0b; --c4: #ec4899;
+        --gap: 12px;
+        --pad: 16px;
+      }
+
+      /* named grid areas */
+      .app {
+        display: grid;
+        grid-template-areas: "side head" "side main";
+        grid-template-columns: 220px 1fr;
+        grid-template-rows: 56px 1fr;
+        width: 100%; height: 100%;
+        background: var(--bg);
+      }
+
+      /* ---------- sidebar ---------- */
+      .side { grid-area: side; background: #111827; color: #d1d5db; display: flex; flex-direction: column; padding: 14px 0 0; }
+      .brand { display: flex; align-items: center; gap: 10px; padding: 0 18px 16px; color: #fff; font-weight: 800; font-size: 17px; letter-spacing: -0.3px; }
+      .logo { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, var(--c1), var(--c4)); position: relative; }
+      .logo::after { content: ""; position: absolute; inset: 7px; border-radius: 50%; border: 2px solid #fff; }
+      .nav-label { font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase; color: #6b7280; padding: 0 18px 6px; }
+      .nav { list-style: none; margin: 0 0 10px; padding: 0; }
+      .nav li { display: flex; align-items: center; gap: 12px; height: 36px; padding: 0 18px 0 15px; border-left: 3px solid transparent; font-size: 13.5px; }
+      .nav li.active { border-left: 3px solid var(--accent); background: rgba(129, 140, 248, 0.16); color: #fff; font-weight: 700; }
+      .nav li .pill { margin-left: auto; font-size: 10px; background: var(--c4); color: #fff; border-radius: 8px; padding: 1px 6px; }
+      .ico { width: 16px; height: 16px; position: relative; flex: none; }
+      /* CSS-shape icons */
+      .i-grid { background: linear-gradient(currentColor 0 0) 0 0/7px 7px no-repeat, linear-gradient(currentColor 0 0) 9px 0/7px 7px no-repeat, linear-gradient(currentColor 0 0) 0 9px/7px 7px no-repeat, linear-gradient(currentColor 0 0) 9px 9px/7px 7px no-repeat; border-radius: 1px; }
+      .i-chart { border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; }
+      .i-chart::after { content: ""; position: absolute; left: 4px; bottom: 2px; width: 3px; height: 8px; background: currentColor; box-shadow: 5px -3px 0 currentColor; }
+      .i-users::before { content: ""; position: absolute; left: 5px; top: 0; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+      .i-users::after { content: ""; position: absolute; left: 2px; bottom: 0; width: 12px; height: 7px; border-radius: 7px 7px 0 0; background: currentColor; }
+      .i-box { border: 2px solid currentColor; border-radius: 3px; }
+      .i-box::after { content: ""; position: absolute; left: 0; right: 0; top: 4px; height: 2px; background: currentColor; }
+      .i-gear { border: 3px double currentColor; border-radius: 50%; }
+      .i-doc { border: 2px solid currentColor; border-radius: 2px; width: 13px; margin-left: 1px; }
+      .i-doc::after { content: ""; position: absolute; left: 2px; top: 3px; width: 5px; height: 2px; background: currentColor; box-shadow: 0 3px 0 currentColor; }
+      .group-head { display: flex; align-items: center; gap: 8px; padding: 0 18px; height: 30px; font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase; color: #9ca3af; }
+      /* collapsible group chevron from rotated borders */
+      .chev { width: 7px; height: 7px; border-right: 2px solid #9ca3af; border-bottom: 2px solid #9ca3af; transform: rotate(45deg) translate(-2px, -2px); margin-left: auto; }
+      .sub li { height: 30px; padding-left: 46px; font-size: 13px; color: #9ca3af; }
+      .sub li:first-child { margin-top: 2px; }
+      .user-card { margin: auto 12px 12px; padding: 10px; border-radius: 12px; background: rgba(255, 255, 255, 0.07); display: flex; align-items: center; gap: 10px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08); }
+      .user-card img { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; border: 2px solid var(--accent); }
+      .user-card b { display: block; color: #fff; font-size: 13px; }
+      .user-card span { font-size: 11px; color: #9ca3af; }
+
+      /* ---------- header ---------- */
+      .head { grid-area: head; display: flex; align-items: center; gap: 14px; padding: 0 var(--pad); background: #fff; border-bottom: 1px solid var(--line); }
+      .head h1 { font-size: 18px; margin: 0; letter-spacing: -0.3px; }
+      .search { position: relative; flex: 1; max-width: 300px; margin-left: auto; }
+      .search input { width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 17px; background: var(--bg); padding: 0 12px 0 34px; font: 13px "Fid Sans"; color: #1d1d1f; outline: none; }
+      /* inset search icon: circle + rotated handle */
+      .search::before { content: ""; position: absolute; left: 12px; top: 10px; width: 10px; height: 10px; border: 2px solid var(--muted); border-radius: 50%; }
+      .search::after { content: ""; position: absolute; left: 23px; top: 21px; width: 5px; height: 2px; background: var(--muted); transform: rotate(45deg); }
+      .bell { position: relative; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line); }
+      .bell::before { content: ""; position: absolute; left: 10px; top: 8px; width: 12px; height: 13px; border-radius: 6px 6px 2px 2px; background: var(--muted); }
+      .bell::after { content: ""; position: absolute; left: 14px; top: 22px; width: 4px; height: 3px; border-radius: 0 0 3px 3px; background: var(--muted); }
+      .badge { position: absolute; top: -3px; right: -3px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: #ef4444; color: #fff; font-size: 10px; line-height: 16px; text-align: center; border: 2px solid #fff; box-sizing: content-box; }
+      .head img { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; }
+
+      /* ---------- main ---------- */
+      .main { grid-area: main; padding: var(--pad); display: flex; flex-direction: column; gap: var(--gap); min-height: 0; overflow: hidden; }
+      .card { background: var(--card); border-radius: 12px; border: 1px solid var(--line); box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); }
+      .card h2 { margin: 0; font-size: 13px; font-weight: 700; }
+      .card .sub-t { color: var(--muted); font-size: 11px; }
+
+      /* auto-fit KPI grid */
+      .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--gap); }
+      .kpi { padding: 12px 14px; height: 92px; position: relative; overflow: hidden; }
+      .kpi .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+      .kpi .val { font-size: 26px; font-weight: 800; letter-spacing: -0.8px; margin: 2px 0 4px; font-variant-numeric: tabular-nums; }
+      .trend { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 1px 8px; font-variant-numeric: tabular-nums; }
+      .up { color: var(--good); background: var(--good-bg); }
+      .down { color: var(--bad); background: var(--bad-bg); }
+      /* sparkline: flex row of percentage-height divs */
+      .spark { position: absolute; right: 12px; bottom: 12px; width: 62px; height: 32px; display: flex; align-items: flex-end; gap: 2px; }
+      .spark i { flex: 1; background: var(--accent); border-radius: 1px 1px 0 0; opacity: 0.85; }
+
+      .row2 { display: grid; grid-template-columns: calc(40% - 6px) calc(60% - 6px); gap: var(--gap); height: 206px; flex: none; }
+      .pane { padding: 12px 14px; display: flex; flex-direction: column; min-width: 0; position: relative; }
+      .donut-wrap { display: flex; align-items: center; gap: 16px; flex: 1; }
+      /* conic-gradient donut with radial-gradient hole */
+      .donut { position: relative; width: 120px; height: 120px; border-radius: 50%; flex: none;
+        background: radial-gradient(circle closest-side, #fff 0 62%, transparent 63%),
+          conic-gradient(var(--c1) 0 38%, var(--c2) 0 62%, var(--c3) 0 84%, var(--c4) 0 100%); }
+      .donut .mid { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+      .donut .mid b { font-size: 20px; letter-spacing: -0.5px; font-variant-numeric: tabular-nums; }
+      .donut .mid span { font-size: 10px; color: var(--muted); }
+      .legend { list-style: none; margin: 0; padding: 0; flex: 1; display: flex; flex-direction: column; gap: 9px; }
+      .legend li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+      .legend li::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--dot); flex: none; }
+      .legend li em { margin-left: auto; font-style: normal; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+      .phead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+      /* outline button */
+      .btn-o { height: 24px; padding: 0 10px; border: 1.5px solid var(--accent); color: var(--accent); background: transparent; border-radius: 6px; font: 700 11px "Fid Sans"; }
+      .chart { position: relative; flex: 1; display: grid; grid-template-columns: 28px 1fr; min-height: 0; }
+      .yax { display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted); padding-bottom: 16px; text-align: right; padding-right: 6px; }
+      .plot { display: grid; grid-template-columns: repeat(7, 1fr); gap: 14px; padding: 0 6px; margin-bottom: 16px; position: relative;
+        /* gridlines from repeating-linear-gradient */
+        background: repeating-linear-gradient(to bottom, #e5e7eb 0 1px, transparent 1px calc(25% )); border-bottom: 1px solid #cbd5e1; }
+      .col { display: flex; flex-direction: column-reverse; position: relative; }
+      .col span { display: block; }
+      .col .s1 { background: var(--c1); border-radius: 0 0 2px 2px; }
+      .col .s2 { background: var(--c2); }
+      .col .s3 { background: var(--c3); border-radius: 3px 3px 0 0; }
+      .col label { position: absolute; bottom: -16px; left: 0; right: 0; text-align: center; font-size: 10px; color: var(--muted); }
+      /* tooltip with rotated square arrow and layered shadows */
+      .tip { position: absolute; left: 41%; top: 34px; z-index: 5; width: 112px; padding: 7px 10px; border-radius: 8px; background: #111827; color: #fff; font-size: 11px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.18), 0 8px 16px rgba(0, 0, 0, 0.18), 0 16px 32px rgba(17, 24, 39, 0.2); }
+      .tip::before { content: ""; position: absolute; left: 14px; bottom: -4px; width: 9px; height: 9px; background: #111827; transform: rotate(45deg); }
+      .tip b { display: block; font-size: 12px; margin-bottom: 2px; }
+      .tip i { font-style: normal; color: #9ca3af; }
+
+      /* table card */
+      .tcard { flex: 1; min-height: 0; padding: 10px 14px 0; overflow: hidden; }
+      .tcard .phead { margin-bottom: 6px; }
+      .div-d { border: 0; border-top: 1px dashed #cbd5e1; margin: 0 0 2px; }
+      table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+      th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); padding: 5px 8px; font-weight: 700; }
+      td { padding: 0 8px; height: 27px; font-size: 12px; border-top: 1px solid #f1f2f6; }
+      tbody tr:nth-child(even) { background: #f8f9fc; }
+      th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      td.name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .st { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 9px; }
+      .st.ok { background: var(--good-bg); color: var(--good); }
+      .st.wait { background: #fef3c7; color: #92400e; }
+      .st.fail { background: var(--bad-bg); color: var(--bad); }
+      /* inline progress bar cell */
+      .bar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; }
+      .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--c1), var(--c2)); }
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <div class="app" data-fid="div.app-1">
+      <aside class="side" data-fid="aside.side-2">
+        <div class="brand" data-fid="div.brand-3"><span class="logo" data-fid="span.logo-4"></span>Northwind</div>
+        <div class="nav-label" data-fid="div.nav-label-5">Workspace</div>
+        <ul class="nav" data-fid="ul.nav-6">
+          <li class="active" data-fid="li.active-7"><span class="ico i-grid" data-fid="span.ico-8"></span>Overview</li>
+          <li data-fid="li-9"><span class="ico i-chart" data-fid="span.ico-10"></span>Analytics</li>
+          <li data-fid="li-11"><span class="ico i-users" data-fid="span.ico-12"></span>Customers<span class="pill" data-fid="span.pill-13">12</span></li>
+          <li data-fid="li-14"><span class="ico i-box" data-fid="span.ico-15"></span>Products</li>
+        </ul>
+        <div class="group-head" data-fid="div.group-head-16">Reports<span class="chev" data-fid="span.chev-17"></span></div>
+        <ul class="nav sub" data-fid="ul.nav-18">
+          <li data-fid="li-19">Monthly summary</li>
+          <li data-fid="li-20">Cohorts</li>
+          <li data-fid="li-21">Exports</li>
+        </ul>
+        <ul class="nav" data-fid="ul.nav-22">
+          <li data-fid="li-23"><span class="ico i-doc" data-fid="span.ico-24"></span>Invoices</li>
+          <li data-fid="li-25"><span class="ico i-gear" data-fid="span.ico-26"></span>Settings</li>
+        </ul>
+        <div class="user-card" data-fid="div.user-card-27">
+          <img src="/assets/avatar.png" alt="" data-fid="img-28">
+          <div data-fid="div-29"><b data-fid="b-30">Maya Lindqvist</b><span>Admin • maya@northwind.co</span></div>
+        </div>
+      </aside>
+
+      <header class="head" data-fid="header.head-32">
+        <h1 data-fid="h1-33">Overview</h1>
+        <div class="search" data-fid="div.search-34"><input type="text" placeholder="Search orders, customers…" data-fid="input-35"></div>
+        <div class="bell" data-fid="div.bell-36"><span class="badge" data-fid="span.badge-37">3</span></div>
+        <img src="/assets/avatar.png" alt="" data-fid="img-38">
+      </header>
+
+      <main class="main" data-fid="main.main-39">
+        <section class="kpis" data-fid="section.kpis-40">
+          <div class="card kpi" data-fid="div.card-41"><div class="lbl" data-fid="div.lbl-42">Revenue</div><div class="val" data-fid="div.val-43">€128,430</div><span class="trend up">+12.4%</span>
+            <div class="spark" data-fid="div.spark-45"><i style="height:35%" data-fid="i-46"></i><i style="height:50%" data-fid="i-47"></i><i style="height:42%" data-fid="i-48"></i><i style="height:68%" data-fid="i-49"></i><i style="height:60%" data-fid="i-50"></i><i style="height:82%" data-fid="i-51"></i><i style="height:100%" data-fid="i-52"></i></div></div>
+          <div class="card kpi" data-fid="div.card-53"><div class="lbl" data-fid="div.lbl-54">Orders</div><div class="val" data-fid="div.val-55">4,862</div><span class="trend up">+5.1%</span>
+            <div class="spark" data-fid="div.spark-57"><i style="height:55%" data-fid="i-58"></i><i style="height:48%" data-fid="i-59"></i><i style="height:70%" data-fid="i-60"></i><i style="height:64%" data-fid="i-61"></i><i style="height:78%" data-fid="i-62"></i><i style="height:72%" data-fid="i-63"></i><i style="height:90%" data-fid="i-64"></i></div></div>
+          <div class="card kpi" data-fid="div.card-65"><div class="lbl" data-fid="div.lbl-66">Conversion</div><div class="val" data-fid="div.val-67">3.84%</div><span class="trend down">−1.2%</span>
+            <div class="spark" data-fid="div.spark-69"><i style="height:90%" data-fid="i-70"></i><i style="height:80%" data-fid="i-71"></i><i style="height:85%" data-fid="i-72"></i><i style="height:62%" data-fid="i-73"></i><i style="height:66%" data-fid="i-74"></i><i style="height:50%" data-fid="i-75"></i><i style="height:44%" data-fid="i-76"></i></div></div>
+          <div class="card kpi" data-fid="div.card-77"><div class="lbl" data-fid="div.lbl-78">Avg. order</div><div class="val" data-fid="div.val-79">€26.41</div><span class="trend up">+2.7%</span>
+            <div class="spark" data-fid="div.spark-81"><i style="height:40%" data-fid="i-82"></i><i style="height:44%" data-fid="i-83"></i><i style="height:38%" data-fid="i-84"></i><i style="height:56%" data-fid="i-85"></i><i style="height:62%" data-fid="i-86"></i><i style="height:58%" data-fid="i-87"></i><i style="height:74%" data-fid="i-88"></i></div></div>
+        </section>
+
+        <section class="row2" data-fid="section.row2-89">
+          <div class="card pane" data-fid="div.card-90">
+            <div class="phead" data-fid="div.phead-91"><div data-fid="div-92"><h2 data-fid="h2-93">Sales by channel</h2><div class="sub-t" data-fid="div.sub-t-94">Last 30 days</div></div></div>
+            <div class="donut-wrap" data-fid="div.donut-wrap-95">
+              <div class="donut" data-fid="div.donut-96"><div class="mid" data-fid="div.mid-97"><b data-fid="b-98">€128k</b><span data-fid="span-99">total</span></div></div>
+              <ul class="legend" data-fid="ul.legend-100">
+                <li style="--dot:var(--c1)" data-fid="li-101">Direct<em data-fid="em-102">38%</em></li>
+                <li style="--dot:var(--c2)" data-fid="li-103">Search<em data-fid="em-104">24%</em></li>
+                <li style="--dot:var(--c3)" data-fid="li-105">Social<em data-fid="em-106">22%</em></li>
+                <li style="--dot:var(--c4)" data-fid="li-107">Email<em data-fid="em-108">16%</em></li>
+              </ul>
+            </div>
+          </div>
+          <div class="card pane" data-fid="div.card-109">
+            <div class="phead" data-fid="div.phead-110"><div data-fid="div-111"><h2 data-fid="h2-112">Weekly revenue</h2><div class="sub-t" data-fid="div.sub-t-113">Stacked by product line</div></div><button class="btn-o" data-fid="button.btn-o-114">Export</button></div>
+            <div class="chart" data-fid="div.chart-115">
+              <div class="yax" data-fid="div.yax-116"><span data-fid="span-117">60k</span><span data-fid="span-118">40k</span><span data-fid="span-119">20k</span><span data-fid="span-120">0</span></div>
+              <div class="plot" data-fid="div.plot-121">
+                <div class="col" data-fid="div.col-122"><span class="s1" style="height:30%" data-fid="span.s1-123"></span><span class="s2" style="height:14%" data-fid="span.s2-124"></span><span class="s3" style="height:10%" data-fid="span.s3-125"></span><label data-fid="label-126">Mon</label></div>
+                <div class="col" data-fid="div.col-127"><span class="s1" style="height:34%" data-fid="span.s1-128"></span><span class="s2" style="height:18%" data-fid="span.s2-129"></span><span class="s3" style="height:12%" data-fid="span.s3-130"></span><label data-fid="label-131">Tue</label></div>
+                <div class="col" data-fid="div.col-132"><span class="s1" style="height:40%" data-fid="span.s1-133"></span><span class="s2" style="height:22%" data-fid="span.s2-134"></span><span class="s3" style="height:16%" data-fid="span.s3-135"></span><label data-fid="label-136">Wed</label></div>
+                <div class="col" data-fid="div.col-137"><span class="s1" style="height:36%" data-fid="span.s1-138"></span><span class="s2" style="height:20%" data-fid="span.s2-139"></span><span class="s3" style="height:11%" data-fid="span.s3-140"></span><label data-fid="label-141">Thu</label></div>
+                <div class="col" data-fid="div.col-142"><span class="s1" style="height:46%" data-fid="span.s1-143"></span><span class="s2" style="height:24%" data-fid="span.s2-144"></span><span class="s3" style="height:18%" data-fid="span.s3-145"></span><label data-fid="label-146">Fri</label></div>
+                <div class="col" data-fid="div.col-147"><span class="s1" style="height:28%" data-fid="span.s1-148"></span><span class="s2" style="height:16%" data-fid="span.s2-149"></span><span class="s3" style="height:9%" data-fid="span.s3-150"></span><label data-fid="label-151">Sat</label></div>
+                <div class="col" data-fid="div.col-152"><span class="s1" style="height:22%" data-fid="span.s1-153"></span><span class="s2" style="height:12%" data-fid="span.s2-154"></span><span class="s3" style="height:8%" data-fid="span.s3-155"></span><label data-fid="label-156">Sun</label></div>
+                <div class="tip" data-fid="div.tip-157"><b data-fid="b-158">Wednesday</b><i>Total</i> €78.2k<br><i>Growth</i> +8.1%</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card tcard" data-fid="section.card-162">
+          <div class="phead" data-fid="div.phead-163"><h2 data-fid="h2-164">Recent orders</h2><span class="sub-t" data-fid="span.sub-t-165">Showing 5 of 4,862</span></div>
+          <hr class="div-d" data-fid="hr.div-d-166">
+          <table data-fid="table-167">
+            <colgroup data-fid="colgroup-168"><col style="width:78px" data-fid="col-169"><col data-fid="col-170"><col style="width:90px" data-fid="col-171"><col style="width:80px" data-fid="col-172"><col style="width:96px" data-fid="col-173"><col style="width:120px" data-fid="col-174"></colgroup>
+            <thead data-fid="thead-175"><tr data-fid="tr-176"><th data-fid="th-177">Order</th><th data-fid="th-178">Customer</th><th data-fid="th-179">Status</th><th class="num" data-fid="th.num-180">Items</th><th class="num" data-fid="th.num-181">Total</th><th data-fid="th-182">Fulfilled</th></tr></thead>
+            <tbody data-fid="tbody-183">
+              <tr data-fid="tr-184"><td data-fid="td-185">#10482</td><td class="name" data-fid="td.name-186">Amelia Hartmann-Oyelaran, Studio Nordlicht Berlin GmbH</td><td data-fid="td-187"><span class="st ok" data-fid="span.st-188">Paid</span></td><td class="num" data-fid="td.num-189">3</td><td class="num" data-fid="td.num-190">€212.40</td><td data-fid="td-191"><div class="bar" data-fid="div.bar-192"><i style="width:100%" data-fid="i-193"></i></div></td></tr>
+              <tr data-fid="tr-194"><td data-fid="td-195">#10481</td><td class="name" data-fid="td.name-196">Jonas Berg</td><td data-fid="td-197"><span class="st wait" data-fid="span.st-198">Pending</span></td><td class="num" data-fid="td.num-199">1</td><td class="num" data-fid="td.num-200">€48.00</td><td data-fid="td-201"><div class="bar" data-fid="div.bar-202"><i style="width:35%" data-fid="i-203"></i></div></td></tr>
+              <tr data-fid="tr-204"><td data-fid="td-205">#10480</td><td class="name" data-fid="td.name-206">Priya Raman</td><td data-fid="td-207"><span class="st ok" data-fid="span.st-208">Paid</span></td><td class="num" data-fid="td.num-209">12</td><td class="num" data-fid="td.num-210">€1,094.75</td><td data-fid="td-211"><div class="bar" data-fid="div.bar-212"><i style="width:80%" data-fid="i-213"></i></div></td></tr>
+              <tr data-fid="tr-214"><td data-fid="td-215">#10479</td><td class="name" data-fid="td.name-216">Tomás Ferreira</td><td data-fid="td-217"><span class="st fail" data-fid="span.st-218">Refunded</span></td><td class="num" data-fid="td.num-219">2</td><td class="num" data-fid="td.num-220">€96.20</td><td data-fid="td-221"><div class="bar" data-fid="div.bar-222"><i style="width:12%" data-fid="i-223"></i></div></td></tr>
+              <tr data-fid="tr-224"><td data-fid="td-225">#10478</td><td class="name" data-fid="td.name-226">Chloé Dubois</td><td data-fid="td-227"><span class="st ok" data-fid="span.st-228">Paid</span></td><td class="num" data-fid="td.num-229">5</td><td class="num" data-fid="td.num-230">€341.00</td><td data-fid="td-231"><div class="bar" data-fid="div.bar-232"><i style="width:62%" data-fid="i-233"></i></div></td></tr>
+            </tbody>
+          </table>
+        </section>
+      </main>
+    </div>
+  
+
+</body></html>

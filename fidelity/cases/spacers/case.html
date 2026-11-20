@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Spacers</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 16px; }
+      .even { width: 300px; height: 24px; display: flex; justify-content: space-between; background: #f2f2f7; }
+      .even > div { width: 40px; height: 24px; }
+      .push { width: 120px; height: 120px; display: flex; flex-direction: column; justify-content: space-between; align-items: center; background: #f2f2f7; }
+      .push > div { width: 80px; height: 20px; }
+      .trailing { width: 300px; display: flex; justify-content: flex-end; align-items: center; gap: 8px; background: #f2f2f7; }
+      .value { width: 48px; height: 20px; background: #af52de; }
+      .ends { width: 300px; padding: 8px; display: flex; justify-content: space-between; align-items: center; background: #e8f0fe; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="even" data-fid="even">
+          <div class="blue" data-fid="even-a"></div>
+          <div class="green" data-fid="even-b"></div>
+          <div class="orange" data-fid="even-c"></div>
+        </div>
+        <div class="push" data-fid="push">
+          <div class="blue" data-fid="push-top"></div>
+          <div class="green" data-fid="push-bottom"></div>
+        </div>
+        <div class="trailing" data-fid="trailing">
+          <span data-fid="total-label">Total</span>
+          <div class="value" data-fid="total-value"></div>
+        </div>
+        <div class="ends" data-fid="ends">
+          <span data-fid="left">Left</span>
+          <span data-fid="right">Right</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

@@ -234,6 +234,16 @@ pub const KIND_LINEAR: f32 = 4.0;
 /// The elliptical rings: the ASPECT rides params.x (the corner slot),
 /// start and end radii stay in params.y/.w.
 pub const KIND_ELLIPTIC: f32 = 5.0;
+/// Added to a gradient's kind: the piece paints nothing before its start.
+///
+/// A ramp of more than two colors is painted piece by piece, each piece
+/// a gradient of two ([`crate::layout::ramp_pieces`]) that paints its
+/// own stretch of the ramp alone. The stretch rides the kind, in tens.
+pub const BAND_CUTS_BELOW: f32 = 10.0;
+/// Added to a gradient's kind: the piece paints nothing at its end or
+/// past it. A shader reads `floor(kind / 10)` as the two bits and the
+/// rest as the kind.
+pub const BAND_CUTS_ABOVE: f32 = 20.0;
 
 // MARK: - The ground seam (what a tier must offer the atlas)
 
@@ -830,7 +840,7 @@ impl RunAtlas {
         };
         let warm = self.entries.get(&hash).is_some_and(|bucket| bucket.iter().any(same));
         if !warm {
-            let Some(upright) = engine.raster_line(slice, font, color, scale) else {
+            let Some(upright) = crate::figures::raster_line(engine, slice, font, color, scale) else {
                 return Ok(None);
             };
             if !ground.ensure_shared(self.size) {
@@ -1125,6 +1135,18 @@ fn push_rect(
     });
 }
 
+/// The number `location` of the way from `near` to `far`, the ends
+/// themselves at 0 and 1: a two-color ramp is the instance it always was.
+fn between(near: f64, far: f64, location: f64) -> f64 {
+    if location <= 0.0 {
+        near
+    } else if location >= 1.0 {
+        far
+    } else {
+        (far - near).mul_add(location, near)
+    }
+}
+
 /// One gradient instance: the fill's quad and corner, plus the second
 /// half of the ramp packed into the bytes the struct already had.
 #[allow(clippy::too_many_arguments)]
@@ -1369,11 +1391,70 @@ pub struct FrameBatches {
     pub worlds: Vec<super::world::WorldJob>,
 }
 
+/// Where a frame's walk stands between its parts. A frame whose text
+/// needs more than the atlas holds is walked in parts ([`build_part`]):
+/// what fits, which the tier draws; then the atlas reset; then the walk
+/// on from the command that did not fit, under the clips open there.
+#[derive(Default)]
+pub struct FrameCursor {
+    /// The first command the next part walks.
+    next: usize,
+    /// The clips open before it.
+    clips: Vec<(Box4, u32)>,
+    /// The big draws the parts before it made: a picture is known by its
+    /// place among the FRAME's big draws, not the part's.
+    big_count: u32,
+}
+
+impl FrameCursor {
+    /// Ends a part before the command at `index`, the batches as they are.
+    fn stop(&mut self, index: usize, clips: Vec<(Box4, u32)>, big_count: u32) -> Walked {
+        self.next = index;
+        self.clips = clips;
+        self.big_count = big_count;
+        Walked::Part
+    }
+}
+
+/// What a walk by [`build_part`] left in the batches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Walked {
+    /// The rest of the frame: the walk reached the end of the list.
+    Whole,
+    /// A part: the tier draws it over what it drew before, resets the
+    /// atlas and walks again from the cursor.
+    Part,
+}
+
+/// What a walk does when the atlas refuses the command at `index`.
+enum Refusal {
+    /// The atlas holds what earlier frames left: the collector runs and
+    /// the part is walked again.
+    Collect,
+    /// The atlas holds this part's own tiles and nothing else: the part
+    /// ends before the command.
+    Part,
+    /// The command alone outgrows an emptied atlas: it is left out, as a
+    /// frame always left out what never fit.
+    Skip,
+}
+
+fn refusal(atlas: &RunAtlas, parts: bool, index: usize, start: usize) -> Refusal {
+    if !parts || !atlas.fresh() {
+        Refusal::Collect
+    } else if index > start {
+        Refusal::Part
+    } else {
+        Refusal::Skip
+    }
+}
+
 /// Walks the display list in paint order and fills the frame batches.
 /// The clip stack mirrors `Surface::walk_clips`: snapped, intersected in
 /// integers, an empty intersection degenerating to a zero-area box.
 /// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
-/// again.
+/// again. A frame whose text outgrows the largest atlas fails here
+/// every time; a tier that can draw it in parts walks by [`build_part`].
 ///
 /// `floor` is the ground of the target, as the raster keeps it
 /// ([`crate::raster::solid_floor`]): `Some` is the solid canvas an opaque
@@ -1394,7 +1475,50 @@ pub fn build_frame(
     batches: &mut FrameBatches,
     floor: Option<Color>,
 ) -> Result<(), AtlasFull> {
+    let mut cursor = FrameCursor::default();
+    walk(ground, display, scale, target, engine, images, atlas, batches, floor, &mut cursor, false).map(|_| ())
+}
+
+/// [`build_frame`] for a tier that can draw a frame in parts. The walk
+/// starts at the cursor (a new frame starts at a new cursor). Where the
+/// atlas fills with this walk's own tiles, the batches hold the commands
+/// before the one that did not fit and the answer is [`Walked::Part`]:
+/// the tier draws them over the target — not clearing it — resets the
+/// atlas and walks again. `Err(AtlasFull)` is the collector's, as for
+/// `build_frame`, and walks the same part again.
+#[allow(clippy::too_many_arguments)]
+pub fn build_part(
+    ground: &mut dyn AtlasGround,
+    display: &DisplayList,
+    scale: usize,
+    target: (usize, usize),
+    engine: &dyn TextEngine,
+    images: &dyn ImageEngine,
+    atlas: &mut RunAtlas,
+    batches: &mut FrameBatches,
+    floor: Option<Color>,
+    cursor: &mut FrameCursor,
+) -> Result<Walked, AtlasFull> {
+    walk(ground, display, scale, target, engine, images, atlas, batches, floor, cursor, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    ground: &mut dyn AtlasGround,
+    display: &DisplayList,
+    scale: usize,
+    target: (usize, usize),
+    engine: &dyn TextEngine,
+    images: &dyn ImageEngine,
+    atlas: &mut RunAtlas,
+    batches: &mut FrameBatches,
+    floor: Option<Color>,
+    cursor: &mut FrameCursor,
+    parts: bool,
+) -> Result<Walked, AtlasFull> {
+    let start = cursor.next;
     atlas.begin_walk();
+    atlas.big_count = cursor.big_count;
     batches.rects.clear();
     batches.sprites.clear();
     batches.glass.clear();
@@ -1404,21 +1528,27 @@ pub fn build_frame(
     batches.world_targets.clear();
     #[cfg(feature = "3d")]
     batches.worlds.clear();
-    batches.rounds.clear();
-    batches.rounds.push(NO_ROUND);
+    // the curves outlive a part: the clips the cursor carries name them
+    if start == 0 {
+        batches.rounds.clear();
+        batches.rounds.push(NO_ROUND);
+    }
     let out = &mut batches.rects;
     let factor = scale as f64;
     let whole: Box4 = (0, 0, target.0 as i64, target.1 as i64);
     // each entry: the hard cut, plus the index of the curve it lives
     // under (the CPU's inheritance rule, spoken in indices)
-    let mut clips: Vec<(Box4, u32)> = Vec::new();
+    let mut clips: Vec<(Box4, u32)> = cursor.clips.clone();
     // the boxes the open glass batch already holds — a pane that
     // touches one of them starts a batch of its own
     let mut glass_batch: Option<Box4> = None;
     // the run that took the last capture of the scene: what a pane that
     // shares reads
     let mut capture: Option<usize> = None;
-    for command in display.iter() {
+    for (index, command) in display.iter().enumerate().skip(start) {
+        // what a part that ends before this command hands on: the
+        // command's own big draw is counted again when it is walked
+        let big_count = atlas.big_count;
         match command {
             // paint that paints nothing is no instance: it would only
             // split the runs around it. A view's clear background between
@@ -1560,57 +1690,64 @@ pub fn build_frame(
                     continue;
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
-                match paint.scaled(factor) {
-                    crate::layout::GradientPaint::Radial {
-                        center,
-                        start,
-                        end,
-                        aspect,
-                        inner,
-                        outer,
-                    } => {
-                        // the circle keeps its kind (and its corner)
-                        // byte for byte; the ellipse trades the corner
-                        // slot for the aspect
-                        let (kind, corners) = if aspect == 1.0 {
-                            (KIND_RADIAL, radii)
-                        } else {
-                            (KIND_ELLIPTIC, Corners::ZERO)
-                        };
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            inner,
-                            outer,
-                            corners,
-                            aspect,
-                            start,
-                            end,
-                            (center.x, center.y),
-                            kind,
-                        )
+                let paint = paint.scaled(factor);
+                let (near, far) = match paint {
+                    crate::layout::GradientPaint::Radial { inner, outer, .. } => (inner, outer),
+                    crate::layout::GradientPaint::Linear { from, to, .. } => (from, to),
+                };
+                let opened = out.len();
+                for piece in crate::layout::ramp_pieces(near, far, paint.stops()) {
+                    let band = if piece.cuts_below { BAND_CUTS_BELOW } else { 0.0 }
+                        + if piece.cuts_above { BAND_CUTS_ABOVE } else { 0.0 };
+                    match paint {
+                        crate::layout::GradientPaint::Radial { center, start, end, aspect, .. } => {
+                            // the circle keeps its kind (and its corner)
+                            // byte for byte; the ellipse trades the corner
+                            // slot for the aspect
+                            let (kind, corners) = if aspect == 1.0 {
+                                (KIND_RADIAL, radii)
+                            } else {
+                                (KIND_ELLIPTIC, Corners::ZERO)
+                            };
+                            let reach = |location: f64| between(start, end, location);
+                            push_gradient(
+                                out,
+                                snapped,
+                                clip,
+                                piece.from.1,
+                                piece.to.1,
+                                corners,
+                                aspect,
+                                reach(piece.from.0),
+                                reach(piece.to.0),
+                                (center.x, center.y),
+                                kind + band,
+                            );
+                        }
+                        // the line's two ends fill the four numbers the
+                        // struct still had: its start in the params, its
+                        // end in the point — the quad stays the box
+                        crate::layout::GradientPaint::Linear { start, end, .. } => {
+                            let along = |location: f64| (between(start.x, end.x, location), between(start.y, end.y, location));
+                            let (first, last) = (along(piece.from.0), along(piece.to.0));
+                            push_gradient(
+                                out,
+                                snapped,
+                                clip,
+                                piece.from.1,
+                                piece.to.1,
+                                radii,
+                                0.0,
+                                first.0,
+                                first.1,
+                                last,
+                                KIND_LINEAR + band,
+                            );
+                        }
                     }
-                    // the line's two ends fill the four numbers the
-                    // struct still had: its start in the params, its
-                    // end in the point — the quad stays the box
-                    crate::layout::GradientPaint::Linear { start, end, from, to } => {
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            from,
-                            to,
-                            radii,
-                            0.0,
-                            start.x,
-                            start.y,
-                            (end.x, end.y),
-                            KIND_LINEAR,
-                        )
-                    }
+                    note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
                 }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                debug_assert!(out.len() > opened, "a ramp is at least one piece");
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1675,8 +1812,15 @@ pub fn build_frame(
                 if base_x + reach_x <= clip.0 || corner_y + reach_y <= clip.1 {
                     continue;
                 }
-                let Some(entry) = atlas.resolve(ground, slice, font, *color, scale, engine)?
-                else {
+                let resolved = match atlas.resolve(ground, slice, font, *color, scale, engine) {
+                    Ok(resolved) => resolved,
+                    Err(full) => match refusal(atlas, parts, index, start) {
+                        Refusal::Collect => return Err(full),
+                        Refusal::Part => return Ok(cursor.stop(index, clips, big_count)),
+                        Refusal::Skip => continue,
+                    },
+                };
+                let Some(entry) = resolved else {
                     continue;
                 };
                 let base_y =
@@ -1720,9 +1864,15 @@ pub fn build_frame(
             DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let slice = &content[range.0..range.1];
-                let Some(entry) =
-                    atlas.resolve_turned(ground, slice, font, *color, scale, Some(*turn), engine)?
-                else {
+                let resolved = match atlas.resolve_turned(ground, slice, font, *color, scale, Some(*turn), engine) {
+                    Ok(resolved) => resolved,
+                    Err(full) => match refusal(atlas, parts, index, start) {
+                        Refusal::Collect => return Err(full),
+                        Refusal::Part => return Ok(cursor.stop(index, clips, big_count)),
+                        Refusal::Skip => continue,
+                    },
+                };
+                let Some(entry) = resolved else {
                     continue;
                 };
                 // the composite_turned mirror: the pivot snapped once, the
@@ -1831,7 +1981,15 @@ pub fn build_frame(
                     );
                     continue;
                 }
-                match atlas.resolve_image(ground, source, width, height, images, between)? {
+                let resolved = match atlas.resolve_image(ground, source, width, height, images, between) {
+                    Ok(resolved) => resolved,
+                    Err(full) => match refusal(atlas, parts, index, start) {
+                        Refusal::Collect => return Err(full),
+                        Refusal::Part => return Ok(cursor.stop(index, clips, big_count)),
+                        Refusal::Skip => continue,
+                    },
+                };
+                match resolved {
                     None => {}
                     // between pixels the picture is ONE tile: a shader that
                     // shares a pixel among texels must find the neighbours
@@ -1984,8 +2142,16 @@ pub fn build_frame(
                 if box_intersect(reach, clip).is_none() {
                     continue;
                 }
+                let resolved = match atlas.resolve_image(ground, source, width, height, images, true) {
+                    Ok(resolved) => resolved,
+                    Err(full) => match refusal(atlas, parts, index, start) {
+                        Refusal::Collect => return Err(full),
+                        Refusal::Part => return Ok(cursor.stop(index, clips, big_count)),
+                        Refusal::Skip => continue,
+                    },
+                };
                 let (kind, tex) =
-                    match atlas.resolve_image(ground, source, width, height, images, true)? {
+                    match resolved {
                         None => continue,
                         Some(ResolvedImage::Tiles(entry)) => {
                             let Some(tile) = entry.tiles.first() else {
@@ -2082,7 +2248,7 @@ pub fn build_frame(
         }
         atlas.worlds.retire(world);
     }
-    Ok(())
+    Ok(Walked::Whole)
 }
 
 /// The clip a primitive paints under: the stack top intersected with the
@@ -2305,6 +2471,55 @@ mod tests {
         )
         .expect("the scene fits the atlas");
         batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect()
+    }
+
+    /// A ramp of three colors is two two-color instances: the first
+    /// owns everything up to the middle stop, the second the rest. A
+    /// ramp of two is the one instance it always was.
+    #[test]
+    fn a_ramp_with_a_stop_is_painted_piece_by_piece() {
+        let rects = |gradient: crate::layout::Gradient| {
+            let rect = Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 100.0, height: 100.0 },
+            };
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::Gradient { rect, paint: gradient.resolve(rect), corner_radius: Corners::ZERO });
+            let mut ground = RecordingGround::default();
+            let mut atlas = RunAtlas::new();
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut ground,
+                &display,
+                1,
+                (400, 400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut atlas,
+                &mut batches,
+                None,
+            )
+            .expect("the scene fits the atlas");
+            batches.rects.iter().map(|rect| (rect.params, rect.color, rect.pad)).collect::<Vec<_>>()
+        };
+        let (red, green, blue) = (Color::rgb(255, 0, 0), Color::rgb(0, 255, 0), Color::rgb(0, 0, 255));
+        let two = rects(crate::layout::Gradient::linear(red, blue));
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].0, [0.0, 50.0, KIND_LINEAR, 0.0]);
+        let three = rects(crate::layout::Gradient::linear(red, blue).stop(0.5, green));
+        assert_eq!(three.len(), 2);
+        // the top half: red into green, from the top edge to the middle,
+        // cut at its end
+        assert_eq!(three[0].0, [0.0, 50.0, KIND_LINEAR + BAND_CUTS_ABOVE, 0.0]);
+        assert_eq!(three[0].1, [255, 0, 0, 255]);
+        assert_eq!(three[0].2[0..4], [0, 255, 0, 255]);
+        assert_eq!(three[0].2[8..12], 50f32.to_ne_bytes());
+        // the bottom half: green into blue, cut before its start
+        assert_eq!(three[1].0, [0.0, 50.0, KIND_LINEAR + BAND_CUTS_BELOW, 50.0]);
+        assert_eq!(three[1].1, [0, 255, 0, 255]);
+        assert_eq!(three[1].2[0..4], [0, 0, 255, 255]);
+        let rings = rects(crate::layout::Gradient::radial(red, blue).radius(0.0, 40.0).stop(0.25, green));
+        assert_eq!(rings.iter().map(|rect| (rect.0[1], rect.0[3])).collect::<Vec<_>>(), [(0.0, 10.0), (10.0, 40.0)]);
     }
 
     fn row(display: &mut DisplayList, y: f64, word: &str) {
@@ -2888,6 +3103,98 @@ mod tests {
         let sprite = &batches.sprites[0];
         assert_eq!(sprite.tex, [0.0, 0.0, 64.0, 36.0], "the texels are the picture's");
         assert_eq!(sprite.dest, [20.0, 20.0, 1220.0, 696.0], "the box is the destination's");
+    }
+
+    /// Sixty lines of sixty-four letters at 8×, each its own words, under
+    /// one clip: 4096×128 texels a line, a shelf each, and more of them
+    /// than the 25 shelves of the largest atlas hold.
+    fn pages_of_text() -> (DisplayList, Box4) {
+        let mut display = DisplayList::default();
+        let clip = Rect {
+            origin: crate::layout::Point { x: 4.0, y: 0.0 },
+            size: crate::layout::Size { width: 600.0, height: 1200.0 },
+        };
+        display.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+        for line in 0..60u32 {
+            let words = format!("{line:02}{}", "abcdefghijklmnopqrstuvwxyz".repeat(3))[..64].to_string();
+            display.push(DrawCommand::TextLine {
+                origin: crate::layout::Point { x: 4.0, y: f64::from(line) * 16.0 },
+                range: (0, words.len()),
+                content: std::sync::Arc::from(words.as_str()),
+                color: Color::rgba(240, 240, 240, 255),
+                font: FontSpec::DEFAULT,
+            });
+        }
+        display.push(DrawCommand::PopClip);
+        (display, snap_scaled(clip, 8.0))
+    }
+
+    #[test]
+    fn a_frame_whose_text_outgrows_the_atlas_walks_in_parts() {
+        let (display, clip) = pages_of_text();
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        let mut cursor = FrameCursor::default();
+        let mut parts: Vec<Vec<SpriteInstance>> = Vec::new();
+        let mut refusals = 0;
+        loop {
+            match build_part(
+                &mut ground,
+                &display,
+                8,
+                (5000, 10000),
+                &crate::text_engine::PixelFont,
+                &RawImages::default(),
+                &mut atlas,
+                &mut batches,
+                Some(crate::layout::Color::CANVAS),
+                &mut cursor,
+            ) {
+                Ok(walked) => {
+                    parts.push(batches.sprites.clone());
+                    if walked == Walked::Whole {
+                        break;
+                    }
+                    // the part is drawn: its tiles may go
+                    atlas.reset(&mut ground, false);
+                }
+                // the collector first, growing the atlas to its largest
+                Err(AtlasFull) => {
+                    refusals += 1;
+                    assert!(refusals <= 2, "an atlas at its largest, emptied, takes a part");
+                    atlas.reset(&mut ground, true);
+                }
+            }
+        }
+        assert_eq!(atlas.size, ATLAS_MAX_SIZE);
+        assert_eq!(parts.len(), 3, "25 lines, 25 more, and the last ten");
+        let sprites: Vec<&SpriteInstance> = parts.iter().flatten().collect();
+        // four chunks a line, every line once, in the order of the list,
+        // and the clip the cursor carried across every part
+        assert_eq!(sprites.len(), 60 * 4);
+        for (line, chunks) in sprites.chunks(4).enumerate() {
+            let top = line as f32 * 128.0;
+            for chunk in chunks {
+                assert!(chunk.dest[1] <= top && top < chunk.dest[3], "line {line} stands in its row");
+                assert_eq!(chunk.clip, [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32]);
+                assert!(chunk.tex[2] <= ATLAS_MAX_SIZE as f32 && chunk.tex[3] <= ATLAS_MAX_SIZE as f32);
+            }
+        }
+        // a tier that cannot draw a part still hears the overflow
+        let mut whole = RunAtlas::new();
+        let walked = build_frame(
+            &mut ground,
+            &display,
+            8,
+            (5000, 10000),
+            &crate::text_engine::PixelFont,
+            &RawImages::default(),
+            &mut whole,
+            &mut batches,
+            Some(crate::layout::Color::CANVAS),
+        );
+        assert!(walked.is_err());
     }
 
     #[test]

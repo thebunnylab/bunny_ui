@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=360" />
+    <title>A sign-in form</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 360px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .form { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 24px; }
+      h1 { margin: 0; font-size: 24px; font-weight: 700; }
+      .group { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+      label { font-size: 13px; color: #8e8e93; }
+      /* the stroke is drawn over the box, not beside it: the words stand
+         12 px from the outer edge */
+      .field { width: 300px; height: 40px; display: flex; align-items: center; padding-left: 11px; background: #fff; border: 1px solid #c7c7cc; border-radius: 8px; color: #8e8e93; }
+      .button { width: 300px; height: 44px; display: flex; align-items: center; justify-content: center; background: #3478f6; color: #fff; border-radius: 10px; font-weight: 600; }
+      .link { font-size: 13px; color: #3478f6; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="form" data-fid="form">
+        <h1 data-fid="title">Sign in</h1>
+        <div class="group">
+          <label data-fid="email-label">Email</label>
+          <div class="field" data-fid="email-field"><span data-fid="email-placeholder">you@example.com</span></div>
+        </div>
+        <div class="group">
+          <label data-fid="password-label">Password</label>
+          <div class="field" data-fid="password-field"><span data-fid="password-placeholder">••••••••</span></div>
+        </div>
+        <div class="button" data-fid="submit"><span data-fid="submit-label">Continue</span></div>
+        <span class="link" data-fid="forgot">Forgot password?</span>
+      </div>
+    </div>
+  </body>
+</html>

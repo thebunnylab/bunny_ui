@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=300" />
+    <title>Padding and margins</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 300px; display: flex; flex-direction: column; align-items: flex-start; background: #fff; }
+      .column { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; }
+      .tint { background: #e8f0fe; }
+      .pad { padding: 12px; }
+      .edges { padding: 6px 0 2px 24px; }
+      .margin-box { display: flex; }
+      .margin-box > div { margin: 10px; }
+      .row { display: flex; align-items: center; }
+      .row > .spaced { margin-right: 20px; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+      .purple { background: #af52de; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="column">
+        <div class="tint pad" data-fid="pad"><div class="blue" style="width: 60px; height: 20px" data-fid="pad-inner"></div></div>
+        <div class="tint edges" data-fid="edges"><div class="green" style="width: 60px; height: 20px" data-fid="edges-inner"></div></div>
+        <div class="tint margin-box" data-fid="margin-box"><div class="orange" style="width: 60px; height: 20px" data-fid="margin-inner"></div></div>
+        <div class="row" data-fid="row">
+          <div class="spaced purple" style="width: 30px; height: 30px" data-fid="row-a"></div>
+          <div class="blue" style="width: 30px; height: 30px" data-fid="row-b"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

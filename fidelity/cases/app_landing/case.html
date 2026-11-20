@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en"><head><base href="/apps/">
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=1024, height=900">
+    <title>Lumen — Ship calmer software</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; width: 1024px; height: 900px; overflow: hidden; position: relative; background: #fbfaf7; counter-reset: feat; }
+
+      /* nav */
+      nav { position: absolute; top: 0; left: 0; right: 0; height: 56px; display: flex; align-items: center; padding: 0 40px; gap: 28px; z-index: 5; }
+      .logo { font-size: 24px; font-weight: 900; letter-spacing: -0.02em;
+        /* gradient text via background-clip */
+        background: linear-gradient(90deg, #6d28d9, #ec4899 60%, #f59e0b); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      nav .links { display: flex; gap: 22px; margin-left: 24px; font-size: 14px; color: #44444a; flex: 1; }
+      .btn { display: inline-block; padding: 9px 18px; border-radius: 999px; font-size: 14px; font-weight: 700; border: 1.5px solid #6d28d9; }
+      .btn.outline { color: #6d28d9; background: transparent; }
+      .btn.fill { background: #6d28d9; color: #fff; box-shadow: 0 4px 12px rgba(109,40,217,.35); }
+
+      /* hero with diagonal bg */
+      .hero-bg { position: absolute; top: 0; left: 0; width: 1024px; height: 330px;
+        background: linear-gradient(120deg, #ede9fe, #fce7f3);
+        /* clip-path polygon diagonal */
+        clip-path: polygon(0 0, 100% 0, 100% 78%, 0 100%); }
+      .hero { position: absolute; top: 64px; left: 40px; width: 470px; }
+      .hero h1 { margin: 0; font-size: 46px; font-weight: 900; letter-spacing: -0.03em; line-height: 1.05; }
+      .hl { position: relative; display: inline-block; z-index: 0; color: #fff; padding: 0 6px; }
+      /* skewed pseudo background highlight */
+      .hl::before { content: ""; position: absolute; inset: 4px 0 2px 0; background: #6d28d9; transform: skewX(-10deg); z-index: -1; border-radius: 3px; }
+      .hero p { margin: 12px 0 14px; font-size: 14px; line-height: 1.45; color: #55555c; width: 420px; }
+      .ctas { display: flex; align-items: center; gap: 12px; }
+      .ctas .btn { padding: 10px 20px; }
+      .ghost { font-size: 14px; font-weight: 700; color: #6d28d9; text-decoration: underline; text-underline-offset: 5px; text-decoration-thickness: 2px; }
+
+      .visual { position: absolute; top: 62px; left: 540px; width: 440px; height: 220px; }
+      .visual img { width: 440px; height: 165px; object-fit: cover; display: block;
+        /* mask-image fade + 3D perspective */
+        -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent); mask-image: linear-gradient(to bottom, #000 55%, transparent);
+        transform: perspective(800px) rotateY(-12deg); border-radius: 14px; }
+      .stat { position: absolute; left: -20px; top: 118px; background: #fff; border-radius: 12px; padding: 10px 14px; width: 150px;
+        /* hard offset shadow */
+        box-shadow: 6px 6px 0 #1d1d1f; border: 1.5px solid #1d1d1f; }
+      .stat b { display: block; font-size: 24px; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+      .stat span { font-size: 11px; color: #6b6b73; }
+      .stat i { display: inline-block; width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 8px solid #16a34a; margin-right: 4px; }
+
+      /* skewed banner */
+      .banner { position: absolute; top: 322px; left: -20px; width: 1064px; height: 40px; background: #1d1d1f; color: #fff; transform: skewY(-2deg);
+        display: flex; align-items: center; justify-content: space-around; font-variant: small-caps; letter-spacing: 0.14em; font-size: 15px; font-weight: 700; }
+
+      /* feature grid */
+      .features { position: absolute; top: 384px; left: 40px; width: 944px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+      .feat { position: relative; background: #fff; border-radius: 12px; padding: 12px 14px 12px 14px; box-shadow: 0 1px 3px rgba(0,0,0,.1); display: grid; grid-template-columns: 36px 1fr; gap: 0 12px; counter-increment: feat; }
+      /* CSS counter numbering */
+      .feat::before { content: counter(feat, decimal-leading-zero); position: absolute; right: 12px; top: 8px; font-size: 22px; font-weight: 900; color: #e5e1f5; font-variant-numeric: tabular-nums; }
+      .feat h3 { margin: 0; font-size: 15px; align-self: end; }
+      .feat p { margin: 2px 0 0; font-size: 12px; line-height: 1.35; color: #6b6b73; grid-column: 2; }
+      .ico { grid-row: span 2; width: 36px; height: 36px; position: relative; border-radius: 10px; background: linear-gradient(135deg, #8b5cf6, #ec4899); }
+      .ico::after { content: ""; position: absolute; inset: 10px; background: #fff; }
+      .ico.c::after { border-radius: 50%; }
+      .ico.t::after { inset: 9px 9px 11px; background: #fff; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+      .ico.d::after { transform: rotate(45deg); inset: 11px; }
+
+      /* testimonial */
+      blockquote { position: absolute; top: 478px; left: 40px; width: 440px; height: 112px; margin: 0; padding: 14px 16px 12px 70px; background: #f3f0ff; border-radius: 14px; font-style: italic; font-size: 13px; line-height: 1.4; overflow: hidden; }
+      /* giant decorative quote mark */
+      blockquote::before { content: "\201C"; position: absolute; left: 12px; top: -14px; font-size: 110px; font-style: normal; font-weight: 900; color: #c4b5fd; line-height: 1; }
+      blockquote footer { margin-top: 6px; display: flex; align-items: center; gap: 8px; font-style: normal; font-size: 11px; color: #55555c; }
+      blockquote footer img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+      blockquote footer img { margin-left: -50px; }
+      blockquote footer span { margin-left: 0; }
+
+      /* two-column text with float shape */
+      .article { position: absolute; top: 478px; left: 504px; width: 480px; height: 112px; column-count: 2; column-gap: 20px; font-size: 11px; line-height: 1.4; color: #44444a; overflow: hidden; text-align: justify; }
+      .article p { margin: 0; }
+      .article p::first-letter { float: left; font-size: 34px; line-height: 0.85; font-weight: 900; color: #6d28d9; padding: 3px 4px 0 0; } /* drop cap */
+      .article img { float: left; width: 50px; height: 50px; border-radius: 50%; object-fit: cover; shape-outside: circle(50%); margin: 2px 6px 2px 0; }
+
+      /* pricing */
+      .pricing { position: absolute; top: 606px; left: 40px; width: 944px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; padding: 0 20px; }
+      .card { position: relative; height: 150px; background: #fff; border-radius: 14px; border: 1px solid #e5e1f5; padding: 10px 16px; overflow: hidden; }
+      .card.pop { transform: scale(1.05); border: 2px solid #6d28d9; box-shadow: 0 10px 24px rgba(109,40,217,.25); }
+      .card h4 { margin: 0; font-size: 13px; color: #6b6b73; text-transform: uppercase; letter-spacing: .08em; }
+      .card .price { font-size: 28px; font-weight: 900; letter-spacing: -0.03em; margin: 0 0 4px; }
+      .card .price small { font-size: 12px; font-weight: 400; color: #6b6b73; }
+      .card ul { margin: 0; padding: 0; list-style: none; font-size: 12px; line-height: 1.55; }
+      .card li { padding-left: 16px; position: relative; }
+      .card li::before { content: ""; position: absolute; left: 2px; top: 5px; width: 9px; height: 5px; border-left: 2px solid #16a34a; border-bottom: 2px solid #16a34a; transform: rotate(-45deg); } /* CSS check bullet */
+      .card.pop li::before { border-color: #6d28d9; }
+      .ribbon { position: absolute; top: 14px; right: -30px; width: 110px; text-align: center; background: #ec4899; color: #fff; font-size: 10px; font-weight: 900; letter-spacing: .1em; padding: 3px 0; transform: rotate(45deg); text-transform: uppercase; }
+
+      /* FAQ */
+      details { position: absolute; top: 784px; left: 40px; width: 560px; background: #fff; border-radius: 10px; padding: 8px 14px; font-size: 12px; line-height: 1.4; color: #55555c; border: 1px solid #e5e1f5; }
+      summary { list-style: none; font-weight: 700; font-size: 13px; color: #1d1d1f; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+      summary::-webkit-details-marker { display: none; }
+      summary::before { content: ""; width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 8px solid #6d28d9; transform: rotate(90deg); } /* styled summary marker */
+      details p { margin: 4px 0 0 16px; }
+
+      .newsletter { position: absolute; top: 784px; left: 624px; width: 360px; height: 76px; border-radius: 10px; padding: 10px 14px; color: #fff; font-size: 12px;
+        background: repeating-linear-gradient(45deg, #6d28d9 0 10px, #7c3aed 10px 20px); /* repeating gradient */ }
+      .newsletter b { font-size: 14px; display: block; margin-bottom: 4px; }
+      .newsletter .field { background: #fff; color: #888; border-radius: 6px; padding: 5px 8px; width: 220px; display: inline-block; }
+
+      /* footer */
+      footer.site { position: absolute; top: 866px; left: 40px; width: 944px; font-size: 11px; color: #6b6b73; }
+      footer.site hr { border: 0; height: 2px; margin: 0 0 4px; background: linear-gradient(90deg, #6d28d9, #ec4899, transparent); } /* styled hr */
+      footer.site .row { display: flex; justify-content: space-between; }
+      footer.site a { color: #6d28d9; text-decoration: underline wavy #ec4899; text-underline-offset: 3px; margin-left: 14px; } /* wavy underline */
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <div class="hero-bg" data-fid="div.hero-bg-1"></div>
+    <nav data-fid="nav-2">
+      <span class="logo" data-fid="span.logo-3">Lumen</span>
+      <div class="links" data-fid="div.links-4"><span data-fid="span-5">Product</span><span data-fid="span-6">Solutions</span><span data-fid="span-7">Pricing</span><span data-fid="span-8">Docs</span><span data-fid="span-9">Blog</span></div>
+      <span class="btn outline" data-fid="span.btn-10">Sign in</span>
+      <span class="btn fill" data-fid="span.btn-11">Start free</span>
+    </nav>
+
+    <section class="hero" data-fid="section.hero-12">
+      <h1 data-fid="h1-13">Ship software that feels <span class="hl">calm</span> to use.</h1>
+      <p data-fid="p-15">Lumen turns scattered product signals into one quiet dashboard, so your team spends less time chasing alerts and more time building.</p>
+      <div class="ctas" data-fid="div.ctas-16">
+        <span class="btn fill" data-fid="span.btn-17">Get started</span>
+        <span class="btn outline" data-fid="span.btn-18">Book a demo</span>
+        <span class="ghost" data-fid="span.ghost-19">See how it works</span>
+      </div>
+    </section>
+
+    <div class="visual" data-fid="div.visual-20">
+      <img src="/assets/cover.png" alt="" data-fid="img-21">
+      <div class="stat" data-fid="div.stat-22"><b data-fid="b-23"><i data-fid="i-24"></i>98.4%</b><span>uptime across 12k teams</span></div>
+    </div>
+
+    <div class="banner" data-fid="div.banner-26"><span data-fid="span-27">Northwind</span><span data-fid="span-28">Acme Labs</span><span data-fid="span-29">Globex</span><span data-fid="span-30">Initech</span><span data-fid="span-31">Umbra Co</span><span data-fid="span-32">Hooli</span></div>
+
+    <section class="features" data-fid="section.features-33">
+      <div class="feat" data-fid="div.feat-34"><div class="ico c" data-fid="div.ico-35"></div><h3 data-fid="h3-36">Unified signals</h3><p data-fid="p-37">Logs, traces and feedback in a single timeline.</p></div>
+      <div class="feat" data-fid="div.feat-38"><div class="ico t" data-fid="div.ico-39"></div><h3 data-fid="h3-40">Smart triage</h3><p data-fid="p-41">Noise is grouped so only real issues reach you.</p></div>
+      <div class="feat" data-fid="div.feat-42"><div class="ico d" data-fid="div.ico-43"></div><h3 data-fid="h3-44">Calm reports</h3><p data-fid="p-45">Weekly digests your whole team will actually read.</p></div>
+    </section>
+
+    <blockquote data-fid="blockquote-46">
+      Lumen cut our alert volume by seventy percent in the first month. Our on-call rotations finally feel humane, and nobody misses the old pager.
+      <footer data-fid="footer-47"><img src="/assets/avatar.png" alt="" data-fid="img-48"><span data-fid="span-49">Maya Ortiz — VP Engineering, Northwind</span></footer>
+    </blockquote>
+
+    <div class="article" data-fid="div.article-50">
+      <p data-fid="p-51"><img src="/assets/photo1.png" alt="" data-fid="img-52">Teams adopt Lumen in an afternoon. Connect a source, pick a few rules, and the quiet dashboard starts to fill with only what matters. Over time the system learns which incidents your team resolves quickly and which need a human, reshaping its priorities without any tuning. Customers report fewer late nights, shorter reviews and a clearer picture of what to build next quarter.</p>
+    </div>
+
+    <section class="pricing" data-fid="section.pricing-53">
+      <div class="card" data-fid="div.card-54"><h4 data-fid="h4-55">Starter</h4><div class="price" data-fid="div.price-56">€0<small> / month</small></div><ul data-fid="ul-58"><li data-fid="li-59">3 projects</li><li data-fid="li-60">7-day history</li><li data-fid="li-61">Community support</li></ul></div>
+      <div class="card pop" data-fid="div.card-62"><span class="ribbon" data-fid="span.ribbon-63">Popular</span><h4 data-fid="h4-64">Team</h4><div class="price" data-fid="div.price-65">€29<small> / seat</small></div><ul data-fid="ul-67"><li data-fid="li-68">Unlimited projects</li><li data-fid="li-69">1-year history</li><li data-fid="li-70">Priority support</li></ul></div>
+      <div class="card" data-fid="div.card-71"><h4 data-fid="h4-72">Scale</h4><div class="price" data-fid="div.price-73">€99<small> / seat</small></div><ul data-fid="ul-75"><li data-fid="li-76">SSO and audit logs</li><li data-fid="li-77">Custom retention</li><li data-fid="li-78">Dedicated manager</li></ul></div>
+    </section>
+
+    <details open="" data-fid="details-79">
+      <summary data-fid="summary-80">Can I switch plans at any time?</summary>
+      <p data-fid="p-81">Yes — upgrade or downgrade whenever you like. Changes apply at the next billing cycle, and unused seats are credited.</p>
+    </details>
+    <div class="newsletter" data-fid="div.newsletter-82"><b data-fid="b-83">Get the quiet newsletter</b><span class="field" data-fid="span.field-84">you@company.com</span></div>
+
+    <footer class="site" data-fid="footer.site-85">
+      <hr data-fid="hr-86">
+      <div class="row" data-fid="div.row-87"><span data-fid="span-88">© 2026 Lumen Labs, Inc. All rights reserved.</span><span data-fid="span-89"><a>Privacy</a><a>Terms</a><a>Status</a></span></div>
+    </footer>
+  
+
+</body></html>

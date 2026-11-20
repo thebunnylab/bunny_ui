@@ -548,7 +548,9 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
     RectInstance rect = rects[in.id];
     // the frame's pixel, wherever the target sits in it
     float2 p = in.position.xy + uniforms.origin;
-    float kind = rect.params.z;
+    // a piece of a longer ramp carries its stretch in the kind's tens
+    float band = floor(rect.params.z / 10.0);
+    float kind = rect.params.z - band * 10.0;
     float coverage;
     if (kind == 0.0) {
         // fill: the cpu corner ramp, clamp(radius - d + 0.5, 0, 1)
@@ -580,23 +582,29 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         // a ramp from rect.xy to point2. The cpu resolved every number
         // in f64 — this only mixes.
         coverage = rect_cov(p, rect.rect, rect.radii);
-        float t;
+        float raw;
         if (kind == 3.0) {
             float distance = length(p - rect.point2);
-            t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
+            raw = (distance - rect.params.y) / (rect.params.w - rect.params.y);
         } else if (kind == 5.0) {
             // the ellipse is a circle in a Y-scaled space; params.x
             // carries the aspect, so the cover is the plain box
             coverage = rect_cov(p, rect.rect, float4(0.0));
             float2 away = p - rect.point2;
             float distance = length(float2(away.x, away.y / rect.params.x));
-            t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
+            raw = (distance - rect.params.y) / (rect.params.w - rect.params.y);
         } else {
             float2 origin = float2(rect.params.y, rect.params.w);
             float2 axis = rect.point2 - origin;
             float length2 = dot(axis, axis);
-            t = length2 > 0.0 ? saturate(dot(p - origin, axis) / length2) : 1.0;
+            raw = length2 > 0.0 ? dot(p - origin, axis) / length2 : 1.0;
         }
+        // a piece paints its own stretch of the ramp alone: from its
+        // start, short of its end — the next piece owns that line
+        if (((band == 1.0 || band == 3.0) && raw < 0.0) || (band >= 2.0 && raw >= 1.0)) {
+            coverage = 0.0;
+        }
+        float t = saturate(raw);
         // the cpu rounds the mixed color to bytes before blending;
         // rounding here keeps the two within one step
         float4 near = float4(rect.color);
@@ -5639,6 +5647,95 @@ mod tests {
         let (gpu, cpu) =
             scene_bytes(&root, Size { width: 160.0, height: 180.0 }, 2, Color::CANVAS);
         assert_close(&gpu, &cpu, 2, "gradients");
+    }
+
+    /// A ramp with stops between its ends is painted piece by piece on
+    /// the GPU and in one pass on the CPU: the two land on the same bytes,
+    /// a hard edge and the rings included.
+    #[test]
+    fn the_stops_ramp_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::{Gradient, UnitPoint};
+        let (red, green, blue) = (Color::hex(0xEF4444), Color::hex(0x22C55E), Color::hex(0x3B82F6));
+        let root = vstack((
+            empty().frame(120.0, 40.0).background_gradient(
+                Gradient::linear(red, blue)
+                    .direction(UnitPoint::LEADING, UnitPoint::TRAILING)
+                    .stop(0.3, green)
+                    .stop(0.6, green)
+                    .stop(0.6, red),
+            ),
+            empty()
+                .frame(120.0, 60.0)
+                .background_gradient(Gradient::radial(red, blue.fade()).radius(4.0, 70.0).stop(0.4, green))
+                .corner_radius(12.0),
+            empty().frame(140.0, 50.0).background_gradient(
+                Gradient::radial(blue, red).radius(0.0, 100.0).aspect(0.4).stop(0.5, green),
+            ),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 160.0, height: 170.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "stops");
+    }
+
+    /// Text under a ramp is a picture of its letters tinted by the ramp:
+    /// the GPU lays the same bytes the raster does.
+    #[test]
+    fn gradient_text_inks_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::{Gradient, UnitPoint};
+        let root = text("Ship calmer")
+            .font_size(28.0)
+            .foreground_gradient(
+                Gradient::linear(Color::hex(0x6D28D9), Color::hex(0xF59E0B))
+                    .direction(UnitPoint::LEADING, UnitPoint::TRAILING)
+                    .stop(0.6, Color::hex(0xEC4899)),
+            )
+            .frame(200.0, 48.0);
+        // the picture is made at the scale the layout runs at, the
+        // device's, as a window's runtime does
+        let runtime = Runtime::new();
+        runtime.set_device_scale(2.0);
+        let display = runtime.display_frame(&root, Size { width: 200.0, height: 48.0 });
+        let cpu = rasterize_with(&display, 400, 96, 2, Color::CANVAS, &PixelFont, &RawImages::default()).to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(400, 96).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_close(&gpu.read_rgba(), &cpu, 2, "gradient text");
+    }
+
+    /// A filtered subtree is a picture of it with its colors changed
+    /// texel by texel: the GPU lays the same bytes the raster does.
+    #[test]
+    fn color_filters_paint_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::angle::Angle;
+        let root = vstack((
+            hstack((
+                empty().frame(40.0, 40.0).background_color(Color::hex(0xEF4444)).corner_radius(10.0),
+                text("Filters").font_size(20.0).foreground_color(Color::hex(0x3B82F6)),
+            ))
+            .grayscale(0.6)
+            .contrast(1.3),
+            empty().frame(120.0, 30.0).background_color(Color::hex(0x22C55E)).hue_rotation(Angle::degrees(90.0)).saturation(1.4),
+            text("inverted").font_size(18.0).color_invert(),
+        ));
+        // the picture is made at the scale the layout runs at, the
+        // device's, as a window's runtime does
+        let runtime = Runtime::new();
+        runtime.set_device_scale(2.0);
+        let display = runtime.display_frame(&root, Size { width: 160.0, height: 120.0 });
+        let sprites = display.iter().filter(|command| matches!(command, bunny_ui::layout::DrawCommand::Sprite { .. })).count();
+        assert_eq!(sprites, 3, "each filtered view is one picture");
+        let cpu = rasterize_with(&display, 320, 240, 2, Color::CANVAS, &PixelFont, &RawImages::default()).to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(320, 240).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        assert_close(&gpu.read_rgba(), &cpu, 2, "color filters");
     }
 
     #[test]

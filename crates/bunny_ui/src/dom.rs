@@ -141,13 +141,17 @@ pub enum DomKind {
 }
 
 /// One image element. `key` is the source identity ([`crate::
-/// image_engine::ImageSource::key`]); `cover` picks `object-fit`
-/// (`false` = our frame IS the rect, the element just fills it;
-/// `true` = the browser covers-and-clips with the same centered math).
+/// image_engine::ImageSource::key`]); `cover` and `contain` pick
+/// `object-fit` — neither: our frame IS the rect, the element just
+/// fills it; `cover`: the browser covers-and-clips with the same
+/// centered math; `contain`: the element holds the whole box it is
+/// offered and the browser letterboxes the picture in its middle, where
+/// the layout places the contained rect.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DomImage {
     pub key: u64,
     pub cover: bool,
+    pub contain: bool,
 }
 
 /// One vector glyph element. `key` is the SYMBOL's identity — never
@@ -329,8 +333,11 @@ pub struct DomLook {
     pub color: Option<Color>,
     pub hover_color: Option<Color>,
     pub pressed_color: Option<Color>,
+    /// The line drawn inward over the box and its children. The page
+    /// draws it as an outline pulled in by its width: a CSS border
+    /// would push the content in.
     pub border: Option<(Color, Px)>,
-    /// `border-style` — the browser fits its own dashes, the same
+    /// The line's style — the browser fits its own dashes, the same
     /// rhythm the house traces.
     pub border_style: Option<crate::shapes::BorderStyle>,
     /// A `repeating-linear-gradient` over the background.
@@ -341,6 +348,26 @@ pub struct DomLook {
     pub turn: Option<(crate::angle::QuarterTurn, bool)>,
     pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
+    /// Where the halo sits from the box (`.shadow_offset`).
+    pub shadow_offset: Option<(Px, Px)>,
+    /// How far the box is drawn from its place (`.offset`): CSS
+    /// `translate`, which the box's neighbours never feel.
+    pub offset: Option<(Px, Px)>,
+    /// The box drawn turned (`.rotation_effect`): degrees clockwise, and
+    /// the pivot as a fraction of the box — CSS `rotate` about a
+    /// `transform-origin`.
+    pub rotation: Option<(Px, Px, Px)>,
+    /// The ramp the text below paints with (`.foreground_gradient`): the
+    /// box's background, cut to the text (`background-clip: text`).
+    pub ink_gradient: Option<crate::layout::Gradient>,
+    /// A text inside a ramp whose ink was set nearer to it: it paints its
+    /// color again (`-webkit-text-fill-color: currentcolor`), as the
+    /// nearer ink wins in `SwiftUI`.
+    pub own_ink: bool,
+    /// The box's floor, `(width, height)` — `min-width` and `min-height`,
+    /// zero for none: a `.frame_min` that hugs its content above it, a
+    /// `.frame_flex` that fills its holder and never shrinks past it.
+    pub floor: Option<(Px, Px)>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -367,6 +394,10 @@ pub struct DomLook {
     pub opacity: Option<f64>,
     /// Foreground CSS filter, independent of the backdrop material.
     pub blur: Option<Px>,
+    /// The color filters (`.grayscale`, `.saturation`, `.contrast`,
+    /// `.hue_rotation`, `.color_invert`), in order: the CSS `filter` list,
+    /// before the blur.
+    pub filters: crate::color_filter::ColorFilters,
     pub hover_opacity: Option<f64>,
     pub pressed_opacity: Option<f64>,
     /// `.group_hovered()` — the ancestor whose `:hover` drives this
@@ -423,6 +454,12 @@ impl DomLook {
         turn: None,
         corner_radius: None,
         shadow: None,
+        shadow_offset: None,
+        offset: None,
+        rotation: None,
+        ink_gradient: None,
+        own_ink: false,
+        floor: None,
         transition: None,
         focus_border: None,
         placeholder_color: None,
@@ -430,6 +467,7 @@ impl DomLook {
         hidden: false,
         opacity: None,
         blur: None,
+        filters: crate::color_filter::ColorFilters::NONE,
         hover_opacity: None,
         pressed_opacity: None,
         group: None,
@@ -453,6 +491,12 @@ impl DomLook {
             turn: None,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
+            shadow_offset: props.shadow_offset.filter(|_| props.shadow.is_some()),
+            offset: props.offset,
+            rotation: props.rotation.map(|(degrees, anchor)| (degrees, anchor.x, anchor.y)),
+            ink_gradient: props.foreground_gradient,
+            own_ink: false,
+            floor: None,
             transition: None,
             focus_border: None,
             placeholder_color: None,
@@ -460,6 +504,7 @@ impl DomLook {
             hidden: props.hidden,
             opacity: props.opacity,
             blur: props.blur,
+            filters: props.filters,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
             group: None,
@@ -484,11 +529,15 @@ impl DomLook {
             || props.stripes.is_some()
             || props.corner_radius.is_some()
             || props.shadow.is_some()
+            || props.offset.is_some()
+            || props.rotation.is_some()
+            || props.foreground_gradient.is_some()
             || props.clip
             || props.hidden
             || props.passive
             || props.opacity.is_some()
             || props.blur.is_some()
+            || !props.filters.is_empty()
             || props.opacity_hovered.is_some()
             || props.opacity_pressed.is_some()
             || props.glass.is_some();
@@ -609,6 +658,9 @@ pub struct DomText {
     /// The face is the one declared above: the text names no font of
     /// its own, and the look it wears carries none.
     pub inherits_face: bool,
+    /// The most lines the text shows (`.line_limit`), zero for none —
+    /// the page clamps the element to them.
+    pub line_limit: u8,
 }
 
 /// One text field. Focus, caret and composition stay with the browser;
@@ -1000,10 +1052,12 @@ impl DomCapture {
         if states || inheriting {
             look.color = Some(ink);
         }
+
         node.style = DomStyle::new(interactive, look, DomMarks { tooltip, group_owner: None });
         if states {
             self.ink_scopes.push(self.stack.len());
         }
+
     }
 
     /// The ink the open node hands down: the BASE color, never the
@@ -1072,6 +1126,18 @@ impl DomCapture {
         }
         self.open(kind, frame, frame.origin);
         self.close();
+    }
+
+    /// The leaf just placed paints its text in its own ink, inside a
+    /// ramp that would cut the text out of it otherwise: a color set
+    /// nearer the text wins, as in `SwiftUI`.
+    pub(crate) fn own_ink(&mut self) {
+        if self.island > 0 {
+            return;
+        }
+        if let Some(leaf) = self.stack.last_mut().and_then(|(_, parent)| parent.children.last_mut()) {
+            leaf.style.look_mut().own_ink = true;
+        }
     }
 
     /// A childless element that carries its own look (the field's
@@ -1207,8 +1273,9 @@ impl DomCapture {
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
     pub gap: Option<f32>,
-    /// Equal-width grid track count; absent on other containers.
-    pub columns: Option<u16>,
+    /// How the container cuts its cells: a grid's equal-width tracks,
+    /// or an overlay's one cell, sized by its base alone.
+    pub cells: Option<Cells>,
     /// The containing block for children taken out of flow.
     pub relative: bool,
     /// Rare child placement parameters, shared when a scene is retained.
@@ -1255,6 +1322,56 @@ pub struct DomLayout {
     /// `unicode-bidi`, so the browser orders its rows, aligns its
     /// `start` and shapes its words the island's way. `None` inherits.
     pub direction: Option<motor::state::LayoutDirection>,
+}
+
+impl DomLayout {
+    /// A grid's equal-width track count.
+    #[must_use]
+    pub const fn columns(&self) -> Option<u16> {
+        match self.cells {
+            Some(Cells::Columns(columns)) => Some(columns),
+            _ => None,
+        }
+    }
+
+    /// The child an overlay's cell takes its size from.
+    #[must_use]
+    pub const fn base(&self) -> Option<LayerBase> {
+        match self.cells {
+            Some(Cells::Base(base)) => Some(base),
+            _ => None,
+        }
+    }
+}
+
+/// How a container cuts its cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cells {
+    /// A grid's equal-width tracks.
+    Columns(u16),
+    /// An overlay's one cell, sized by its base alone: the layers are
+    /// laid over the base's box and never grow it, as `SwiftUI`'s
+    /// `.overlay` and `.background` are. A pile, which every child
+    /// sizes, names none.
+    Base(LayerBase),
+}
+
+/// Which child of an overlay's cell is its base: the first under an
+/// overlay, the last under a background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerBase {
+    First,
+    Last,
+}
+
+impl LayerBase {
+    /// The rule's flag bits: 2 the first child, 4 the last.
+    const fn flag(self) -> u8 {
+        match self {
+            Self::First => 2,
+            Self::Last => 4,
+        }
+    }
 }
 
 /// A box the browser sticks: `position: sticky; top` — the browser holds
@@ -1402,6 +1519,12 @@ impl DomHints {
     pub fn voice(&self) -> u8 {
         self.address.as_deref().map_or(0, |address| address.voice.wire())
     }
+
+    /// The name a harness finds the element by (`.test_id(…)`).
+    #[must_use]
+    pub fn test_id(&self) -> Option<&str> {
+        self.address.as_deref().and_then(|address| address.test_id.as_deref())
+    }
 }
 
 // MARK: - Patches
@@ -1515,6 +1638,8 @@ pub enum DomPatch {
         kind: CreateKind,
         /// Bit 0: the element lays itself out — a table-family tag,
         /// whose display is the browser's own and takes no flex line.
+        /// Bits 1 and 2: an overlay's cell, sized by its first child
+        /// alone, or by its last ([`Cells::Base`]).
         flags: u8,
         style: Box<DomLook>,
         layout: Box<DomLayout>,
@@ -2380,7 +2505,7 @@ fn look_hash(node: &DomNode) -> u64 {
         Some(layout) => {
             1u8.hash(&mut hasher);
             hash_f32(layout.gap, &mut hasher);
-            if let Some(columns) = layout.columns {
+            if let Some(columns) = layout.columns() {
                 columns.hash(&mut hasher);
             }
             layout.align.hash(&mut hasher);
@@ -2403,6 +2528,9 @@ fn look_hash(node: &DomNode) -> u64 {
             if let Some(direction) = layout.direction {
                 direction.is_rtl().hash(&mut hasher);
             }
+            if let Some(base) = layout.base() {
+                (0x6261_7365u32, base.flag()).hash(&mut hasher);
+            }
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -2421,6 +2549,36 @@ fn look_hash(node: &DomNode) -> u64 {
         .map(|corners| [corners.top_left.to_bits(), corners.top_right.to_bits(), corners.bottom_right.to_bits(), corners.bottom_left.to_bits()])
         .hash(&mut hasher);
     style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
+    // hashed only when present: a look without them keeps the name a
+    // served page gave it before they existed
+    if let Some((x, y)) = style.shadow_offset {
+        (1u8, x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some((x, y)) = style.offset {
+        (2u8, x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some((degrees, x, y)) = style.rotation {
+        (3u8, degrees.to_bits(), x.to_bits(), y.to_bits()).hash(&mut hasher);
+    }
+    if let Some(gradient) = &style.ink_gradient {
+        4u8.hash(&mut hasher);
+        let mut ramp = Vec::new();
+        encode_ramp(&mut ramp, gradient);
+        encode_stops(&mut ramp, gradient.stops());
+        ramp.hash(&mut hasher);
+    }
+    if style.own_ink {
+        5u8.hash(&mut hasher);
+    }
+    if let Some((width, height)) = style.floor {
+        (6u8, width.to_bits(), height.to_bits()).hash(&mut hasher);
+    }
+    if !style.filters.is_empty() {
+        7u8.hash(&mut hasher);
+        for (kind, amount) in style.filters.iter().map(crate::color_filter::ColorFilter::wire) {
+            (kind, amount.to_bits()).hash(&mut hasher);
+        }
+    }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
@@ -2440,19 +2598,25 @@ fn look_hash(node: &DomNode) -> u64 {
     style.group.hash(&mut hasher);
     style.pass_through.hash(&mut hasher);
     match &style.gradient {
-        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer }) => {
+        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. }) => {
             1u8.hash(&mut hasher);
             [center.x.to_bits(), center.y.to_bits(), start.to_bits(), end.unwrap_or(-1.0).to_bits(), aspect.to_bits()].hash(&mut hasher);
             hash_color(Some(*inner), &mut hasher);
             hash_color(Some(*outer), &mut hasher);
         }
-        Some(crate::layout::Gradient::Linear { start, end, from, to }) => {
+        Some(crate::layout::Gradient::Linear { start, end, from, to, .. }) => {
             2u8.hash(&mut hasher);
             [start.x.to_bits(), start.y.to_bits(), end.x.to_bits(), end.y.to_bits()].hash(&mut hasher);
             hash_color(Some(*from), &mut hasher);
             hash_color(Some(*to), &mut hasher);
         }
         None => 0u8.hash(&mut hasher),
+    }
+    // only a ramp with stops between its ends adds to the hash: a
+    // two-color look keeps the rule it had
+    for (location, color) in style.gradient.iter().flat_map(|gradient| gradient.stops().iter()) {
+        location.to_bits().hash(&mut hasher);
+        hash_color(Some(color), &mut hasher);
     }
     match &style.glass {
         Some(glass) => {
@@ -2471,6 +2635,9 @@ fn look_hash(node: &DomNode) -> u64 {
             (face.slant as u8).hash(&mut hasher);
             face.family.name().as_deref().hash(&mut hasher);
             face.tracking.to_bits().hash(&mut hasher);
+            if face.monospaced_digits {
+                1u8.hash(&mut hasher);
+            }
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -2484,9 +2651,16 @@ fn look_hash(node: &DomNode) -> u64 {
         (text.font.slant as u8).hash(&mut hasher);
         text.font.family.name().as_deref().hash(&mut hasher);
         text.font.tracking.to_bits().hash(&mut hasher);
+        if text.font.monospaced_digits {
+            1u8.hash(&mut hasher);
+        }
         hash_f32(text.line_height, &mut hasher);
         text.text_align.map(|align| align as u8).hash(&mut hasher);
         text.truncation.map(|mode| mode as u8).hash(&mut hasher);
+        // only a limit adds to the hash: a text with none keeps its rule
+        if text.line_limit > 0 {
+            (0x6c69_6d69u64, text.line_limit).hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -2503,7 +2677,7 @@ fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<
     patches.push(DomPatch::DefineRule {
         rule,
         kind,
-        flags: u8::from(lays_itself_out(&node.hints)),
+        flags: u8::from(lays_itself_out(&node.hints)) | node.layout.as_ref().and_then(DomLayout::base).map_or(0, LayerBase::flag),
         style: Box::new(look_style(&node.style)),
         layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
         text: match &node.kind {
@@ -2526,6 +2700,7 @@ fn face_only(face: FontSpec) -> DomText {
         highlights: None,
         truncation: None,
         inherits_face: false,
+        line_limit: 0,
     }
 }
 
@@ -2971,6 +3146,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
                 || text.line_height != was.line_height
                 || text.text_align != was.text_align
                 || text.truncation != was.truncation
+                || text.line_limit != was.line_limit
             {
                 return false;
             }
@@ -2999,7 +3175,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
 /// reads of a layout.)
 fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
     a.gap == b.gap
-        && a.columns == b.columns
+        && a.cells == b.cells
         && a.align == b.align
         && a.padding == b.padding
         && a.grow == b.grow
@@ -4401,7 +4577,40 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// glue writes them as `aria-hidden`, `role="status"` / `role="alert"`
 /// with `aria-live`, and `aria-label`; a focused control whose element
 /// leaves hands the focus back to the control that had it before.
-pub const ABI_VERSION: u32 = 26;
+///
+/// 27 (2026-11-18): the harness's name. After the element's name, Create
+/// (op 1) and `SetHints` (op 15) carry the view's `.test_id(…)` as a
+/// u16-length string, empty for none; the glue writes it as
+/// `data-testid`. The fit byte of `SetImage` (op 9) gains a value: 2 is
+/// `object-fit: contain`, for a flow picture that holds its whole box.
+///
+/// 28 (2026-11-19): a look's record ends with a second mask, a byte:
+/// bit 0 the halo's offset (`.shadow_offset`, f32 x + f32 y), bit 1 the
+/// box's own offset (`.offset`, f32 x + f32 y, CSS `translate`), bit 2
+/// its turn (`.rotation_effect`, f32 degrees clockwise + f32 x + f32 y of
+/// the pivot as a fraction of the box, CSS `rotate` about a
+/// `transform-origin`), bit 3 the colors its ramp passes through (u8
+/// count, then per stop f32 location along the ramp + u32 rgba), bit 4
+/// the ramp its text paints with (`.foreground_gradient`: the ramp's
+/// record as bit 13 of the first mask carries it, then its stops as bit
+/// 3's), bit 5 a box inside such a ramp that paints its text in its own
+/// ink again, bit 6 the box's floor (f32 min width + f32 min height, zero
+/// for none), bit 7 its color filters (`.grayscale`, `.saturation`,
+/// `.contrast`, `.hue_rotation`, `.color_invert`: u8 count, then per
+/// filter, in the order they apply, u8 kind — 0 grayscale, 1 saturate, 2
+/// contrast, 3 hue-rotate, 4 invert — + f32 amount, degrees for the hue;
+/// the CSS `filter` list, before the blur, a negative contrast written
+/// `invert(1) contrast(-amount)`) — the first mask's thirty-two bits were
+/// all taken. A rule's flags byte gains bits 1 and 2: an overlay's cell, sized by
+/// its first child alone, or by its last — `grid-template: auto 0fr /
+/// auto 0fr` with the base in the first track and every layer across
+/// both, so a layer larger than its base never grows the cell.
+///
+/// The text look's record ends with two bytes: the most lines the text
+/// shows (`.line_limit`, 0 for none; the glue clamps the element to them,
+/// `-webkit-line-clamp`), then the figures' byte — bit 0, one advance
+/// each (`.monospaced_digit()`, CSS `tabular-nums`).
+pub const ABI_VERSION: u32 = 28;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4583,6 +4792,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(hints.control());
                 out.push(hints.voice());
                 push_bytes_u16(&mut out, hints.label().unwrap_or("").as_bytes());
+                push_bytes_u16(&mut out, hints.test_id().unwrap_or("").as_bytes());
                 out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
@@ -4677,7 +4887,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *id);
                 push_u32(&mut out, (image.key >> 32) as u32);
                 push_u32(&mut out, image.key as u32);
-                out.push(image.cover as u8);
+                out.push(u8::from(image.cover) | u8::from(image.contain) << 1);
             }
             DomPatch::SetIcon { id, icon } => {
                 out.push(10);
@@ -4871,6 +5081,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     &mut out,
                     address.and_then(|address| address.label.as_deref()).unwrap_or("").as_bytes(),
                 );
+                push_bytes_u16(
+                    &mut out,
+                    address.and_then(|address| address.test_id.as_deref()).unwrap_or("").as_bytes(),
+                );
             }
             DomPatch::SetLanguage { id, lang, dir } => {
                 out.push(27);
@@ -5020,30 +5234,8 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if let Some(color) = style.pressed_color {
         push_u32(out, pack_color(color));
     }
-    if let Some(gradient) = style.gradient {
-        match gradient {
-            crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer } => {
-                out.push(0);
-                push_f32(out, center.x);
-                push_f32(out, center.y);
-                push_f32(out, start);
-                // no reach given = the box's own farthest corner, which
-                // CSS spells `farthest-corner`
-                push_f32(out, end.unwrap_or(-1.0));
-                push_f32(out, aspect);
-                push_u32(out, pack_color(inner));
-                push_u32(out, pack_color(outer));
-            }
-            crate::layout::Gradient::Linear { start, end, from, to } => {
-                out.push(1);
-                push_f32(out, start.x);
-                push_f32(out, start.y);
-                push_f32(out, end.x);
-                push_f32(out, end.y);
-                push_u32(out, pack_color(from));
-                push_u32(out, pack_color(to));
-            }
-        }
+    if let Some(gradient) = &style.gradient {
+        encode_ramp(out, gradient);
     }
     if let Some(opacity) = style.opacity {
         push_f32(out, opacity);
@@ -5099,6 +5291,85 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
             crate::layout::ScrollIndicators::Hidden | crate::layout::ScrollIndicators::Visible => 0,
         });
     }
+    // the first mask is full: what came after rides a second one, a byte
+    let stops = style.gradient.as_ref().map(crate::layout::Gradient::stops).filter(|stops| !stops.is_empty());
+    let more = u8::from(style.shadow_offset.is_some())
+        | u8::from(style.offset.is_some()) << 1
+        | u8::from(style.rotation.is_some()) << 2
+        | u8::from(stops.is_some()) << 3
+        | u8::from(style.ink_gradient.is_some()) << 4
+        | u8::from(style.own_ink) << 5
+        | u8::from(style.floor.is_some()) << 6
+        | u8::from(!style.filters.is_empty()) << 7;
+    out.push(more);
+    for (x, y) in [style.shadow_offset, style.offset].into_iter().flatten() {
+        push_f32(out, x);
+        push_f32(out, y);
+    }
+    if let Some((degrees, x, y)) = style.rotation {
+        push_f32(out, degrees);
+        push_f32(out, x);
+        push_f32(out, y);
+    }
+    if let Some(stops) = stops {
+        encode_stops(out, stops);
+    }
+    if let Some(gradient) = &style.ink_gradient {
+        encode_ramp(out, gradient);
+        encode_stops(out, gradient.stops());
+    }
+    if let Some((width, height)) = style.floor {
+        push_f32(out, width);
+        push_f32(out, height);
+    }
+    if !style.filters.is_empty() {
+        #[allow(clippy::cast_possible_truncation, reason = "at most ColorFilters::MOST")]
+        out.push(style.filters.len() as u8);
+        for (kind, amount) in style.filters.iter().map(crate::color_filter::ColorFilter::wire) {
+            out.push(kind);
+            push_f32(out, amount);
+        }
+    }
+}
+
+/// A ramp's shape and its two ends: u8 kind (0 the rings, 1 the line),
+/// then the rings' centre, inner radius, reach (-1 for the farthest
+/// corner) and aspect, or the line's two ends, then the two colors.
+fn encode_ramp(out: &mut Vec<u8>, gradient: &crate::layout::Gradient) {
+    match *gradient {
+        crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer, .. } => {
+            out.push(0);
+            push_f32(out, center.x);
+            push_f32(out, center.y);
+            push_f32(out, start);
+            // no reach given = the box's own farthest corner, which
+            // CSS spells `farthest-corner`
+            push_f32(out, end.unwrap_or(-1.0));
+            push_f32(out, aspect);
+            push_u32(out, pack_color(inner));
+            push_u32(out, pack_color(outer));
+        }
+        crate::layout::Gradient::Linear { start, end, from, to, .. } => {
+            out.push(1);
+            push_f32(out, start.x);
+            push_f32(out, start.y);
+            push_f32(out, end.x);
+            push_f32(out, end.y);
+            push_u32(out, pack_color(from));
+            push_u32(out, pack_color(to));
+        }
+    }
+}
+
+/// The colors between a ramp's ends: u8 count, then per stop f32
+/// location + u32 rgba.
+fn encode_stops(out: &mut Vec<u8>, stops: &crate::layout::Stops) {
+    #[allow(clippy::cast_possible_truncation, reason = "at most Stops::MOST")]
+    out.push(stops.len() as u8);
+    for (location, color) in stops.iter() {
+        push_f32(out, location);
+        push_u32(out, pack_color(color));
+    }
 }
 
 fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
@@ -5145,7 +5416,7 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     if layout.direction.is_some() {
         mask |= 1 << 13;
     }
-    if layout.columns.is_some() {
+    if layout.columns().is_some() {
         mask |= 1 << 14;
     }
     if layout.relative {
@@ -5185,7 +5456,7 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     if let Some(direction) = layout.direction {
         out.push(direction.is_rtl() as u8);
     }
-    if let Some(columns) = layout.columns {
+    if let Some(columns) = layout.columns() {
         push_u16(out, columns);
     }
 }
@@ -5219,6 +5490,10 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
     });
     // 1 = the face is the one declared above: the look names no font
     out.push(text.inherits_face as u8);
+    // the most lines it shows, 0 for none
+    out.push(text.line_limit);
+    // bit 0: the figures take one advance each (`tabular-nums`)
+    out.push(u8::from(text.font.monospaced_digits));
 }
 
 /// The kind's byte on the wire, shared by the create op and the rule.
@@ -5512,8 +5787,9 @@ mod tests {
     /// count, the op, the rule's two words, the kind and the flags.
     const MASK_AT: usize = 4 + 1 + 8 + 1 + 1;
     /// What follows a look's style record when the flow record is bare
-    /// and no text face rides along: the flow mask and the text flag.
-    const BARE_TAIL: usize = 2 + 1;
+    /// and no text face rides along: the second style mask (ABI 28), the
+    /// flow mask and the text flag.
+    const BARE_TAIL: usize = 1 + 2 + 1;
 
     #[derive(Clone)]
     struct MiniList {
@@ -6024,14 +6300,14 @@ mod tests {
         let hints = DomHints { address: Some(address.clone()), ..DomHints::default() };
         let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
         // count, op, id, parent, before, tag, class, id, href(u16),
-        // control, voice, name(u16), kind
+        // control, voice, name(u16), test id(u16), kind
         assert_eq!(created[4], 1);
-        assert_eq!(created[created.len() - 5..], [3 | 8 | 2 << 4, 0, 0, 0, 1]);
+        assert_eq!(created[created.len() - 7..], [3 | 8 | 2 << 4, 0, 0, 0, 0, 0, 1]);
         let live = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
         assert_eq!(live[4], 15);
-        assert_eq!(live[live.len() - 4..], [3 | 8 | 2 << 4, 0, 0, 0]);
+        assert_eq!(live[live.len() - 6..], [3 | 8 | 2 << 4, 0, 0, 0, 0, 0]);
         let plain = encode(&[DomPatch::SetHints { id: 7, class: None, address: None }]);
-        assert_eq!(plain[plain.len() - 4..], [0, 0, 0, 0], "an element that is no control and says nothing");
+        assert_eq!(plain[plain.len() - 6..], [0, 0, 0, 0, 0, 0], "an element that is no control and says nothing");
     }
 
     /// The rest of what an element says (ABI 26): whether what a control
@@ -6051,10 +6327,140 @@ mod tests {
         let address = Address::named(&Some(Address::controlling(&None, opener)), Rc::from("Language"));
         let address = Address::voiced(&Some(address), |voice| voice.live = Some(crate::accessibility::Live::Polite));
         let said = encode(&[DomPatch::SetHints { id: 7, class: None, address: Some(address) }]);
-        let tail = &said[said.len() - 12..];
+        let tail = &said[said.len() - 14..];
         assert_eq!(tail[..2], [1 | 8 | 2 << 6, 1 << 1], "the control, then the voice");
         assert_eq!(tail[2..4], 8u16.to_le_bytes(), "then the name's length");
-        assert_eq!(&tail[4..], b"Language");
+        assert_eq!(&tail[4..12], b"Language");
+        assert_eq!(tail[12..], [0, 0], "and no test id");
+    }
+
+    /// A filled shape under a plain ink wears that ink: the box that
+    /// carried it declares no CSS `color` (only a state needs one), so a
+    /// `currentColor` fill would fall to the page's own colour. Under a
+    /// hover ink the shape inherits, and the browser flips it.
+    #[test]
+    fn a_shape_wears_the_ink_it_was_given() {
+        let blue = Color::rgba(52, 120, 246, 255);
+        let red = Color::rgba(255, 59, 48, 255);
+        let runtime = Runtime::new();
+        let view = vstack!(
+            rectangle().foreground_color(blue).frame(40.0, 20.0).test_id("plain"),
+            rectangle().frame(40.0, 20.0).test_id("hover").foreground_color(blue).foreground_hovered(red),
+        )
+        .foreground_color(Color::rgba(0, 0, 0, 255));
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let shape_under = |name: &str| {
+            let named = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } if hints.test_id() == Some(name) => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} mounted: {mount:?}"));
+            let mut parents = vec![named];
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, parent, kind: CreateKind::Rectangle, .. } => {
+                        if parents.contains(parent) {
+                            return Some(*id);
+                        }
+                        parents.push(*id);
+                        None
+                    }
+                    DomPatch::Create { id, parent, .. } if parents.contains(parent) => {
+                        parents.push(*id);
+                        None
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a rectangle under {name}: {mount:?}"))
+        };
+        let color_of = |id| look_of(&mount, id).and_then(|(look, _)| look.color);
+        assert_eq!(color_of(shape_under("plain")), Some(blue), "{mount:?}");
+        assert_eq!(color_of(shape_under("hover")), None, "the hovered ink is inherited: {mount:?}");
+    }
+
+    /// A padding around a frame of a fixed size goes AROUND it: the
+    /// frame's size is its content's, and the element that carries both
+    /// sizes its border edge.
+    #[test]
+    fn a_padded_frame_keeps_its_size_inside_the_padding() {
+        let runtime = Runtime::new();
+        let view = vstack!(
+            rectangle().frame(60.0, 20.0).padding_length(12.0).test_id("pad"),
+            rectangle().frame(60.0, 20.0).padding_edge(motor::views::Edge::Leading, 24.0).test_id("edge"),
+        );
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let size_of = |name: &str| {
+            let id = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { id, hints, .. } if hints.test_id() == Some(name) => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} mounted: {mount:?}"));
+            let (_, layout) = look_of(&mount, id).expect("a look");
+            let (width, height) = mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::SetBox { id: at, width, height, .. } if *at == id => Some((*width, *height)),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (width, height, layout.padding)
+        };
+        assert_eq!(size_of("pad"), (Some(84.0), Some(44.0), Some((12.0, 12.0, 12.0, 12.0))));
+        assert_eq!(size_of("edge"), (Some(84.0), Some(20.0), Some((0.0, 0.0, 0.0, 24.0))));
+
+        // a frame a harness names keeps its own box inside the padding
+        let named = rectangle().frame(60.0, 20.0).test_id("inner").padding_length(12.0);
+        let mount = Runtime::new().dom_frame(&named, Size { width: 200.0, height: 200.0 });
+        let inner = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.test_id() == Some("inner") => Some(*id),
+                _ => None,
+            })
+            .expect("the named frame mounted");
+        let boxed = mount.iter().find_map(|patch| match patch {
+            DomPatch::SetBox { id, width, height, .. } if *id == inner => Some((*width, *height)),
+            _ => None,
+        });
+        assert_eq!(boxed, Some((Some(60.0), Some(20.0))), "{mount:?}");
+    }
+
+    /// The harness's name (ABI 27) crosses last among the hints, on a
+    /// create and on the live hints alike, and lands on the element the
+    /// view lowered to — a stack, a text, a padded box — whatever the
+    /// modifiers around it.
+    #[test]
+    fn a_test_id_is_on_the_wire_and_on_the_element() {
+        let address = crate::layout::Address::tested(&None, Some(&Rc::from("row")));
+        let hints = DomHints { address: address.clone(), ..DomHints::default() };
+        let created = encode(&[DomPatch::Create { id: 7, parent: 0, before: 0, kind: CreateKind::Box, hints }]);
+        assert_eq!(created[created.len() - 8..created.len() - 4], [0, 0, 3, 0], "an empty name, then the id's length");
+        assert_eq!(&created[created.len() - 4..created.len() - 1], b"row", "and the kind after it");
+        let live = encode(&[DomPatch::SetHints { id: 7, class: None, address }]);
+        assert_eq!(&live[live.len() - 5..], [3, 0, b'r', b'o', b'w']);
+
+        let runtime = Runtime::new();
+        let view = vstack!(
+            text("a").test_id("word"),
+            text("b").padding_length(4.0).background_color(Color::rgba(0, 0, 0, 255)).test_id("padded"),
+            hstack!(text("c"), text("d")).spacing(3.0).test_id("row"),
+        )
+        .test_id("column");
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let mut named: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { hints, .. } => hints.test_id(),
+                _ => None,
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["column", "padded", "row", "word"], "{mount:?}");
     }
 
     /// A page has no accessibility tree, so what a view says of an
@@ -7441,10 +7847,11 @@ mod tests {
             &0u32.to_le_bytes()[..],
             &[0, 0, 0],
             &0u16.to_le_bytes()[..],
-            // no control (ABI 25), no voice and no name (ABI 26), then
-            // the kind
+            // no control (ABI 25), no voice and no name (ABI 26), no
+            // test id (ABI 27), then the kind
             &[0],
             &[0],
+            &0u16.to_le_bytes()[..],
             &0u16.to_le_bytes()[..],
             &[1],
             &[3],
@@ -7776,7 +8183,7 @@ mod tests {
     fn the_image_encoding_is_byte_stable() {
         let bytes = encode(&[DomPatch::SetImage {
             id: 7,
-            image: DomImage { key: 0x1122_3344_5566_7788, cover: true },
+            image: DomImage { key: 0x1122_3344_5566_7788, cover: true, contain: false },
         }]);
         let expected: Vec<u8> = [
             &1u32.to_le_bytes()[..],
@@ -7790,13 +8197,40 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    /// A resizable picture that fits holds the whole box it is offered
+    /// and the browser letterboxes it (fit byte 2); one that fills
+    /// covers (1); a picture at its own size is just its rect (0).
+    #[test]
+    fn a_picture_says_how_it_fits() {
+        let runtime = Runtime::new();
+        let view = vstack!(
+            image(tiny_image(21)).resizable().aspect_ratio(motor::views::ContentMode::Fit).frame(40.0, 40.0),
+            image(tiny_image(22)).resizable().aspect_ratio(motor::views::ContentMode::Fill).frame(40.0, 40.0),
+            image(tiny_image(23)),
+        );
+        let mount = runtime.dom_frame(&view, Size { width: 200.0, height: 200.0 });
+        let fit_of = |seed| {
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::SetImage { image, .. } if image.key == tiny_image(seed).key() => Some(image),
+                    _ => None,
+                })
+                .map_or_else(
+                    || panic!("picture {seed} mounted: {mount:?}"),
+                    |image| encode(&[DomPatch::SetImage { id: 1, image: *image }]).last().copied(),
+                )
+        };
+        assert_eq!([fit_of(21), fit_of(22), fit_of(23)], [Some(2), Some(1), Some(0)]);
+    }
+
     /// The walk asks whether a style paints without building one: the
     /// answer must be the one the built style gives, prop by prop — a
     /// prop it missed would fold a painted box into its text.
     #[test]
     fn whether_props_paint_is_asked_prop_by_prop() {
         let ink = Color::hex(0x123456);
-        let each: [fn(&mut VisualProps); 14] = [
+        let each: [fn(&mut VisualProps); 15] = [
             |props| props.background = Some(Color::hex(0x123456)),
             |props| {
                 props.gradient = Some(crate::layout::Gradient::Linear {
@@ -7804,6 +8238,7 @@ mod tests {
                     end: crate::layout::UnitPoint { x: 1.0, y: 1.0 },
                     from: Color::BLACK,
                     to: Color::WHITE,
+                    stops: crate::layout::Stops::NONE,
                 })
             },
             |props| props.background_hovered = Some(Color::BLACK),
@@ -7818,6 +8253,7 @@ mod tests {
             |props| props.opacity_hovered = Some(0.5),
             |props| props.opacity_pressed = Some(0.5),
             |props| props.glass = Some(crate::layout::Glass::regular()),
+            |props| props.filters = crate::color_filter::ColorFilters::one(crate::color_filter::ColorFilter::Invert),
         ];
         // an ink alone paints nothing a style records: the text takes it
         let bare = VisualProps { foreground: Some(ink), ..VisualProps::default() };
@@ -7908,6 +8344,7 @@ mod tests {
                 end: crate::layout::UnitPoint { x: 1.0, y: 0.5 },
                 from: Color::BLACK,
                 to: Color::WHITE,
+                stops: crate::layout::Stops::NONE,
             }),
             hover_background: Some(Color::hex(0x223344)),
             pressed_background: Some(Color::hex(0x334455)),
@@ -7920,6 +8357,12 @@ mod tests {
             turn: None,
             corner_radius: Some(Corners::all(6.0)),
             shadow: Some((4.0, Color::hex_a(0x0000_0040))),
+            shadow_offset: None,
+            offset: None,
+            rotation: None,
+            ink_gradient: None,
+            own_ink: false,
+            floor: None,
             transition: Some((0.4, 0.8)),
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
@@ -7927,6 +8370,7 @@ mod tests {
             hidden: false,
             opacity: Some(0.5),
             blur: None,
+            filters: crate::color_filter::ColorFilters::NONE,
             hover_opacity: Some(0.75),
             pressed_opacity: Some(0.25),
             group: Some(7),
@@ -7952,6 +8396,7 @@ mod tests {
             highlights: None,
             truncation: Some(Truncation::End),
             inherits_face: false,
+            line_limit: 0,
         });
         let plain = flow_row("c");
         assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
@@ -7963,6 +8408,11 @@ mod tests {
         boxed.style.set_group_owner(Some(9));
         boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
         assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
+        // a line limit is a look of its own
+        if let DomKind::Text(text) = &mut words.kind {
+            text.line_limit = 2;
+        }
+        assert_ne!(look_hash(&words), 0x80c1_7ab4_826a_edc3);
     }
 
     #[test]
@@ -7970,7 +8420,7 @@ mod tests {
         let soft = DomLook { background: Some(Color::WHITE), blur: Some(3.5), ..DomLook::default() };
         let mut encoded = Vec::new();
         encode_style(&mut encoded, &soft);
-        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64]);
+        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64, 0]);
     }
 
     #[test]
@@ -8116,6 +8566,8 @@ mod tests {
         tail.extend_from_slice(&pack_color(ink).to_le_bytes());
         // three quarters, laid out by the browser: the flow's code
         tail.push(2 + 3);
+        // and the second mask, empty (ABI 28)
+        tail.push(0);
         assert!(out.ends_with(&tail), "{out:?}");
         // the glue reads all three
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
@@ -8123,6 +8575,116 @@ mod tests {
             assert!(glue.contains(bit), "glue_dom.js reads {bit}");
         }
         assert!(glue.contains("stroke-dasharray"), "glue_dom.js hands a dashed pen its rhythm");
+    }
+
+    /// A ramp's stops ride the second mask (bit 3): their count, then
+    /// each stop's location and color. A two-color ramp sets no bit, and
+    /// its look keeps the hash it had.
+    #[test]
+    fn a_ramps_stops_ride_the_second_mask() {
+        let ramp = crate::layout::Gradient::linear(Color::BLACK, Color::WHITE);
+        let look = |gradient| DomLook { gradient: Some(gradient), ..DomLook::NONE };
+        let mut plain = Vec::new();
+        encode_style(&mut plain, &look(ramp));
+        assert_eq!(plain.last(), Some(&0), "a two-color ramp leaves the second mask empty");
+        let green = Color::rgb(0, 255, 0);
+        let mut striped = Vec::new();
+        encode_style(&mut striped, &look(ramp.stop(0.5, green)));
+        let mut tail = vec![1 << 3, 1];
+        tail.extend_from_slice(&0.5f32.to_le_bytes());
+        tail.extend_from_slice(&pack_color(green).to_le_bytes());
+        assert!(striped.ends_with(&tail), "{striped:?}");
+        assert_eq!(striped.len(), plain.len() + 1 + 8);
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("more & 8"), "glue_dom.js reads the stops");
+    }
+
+    /// The ramp a text paints with rides the second mask (bit 4) — the
+    /// ramp's record, then its stops — and a box that paints its text in
+    /// its own ink again sets bit 5 alone.
+    #[test]
+    fn a_text_ramp_rides_the_second_mask() {
+        let ramp = crate::layout::Gradient::linear(Color::BLACK, Color::WHITE);
+        let mut out = Vec::new();
+        encode_style(&mut out, &DomLook { ink_gradient: Some(ramp), ..DomLook::NONE });
+        let mut tail = vec![1 << 4];
+        encode_ramp(&mut tail, &ramp);
+        tail.push(0);
+        assert!(out.ends_with(&tail), "{out:?}");
+        let mut own = Vec::new();
+        encode_style(&mut own, &DomLook { own_ink: true, ..DomLook::NONE });
+        assert_eq!(own.last(), Some(&(1 << 5)));
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("more & 16") && glue.contains("more & 32"), "glue_dom.js reads both");
+    }
+
+    /// A box's floor rides the second mask (bit 6): two f32, zero for
+    /// none.
+    #[test]
+    fn a_floor_rides_the_second_mask() {
+        let mut out = Vec::new();
+        encode_style(&mut out, &DomLook { floor: Some((18.0, 0.0)), ..DomLook::NONE });
+        let mut tail = vec![1 << 6];
+        tail.extend_from_slice(&18f32.to_le_bytes());
+        tail.extend_from_slice(&0f32.to_le_bytes());
+        assert!(out.ends_with(&tail), "{out:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 64"), "glue_dom.js reads it");
+    }
+
+    /// A text's line limit ends its look's record: a byte, zero for none.
+    #[test]
+    fn a_line_limit_ends_the_text_look() {
+        let limited = |line_limit| {
+            let mut out = Vec::new();
+            encode_text_look(&mut out, &DomText { line_limit, ..face_only(FontSpec::DEFAULT) });
+            out
+        };
+        let (free, two) = (limited(0), limited(2));
+        assert_eq!(free.len(), two.len());
+        // the figures' byte follows it
+        assert_eq!(free[free.len() - 2], 0, "{free:?}");
+        assert_eq!(two[two.len() - 2], 2, "{two:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("const lineLimit = u8();"), "glue_dom.js reads it");
+    }
+
+    /// A box's color filters ride the second mask (bit 7): a count, then
+    /// a kind and an amount each, in the order they apply. A look with
+    /// none keeps the hash it had.
+    #[test]
+    fn color_filters_ride_the_second_mask() {
+        use crate::color_filter::{ColorFilter, ColorFilters};
+        let filters = ColorFilters::one(ColorFilter::Grayscale(1.0)).then(ColorFilters::one(ColorFilter::HueRotation(90.0)));
+        let look = DomLook { filters: filters.expect("two fit"), ..DomLook::NONE };
+        let mut out = Vec::new();
+        encode_style(&mut out, &look);
+        let mut tail = vec![1 << 7, 2, 0];
+        tail.extend_from_slice(&1f32.to_le_bytes());
+        tail.push(3);
+        tail.extend_from_slice(&90f32.to_le_bytes());
+        assert!(out.ends_with(&tail), "{out:?}");
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 128"), "glue_dom.js reads them");
+        let node = |look: DomLook| {
+            let mut node = flow_row("a");
+            node.style = DomStyle::new(None, look, DomMarks::default());
+            look_hash(&node)
+        };
+        assert_ne!(node(look), node(DomLook::NONE));
+    }
+
+    /// The text look's record ends with the figures' byte: bit 0, one
+    /// advance each.
+    #[test]
+    fn the_figures_ride_the_text_look() {
+        let record = |monospaced_digits| {
+            let mut out = Vec::new();
+            let font = FontSpec { monospaced_digits, ..FontSpec::DEFAULT };
+            encode_text_look(&mut out, &DomText { font, ..face_only(FontSpec::DEFAULT) });
+            out
+        };
+        let (plain, tabular) = (record(false), record(true));
+        assert_eq!((plain.last(), tabular.last()), (Some(&0), Some(&1)));
+        assert_eq!(plain[..plain.len() - 1], tabular[..tabular.len() - 1]);
+        assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("tabular-nums"), "glue_dom.js writes it");
     }
 
     #[test]
@@ -9129,7 +9691,7 @@ mod tests {
         encode_layout(
             &mut bytes,
             &DomLayout {
-                columns: Some(3),
+                cells: Some(Cells::Columns(3)),
                 gap: Some(4.0),
                 wrap: Some(8.0),
                 align: Some(1),
@@ -9334,6 +9896,8 @@ mod tests {
             &[10, 1],
             &1u32.to_le_bytes()[..],
             &0x112233FFu32.to_le_bytes()[..],
+            // the second style mask, empty (ABI 28)
+            &[0],
             &(1u16 | 1 << 7).to_le_bytes()[..],
             &8f32.to_le_bytes()[..],
             &[0],

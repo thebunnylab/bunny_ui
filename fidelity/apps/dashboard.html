@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=1024, height=700" />
+    <title>Dashboard</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 14px "Fid Sans"; color: #1d1d1f; width: 1024px; height: 700px; overflow: hidden; }
+
+      /* custom properties theme */
+      :root {
+        --accent: #4f46e5;
+        --accent-tint: rgba(79, 70, 229, 0.10);
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --bg: #f4f5f9;
+        --card: #ffffff;
+        --good: #15803d;
+        --good-bg: #dcfce7;
+        --bad: #b91c1c;
+        --bad-bg: #fee2e2;
+        --c1: #4f46e5; --c2: #06b6d4; --c3: #f59e0b; --c4: #ec4899;
+        --gap: 12px;
+        --pad: 16px;
+      }
+
+      /* named grid areas */
+      .app {
+        display: grid;
+        grid-template-areas: "side head" "side main";
+        grid-template-columns: 220px 1fr;
+        grid-template-rows: 56px 1fr;
+        width: 100%; height: 100%;
+        background: var(--bg);
+      }
+
+      /* ---------- sidebar ---------- */
+      .side { grid-area: side; background: #111827; color: #d1d5db; display: flex; flex-direction: column; padding: 14px 0 0; }
+      .brand { display: flex; align-items: center; gap: 10px; padding: 0 18px 16px; color: #fff; font-weight: 800; font-size: 17px; letter-spacing: -0.3px; }
+      .logo { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, var(--c1), var(--c4)); position: relative; }
+      .logo::after { content: ""; position: absolute; inset: 7px; border-radius: 50%; border: 2px solid #fff; }
+      .nav-label { font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase; color: #6b7280; padding: 0 18px 6px; }
+      .nav { list-style: none; margin: 0 0 10px; padding: 0; }
+      .nav li { display: flex; align-items: center; gap: 12px; height: 36px; padding: 0 18px 0 15px; border-left: 3px solid transparent; font-size: 13.5px; }
+      .nav li.active { border-left: 3px solid var(--accent); background: rgba(129, 140, 248, 0.16); color: #fff; font-weight: 700; }
+      .nav li .pill { margin-left: auto; font-size: 10px; background: var(--c4); color: #fff; border-radius: 8px; padding: 1px 6px; }
+      .ico { width: 16px; height: 16px; position: relative; flex: none; }
+      /* CSS-shape icons */
+      .i-grid { background: linear-gradient(currentColor 0 0) 0 0/7px 7px no-repeat, linear-gradient(currentColor 0 0) 9px 0/7px 7px no-repeat, linear-gradient(currentColor 0 0) 0 9px/7px 7px no-repeat, linear-gradient(currentColor 0 0) 9px 9px/7px 7px no-repeat; border-radius: 1px; }
+      .i-chart { border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; }
+      .i-chart::after { content: ""; position: absolute; left: 4px; bottom: 2px; width: 3px; height: 8px; background: currentColor; box-shadow: 5px -3px 0 currentColor; }
+      .i-users::before { content: ""; position: absolute; left: 5px; top: 0; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+      .i-users::after { content: ""; position: absolute; left: 2px; bottom: 0; width: 12px; height: 7px; border-radius: 7px 7px 0 0; background: currentColor; }
+      .i-box { border: 2px solid currentColor; border-radius: 3px; }
+      .i-box::after { content: ""; position: absolute; left: 0; right: 0; top: 4px; height: 2px; background: currentColor; }
+      .i-gear { border: 3px double currentColor; border-radius: 50%; }
+      .i-doc { border: 2px solid currentColor; border-radius: 2px; width: 13px; margin-left: 1px; }
+      .i-doc::after { content: ""; position: absolute; left: 2px; top: 3px; width: 5px; height: 2px; background: currentColor; box-shadow: 0 3px 0 currentColor; }
+      .group-head { display: flex; align-items: center; gap: 8px; padding: 0 18px; height: 30px; font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase; color: #9ca3af; }
+      /* collapsible group chevron from rotated borders */
+      .chev { width: 7px; height: 7px; border-right: 2px solid #9ca3af; border-bottom: 2px solid #9ca3af; transform: rotate(45deg) translate(-2px, -2px); margin-left: auto; }
+      .sub li { height: 30px; padding-left: 46px; font-size: 13px; color: #9ca3af; }
+      .sub li:first-child { margin-top: 2px; }
+      .user-card { margin: auto 12px 12px; padding: 10px; border-radius: 12px; background: rgba(255, 255, 255, 0.07); display: flex; align-items: center; gap: 10px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08); }
+      .user-card img { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; border: 2px solid var(--accent); }
+      .user-card b { display: block; color: #fff; font-size: 13px; }
+      .user-card span { font-size: 11px; color: #9ca3af; }
+
+      /* ---------- header ---------- */
+      .head { grid-area: head; display: flex; align-items: center; gap: 14px; padding: 0 var(--pad); background: #fff; border-bottom: 1px solid var(--line); }
+      .head h1 { font-size: 18px; margin: 0; letter-spacing: -0.3px; }
+      .search { position: relative; flex: 1; max-width: 300px; margin-left: auto; }
+      .search input { width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 17px; background: var(--bg); padding: 0 12px 0 34px; font: 13px "Fid Sans"; color: #1d1d1f; outline: none; }
+      /* inset search icon: circle + rotated handle */
+      .search::before { content: ""; position: absolute; left: 12px; top: 10px; width: 10px; height: 10px; border: 2px solid var(--muted); border-radius: 50%; }
+      .search::after { content: ""; position: absolute; left: 23px; top: 21px; width: 5px; height: 2px; background: var(--muted); transform: rotate(45deg); }
+      .bell { position: relative; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line); }
+      .bell::before { content: ""; position: absolute; left: 10px; top: 8px; width: 12px; height: 13px; border-radius: 6px 6px 2px 2px; background: var(--muted); }
+      .bell::after { content: ""; position: absolute; left: 14px; top: 22px; width: 4px; height: 3px; border-radius: 0 0 3px 3px; background: var(--muted); }
+      .badge { position: absolute; top: -3px; right: -3px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: #ef4444; color: #fff; font-size: 10px; line-height: 16px; text-align: center; border: 2px solid #fff; box-sizing: content-box; }
+      .head img { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; }
+
+      /* ---------- main ---------- */
+      .main { grid-area: main; padding: var(--pad); display: flex; flex-direction: column; gap: var(--gap); min-height: 0; overflow: hidden; }
+      .card { background: var(--card); border-radius: 12px; border: 1px solid var(--line); box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); }
+      .card h2 { margin: 0; font-size: 13px; font-weight: 700; }
+      .card .sub-t { color: var(--muted); font-size: 11px; }
+
+      /* auto-fit KPI grid */
+      .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--gap); }
+      .kpi { padding: 12px 14px; height: 92px; position: relative; overflow: hidden; }
+      .kpi .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+      .kpi .val { font-size: 26px; font-weight: 800; letter-spacing: -0.8px; margin: 2px 0 4px; font-variant-numeric: tabular-nums; }
+      .trend { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 1px 8px; font-variant-numeric: tabular-nums; }
+      .up { color: var(--good); background: var(--good-bg); }
+      .down { color: var(--bad); background: var(--bad-bg); }
+      /* sparkline: flex row of percentage-height divs */
+      .spark { position: absolute; right: 12px; bottom: 12px; width: 62px; height: 32px; display: flex; align-items: flex-end; gap: 2px; }
+      .spark i { flex: 1; background: var(--accent); border-radius: 1px 1px 0 0; opacity: 0.85; }
+
+      .row2 { display: grid; grid-template-columns: calc(40% - 6px) calc(60% - 6px); gap: var(--gap); height: 206px; flex: none; }
+      .pane { padding: 12px 14px; display: flex; flex-direction: column; min-width: 0; position: relative; }
+      .donut-wrap { display: flex; align-items: center; gap: 16px; flex: 1; }
+      /* conic-gradient donut with radial-gradient hole */
+      .donut { position: relative; width: 120px; height: 120px; border-radius: 50%; flex: none;
+        background: radial-gradient(circle closest-side, #fff 0 62%, transparent 63%),
+          conic-gradient(var(--c1) 0 38%, var(--c2) 0 62%, var(--c3) 0 84%, var(--c4) 0 100%); }
+      .donut .mid { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+      .donut .mid b { font-size: 20px; letter-spacing: -0.5px; font-variant-numeric: tabular-nums; }
+      .donut .mid span { font-size: 10px; color: var(--muted); }
+      .legend { list-style: none; margin: 0; padding: 0; flex: 1; display: flex; flex-direction: column; gap: 9px; }
+      .legend li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+      .legend li::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--dot); flex: none; }
+      .legend li em { margin-left: auto; font-style: normal; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+      .phead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+      /* outline button */
+      .btn-o { height: 24px; padding: 0 10px; border: 1.5px solid var(--accent); color: var(--accent); background: transparent; border-radius: 6px; font: 700 11px "Fid Sans"; }
+      .chart { position: relative; flex: 1; display: grid; grid-template-columns: 28px 1fr; min-height: 0; }
+      .yax { display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted); padding-bottom: 16px; text-align: right; padding-right: 6px; }
+      .plot { display: grid; grid-template-columns: repeat(7, 1fr); gap: 14px; padding: 0 6px; margin-bottom: 16px; position: relative;
+        /* gridlines from repeating-linear-gradient */
+        background: repeating-linear-gradient(to bottom, #e5e7eb 0 1px, transparent 1px calc(25% )); border-bottom: 1px solid #cbd5e1; }
+      .col { display: flex; flex-direction: column-reverse; position: relative; }
+      .col span { display: block; }
+      .col .s1 { background: var(--c1); border-radius: 0 0 2px 2px; }
+      .col .s2 { background: var(--c2); }
+      .col .s3 { background: var(--c3); border-radius: 3px 3px 0 0; }
+      .col label { position: absolute; bottom: -16px; left: 0; right: 0; text-align: center; font-size: 10px; color: var(--muted); }
+      /* tooltip with rotated square arrow and layered shadows */
+      .tip { position: absolute; left: 41%; top: 34px; z-index: 5; width: 112px; padding: 7px 10px; border-radius: 8px; background: #111827; color: #fff; font-size: 11px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.18), 0 8px 16px rgba(0, 0, 0, 0.18), 0 16px 32px rgba(17, 24, 39, 0.2); }
+      .tip::before { content: ""; position: absolute; left: 14px; bottom: -4px; width: 9px; height: 9px; background: #111827; transform: rotate(45deg); }
+      .tip b { display: block; font-size: 12px; margin-bottom: 2px; }
+      .tip i { font-style: normal; color: #9ca3af; }
+
+      /* table card */
+      .tcard { flex: 1; min-height: 0; padding: 10px 14px 0; overflow: hidden; }
+      .tcard .phead { margin-bottom: 6px; }
+      .div-d { border: 0; border-top: 1px dashed #cbd5e1; margin: 0 0 2px; }
+      table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+      th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); padding: 5px 8px; font-weight: 700; }
+      td { padding: 0 8px; height: 27px; font-size: 12px; border-top: 1px solid #f1f2f6; }
+      tbody tr:nth-child(even) { background: #f8f9fc; }
+      th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      td.name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .st { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 9px; }
+      .st.ok { background: var(--good-bg); color: var(--good); }
+      .st.wait { background: #fef3c7; color: #92400e; }
+      .st.fail { background: var(--bad-bg); color: var(--bad); }
+      /* inline progress bar cell */
+      .bar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; }
+      .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--c1), var(--c2)); }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="side">
+        <div class="brand"><span class="logo"></span>Northwind</div>
+        <div class="nav-label">Workspace</div>
+        <ul class="nav">
+          <li class="active"><span class="ico i-grid"></span>Overview</li>
+          <li><span class="ico i-chart"></span>Analytics</li>
+          <li><span class="ico i-users"></span>Customers<span class="pill">12</span></li>
+          <li><span class="ico i-box"></span>Products</li>
+        </ul>
+        <div class="group-head">Reports<span class="chev"></span></div>
+        <ul class="nav sub">
+          <li>Monthly summary</li>
+          <li>Cohorts</li>
+          <li>Exports</li>
+        </ul>
+        <ul class="nav">
+          <li><span class="ico i-doc"></span>Invoices</li>
+          <li><span class="ico i-gear"></span>Settings</li>
+        </ul>
+        <div class="user-card">
+          <img src="/assets/avatar.png" alt="" />
+          <div><b>Maya Lindqvist</b><span>Admin • maya@northwind.co</span></div>
+        </div>
+      </aside>
+
+      <header class="head">
+        <h1>Overview</h1>
+        <div class="search"><input type="text" placeholder="Search orders, customers…" /></div>
+        <div class="bell"><span class="badge">3</span></div>
+        <img src="/assets/avatar.png" alt="" />
+      </header>
+
+      <main class="main">
+        <section class="kpis">
+          <div class="card kpi"><div class="lbl">Revenue</div><div class="val">€128,430</div><span class="trend up">+12.4%</span>
+            <div class="spark"><i style="height:35%"></i><i style="height:50%"></i><i style="height:42%"></i><i style="height:68%"></i><i style="height:60%"></i><i style="height:82%"></i><i style="height:100%"></i></div></div>
+          <div class="card kpi"><div class="lbl">Orders</div><div class="val">4,862</div><span class="trend up">+5.1%</span>
+            <div class="spark"><i style="height:55%"></i><i style="height:48%"></i><i style="height:70%"></i><i style="height:64%"></i><i style="height:78%"></i><i style="height:72%"></i><i style="height:90%"></i></div></div>
+          <div class="card kpi"><div class="lbl">Conversion</div><div class="val">3.84%</div><span class="trend down">−1.2%</span>
+            <div class="spark"><i style="height:90%"></i><i style="height:80%"></i><i style="height:85%"></i><i style="height:62%"></i><i style="height:66%"></i><i style="height:50%"></i><i style="height:44%"></i></div></div>
+          <div class="card kpi"><div class="lbl">Avg. order</div><div class="val">€26.41</div><span class="trend up">+2.7%</span>
+            <div class="spark"><i style="height:40%"></i><i style="height:44%"></i><i style="height:38%"></i><i style="height:56%"></i><i style="height:62%"></i><i style="height:58%"></i><i style="height:74%"></i></div></div>
+        </section>
+
+        <section class="row2">
+          <div class="card pane">
+            <div class="phead"><div><h2>Sales by channel</h2><div class="sub-t">Last 30 days</div></div></div>
+            <div class="donut-wrap">
+              <div class="donut"><div class="mid"><b>€128k</b><span>total</span></div></div>
+              <ul class="legend">
+                <li style="--dot:var(--c1)">Direct<em>38%</em></li>
+                <li style="--dot:var(--c2)">Search<em>24%</em></li>
+                <li style="--dot:var(--c3)">Social<em>22%</em></li>
+                <li style="--dot:var(--c4)">Email<em>16%</em></li>
+              </ul>
+            </div>
+          </div>
+          <div class="card pane">
+            <div class="phead"><div><h2>Weekly revenue</h2><div class="sub-t">Stacked by product line</div></div><button class="btn-o">Export</button></div>
+            <div class="chart">
+              <div class="yax"><span>60k</span><span>40k</span><span>20k</span><span>0</span></div>
+              <div class="plot">
+                <div class="col"><span class="s1" style="height:30%"></span><span class="s2" style="height:14%"></span><span class="s3" style="height:10%"></span><label>Mon</label></div>
+                <div class="col"><span class="s1" style="height:34%"></span><span class="s2" style="height:18%"></span><span class="s3" style="height:12%"></span><label>Tue</label></div>
+                <div class="col"><span class="s1" style="height:40%"></span><span class="s2" style="height:22%"></span><span class="s3" style="height:16%"></span><label>Wed</label></div>
+                <div class="col"><span class="s1" style="height:36%"></span><span class="s2" style="height:20%"></span><span class="s3" style="height:11%"></span><label>Thu</label></div>
+                <div class="col"><span class="s1" style="height:46%"></span><span class="s2" style="height:24%"></span><span class="s3" style="height:18%"></span><label>Fri</label></div>
+                <div class="col"><span class="s1" style="height:28%"></span><span class="s2" style="height:16%"></span><span class="s3" style="height:9%"></span><label>Sat</label></div>
+                <div class="col"><span class="s1" style="height:22%"></span><span class="s2" style="height:12%"></span><span class="s3" style="height:8%"></span><label>Sun</label></div>
+                <div class="tip"><b>Wednesday</b><i>Total</i> €78.2k<br /><i>Growth</i> +8.1%</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card tcard">
+          <div class="phead"><h2>Recent orders</h2><span class="sub-t">Showing 5 of 4,862</span></div>
+          <hr class="div-d" />
+          <table>
+            <colgroup><col style="width:78px" /><col /><col style="width:90px" /><col style="width:80px" /><col style="width:96px" /><col style="width:120px" /></colgroup>
+            <thead><tr><th>Order</th><th>Customer</th><th>Status</th><th class="num">Items</th><th class="num">Total</th><th>Fulfilled</th></tr></thead>
+            <tbody>
+              <tr><td>#10482</td><td class="name">Amelia Hartmann-Oyelaran, Studio Nordlicht Berlin GmbH</td><td><span class="st ok">Paid</span></td><td class="num">3</td><td class="num">€212.40</td><td><div class="bar"><i style="width:100%"></i></div></td></tr>
+              <tr><td>#10481</td><td class="name">Jonas Berg</td><td><span class="st wait">Pending</span></td><td class="num">1</td><td class="num">€48.00</td><td><div class="bar"><i style="width:35%"></i></div></td></tr>
+              <tr><td>#10480</td><td class="name">Priya Raman</td><td><span class="st ok">Paid</span></td><td class="num">12</td><td class="num">€1,094.75</td><td><div class="bar"><i style="width:80%"></i></div></td></tr>
+              <tr><td>#10479</td><td class="name">Tomás Ferreira</td><td><span class="st fail">Refunded</span></td><td class="num">2</td><td class="num">€96.20</td><td><div class="bar"><i style="width:12%"></i></div></td></tr>
+              <tr><td>#10478</td><td class="name">Chloé Dubois</td><td><span class="st ok">Paid</span></td><td class="num">5</td><td class="num">€341.00</td><td><div class="bar"><i style="width:62%"></i></div></td></tr>
+            </tbody>
+          </table>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

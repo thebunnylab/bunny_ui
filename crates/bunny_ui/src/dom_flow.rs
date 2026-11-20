@@ -93,6 +93,7 @@ pub(crate) struct FlowKey {
     in_ink_scope: bool,
     font: FontSpec,
     line_height: Option<Px>,
+    line_limit: u8,
     text_align: Option<motor::views::TextAlignment>,
     direction: motor::state::LayoutDirection,
     interactive: Option<std::rc::Rc<str>>,
@@ -149,9 +150,12 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         changed: ChangedIndex::new(env.changed),
         ink: Vec::new(),
         ink_scopes: Vec::new(),
+        inks_set: 0,
+        ramps: Vec::new(),
         font: FontSpec::DEFAULT,
         declared: FontSpec::DEFAULT,
         line_height: None,
+        line_limit: 0,
         text_align: None,
         direction: env.direction,
         pending_interactive: None,
@@ -276,6 +280,12 @@ struct Walk<'a> {
     /// Depths where a hover/pressed ink opened: inside one, text
     /// inherits instead of painting its own color.
     ink_scopes: Vec<usize>,
+    /// How many colors are set by the styles open around here, and, for
+    /// each open ramp the text paints with, how many were when it
+    /// opened: a text under a ramp with more colors set since paints in
+    /// its own ink, as the nearer ink wins in `SwiftUI`.
+    inks_set: usize,
+    ramps: Vec<usize>,
     font: FontSpec,
     /// The face declared by the nearest element above that declares
     /// one — the root's default until a box changes it. A text with
@@ -284,6 +294,8 @@ struct Walk<'a> {
     /// The inherited line box, mirroring `font` — the browser steps the
     /// lines by it, the way our own placement does.
     line_height: Option<crate::layout::Px>,
+    /// The inherited line limit, mirroring `line_height`; zero is none.
+    line_limit: u8,
     /// The inherited line alignment, mirroring `line_height`.
     text_align: Option<motor::views::TextAlignment>,
     /// Which way the walk reads here — the root's, or an island's.
@@ -477,16 +489,28 @@ fn align_code(align: CrossAlign) -> u8 {
     }
 }
 
+/// The edge a [`crate::layout::UnitPoint`] coordinate names. A cell
+/// aligns by edges, so a point between them goes to the nearest.
+fn unit_align(at: f64) -> CrossAlign {
+    if at <= 0.25 {
+        CrossAlign::Start
+    } else if at >= 0.75 {
+        CrossAlign::End
+    } else {
+        CrossAlign::Center
+    }
+}
+
 /// [`align_code`] with the vertical edge a node names in the high nibble
-/// ([`crate::dom::DomLayout::align`]): only the top and bottom rows of an
-/// `Alignment` hold a child against an edge. The middle row centres
-/// natively and keeps the flow's own placement here, which is what it
-/// lowered to before it had a name — so its byte is the one it was.
+/// ([`crate::dom::DomLayout::align`]). The middle row centres: a frame
+/// taller than its child holds the child in its middle, as the pixel
+/// pipelines place it, and a flex column's own placement would put it on
+/// top.
 fn align_both(align: CrossAlign, vertical: CrossAlign) -> u8 {
     let edge = match vertical {
         CrossAlign::Start | CrossAlign::Baseline => 1,
+        CrossAlign::Center => 2,
         CrossAlign::End => 3,
-        CrossAlign::Center => 0,
     };
     align_code(align) | edge << 4
 }
@@ -499,6 +523,7 @@ impl Walk<'_> {
             in_ink_scope: !self.ink_scopes.is_empty(),
             font: self.font,
             line_height: self.line_height,
+            line_limit: self.line_limit,
             text_align: self.text_align,
             direction: self.direction,
             interactive: self.pending_interactive.clone(),
@@ -537,6 +562,7 @@ impl Walk<'_> {
             in_ink_scope,
             font,
             line_height,
+            line_limit,
             text_align,
             direction,
             interactive,
@@ -552,6 +578,7 @@ impl Walk<'_> {
             && *unbounded == self.unbounded
             && *direction == self.direction
             && *line_height == self.line_height
+            && *line_limit == self.line_limit
             && *text_align == self.text_align
             && *group == self.groups.last().copied()
             && *in_overlay == (self.overlay_depth > 0)
@@ -610,6 +637,7 @@ impl Walk<'_> {
                 None => (None, None),
             };
             Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
+            Self::stamp_test_id(&mut out[opened..], hints.test_id());
             // what a control IS rides to the element that answers its
             // press: the page has no accessibility tree to ask, so the
             // glue says the role, the state and the tab stop as attributes
@@ -641,7 +669,7 @@ impl Walk<'_> {
                 container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 let columns = (*columns).clamp(1, u16::MAX as usize);
-                layout.columns = Some(columns as u16);
+                layout.cells = Some(crate::dom::Cells::Columns(columns as u16));
                 layout.gap = Some(*spacing as f32);
                 layout.wrap = Some(*row_spacing as f32);
                 layout.align = Some(align_both(*align, *vertical));
@@ -791,6 +819,7 @@ impl Walk<'_> {
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    Self::stamp_cell(child, &mut container.children[opened..]);
                     if let Some(at) = child.placed_at() {
                         stamp_position(&mut container.children[opened..], at, true, child, None);
                     }
@@ -803,9 +832,12 @@ impl Walk<'_> {
                 // FOLD: a padding around one pure layout node becomes
                 // that node's own padding (nested edges sum). Styled
                 // boxes never fold — their background must stay tight
-                // to the child, and CSS padding would slide under it.
+                // to the child, and CSS padding would slide under it —
+                // and neither does a node a harness names: its box is
+                // the view's, not the padding's.
                 if let [only] = lowered.as_mut_slice()
                     && only.style.is_default()
+                    && only.hints.test_id().is_none()
                     && !only.layout.as_ref().is_some_and(|layout| layout.relative)
                     && matches!(
                         only.kind,
@@ -822,6 +854,12 @@ impl Walk<'_> {
                         sum(was_bottom, bottom),
                         sum(was_leading, leading),
                     ));
+                    // the box sizes its border edge: a frame's own size is
+                    // its content's, and the padding goes around it
+                    layout.width = layout.width.map(|width| sum(width, leading + trailing));
+                    layout.height = layout.height.map(|height| sum(height, top + bottom));
+                    layout.max_width = layout.max_width.map(|width| sum(width, leading + trailing));
+                    layout.max_height = layout.max_height.map(|height| sum(height, top + bottom));
                     out.append(&mut lowered);
                     return;
                 }
@@ -855,6 +893,14 @@ impl Walk<'_> {
                 self.unbounded = outer_unbounded;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                // a frame pins what it names: the hunger inside stops at
+                // the axes it pins, or the box around it (a background,
+                // a border) stretches to the holder past the frame
+                let open_hunger = (width.is_none() && child.is_flexible(Axis::Horizontal, None))
+                    || (height.is_none() && child.is_flexible(Axis::Vertical, None));
+                if !open_hunger && let Some(layout) = container.layout.as_mut() {
+                    layout.stretch = false;
+                }
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
@@ -890,20 +936,41 @@ impl Walk<'_> {
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
-            // The flex frame on the web flow: a growing box. Its FLOOR is not
-            // honoured here yet — the flow layout carries no minimum, so a
-            // pane narrower than a table's floors squeezes the lanes on the
-            // web where the desktop scrolls them. Recorded, not hidden.
-            LayoutNode::FlexFrame { align, vertical, child, .. } => {
+            // The flex frame on the web flow: a growing box, never smaller
+            // than its floor — a pane narrower than a table's floors
+            // overflows the lanes, as the desktop does
+            LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.grow = true;
                     layout.align = Some(align_both(*align, *vertical));
                 }
+                if *min_width > 0.0 || *min_height > 0.0 {
+                    container.style.look_mut().floor = Some((*min_width, *min_height));
+                }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
+                Self::fold_table_wrapper(container);
+            }
+            // a box that hugs its content above a floor: its own `min-width`
+            // and `min-height`, the content placed by the alignment
+            LayoutNode::MinFrame { min_width, min_height, align, vertical, child } => {
+                let container = placed(out, node(DomKind::FlexColumn));
+                container.layout.as_mut().expect("flow node").align = Some(align_both(*align, *vertical));
+                if *min_width > 0.0 || *min_height > 0.0 {
+                    container.style.look_mut().floor = Some((*min_width, *min_height));
+                }
+                self.lower_into(child, &mut container.children);
+                Self::stamp_fill(child, &mut container.children);
+                Self::inherit_stretch(container);
+                // it hugs: the hunger inside is all it has
+                let hungry = child.is_flexible(Axis::Horizontal, None) || child.is_flexible(Axis::Vertical, None);
+                if !hungry && let Some(layout) = container.layout.as_mut() {
+                    layout.stretch = false;
+                }
                 Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
@@ -926,8 +993,13 @@ impl Walk<'_> {
                 shape.layout.as_mut().expect("flow node").grow = true;
                 // currentColor follows inherited hover/press ink in CSS too.
                 // An unstyled shape retains the original rectangle's fill.
+                // A plain ink is no element's CSS `color` — the box that
+                // carried it declares one only for a state — so outside a
+                // hover scope the shape names the ink itself.
                 if self.ink.is_empty() {
                     shape.style.look_mut().color = Some(Color::FILL);
+                } else if self.ink_scopes.is_empty() {
+                    shape.style.look_mut().color = Some(self.current_ink());
                 }
             }
             LayoutNode::Leaf { size } => {
@@ -939,10 +1011,12 @@ impl Walk<'_> {
             LayoutNode::Styled { props, child, .. } => {
                 let outer_font = self.font;
                 let outer_line_height = self.line_height;
+                let outer_line_limit = self.line_limit;
                 let outer_text_align = self.text_align;
                 let outer_direction = self.direction;
                 self.font = props.font.apply_over(self.font);
                 self.line_height = props.line_height.or(self.line_height);
+                self.line_limit = props.line_limit.unwrap_or(self.line_limit);
                 self.text_align = props.text_align.or(self.text_align);
                 self.direction = props.direction.unwrap_or(self.direction);
                 // a style that turns the direction opens an ISLAND: its box
@@ -973,10 +1047,14 @@ impl Walk<'_> {
                     && !DomLook::paints(props)
                 {
                     self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
+                    let sets = usize::from(props.foreground.is_some());
+                    self.inks_set += sets;
                     self.lower_into(child, out);
+                    self.inks_set -= sets;
                     self.ink.pop();
                     self.font = outer_font;
                     self.line_height = outer_line_height;
+                    self.line_limit = outer_line_limit;
                     self.text_align = outer_text_align;
                     self.direction = outer_direction;
                     return;
@@ -1009,6 +1087,7 @@ impl Walk<'_> {
                 // the scene, as the engine's does
                 if self.direction.is_rtl() {
                     look.gradient = look.gradient.map(crate::layout::Gradient::flipped);
+                    look.ink_gradient = look.ink_gradient.map(crate::layout::Gradient::flipped);
                 }
                 let marks = DomMarks { tooltip: self.pending_tooltip.take(), group_owner: None };
                 // the tint is the half of the material an ELEMENT owns:
@@ -1037,6 +1116,12 @@ impl Walk<'_> {
                 if states {
                     self.ink_scopes.push(self.ink.len());
                 }
+                // a ramp wins over a color set beside it
+                let sets = usize::from(props.foreground.is_some() && props.foreground_gradient.is_none());
+                self.inks_set += sets;
+                if props.foreground_gradient.is_some() {
+                    self.ramps.push(self.inks_set);
+                }
                 // a box that changes the face declares it for its
                 // subtree, once; the texts under it with that face
                 // inherit it and name none of their own
@@ -1047,16 +1132,22 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut boxed.children);
                 self.declared = outer_declared;
+                if props.foreground_gradient.is_some() {
+                    self.ramps.pop();
+                }
+                self.inks_set -= sets;
                 if states {
                     self.ink_scopes.pop();
                 }
                 self.ink.pop();
                 self.font = outer_font;
                 self.line_height = outer_line_height;
+                self.line_limit = outer_line_limit;
                 self.text_align = outer_text_align;
                 self.direction = outer_direction;
                 Self::stamp_fill(child, &mut boxed.children);
                 Self::inherit_stretch(boxed);
+                Self::inherit_offer(boxed);
             }
             LayoutNode::Text { content, highlights, truncation, .. } => {
                 // a text that reads for itself carries its binding into
@@ -1073,7 +1164,12 @@ impl Walk<'_> {
                     highlights: highlights.clone(),
                     truncation: *truncation,
                     inherits_face: self.font == self.declared,
+                    line_limit: self.line_limit,
                 })));
+                // under a ramp, a color set nearer the text wins
+                if self.ramps.last().is_some_and(|at| self.inks_set > *at) {
+                    text.style.look_mut().own_ink = true;
+                }
                 text.style.interactive = self.pending_interactive.take();
                 text.style.set_tooltip(self.pending_tooltip.take());
                 text.binding = binding.map(crate::dom::NodeBinding::Text);
@@ -1149,9 +1245,13 @@ impl Walk<'_> {
                             fit,
                             Some(motor::views::ContentMode::Fill)
                         );
+                        // a contained picture holds its whole box below and
+                        // the browser letterboxes it there
+                        let contain = *resizable && matches!(fit, Some(motor::views::ContentMode::Fit));
                         let mut picture = node(DomKind::Image(crate::dom::DomImage {
                             key: source.key(),
                             cover,
+                            contain,
                         }));
                         // a resizable picture takes the length it is offered
                         // down its holder, as the pixel layout sizes it to
@@ -1411,16 +1511,29 @@ impl Walk<'_> {
                     owner.style.set_group_owner(Some(key));
                 }
             }
-            LayoutNode::Overlay { behind, layer, child, .. } => {
+            LayoutNode::Overlay { at, behind, layer, child } => {
                 // one grid cell, both in it — the browser stacks them
-                // in document order
+                // in document order. The cell is the box's own size, so
+                // placing both by the layer's point moves the layer
+                // alone: a point of the layer meets the same point of
+                // the box
                 let cell = placed(out, node(DomKind::Layers));
+                cell.layout.as_mut().expect("flow node").align =
+                    Some(align_both(unit_align(at.x), unit_align(at.y)));
                 self.overlay_depth += 1;
                 let mut over = Vec::new();
                 self.lower_into(layer, &mut over);
                 self.overlay_depth -= 1;
+                Self::stamp_cell(layer, &mut over);
                 let mut under = Vec::new();
                 self.lower_into(child, &mut under);
+                Self::stamp_cell(child, &mut under);
+                // the base alone sizes the cell: a layer larger than the
+                // box overflows it, as SwiftUI's does
+                if let [_] = under.as_slice() {
+                    let base = if *behind { crate::dom::LayerBase::Last } else { crate::dom::LayerBase::First };
+                    cell.layout.as_mut().expect("flow node").cells = Some(crate::dom::Cells::Base(base));
+                }
                 if *behind {
                     cell.children.extend(over);
                     cell.children.extend(under);
@@ -1474,10 +1587,11 @@ impl Walk<'_> {
                 // the browser keeps its own safe area outside the tab
                 self.lower_into(child, out);
             }
-            LayoutNode::Hinted { tag, class, dom_id, href, child } => {
+            LayoutNode::Hinted { tag, class, dom_id, href, test_id, child } => {
                 let opened = out.len();
                 self.lower_into(child, out);
                 Self::stamp_hints(&mut out[opened..], tag, class, dom_id, href);
+                Self::stamp_test_id(&mut out[opened..], test_id.as_ref());
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
@@ -1649,6 +1763,16 @@ impl Walk<'_> {
         }
     }
 
+    /// The harness's name, on every element the view lowered to.
+    fn stamp_test_id(lowered: &mut [DomNode], test_id: Option<&std::rc::Rc<str>>) {
+        if test_id.is_none() {
+            return;
+        }
+        for tested in lowered {
+            tested.hints.address = crate::layout::Address::tested(&tested.hints.address, test_id);
+        }
+    }
+
     /// A boundary's promise of reuse, pushed when nothing it shows can
     /// have changed; the record's fill comes back with it, `None` when
     /// the group must be lowered again. `retained` says the walk reached
@@ -1770,6 +1894,22 @@ impl Walk<'_> {
         }
     }
 
+    /// A grid cell places what it holds by the cell's alignment, and a
+    /// flex line's grow means nothing there: a layer that takes what
+    /// it is offered stretches across the cell on that axis instead —
+    /// `fill` is `justify-self: stretch` too, the horizontal one, and
+    /// `stretch` the vertical.
+    fn stamp_cell(child: &LayoutNode, lowered: &mut [DomNode]) {
+        let across = child.is_flexible(Axis::Horizontal, None);
+        let down = child.is_flexible(Axis::Vertical, None);
+        for node in lowered {
+            if let Some(layout) = node.layout.as_mut() {
+                layout.fill |= across;
+                layout.stretch |= down;
+            }
+        }
+    }
+
     /// A frame is a column that places its child by its alignment, so
     /// the column's own stretch is off — and a child that takes the
     /// width it is offered (a band, a row with a spacer) would hug its
@@ -1857,8 +1997,11 @@ impl Walk<'_> {
         if !lone_table {
             return;
         }
+        // a block cannot centre: only the leading edge folds, and the
+        // middle row keeps the block's top, as it always did
+        let leading = [align_code(CrossAlign::Start), align_both(CrossAlign::Start, CrossAlign::Center)];
         if let Some(layout) = container.layout.as_mut()
-            && layout.align == Some(align_code(CrossAlign::Start))
+            && layout.align.is_some_and(|align| leading.contains(&align))
             && layout.wrap.is_none()
         {
             layout.plain = true;
@@ -1895,6 +2038,23 @@ impl Walk<'_> {
     /// A hungry interior keeps its hunger through a pure wrapper —
     /// the stretch has to reach the flex line that can actually feed
     /// it, or the wrapper sizes to its content and starves the child.
+    /// A box around a picture that takes its offer — its clip, its
+    /// corners, its border — is laid out as the picture: it takes the
+    /// offer and stretches across, or the picture's own stretch stops at
+    /// the box and the box keeps the picture's natural width.
+    fn inherit_offer(container: &mut DomNode) {
+        let takes_offer = |node: &DomNode| {
+            node.layout.as_ref().is_some_and(|layout| layout.fill && (matches!(node.kind, DomKind::Image(_)) || layout.stretch))
+        };
+        if let [only] = container.children.as_slice()
+            && takes_offer(only)
+            && let Some(layout) = container.layout.as_mut()
+        {
+            layout.fill = true;
+            layout.stretch = true;
+        }
+    }
+
     fn inherit_stretch(container: &mut DomNode) {
         if container
             .children
@@ -2121,7 +2281,7 @@ mod tests {
         assert_eq!(grid.style.interactive.as_deref(), Some("grid-action"));
         let layout = grid.layout.as_ref().unwrap();
         assert_eq!(
-            (layout.columns, layout.gap, layout.wrap),
+            (layout.columns(), layout.gap, layout.wrap),
             (Some(2), Some(4.0), Some(8.0))
         );
         let span = |index: usize| {
@@ -2345,9 +2505,12 @@ mod tests {
             changed: ChangedIndex::new(env.changed),
             ink: Vec::new(),
             ink_scopes: Vec::new(),
+            inks_set: 0,
+            ramps: Vec::new(),
             font: FontSpec::DEFAULT,
             declared: FontSpec::DEFAULT,
             line_height: None,
+            line_limit: 0,
             text_align: None,
             direction: env.direction,
             pending_interactive: None,
@@ -2374,12 +2537,13 @@ mod tests {
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
         type WalkChange = (&'static str, fn(&mut Walk));
-        let moves: [WalkChange; 12] = [
+        let moves: [WalkChange; 13] = [
             ("the direction", |walk| walk.direction = motor::state::LayoutDirection::RightToLeft),
             ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
             ("an ink scope", |walk| walk.ink_scopes.push(0)),
             ("the face", |walk| walk.font.size += 3.0),
             ("the line box", |walk| walk.line_height = Some(21.0)),
+            ("the line limit", |walk| walk.line_limit = 2),
             ("the alignment", |walk| walk.text_align = Some(motor::views::TextAlignment::Center)),
             ("a press", |walk| walk.pending_interactive = Some(std::rc::Rc::from("App/#0/button"))),
             ("a transition", |walk| walk.pending_transition = Some((0.3, 0.8))),
@@ -2467,6 +2631,7 @@ mod tests {
                     end: crate::layout::UnitPoint::TRAILING,
                     from: Color::BLACK,
                     to: Color::WHITE,
+                    stops: crate::layout::Stops::NONE,
                 }),
                 ..Default::default()
             }
@@ -2525,9 +2690,11 @@ mod tests {
             scene.children[0].layout.as_ref().expect("flow").align
         };
 
-        assert_eq!(code(CrossAlign::Start), Some(align_code(CrossAlign::Start)));
-        assert_eq!(code(CrossAlign::Center), Some(align_code(CrossAlign::Center)));
-        assert_eq!(code(CrossAlign::End), Some(align_code(CrossAlign::End)));
+        // and the middle row on the vertical one: the lane's child sits
+        // in the lane's middle
+        for align in [CrossAlign::Start, CrossAlign::Center, CrossAlign::End] {
+            assert_eq!(code(align), Some(align_code(align) | 2 << 4));
+        }
     }
 
     /// The native host lowers to the browser's own island: an iframe

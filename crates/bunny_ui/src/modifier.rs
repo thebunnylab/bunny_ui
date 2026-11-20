@@ -42,9 +42,14 @@ pub enum Modifier {
     FrameWH(f64, f64, Alignment),
     FrameWidth(f64, Alignment),
     FrameHeight(f64),
+    /// `.frame(height:alignment:)` — exact on the vertical axis, the
+    /// child placed on the named edge inside it.
+    FrameHeightAligned(f64, Alignment),
     Tracking(Tracking),
     FrameMax(f64, f64, Alignment),
     FrameFlex(f64, f64, Alignment),
+    /// `.frame(minWidth:minHeight:alignment:)` — hugs above a floor.
+    FrameMin(f64, f64, Alignment),
     HugHeight,
     /// The outer box sits at this point in its enclosing stack.
     Position(crate::layout::Point),
@@ -75,11 +80,23 @@ pub enum Modifier {
 
     // MARK: - Visuals (pure data → `Styled` in the scene)
     BackgroundColor(Color),
-    BackgroundGradient(crate::layout::Gradient),
+    /// Boxed: a ramp carries its stops inline.
+    BackgroundGradient(Box<crate::layout::Gradient>),
     /// Whether the background lies over what is under it or replaces it.
     BackgroundBlend(crate::layout::BackgroundBlend),
     ForegroundColor(Color),
+    /// Boxed: a ramp carries its stops inline.
+    ForegroundGradient(Box<crate::layout::Gradient>),
     Border(Color, f64),
+    /// `.shadow_offset(x, y)` — where the halo sits from the box.
+    ShadowOffset(f64, f64),
+    /// `.offset(x, y)` — the box drawn this far from its place.
+    Offset(f64, f64),
+    /// `.rotation_effect(…)` — degrees clockwise, about a point of the box.
+    Rotation(f64, crate::layout::UnitPoint),
+    /// `.grayscale(…)`, `.saturation(…)`, `.contrast(…)`,
+    /// `.hue_rotation(…)`, `.color_invert()`.
+    ColorFilter(crate::color_filter::ColorFilter),
     /// `.border_style(…)` — how the border's line is drawn.
     BorderStyle(crate::shapes::BorderStyle),
     /// `.background_stripes(…)` — bands over the background.
@@ -106,6 +123,8 @@ pub enum Modifier {
         over: Option<crate::layout::DragOverAction>,
     },
     Monospaced,
+    /// `.monospacedDigit()` — the figures take one advance each.
+    MonospacedDigit,
     /// `.font_family(…)` — the face itself, by name. Only the family
     /// travels: a size, a weight and a lean around it all survive.
     FontFamily(crate::text_engine::Family),
@@ -115,6 +134,9 @@ pub enum Modifier {
     /// points. Inherited, and an exception to "props is paint only": it
     /// sets what a paragraph measures.
     LineHeight(f64),
+    /// The most lines the text below shows, the last one closed with an
+    /// ellipsis — `.lineLimit(n)`. Inherited like the font; zero is none.
+    LineLimit(u8),
     /// A weight by NAME — the rest of the font stays.
     FontWeight(crate::text_engine::Weight),
     BackgroundHovered(Color),
@@ -190,6 +212,9 @@ pub enum Modifier {
         Option<std::rc::Rc<str>>,
         Option<std::rc::Rc<str>>,
     ),
+    /// `.test_id(…)` — the name a harness finds the view by, on every
+    /// lowering: an attribute on the page, a frame in the pixel table.
+    TestId(std::rc::Rc<str>),
     /// `.layout(Exact)` — the element lowering keeps our numbers here.
     LayoutMode(crate::layout::LayoutMode),
 
@@ -292,9 +317,11 @@ impl Modifier {
             Modifier::FrameWH { .. } => "frame",
             Modifier::FrameWidth { .. } => "frame_width",
             Modifier::FrameHeight { .. } => "frame_height",
+            Modifier::FrameHeightAligned { .. } => "frame_height_aligned",
             Modifier::Tracking { .. } => "tracking",
             Modifier::FrameMax { .. } => "frame_max",
             Modifier::FrameFlex { .. } => "frame_flex",
+            Modifier::FrameMin { .. } => "frame_min",
             Modifier::HugHeight => "hug_height",
             Modifier::Position(_) => "position",
             Modifier::Span(_, _) => "span",
@@ -317,7 +344,18 @@ impl Modifier {
             Modifier::BackgroundGradient { .. } => "background_gradient",
             Modifier::BackgroundBlend { .. } => "background_blend",
             Modifier::ForegroundColor { .. } => "foreground_color",
+            Modifier::ForegroundGradient { .. } => "foreground_gradient",
             Modifier::Border { .. } => "border",
+            Modifier::ShadowOffset { .. } => "shadow_offset",
+            Modifier::Offset { .. } => "offset",
+            Modifier::Rotation { .. } => "rotation_effect",
+            Modifier::ColorFilter(filter) => match filter {
+                crate::color_filter::ColorFilter::Grayscale(_) => "grayscale",
+                crate::color_filter::ColorFilter::Saturation(_) => "saturation",
+                crate::color_filter::ColorFilter::Contrast(_) => "contrast",
+                crate::color_filter::ColorFilter::HueRotation(_) => "hue_rotation",
+                crate::color_filter::ColorFilter::Invert => "color_invert",
+            },
             Modifier::BorderStyle { .. } => "border_style",
             Modifier::BackgroundStripes { .. } => "background_stripes",
             Modifier::QuarterTurn { .. } => "quarter_turn",
@@ -329,9 +367,11 @@ impl Modifier {
             Modifier::OnDrag { .. } => "on_drag",
             Modifier::OnDrop { .. } => "on_drop",
             Modifier::Monospaced => "monospaced",
+            Modifier::MonospacedDigit => "monospaced_digit",
             Modifier::FontFamily { .. } => "font_family",
             Modifier::FontSize { .. } => "font_size",
             Modifier::LineHeight { .. } => "line_height",
+            Modifier::LineLimit { .. } => "line_limit",
             Modifier::FontWeight { .. } => "font_weight",
             Modifier::BackgroundHovered { .. } => "background_hovered",
             Modifier::Opacity { .. } => "opacity",
@@ -367,6 +407,7 @@ impl Modifier {
             Modifier::WindowDragRegion => "window_drag_region",
             Modifier::WindowControl { .. } => "window_control",
             Modifier::ElementHint { .. } => "element",
+            Self::TestId(_) => "test_id",
             Modifier::LayoutMode { .. } => "layout_mode",
             Modifier::OnClick { .. } => "on_click",
             Modifier::OnHover { .. } => "on_hover",
@@ -414,6 +455,7 @@ impl Modifier {
                 format!(" [.frame(width: {width}, alignment: {alignment})]")
             }
             Modifier::FrameHeight(height) => format!(" [.frame(height: {height})]"),
+            Modifier::FrameHeightAligned(height, alignment) => format!(" [.frame(height: {height}, alignment: {alignment})]"),
             Modifier::Tracking(Tracking::Points(points)) => format!(" [.tracking({points})]"),
             Modifier::Tracking(Tracking::Em(em)) => format!(" [.tracking({em}em)]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
@@ -421,6 +463,9 @@ impl Modifier {
             ),
             Modifier::FrameFlex(min_width, min_height, alignment) => format!(
                 " [.frame(flex, minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
+            ),
+            Modifier::FrameMin(min_width, min_height, alignment) => format!(
+                " [.frame(minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
             ),
             Modifier::HugHeight => " [.hugHeight]".into(),
             Modifier::Span(columns, rows) => format!(" [.span({columns}, {rows})]"),
@@ -448,7 +493,7 @@ impl Modifier {
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
             Modifier::BackgroundBlend(blend) => format!(" [.backgroundBlend({blend:?})]"),
-            Modifier::BackgroundGradient(gradient) => match gradient {
+            Modifier::BackgroundGradient(gradient) => match **gradient {
                 crate::layout::Gradient::Radial { inner, outer, .. } => {
                     format!(" [.background(RadialGradient({inner} → {outer}))]")
                 }
@@ -457,7 +502,25 @@ impl Modifier {
                 }
             },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
+            Modifier::ForegroundGradient(gradient) => match **gradient {
+                crate::layout::Gradient::Radial { inner, outer, .. } => {
+                    format!(" [.foregroundStyle(RadialGradient({inner} → {outer}))]")
+                }
+                crate::layout::Gradient::Linear { from, to, .. } => {
+                    format!(" [.foregroundStyle(LinearGradient({from} → {to}))]")
+                }
+            },
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
+            Modifier::ShadowOffset(x, y) => format!(" [.shadow(x: {x}, y: {y})]"),
+            Modifier::Offset(x, y) => format!(" [.offset(x: {x}, y: {y})]"),
+            Modifier::Rotation(degrees, anchor) => format!(" [.rotationEffect(.degrees({degrees}), anchor: ({}, {}))]", anchor.x, anchor.y),
+            Modifier::ColorFilter(filter) => match filter {
+                crate::color_filter::ColorFilter::Grayscale(amount) => format!(" [.grayscale({amount})]"),
+                crate::color_filter::ColorFilter::Saturation(amount) => format!(" [.saturation({amount})]"),
+                crate::color_filter::ColorFilter::Contrast(amount) => format!(" [.contrast({amount})]"),
+                crate::color_filter::ColorFilter::HueRotation(degrees) => format!(" [.hueRotation(.degrees({degrees}))]"),
+                crate::color_filter::ColorFilter::Invert => " [.colorInvert()]".into(),
+            },
             Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
             Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
             Modifier::BackgroundStripes(stripes) => format!(
@@ -483,12 +546,14 @@ impl Modifier {
             Modifier::OnDrag(_) => " [.onDrag()]".into(),
             Modifier::OnDrop { .. } => " [.onDrop()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::MonospacedDigit => " [.monospacedDigit()]".into(),
             Modifier::FontFamily(family) => {
                 format!(" [.font_family({:?})]", family.name().unwrap_or_default())
             }
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::LineHeight(height) => format!(" [.lineHeight({height})]"),
+            Modifier::LineLimit(lines) => format!(" [.lineLimit({lines})]"),
             Modifier::FontWeight(weight) => format!(" [.fontWeight(.{weight:?})]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::Opacity(value) => format!(" [.opacity({value})]"),
@@ -556,6 +621,7 @@ impl Modifier {
             Modifier::ElementHint(tag, class, dom_id, href) => {
                 format!(" [.element({tag:?}, {class:?}, {dom_id:?}, {href:?})]")
             }
+            Self::TestId(id) => format!(" [.test_id({id:?})]"),
             Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnHover(_) => " [.onHover()]".into(),
@@ -662,7 +728,7 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
         // wrapper, where no style reached it to merge: the new one
         // nests, as it did. One that merges merges where it stands
         LayoutNode::Styled { props, hints, action: None, .. }
-            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() => {
+            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() && filters_fold(props, &delta) => {
             VisualProps::restyle(props, delta);
         }
         node => wrap_in_place(node, |other| LayoutNode::Styled {
@@ -672,6 +738,16 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
             action: None,
         }),
     }
+}
+
+/// May `delta`, set outside a style, fold into it? A filter takes in
+/// everything the style paints, so it folds into any; once filtered, a
+/// style takes in only more filters, while they fit — what is set
+/// further out lies outside the filter.
+fn filters_fold(props: &VisualProps, delta: &VisualProps) -> bool {
+    props.filters.is_empty()
+        || (VisualProps { filters: crate::color_filter::ColorFilters::NONE, ..*delta } == VisualProps::default()
+            && props.filters.then(delta.filters).is_some())
 }
 
 /// Makes what the base left the target of `path`. A stack, a text or a
@@ -1350,6 +1426,12 @@ pub(crate) fn apply(
                 child: Box::new(node),
             });
         }
+        Modifier::FrameHeightAligned(height, alignment) => {
+            let height = Some(*height);
+            let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::Frame { width: None, height, align, vertical, child: Box::new(node) });
+        }
         Modifier::FrameMax(max_width, max_height, alignment) => {
             let (max_width, max_height) = (*max_width, *max_height);
             let align = crate::views::cross_align(*alignment);
@@ -1357,6 +1439,18 @@ pub(crate) fn apply(
             out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
                 max_width,
                 max_height,
+                align,
+                vertical,
+                child: Box::new(node),
+            });
+        }
+        Modifier::FrameMin(min_width, min_height, alignment) => {
+            let (min_width, min_height) = (*min_width, *min_height);
+            let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::MinFrame {
+                min_width,
+                min_height,
                 align,
                 vertical,
                 child: Box::new(node),
@@ -1406,7 +1500,7 @@ pub(crate) fn apply(
         Modifier::BackgroundGradient(gradient) => wrap_styled(
             out,
             mark,
-            VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
+            VisualProps { gradient: Some(**gradient), ..VisualProps::default() },
         ),
         Modifier::BackgroundBlend(blend) => wrap_styled(
             out,
@@ -1433,11 +1527,37 @@ pub(crate) fn apply(
             mark,
             VisualProps { foreground: Some(*color), ..VisualProps::default() },
         ),
+        Modifier::ForegroundGradient(gradient) => wrap_styled(
+            out,
+            mark,
+            VisualProps { foreground_gradient: Some(**gradient), ..VisualProps::default() },
+        ),
         Modifier::Border(color, width) => wrap_styled(
             out,
             mark,
             VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
         ),
+        Modifier::ShadowOffset(x, y) => wrap_styled(
+            out,
+            mark,
+            VisualProps { shadow_offset: Some((*x, *y)), ..VisualProps::default() },
+        ),
+        Modifier::Offset(x, y) => wrap_styled(
+            out,
+            mark,
+            VisualProps { offset: Some((*x, *y)), ..VisualProps::default() },
+        ),
+        Modifier::Rotation(degrees, anchor) => wrap_styled(
+            out,
+            mark,
+            VisualProps { rotation: Some((*degrees, *anchor)), ..VisualProps::default() },
+        ),
+        Modifier::ColorFilter(filter) => {
+            if let Some(filter) = filter.normalized() {
+                let filters = crate::color_filter::ColorFilters::one(filter);
+                wrap_styled(out, mark, VisualProps { filters, ..VisualProps::default() });
+            }
+        }
         Modifier::BorderStyle(style) => wrap_styled(
             out,
             mark,
@@ -1544,6 +1664,14 @@ pub(crate) fn apply(
                 ..VisualProps::default()
             },
         ),
+        Modifier::MonospacedDigit => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { monospaced_digits: Some(true), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
         // only the face travels: the size, the weight and the lean
         // around it are slots this modifier says nothing about
         Modifier::FontFamily(family) => wrap_styled(
@@ -1576,6 +1704,11 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { line_height: Some(*height), ..VisualProps::default() },
+        ),
+        Modifier::LineLimit(lines) => wrap_styled(
+            out,
+            mark,
+            VisualProps { line_limit: Some(*lines), ..VisualProps::default() },
         ),
         Modifier::FontWeight(weight) => wrap_styled(
             out,
@@ -1844,7 +1977,7 @@ pub(crate) fn apply(
                 // where both speak, as the flow applies them anyway —
                 // `.element("a").css_class("x")` is one node, not two
                 LayoutNode::Hinted { tag, class, dom_id, href, .. } => {
-                    hint_over([tag, class, dom_id, href], outer)
+                    hint_over([tag, class, dom_id, href], outer);
                 }
                 // a hint over a kept boundary rides the reference itself:
                 // a list that re-runs makes one per row, and a box around
@@ -1861,11 +1994,29 @@ pub(crate) fn apply(
                         class: class.clone(),
                         dom_id: dom_id.clone(),
                         href: href.clone(),
+                        test_id: None,
                         child: Box::new(other),
                     }),
                 },
             }
         }
+        Modifier::TestId(id) => match out.base_from(mark) {
+            LayoutNode::Hinted { test_id, .. } => *test_id = Some(Rc::clone(id)),
+            LayoutNode::BoundaryRef { hints, .. } => {
+                hints.address = crate::layout::Address::tested(&hints.address, Some(id));
+            }
+            node => match node.carried_hints_mut() {
+                Some(hints) => hints.address = crate::layout::Address::tested(&hints.address, Some(id)),
+                None => wrap_in_place(node, |other| LayoutNode::Hinted {
+                    tag: None,
+                    class: None,
+                    dom_id: None,
+                    href: None,
+                    test_id: Some(Rc::clone(id)),
+                    child: Box::new(other),
+                }),
+            },
+        },
         Modifier::LayoutMode(mode) => {
             // Auto is what every target does already; only Exact asks
             // the element lowering to keep the engine's numbers

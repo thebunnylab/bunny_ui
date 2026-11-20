@@ -41,6 +41,7 @@ unsafe extern "C" {
         family_ptr: *const u8,
         family_len: usize,
         out: *mut f64,
+        tracking: f64,
     );
     /// Draws one line into a `width × height` physical rectangle and
     /// copies the straight-alpha RGBA into `out`. The glue places the
@@ -63,6 +64,7 @@ unsafe extern "C" {
         descent: f64,
         color: u32,
         out: *mut u8,
+        tracking: f64,
     );
 }
 
@@ -176,6 +178,7 @@ impl TextEngine for CanvasTextEngine {
                 family.as_ptr(),
                 family.len(),
                 out.as_mut_ptr(),
+                font.tracking,
             );
         }
         LineMetrics { width: out[0], ascent: out[1], descent: out[2] }
@@ -230,6 +233,7 @@ impl TextEngine for CanvasTextEngine {
                 below as f64 / scale as f64,
                 pack_color(color),
                 rgba.as_mut_ptr(),
+                font.tracking,
             );
         }
         let raster = TextRaster {

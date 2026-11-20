@@ -203,9 +203,10 @@ fn an_exact_interior_gives_the_sticky_view_its_containing_block() {
     // pointer of its own
     assert!(page.html.contains("height:600px"), "{}", page.html);
     assert!(page.css.contains("pointer-events:none"), "{}", page.css);
-    // the view: in the flow at the top of its block, stuck by the browser
+    // the view: in the flow at the top of its block, stuck by the browser,
+    // its pinned size a floor too
     assert!(
-        page.html.contains("height:80px;pointer-events:auto;position:sticky;top:10px;width:100px"),
+        page.html.contains("height:80px;min-height:80px;min-width:100px;pointer-events:auto;position:sticky;top:10px;width:100px"),
         "{}",
         page.html
     );

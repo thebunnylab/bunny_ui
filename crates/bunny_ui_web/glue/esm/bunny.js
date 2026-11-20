@@ -38,7 +38,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 26;
+export const EXPECTED_ABI = 28;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";
@@ -453,7 +453,10 @@ export function js_image_raster(hi, lo, width, height, out) {
   ink.setTransform(1, 0, 0, 1, 0, 0);
   ink.clearRect(0, 0, width, height);
   ink.imageSmoothingEnabled = true;
-  ink.imageSmoothingQuality = "high";
+  // the filter the page's own <img> is drawn with — bilinear, the
+  // browser's "low": "high" resamples an enlarged picture with a
+  // cubic, and every pixel of it lands one step from the page's
+  ink.imageSmoothingQuality = "low";
   ink.drawImage(bitmap, 0, 0, width, height);
   const pixels = ink.getImageData(0, 0, width, height).data;
   new Uint8Array(memory.buffer, out >>> 0, width * height * 4).set(pixels);
@@ -463,22 +466,31 @@ export function js_image_raster(hi, lo, width, height, out) {
 // Ascent/descent come from the FONT's bounding box (stable per font);
 // an empty string keeps the metrics and reports width 0.
 export function js_measure_text(
-  pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
+  pointer, length, size, weight, mono, italic, familyPointer, familyLength, out, tracking = 0,
 ) {
   if (dom) {
     return dom.js_measure_text(
-      pointer, length, size, weight, mono, italic, familyPointer, familyLength, out,
+      pointer, length, size, weight, mono, italic, familyPointer, familyLength, out, tracking,
     );
   }
   if (!host) return;
   const line = text(pointer, length);
+  // measured at the device's size, as the page lays text out on a
+  // HiDPI screen: the face's ascent and descent round there
+  const ratio = globalThis.devicePixelRatio || 1;
   const ink = inkSurface(1, 1);
-  ink.font = cssFont(size, weight, mono, italic, text(familyPointer, familyLength) || null);
+  ink.font = cssFont(size * ratio, weight, mono, italic, text(familyPointer, familyLength) || null);
+  // kerning as the page's own text has it: a canvas left at "auto"
+  // measures a line with spaces wider than the element that shows it,
+  // and breaks a paragraph a word early
+  ink.fontKerning = "normal";
+  // `.tracking`: the letters spread as the page spreads them
+  ink.letterSpacing = `${tracking * ratio}px`;
   const probe = ink.measureText(line || "Mg");
   const metrics = new Float64Array(memory.buffer, out >>> 0, 3);
-  metrics[0] = line ? probe.width : 0;
-  metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
-  metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
+  metrics[0] = line ? probe.width / ratio : 0;
+  metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
+  metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
 }
 
 // Draws one line into a width×height physical rectangle and copies the
@@ -486,12 +498,12 @@ export function js_measure_text(
 // alpha — the compositor's contract, no conversion here.
 export function js_raster_text(
   pointer, length, size, weight, mono, italic, familyPointer, familyLength,
-  scale, width, height, descent, color, out,
+  scale, width, height, descent, color, out, tracking = 0,
 ) {
   if (dom) {
     return dom.js_raster_text(
       pointer, length, size, weight, mono, italic, familyPointer, familyLength,
-      scale, width, height, descent, color, out,
+      scale, width, height, descent, color, out, tracking,
     );
   }
   if (!host) return;
@@ -499,17 +511,19 @@ export function js_raster_text(
   const ink = inkSurface(width, height);
   ink.setTransform(1, 0, 0, 1, 0, 0);
   ink.clearRect(0, 0, width, height);
-  ink.setTransform(scale, 0, 0, scale, 0, 0);
-  ink.font = cssFont(size, weight, mono, italic, text(familyPointer, familyLength) || null);
+  ink.font = cssFont(size * scale, weight, mono, italic, text(familyPointer, familyLength) || null);
+  ink.fontKerning = "normal";
+  ink.letterSpacing = `${tracking * scale}px`;
   ink.textBaseline = "alphabetic";
   const r = (color >>> 24) & 0xff;
   const g = (color >>> 16) & 0xff;
   const b = (color >>> 8) & 0xff;
   const a = color & 0xff;
   ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-  // baseline sits `descent` above the box bottom — the ceil slack stays
+  // the face at the device's size, as the page draws it on a HiDPI
+      // screen; baseline sits `descent` above the box bottom — the ceil slack stays
   // on top, mirroring the desktop engine
-  ink.fillText(line, 0, height / scale - descent);
+  ink.fillText(line, 0, height - descent * scale);
   const pixels = ink.getImageData(0, 0, width, height).data;
   new Uint8Array(memory.buffer, out >>> 0, width * height * 4).set(pixels);
 }

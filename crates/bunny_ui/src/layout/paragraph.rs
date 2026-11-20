@@ -346,9 +346,20 @@ impl<'a, 'e> Shape<'a, 'e> {
         LineBox { ascent, descent, advance: self.env.line_height.unwrap_or(ascent + descent) }
     }
 
+    /// The lines a text shows: those its room holds, never more than the
+    /// inherited `.line_limit(…)` — the last one shown then closes with
+    /// an ellipsis, as one cut by its room does.
+    fn rows_that_fit(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
+        let fit = self.rows_in(lines, room);
+        match self.env.line_limit {
+            0 => fit,
+            limit => fit.min(usize::from(limit)),
+        }
+    }
+
     /// How many of `lines` a box `room` tall shows — at least one, the way
     /// a paragraph told how tall it may be answers that and no more.
-    fn rows_that_fit(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
+    fn rows_in(&self, lines: &[(usize, usize)], room: Option<Px>) -> usize {
         if self.runs.is_none() {
             return rows_that_fit(lines.len(), self.line_box((0, 0)).advance, room);
         }
@@ -419,6 +430,34 @@ pub(super) fn measure_text(
         },
         height: shape.height(&lines, shown),
     }
+}
+
+/// The narrowest a text gets without breaking a word — the CSS
+/// min-content width a flex line floors a shrinking text at: its widest
+/// word, in the faces it is drawn in. A text that truncates has none:
+/// it gives up characters instead.
+pub(super) fn min_content(
+    content: &str,
+    marks: Option<&TextMarks>,
+    truncation: Option<Truncation>,
+    env: &LayoutEnv<'_>,
+) -> Px {
+    if truncation.is_some() {
+        return 0.0;
+    }
+    let shape = Shape::of(content, marks, env);
+    let mut widest: Px = 0.0;
+    let mut word = None;
+    for (at, character) in content.char_indices().chain(std::iter::once((content.len(), ' '))) {
+        if character.is_whitespace() {
+            if let Some(start) = word.take() {
+                widest = widest.max(shape.width((start, at)));
+            }
+        } else if word.is_none() {
+            word = Some(at);
+        }
+    }
+    widest
 }
 
 /// The first baseline of a text, from its top: its first line's ascent.

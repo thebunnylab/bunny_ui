@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="fidelity" content="width=400, height=320" />
+    <title>A settings list</title>
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; background: #fff; }
+      body { font: 16px "Fid Sans"; color: #1d1d1f; }
+      .page { width: 400px; height: 320px; display: flex; flex-direction: column; align-items: flex-start; background: #f2f2f7; }
+      .page { padding: 16px; }
+      .list { width: 368px; background: #fff; border-radius: 12px; display: flex; flex-direction: column; }
+      .row { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+      .icon { width: 28px; height: 28px; border-radius: 7px; }
+      .labels { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+      .subtitle { font-size: 13px; color: #8e8e93; }
+      .spacer { flex: 1; }
+      .chevron { font-size: 20px; color: #c7c7cc; }
+      .separator { height: 1px; margin-left: 56px; background: #e5e5ea; }
+      .blue { background: #3478f6; }
+      .green { background: #34c759; }
+      .orange { background: #ff9500; }
+    </style>
+  </head>
+  <body>
+    <div class="page" data-fid="page">
+      <div class="list" data-fid="list">
+        <div class="row" data-fid="wifi">
+          <div class="icon blue" data-fid="wifi-icon"></div>
+          <div class="labels"><span data-fid="wifi-title">Wi-Fi</span><span class="subtitle" data-fid="wifi-subtitle">Home network</span></div>
+          <div class="spacer"></div>
+          <span class="chevron" data-fid="wifi-chevron">›</span>
+        </div>
+        <div class="separator" data-fid="separator-1"></div>
+        <div class="row" data-fid="battery">
+          <div class="icon green" data-fid="battery-icon"></div>
+          <div class="labels"><span data-fid="battery-title">Battery</span><span class="subtitle" data-fid="battery-subtitle">82% — about 9 hours left</span></div>
+          <div class="spacer"></div>
+          <span class="chevron" data-fid="battery-chevron">›</span>
+        </div>
+        <div class="separator" data-fid="separator-2"></div>
+        <div class="row" data-fid="alerts">
+          <div class="icon orange" data-fid="alerts-icon"></div>
+          <div class="labels"><span data-fid="alerts-title">Notifications</span><span class="subtitle" data-fid="alerts-subtitle">Banners, sounds, badges</span></div>
+          <div class="spacer"></div>
+          <span class="chevron" data-fid="alerts-chevron">›</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

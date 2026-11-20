@@ -135,6 +135,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::LineHeight(height))
     }
 
+    /// `.lineLimit(2)` — the text below shows at most this many lines;
+    /// when its words need more, the last one shown ends with an ellipsis.
+    /// Inherited like the font, the nearer limit wins, and zero is no
+    /// limit — the way to lift one set further out.
+    #[track_caller]
+    fn line_limit(self, lines: u8) -> Modified<Self> {
+        Modified::new(self, Modifier::LineLimit(lines))
+    }
+
     /// `.id("source-control")` — the view takes a NAME in the identity.
     ///
     /// Without it a view is known by its POSITION among siblings
@@ -308,10 +317,33 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::FrameHeight(height))
     }
 
+    /// `.frame(height: 48, alignment: .top)` — the vertical twin of
+    /// [`ViewExt::frame_width_aligned`]: the box is exact on that axis and
+    /// the content sits on the named edge in it, where
+    /// [`ViewExt::frame_height`] centres it.
+    #[track_caller]
+    fn frame_height_aligned(self, height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified::new(self, Modifier::FrameHeightAligned(height, alignment))
+    }
+
     /// `.frame(maxWidth: .infinity, maxHeight: 60, alignment: .leading)`
     #[track_caller]
     fn frame_max(self, max_width: f64, max_height: f64, alignment: Alignment) -> Modified<Self> {
         Modified::new(self, Modifier::FrameMax(max_width, max_height, alignment))
+    }
+
+    /// `.frame(minWidth: 18, alignment: .center)` — the box hugs its
+    /// content and is never smaller than the floor: a badge as wide as
+    /// its count, but no narrower than a circle; a key cap as wide as its
+    /// word. A floor of zero is none. The content is offered the proposal
+    /// raised to the floor, as `SwiftUI`'s flexible frame offers it, and
+    /// sits by the alignment when the floor is the wider.
+    ///
+    /// Where [`ViewExt::frame_flex`] fills what it is proposed, this keeps
+    /// to its content: it is `SwiftUI`'s `minWidth` with no `maxWidth`.
+    #[track_caller]
+    fn frame_min(self, min_width: f64, min_height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified::new(self, Modifier::FrameMin(min_width, min_height, alignment))
     }
 
     /// A flexible box with a floor: it fills what it is proposed, never
@@ -502,10 +534,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// )
     /// // a bar with a sheen
     /// .background_gradient(Gradient::linear(TOP_INK, BOTTOM_INK))
+    /// // a ramp through a third color, half way down
+    /// .background_gradient(Gradient::linear(RED, BLUE).stop(0.5, GREEN))
     /// ```
     #[track_caller]
     fn background_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
-        Modified::new(self, Modifier::BackgroundGradient(gradient))
+        Modified::new(self, Modifier::BackgroundGradient(Box::new(gradient)))
     }
 
     /// How this view's background meets what is already painted under
@@ -591,6 +625,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref())), None))
     }
 
+    /// The name a harness finds this view by, whatever the lowering:
+    /// the element lowering writes it as `data-testid`, and the pixel
+    /// pipelines keep the view's frame under it
+    /// ([`crate::runtime::Runtime::test_frames`]). It changes nothing a
+    /// reader sees.
+    #[track_caller]
+    fn test_id(self, id: impl AsRef<str>) -> Modified<Self> {
+        Modified::new(self, Modifier::TestId(crate::modifier::hint(id.as_ref())))
+    }
+
     /// A link: the Dom lowering builds an `<a href>` for this view, so
     /// the browser owns the navigation — a press follows it, a middle
     /// press opens a tab, a crawler reads it. `#name` reaches the
@@ -653,6 +697,21 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     #[track_caller]
     fn foreground_color(self, color: Color) -> Modified<Self> {
         Modified::new(self, Modifier::ForegroundColor(color))
+    }
+
+    /// `.foregroundStyle(LinearGradient(…))` — the text below paints with
+    /// the ramp, laid across this view's box: a headline from violet to
+    /// pink, its letters cut out of one gradient. A foreground color set
+    /// further in wins, as in `SwiftUI`.
+    ///
+    /// ```ignore
+    /// text("Ship calmer")
+    ///     .font_size(48.0)
+    ///     .foreground_gradient(Gradient::linear(VIOLET, PINK).direction(UnitPoint::LEADING, UnitPoint::TRAILING))
+    /// ```
+    #[track_caller]
+    fn foreground_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
+        Modified::new(self, Modifier::ForegroundGradient(Box::new(gradient)))
     }
 
     /// `.border(Color.gray, width: 1)` — a frame inward from the edge.
@@ -834,6 +893,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     #[track_caller]
     fn monospaced(self) -> Modified<Self> {
         Modified::new(self, Modifier::Monospaced)
+    }
+
+    /// `.monospacedDigit()` — the figures of the text below take one
+    /// advance each, the letters keep theirs: a column of numbers lines
+    /// up, a clock that ticks keeps its width. It inherits like the
+    /// font, and only this travels: the size, the weight and the face
+    /// around it survive. The page writes `font-variant-numeric:
+    /// tabular-nums`.
+    #[track_caller]
+    fn monospaced_digit(self) -> Modified<Self> {
+        Modified::new(self, Modifier::MonospacedDigit)
     }
 
     /// `.font_family("Menlo")` — the face by name, for a scene that
@@ -1306,6 +1376,76 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     #[track_caller]
     fn shadow(self, radius: f64) -> Modified<Self> {
         Modified::new(self, Modifier::Shadow(radius, crate::layout::Color::rgba(0, 0, 0, 80)))
+    }
+
+    /// `.shadow(color:radius:x:y:)`'s offset: the halo of
+    /// [`ViewExt::shadow_color`] drawn this far from the box — a light
+    /// from above casts it down (`y > 0`). The box itself stays.
+    #[track_caller]
+    fn shadow_offset(self, x: f64, y: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ShadowOffset(x, y))
+    }
+
+    /// `.offset(x: 4, y: -6)` — the view drawn this far from where the
+    /// layout put it, as SwiftUI's `.offset`: what is around it keeps its
+    /// place, the pointer finds the view where it is drawn. A badge
+    /// hanging off a corner, a card lifted as it is dragged.
+    #[track_caller]
+    fn offset(self, x: f64, y: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::Offset(x, y))
+    }
+
+    /// `.rotationEffect(.degrees(12))` — the view drawn turned this far,
+    /// clockwise, about its centre, as `SwiftUI` turns it: paint and its
+    /// shadow turn, the layout around it keeps its place. A tilted card,
+    /// a disc on a turntable, a dragged item.
+    #[track_caller]
+    fn rotation_effect(self, angle: crate::angle::Angle) -> Modified<Self> {
+        Modified::new(self, Modifier::Rotation(whole_degrees(angle), crate::layout::UnitPoint::CENTER))
+    }
+
+    /// [`ViewExt::rotation_effect`] about another point of the view:
+    /// `UnitPoint::TOP_LEADING` swings it from its corner.
+    #[track_caller]
+    fn rotation_effect_at(self, angle: crate::angle::Angle, anchor: crate::layout::UnitPoint) -> Modified<Self> {
+        Modified::new(self, Modifier::Rotation(whole_degrees(angle), anchor))
+    }
+
+    /// `.grayscale(1)` — the colors of everything the view paints drained
+    /// toward their gray, from 0 (as they are) to 1 (gray): an archived
+    /// card, a locked tile. Chained color filters apply in the order
+    /// written, as a CSS `filter` list does; a ground laid around the
+    /// view later keeps its color.
+    #[track_caller]
+    fn grayscale(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Grayscale(amount)))
+    }
+
+    /// `.saturation(1.4)` — the colors richer past 1, grayer below it, gray
+    /// at 0.
+    #[track_caller]
+    fn saturation(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Saturation(amount)))
+    }
+
+    /// `.contrast(1.3)` — the colors pushed away from the middle gray past
+    /// 1, toward it below; a negative amount inverts them too.
+    #[track_caller]
+    fn contrast(self, amount: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Contrast(amount)))
+    }
+
+    /// `.hueRotation(.degrees(90))` — every hue turned this far round the
+    /// color circle, its lightness kept.
+    #[track_caller]
+    fn hue_rotation(self, angle: crate::angle::Angle) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::HueRotation(whole_degrees(angle))))
+    }
+
+    /// `.colorInvert()` — every color turned into its opposite.
+    #[track_caller]
+    fn color_invert(self) -> Modified<Self> {
+        Modified::new(self, Modifier::ColorFilter(crate::color_filter::ColorFilter::Invert))
     }
 
     /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
@@ -1961,3 +2101,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 }
 
 impl<V: View<Arity = Single>> ViewExt for V {}
+
+/// An angle's degrees without the noise of the trip through radians:
+/// `Angle::degrees(-3.0)` reads back as -3, not -3.0000000000000004.
+fn whole_degrees(angle: crate::angle::Angle) -> f64 {
+    (angle.as_degrees() * 1e9).round() / 1e9
+}

@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head><base href="/apps/">
+    <meta charset="utf-8">
+    <meta name="fidelity" content="width=600, height=800">
+    <title>Account settings</title>
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body { font: 15px "Fid Sans"; color: #1d1d1f; width: 600px; height: 800px; overflow: hidden; background: #f2f2f7; }
+      input, select, textarea, button { font: inherit; color: inherit; }
+      .page { padding: 10px 14px; font-size: 12px; }
+      h1 { font-size: 17px; margin: 0; letter-spacing: -.2px; }
+      .top { display: flex; align-items: center; justify-content: space-between; height: 26px; margin-bottom: 6px; }
+      .top small { color: #8e8e93; font-size: 11px; }
+
+      /* fieldset + legend as card sections */
+      fieldset { margin: 0 0 6px; padding: 5px 10px 6px; border: 1px solid #d8d8de; border-radius: 10px; background: #fff; min-width: 0; }
+      legend { padding: 0 6px; font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: #6e6e73; }
+
+      /* two-column form grid, right-aligned labels */
+      .form { display: grid; grid-template-columns: 140px 1fr; column-gap: 12px; row-gap: 4px; align-items: center; }
+      .form > label, .form > .lab { text-align: right; color: #48484a; font-size: 12px; }
+      .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+      input[type=text], input[type=email], input[type=password], select, input[type=date] {
+        appearance: none; height: 22px; padding: 0 8px; border: 1px solid #c7c7cc; border-radius: 6px; background: #fff; font-size: 12px; width: 100%;
+      }
+      /* ::placeholder colour */
+      ::placeholder { color: #aeaeb2; font-style: italic; }
+      /* inline error: red border + message with CSS "!" circle */
+      .bad { border-color: #ff3b30 !important; background: #fff5f4 !important; }
+      .err { color: #d70015; font-size: 10px; display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+      .err::before { content: "!"; width: 12px; height: 12px; border-radius: 50%; background: #ff3b30; color: #fff; font-size: 9px; font-weight: 900; line-height: 12px; text-align: center; flex: none; }
+      /* focus ring via outline + offset */
+      .ring { outline: 2px solid #3478f6; outline-offset: 2px; border-color: #3478f6 !important; }
+      select { padding-right: 22px; background: #fff linear-gradient(45deg, transparent 50%, #6e6e73 50%) no-repeat right 12px center / 5px 5px; position: relative; }
+
+      /* toggle switches: appearance none + ::before knob */
+      input[type=checkbox].sw { appearance: none; width: 34px; height: 20px; border-radius: 10px; background: #d1d1d6; position: relative; margin: 0; flex: none; }
+      input[type=checkbox].sw::before { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+      input[type=checkbox].sw:checked { background: #34c759; }
+      input[type=checkbox].sw:checked::before { left: 16px; }
+      .hint { color: #8e8e93; font-size: 11px; }
+
+      /* radios */
+      input[type=radio].rd { appearance: none; width: 14px; height: 14px; border: 1.5px solid #8e8e93; border-radius: 50%; margin: 0; position: relative; }
+      input[type=radio].rd:checked { border-color: #3478f6; background: radial-gradient(#3478f6 0 40%, transparent 45%); }
+      .opt { display: inline-flex; align-items: center; gap: 5px; margin-right: 8px; }
+
+      /* segmented control: radio + label, :checked + label */
+      .seg { display: inline-flex; background: #e5e5ea; border-radius: 7px; padding: 2px; }
+      .seg input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .seg label { padding: 2px 12px; border-radius: 5px; font-size: 11px; color: #3a3a3c; }
+      .seg input:checked + label { background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); font-weight: 700; color: #000; }
+
+      /* range with accent-color */
+      input[type=range] { accent-color: #ff9500; width: 100%; margin: 0; height: 16px; }
+      input[type=color] { appearance: none; width: 34px; height: 22px; padding: 0; border: 1px solid #c7c7cc; border-radius: 6px; background: none; }
+      input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+      input[type=color]::-webkit-color-swatch { border: 0; border-radius: 4px; }
+      input[type=date] { width: 130px; }
+
+      textarea { resize: vertical; width: 100%; height: 40px; padding: 4px 8px; border: 1px solid #c7c7cc; border-radius: 6px; font-size: 12px; line-height: 1.3; display: block; }
+      progress, meter { width: 100%; height: 10px; }
+      progress { appearance: none; border: 0; border-radius: 5px; overflow: hidden; background: #e5e5ea; }
+      progress::-webkit-progress-bar { background: #e5e5ea; }
+      progress::-webkit-progress-value { background: linear-gradient(90deg, #5ac8fa, #3478f6); border-radius: 5px; }
+      meter { appearance: auto; }
+
+      /* kbd chips */
+      kbd { display: inline-block; min-width: 18px; padding: 1px 5px; text-align: center; font: 10px "Fid Sans"; font-weight: 700; color: #3a3a3c; background: linear-gradient(#fff, #ececf0); border: 1px solid #c7c7cc; border-bottom-width: 2px; border-radius: 4px; }
+      .sc { display: inline-flex; align-items: center; gap: 3px; margin-right: 10px; font-size: 11px; color: #6e6e73; }
+
+      /* avatar row + dashed dropzone */
+      .up { display: flex; gap: 10px; align-items: center; }
+      .up img { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; box-shadow: 0 0 0 2px #fff, 0 0 0 3px #c7c7cc; }
+      .drop { flex: 1; height: 44px; border: 1.5px dashed #aeaeb2; border-radius: 8px; display: flex; align-items: center; justify-content: center; gap: 8px; color: #6e6e73; font-size: 11px; background: repeating-linear-gradient(45deg, #fafafc 0 6px, #fff 6px 12px); }
+      .drop b { color: #3478f6; }
+      .drop i { width: 14px; height: 14px; border-bottom: 2px solid #6e6e73; border-left: 2px solid #6e6e73; border-right: 2px solid #6e6e73; border-radius: 0 0 3px 3px; position: relative; }
+      .drop i::before { content: ""; position: absolute; left: 4px; top: -8px; width: 2px; height: 9px; background: #6e6e73; }
+
+      /* details with custom marker */
+      details { margin: 0 0 6px; background: #fff; border: 1px solid #d8d8de; border-radius: 10px; padding: 5px 10px; }
+      summary { list-style: none; cursor: pointer; font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+      summary::-webkit-details-marker { display: none; }
+      summary::before { content: ""; width: 5px; height: 5px; border-right: 2px solid #3478f6; border-bottom: 2px solid #3478f6; transform: rotate(45deg); margin-right: 3px; }
+      details:not([open]) summary::before { transform: rotate(-45deg); }
+      details .row { margin-top: 5px; flex-wrap: wrap; }
+
+      /* disabled section */
+      fieldset.off { opacity: .5; pointer-events: none; }
+      .chip { padding: 1px 8px; border-radius: 9px; background: #e5e5ea; font-size: 10px; }
+
+      /* danger zone + styled hr */
+      hr { border: 0; height: 1px; margin: 5px 0; background: linear-gradient(90deg, transparent, #c7c7cc 20%, #c7c7cc 80%, transparent); }
+      .danger { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1.5px solid #ff3b30; border-radius: 10px; padding: 7px 10px; background: #fff; }
+      .danger b { color: #d70015; font-size: 12px; }
+      .danger p { margin: 1px 0 0; font-size: 10px; color: #6e6e73; }
+      .btn-red { border: 0; background: #ff3b30; color: #fff; font-weight: 700; font-size: 12px; padding: 5px 12px; border-radius: 7px; box-shadow: 0 1px 0 #b8261d; }
+      .btn { border: 1px solid #c7c7cc; background: #fff; font-size: 11px; padding: 2px 10px; border-radius: 6px; }
+    </style>
+  </head>
+  <body data-fid="body-0">
+    <div class="page" data-fid="div.page-1">
+      <div class="top" data-fid="div.top-2"><h1 data-fid="h1-3">Account settings</h1><small data-fid="small-4">Last saved 2 min ago • © 2026</small></div>
+
+      <fieldset data-fid="fieldset-5">
+        <legend data-fid="legend-6">Profile</legend>
+        <div class="form" data-fid="div.form-7">
+          <span class="lab" data-fid="span.lab-8">Photo</span>
+          <div class="up" data-fid="div.up-9">
+            <img src="/assets/avatar.png" alt="" data-fid="img-10">
+            <div class="drop" data-fid="div.drop-11"><i data-fid="i-12"></i><span data-fid="span-13">Drop an image or <b>browse</b> — PNG, up to 4 MB</span></div>
+          </div>
+          <label for="n" data-fid="label-15">Full name</label>
+          <input id="n" type="text" placeholder="Your name" value="Ada Lovelace" data-fid="input-16">
+          <label for="e" data-fid="label-17">Email</label>
+          <div data-fid="div-18"><input id="e" type="email" class="bad" value="ada@lovelace" placeholder="you@example.com" data-fid="input.bad-19"><div class="err" data-fid="div.err-20">Enter a full address, like ada@example.com</div></div>
+          <label for="p" data-fid="label-21">Password</label>
+          <input id="p" type="password" placeholder="At least 12 characters" data-fid="input-22">
+          <label for="u" data-fid="label-23">Username</label>
+          <input id="u" type="text" class="ring" placeholder="@handle" data-fid="input.ring-24">
+        </div>
+      </fieldset>
+
+      <fieldset data-fid="fieldset-25">
+        <legend data-fid="legend-26">Preferences</legend>
+        <div class="form" data-fid="div.form-27">
+          <span class="lab" data-fid="span.lab-28">Email digests</span>
+          <div class="row" data-fid="div.row-29"><input class="sw" type="checkbox" checked="" data-fid="input.sw-30"><span class="hint" data-fid="span.hint-31">Weekly summary, Mondays</span></div>
+          <span class="lab" data-fid="span.lab-32">Beta features</span>
+          <div class="row" data-fid="div.row-33"><input class="sw" type="checkbox" data-fid="input.sw-34"><span class="hint" data-fid="span.hint-35">Off — may be unstable</span></div>
+          <span class="lab" data-fid="span.lab-36">Contact via</span>
+          <div class="row" data-fid="div.row-37"><label class="opt" data-fid="label.opt-38"><input class="rd" type="radio" name="c" checked="" data-fid="input.rd-39">Email</label><label class="opt" data-fid="label.opt-40"><input class="rd" type="radio" name="c" data-fid="input.rd-41">Phone</label><label class="opt" data-fid="label.opt-42"><input class="rd" type="radio" name="c" data-fid="input.rd-43">Post</label></div>
+          <span class="lab" data-fid="span.lab-44">Theme</span>
+          <div class="seg" data-fid="div.seg-45"><input type="radio" id="t1" name="t" data-fid="input-46"><label for="t1" data-fid="label-47">Light</label><input type="radio" id="t2" name="t" checked="" data-fid="input-48"><label for="t2" data-fid="label-49">Auto</label><input type="radio" id="t3" name="t" data-fid="input-50"><label for="t3" data-fid="label-51">Dark</label></div>
+          <label for="r" data-fid="label-52">Region</label>
+          <select id="r" data-fid="select-53"><option>Europe — Lisbon (UTC+0)</option><option>Americas — New York</option></select>
+        </div>
+      </fieldset>
+
+      <fieldset data-fid="fieldset-54">
+        <legend data-fid="legend-55">Appearance</legend>
+        <div class="form" data-fid="div.form-56">
+          <label for="s" data-fid="label-57">Text size</label>
+          <input id="s" type="range" min="0" max="10" value="6" data-fid="input-58">
+          <label for="c1" data-fid="label-59">Accent</label>
+          <div class="row" data-fid="div.row-60"><input id="c1" type="color" value="#3478f6" data-fid="input-61"><span class="hint" data-fid="span.hint-62">#3478F6</span></div>
+          <label for="d" data-fid="label-63">Member since</label>
+          <input id="d" type="date" value="2026-01-15" data-fid="input-64">
+        </div>
+      </fieldset>
+
+      <fieldset data-fid="fieldset-65">
+        <legend data-fid="legend-66">Bio &amp; storage</legend>
+        <div class="form" data-fid="div.form-67">
+          <label for="b" data-fid="label-68">Bio</label>
+          <textarea id="b" data-fid="textarea-69">Mathematician, writer, and collector of very small programs.</textarea>
+          <span class="lab" data-fid="span.lab-70">Storage</span>
+          <div data-fid="div-71"><progress value="0.6" max="1" data-fid="progress-72"></progress><div class="hint" style="margin-top:2px" data-fid="div.hint-73">9.6 GB of 16 GB used</div></div>
+          <span class="lab" data-fid="span.lab-74">Quota</span>
+          <meter value="0.3" low="0.4" high="0.8" optimum="1" data-fid="meter-75"></meter>
+        </div>
+      </fieldset>
+
+      <details open="" data-fid="details-76">
+        <summary data-fid="summary-77">Advanced</summary>
+        <div class="row" data-fid="div.row-78">
+          <span class="sc" data-fid="span.sc-79">Search <kbd data-fid="kbd-80">Ctrl</kbd>+<kbd data-fid="kbd-81">K</kbd></span>
+          <span class="sc" data-fid="span.sc-82">New <kbd data-fid="kbd-83">Ctrl</kbd>+<kbd data-fid="kbd-84">Shift</kbd>+<kbd data-fid="kbd-85">N</kbd></span>
+          <span class="sc" data-fid="span.sc-86">Save <kbd data-fid="kbd-87">Ctrl</kbd>+<kbd data-fid="kbd-88">S</kbd></span>
+        </div>
+      </details>
+
+      <fieldset class="off" data-fid="fieldset.off-89">
+        <legend data-fid="legend-90">Team billing (locked)</legend>
+        <div class="row" data-fid="div.row-91"><input class="sw" type="checkbox" checked="" data-fid="input.sw-92"><span data-fid="span-93">Invoices</span><span class="chip" data-fid="span.chip-94">Admin only</span><button class="btn" data-fid="button.btn-95">Manage</button></div>
+      </fieldset>
+
+      <hr data-fid="hr-96">
+      <div class="danger" data-fid="div.danger-97">
+        <div data-fid="div-98"><b>Delete account</b><p data-fid="p-100">Removes your data for good. This can’t be undone.</p></div>
+        <button class="btn-red" data-fid="button.btn-red-101">Delete…</button>
+      </div>
+    </div>
+  
+
+</body></html>
