@@ -16,8 +16,8 @@ app_dashboard	AxB	30	236404	46790
 app_dashboard	AxC	25	295814	80070
 app_dashboard	BxC	13	112055	52354
 app_hop	AxB	261	7279861	1507661
-app_hop	AxC	332	14620880	3447614
-app_hop	BxC	65	14242221	3431151
+app_hop	AxC	320	5714913	1118536
+app_hop	BxC	22	8473151	2177279
 app_kanban	AxB	0	254174	53572
 app_kanban	AxC	1	231238	115829
 app_kanban	BxC	3	172049	88801
@@ -25,8 +25,8 @@ app_landing	AxB	23	966746	258036
 app_landing	AxC	24	812407	311167
 app_landing	BxC	3	698143	309406
 app_music	AxB	0	649904	104461
-app_music	AxC	0	955204	147146
-app_music	BxC	0	920642	121739
+app_music	AxC	0	916921	146313
+app_music	BxC	0	880801	120728
 app_profile	AxB	20	267661	30704
 app_profile	AxC	40	282497	49002
 app_profile	BxC	0	158146	36940
@@ -63,6 +63,9 @@ list	BxC	0	414	138
 nested	AxB	0	0	0
 nested	AxC	0	0	1677
 nested	BxC	0	0	1677
+optical_size	AxB	0	0	0
+optical_size	AxC	0	0	10714
+optical_size	BxC	0	0	10714
 overflow	AxB	0	0	0
 overflow	AxC	0	0	0
 overflow	BxC	0	0	0
