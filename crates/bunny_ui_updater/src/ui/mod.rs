@@ -38,13 +38,30 @@ const RESOLUTION: usize = 1000;
 
 /// The update control: [`update_pill`].
 #[derive(Clone, Copy, Debug, Default)]
-pub struct UpdatePill;
+pub struct UpdatePill {
+    truncating: bool,
+}
 
 /// The update control. Nothing (no size, no node of its own) while the
 /// updater has nothing to say or no updater runs.
+///
+/// It keeps the width of its words: a container that runs out of room
+/// moves or folds its other content, and the pill never reads as a
+/// lone "…". Call [`UpdatePill::truncating`] where the pill must fit
+/// a fixed space instead.
 #[must_use]
 pub fn update_pill() -> UpdatePill {
-    UpdatePill
+    UpdatePill::default()
+}
+
+impl UpdatePill {
+    /// Lets the pill give up width: squeezed, its words end in an ellipsis
+    /// on one line. For a pill in a space that cannot move or fold.
+    #[must_use]
+    pub fn truncating(mut self) -> UpdatePill {
+        self.truncating = true;
+        self
+    }
 }
 
 impl View for UpdatePill {
@@ -63,21 +80,29 @@ impl View for UpdatePill {
             Tone::Action => theme.accent,
             Tone::Quiet => theme.fg_secondary,
         };
-        // one line: a squeezed pill ends in an ellipsis, never over its
-        // neighbors
-        let label = text(reading.label)
-            .font_size(FONT_SIZE)
-            .foreground_color(ink)
-            .truncation_mode(Truncation::End)
-            .padding_edge(Edge::Leading, 8.0)
-            .padding_edge(Edge::Trailing, 8.0)
-            .frame_height(HEIGHT)
-            .background(UnitPoint::CENTER, Ground { filled: reading.filled, well: theme.control, wash: wash(theme.accent) });
-        if reading.clickable {
-            label.on_click(crate::click).id("update-pill").render_into(ctx, out);
+        let words = text(reading.label).font_size(FONT_SIZE).foreground_color(ink);
+        let ground = Ground { filled: reading.filled, well: theme.control, wash: wash(theme.accent) };
+        // rigid by default: a pill that shrinks to "…" looks broken; a
+        // truncating one ends in an ellipsis on one line when squeezed
+        if self.truncating {
+            finish(words.truncation_mode(Truncation::End), ground, reading.clickable, ctx, out);
         } else {
-            label.id("update-pill").render_into(ctx, out);
+            finish(words, ground, reading.clickable, ctx, out);
         }
+    }
+}
+
+/// The words on the pill's ground, with the click when there is one.
+fn finish<V: View<Arity = Single>>(words: V, ground: Ground, clickable: bool, ctx: &Context, out: &mut NodeList) {
+    let label = words
+        .padding_edge(Edge::Leading, 8.0)
+        .padding_edge(Edge::Trailing, 8.0)
+        .frame_height(HEIGHT)
+        .background(UnitPoint::CENTER, ground);
+    if clickable {
+        label.on_click(crate::click).id("update-pill").render_into(ctx, out);
+    } else {
+        label.id("update-pill").render_into(ctx, out);
     }
 }
 

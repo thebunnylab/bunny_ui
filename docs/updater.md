@@ -99,8 +99,12 @@ fn home() -> impl View {
 - **Nothing to say:** the pill takes no room. That covers no updater in
   the build, and a build that is up to date.
 - **Its words** follow the locale of the view, in the sixteen languages
-  of the framework's own words. A long message ends in an ellipsis on
-  one line.
+  of the framework's own words.
+- **It keeps the width of its words.** In a row with no room, the other
+  views give way, and a container that folds content folds them: a pill
+  that shrinks to "…" looks broken. `update_pill().truncating()` lets
+  it end in an ellipsis on one line instead, for a space that cannot
+  move.
 - **During a download,** the pill's own ground fills with the share that
   arrived, so the pill keeps its size and no bar crosses the words.
 - **The colors** come from the theme: the words in the accent when a
