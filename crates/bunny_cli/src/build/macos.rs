@@ -170,7 +170,7 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
 
     let dmg = if options.dmg {
         let dmg = out.join(format!("{name}-{}.dmg", project.version));
-        disk_image(&app, &name, &dmg, &signer, log)?;
+        disk_image(&app, (&name, dmg_format(&minimum)), &dmg, &signer, log)?;
         info.file(&dmg.file_name().unwrap_or_default().to_string_lossy());
         Some(dmg)
     } else {
@@ -350,9 +350,18 @@ fn sign(app: &Path, signer: &Signer, macos: &Path, log: &mut Log) -> Result<()> 
     Ok(())
 }
 
+/// The disk image's compression for an app that runs from macOS `minimum`
+/// on: LZMA (`ULMO`), less than half zlib's size for a binary, where every
+/// Mac the app runs on opens it (10.15 and later), zlib (`UDZO`) before.
+fn dmg_format(minimum: &str) -> &'static str {
+    let mut parts = minimum.split('.').map(|part| part.trim().parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if major > 10 || (major == 10 && minor >= 15) { "ULMO" } else { "UDZO" }
+}
+
 /// A compressed disk image with the app and a link to Applications, the
 /// way a Mac app is handed out — signed by the app's Developer ID.
-fn disk_image(app: &Path, name: &str, dmg: &Path, signer: &Signer, log: &mut Log) -> Result<()> {
+fn disk_image(app: &Path, (name, format): (&str, &str), dmg: &Path, signer: &Signer, log: &mut Log) -> Result<()> {
     let staging = dmg.with_extension("staging");
     platform::fresh_dir(&staging)?;
     let inside = staging.join(app.file_name().unwrap_or_default());
@@ -371,7 +380,7 @@ fn disk_image(app: &Path, name: &str, dmg: &Path, signer: &Signer, log: &mut Log
         staging.as_os_str(),
         OsStr::new("-ov"),
         OsStr::new("-format"),
-        OsStr::new("UDZO"),
+        OsStr::new(format),
         dmg.as_os_str(),
     ];
     let made = log.run("hdiutil", &args, LONG)?;
@@ -460,6 +469,16 @@ mod tests {
      2 valid identities found"#;
         assert_eq!(developer_ids(text), ["Developer ID Application: Bunny Lab (AB12CD34EF)"]);
         assert!(developer_ids("     0 valid identities found").is_empty());
+    }
+
+    #[test]
+    fn the_disk_image_is_lzma_where_every_mac_it_runs_on_opens_it() {
+        assert_eq!(dmg_format("14.0"), "ULMO");
+        assert_eq!(dmg_format("13.0"), "ULMO");
+        assert_eq!(dmg_format("10.15"), "ULMO");
+        assert_eq!(dmg_format("10.14"), "UDZO");
+        assert_eq!(dmg_format("10.9"), "UDZO");
+        assert_eq!(dmg_format("garbage"), "UDZO");
     }
 
     #[test]
