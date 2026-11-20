@@ -73,6 +73,34 @@ function cssFont(size, weight, mono, italic, named) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
+// Sets one line's face on the ink and answers the scale it is set at and
+// the line's width in CSS px. The page shapes its text at the device's
+// size and takes a variable face's optical size from the CSS one; a canvas
+// sets one size for both. A face that draws the same at either size is
+// set at the device's, where the page shapes it. One whose cut follows the
+// size (an optical-size axis: Inter set at twice its size is its display
+// cut, 7% narrower than the page's) is set at the page's own size, and a
+// raster scales it to the device's.
+function setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) {
+  // kerning as the page's own text has it: a canvas left at "auto"
+  // measures a line with spaces wider than the element that shows it,
+  // and breaks a paragraph a word early
+  ink.fontKerning = "normal";
+  // `.tracking`: the letters spread as the page spreads them
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  const page = ink.measureText(text).width;
+  ink.font = cssFont(size * ratio, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking * ratio}px`;
+  const device = ink.measureText(text).width / ratio;
+  if (Math.abs(page - device) <= Math.max(page, device) * 1e-4) {
+    return { set: ratio, width: device };
+  }
+  ink.font = cssFont(size, weight, mono, italic, family);
+  ink.letterSpacing = `${tracking}px`;
+  return { set: 1, width: page };
+}
+
 // The engine names a key by what it types with NO modifier — so a
 // chord on shifted punctuation is spellable at all. `event.key` has the
 // shift APPLIED (shift and backslash arrives as a pipe), so the chord
@@ -409,20 +437,16 @@ const imports = {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
       );
-      // measured at the device's size, as the page lays text out on a
-      // HiDPI screen: the face's ascent and descent round there
       const ratio = globalThis.devicePixelRatio || 1;
+      const family = familyOf(familyPointer, familyLength);
       const ink = inkSurface(1, 1);
-      ink.font = cssFont(size * ratio, weight, mono, italic, familyOf(familyPointer, familyLength));
-      // kerning as the page's own text has it: a canvas left at "auto"
-      // measures a line with spaces wider than the element that shows it,
-      // and breaks a paragraph a word early
-      ink.fontKerning = "normal";
-      // `.tracking`: the letters spread as the page spreads them
-      ink.letterSpacing = `${tracking * ratio}px`;
+      const line = text ? setLine(ink, text, size, weight, mono, italic, family, tracking, ratio) : null;
+      // the ascent and descent at the device's size, as the page lays
+      // text out on a HiDPI screen: they round there
+      ink.font = cssFont(size * ratio, weight, mono, italic, family);
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(wasm.memory.buffer, out, 3);
-      metrics[0] = text ? probe.width / ratio : 0;
+      metrics[0] = line ? line.width : 0;
       metrics[1] = (probe.fontBoundingBoxAscent ?? size * ratio * 0.8) / ratio;
       metrics[2] = (probe.fontBoundingBoxDescent ?? size * ratio * 0.25) / ratio;
     },
@@ -452,19 +476,18 @@ const imports = {
       const ink = inkSurface(width, height);
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
-      ink.font = cssFont(size * scale, weight, mono, italic, familyOf(familyPointer, familyLength));
-      ink.fontKerning = "normal";
-      ink.letterSpacing = `${tracking * scale}px`;
+      const line = setLine(ink, text, size, weight, mono, italic, familyOf(familyPointer, familyLength), tracking, scale);
+      // a face set at the page's size is scaled to the device's
+      ink.setTransform(scale / line.set, 0, 0, scale / line.set, 0, 0);
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
       const b = (color >>> 8) & 0xff;
       const a = color & 0xff;
       ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-      // the face at the device's size, as the page draws it on a HiDPI
-      // screen; baseline sits `descent` above the box bottom — the ceil slack
+      // baseline sits `descent` above the box bottom — the ceil slack
       // stays on top, mirroring the desktop engine
-      ink.fillText(text, 0, height - descent * scale);
+      ink.fillText(text, 0, (height - descent * scale) / (scale / line.set));
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
     },

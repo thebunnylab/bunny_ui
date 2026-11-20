@@ -10,7 +10,8 @@
 
 /* The faces of hop's landing (app_hop), from hop's own copies: Inter,
    which also stands in for Inter Tight (not shipped), and Fira Mono's one
-   weight. The page and both bunny modes read the same files. */
+   weight. The page and both bunny modes read the same files. Inter's
+   optical-size axis has a case of its own (optical_size). */
 @font-face {
   font-family: "Inter";
   src: url("/fonts/InterVariable.ttf") format("truetype");
