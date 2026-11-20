@@ -275,6 +275,34 @@ fn a_clipped_multichild_blur_matches_full_and_culled_placement() {
 }
 
 #[test]
+fn a_blur_under_an_ancestor_clip_blurs_the_whole_picture_and_then_cuts() {
+    // a picture larger than the box that clips it, pulled past the box's
+    // top-left corner: the corner lies 20 points inside the picture, five
+    // sigmas, and stays as opaque as the picture is
+    let view = spacer()
+        .frame_aligned(60.0, 60.0, Alignment::TopLeading)
+        .overlay(
+            UnitPoint::TOP_LEADING,
+            rectangle()
+                .foreground_color(Color::rgb(255, 0, 0))
+                .frame_aligned(100.0, 100.0, Alignment::TopLeading)
+                .clipped()
+                .blur(4.0)
+                .offset(-20.0, -20.0),
+        )
+        .clipped();
+    let pixels = paint(&view);
+    for (x, y) in [(0, 0), (30, 0), (0, 30), (59, 0)] {
+        let at = (y * 60 + x) * 4;
+        assert_eq!(
+            &pixels[at..at + 4],
+            &[255, 0, 0, 255],
+            "({x}, {y}) is deep inside the picture"
+        );
+    }
+}
+
+#[test]
 fn native_hosts_keep_their_paint_order_and_geometry_inside_blur() {
     #[derive(Clone, Copy)]
     struct Hosted;

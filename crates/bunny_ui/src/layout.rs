@@ -5324,6 +5324,14 @@ pub struct Placement {
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
     clip: Vec<Rect>,
+    /// What each open clip's command carries, beside `clip`: the same cut
+    /// intersected only with the clips opened since the innermost blurred
+    /// picture began at [`Placement::picture_floor`]. A blur spreads the
+    /// whole picture and the clips around it cut the result, as CSS and
+    /// SwiftUI do; a picture cut first fades at a border nobody drew.
+    drawn_clip: Vec<Rect>,
+    /// The depth of `clip` where the innermost blurred picture opened.
+    picture_floor: usize,
     /// Stack of scroll CONTENT origins — animated origins anchor here,
     /// so scrolling moves content 1:1 and never bends a spring.
     anchors: Vec<Point>,
@@ -5712,12 +5720,15 @@ impl Placement {
     /// on the same integers either way; emitting the intersection is
     /// strictly narrowing, never a second semantics.
     fn push_clip(&mut self, rect: Rect, corner_radius: impl Into<Corners>) {
-        let clipped = match self.clip.last() {
+        let cut = |top: Option<&Rect>| match top {
             Some(top) => rect
                 .intersection(*top)
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
+        let clipped = cut(self.clip.last());
+        let drawn = cut(self.drawn_clip.last().filter(|_| self.drawn_clip.len() > self.picture_floor));
+        self.drawn_clip.push(drawn);
         // an EMPTY clip shows nothing, and says so once: everything under
         // it is muted, its own pair of commands included
         if !self.keep_unseen && clipped.is_empty() {
@@ -5727,7 +5738,7 @@ impl Placement {
         }
         if !self.skip_display && self.muted == 0 {
             self.display.push(DrawCommand::PushClip {
-                rect: clipped,
+                rect: drawn,
                 corner_radius: corner_radius.into(),
             });
         }
@@ -5735,6 +5746,7 @@ impl Placement {
     }
 
     fn pop_clip(&mut self) {
+        self.drawn_clip.pop();
         let closed = self.clip.pop();
         if !self.keep_unseen && closed.is_some_and(|clip| clip.is_empty()) {
             self.muted = self.muted.saturating_sub(1);
@@ -10254,6 +10266,7 @@ impl LayoutNode {
                 let filtered: Option<()> = None;
                 let old_thumbs = out.thumb_layers;
                 let old_keep = out.keep_unseen;
+                let old_floor = out.picture_floor;
                 if turn.is_some() {
                     out.compositing += 1;
                 }
@@ -10265,6 +10278,7 @@ impl LayoutNode {
                     out.thumb_layers = false;
                     // Paint outside an ancestor clip can blur back into it.
                     out.keep_unseen = true;
+                    out.picture_floor = out.clip.len();
                 }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
@@ -10469,6 +10483,7 @@ impl LayoutNode {
                     out.compositing -= 1;
                     out.thumb_layers = old_thumbs;
                     out.keep_unseen = old_keep;
+                    out.picture_floor = old_floor;
                     #[cfg(feature = "canvas")]
                     {
                         let viewport = env.overlay_bounds.or(out.accessibility_viewport).unwrap_or(frame);
