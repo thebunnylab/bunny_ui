@@ -41,8 +41,14 @@
 //!
 //! There is no capability to write, to open the network or to read a
 //! file: a block is a zero-import Wasm module, so it has nothing to ask
-//! with. What a block may request — a declared action, the page's
-//! filters, the open record — joins as new kinds and new bits.
+//! with. What its **signature** lets it have joins as kinds and bits the
+//! host grants or withholds: the page it stands on ([`Context`], under
+//! [`Capabilities::CONTEXT`]), the rows of the views it reads ([`Rows`],
+//! under [`Capabilities::READS`]) and the declared actions it may ask the
+//! shell to run ([`Requested`], under [`Capabilities::REQUESTS`]). A
+//! request is a question, never a write: the shell judges it against the
+//! signature, runs it through its own gate, and answers with an
+//! [`Outcome`].
 //!
 //! ## The scene
 //!
@@ -77,6 +83,7 @@ mod kind {
     pub const SEMANTICS: u8 = 0x05;
     pub const PACE: u8 = 0x06;
     pub const FAULT: u8 = 0x07;
+    pub const REQUEST: u8 = 0x08;
     // host → guest
     pub const OFFER: u8 = 0x40;
     pub const RESIZE: u8 = 0x41;
@@ -87,6 +94,9 @@ mod kind {
     pub const FOCUS: u8 = 0x46;
     pub const ACCESSIBILITY: u8 = 0x47;
     pub const TICK: u8 = 0x48;
+    pub const CONTEXT: u8 = 0x49;
+    pub const ROWS: u8 = 0x4a;
+    pub const ANSWER: u8 = 0x4b;
 }
 
 // =============================================================================
@@ -135,8 +145,17 @@ impl Capabilities {
     /// The host is the block's clock: ticks reach it, and it says when it
     /// wants them.
     pub const TIME: Capabilities = Capabilities(1 << 5);
+    /// The page the block stands on reaches it: its filters and the record
+    /// open on it ([`ToGuest::Context`]).
+    pub const CONTEXT: Capabilities = Capabilities(1 << 6);
+    /// The rows of the views the block's signature reads reach it
+    /// ([`ToGuest::Rows`]), as the person looking may see them.
+    pub const READS: Capabilities = Capabilities(1 << 7);
+    /// The block may ask the shell to run a declared action
+    /// ([`ToHost::Request`]), and hears how it went ([`ToGuest::Answer`]).
+    pub const REQUESTS: Capabilities = Capabilities(1 << 8);
     /// Every capability this build has a name for.
-    pub const KNOWN: Capabilities = Capabilities(0b11_1111);
+    pub const KNOWN: Capabilities = Capabilities(0b1_1111_1111);
 
     /// The capabilities a peer sent, unknown bits and all.
     pub const fn from_bits(bits: u64) -> Capabilities {
@@ -169,13 +188,16 @@ impl BitAnd for Capabilities {
 
 impl fmt::Debug for Capabilities {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(Capabilities, &str); 6] = [
+        const NAMES: [(Capabilities, &str); 9] = [
             (Capabilities::SCENE, "SCENE"),
             (Capabilities::POINTER, "POINTER"),
             (Capabilities::KEYS, "KEYS"),
             (Capabilities::TEXT, "TEXT"),
             (Capabilities::ACCESSIBILITY, "ACCESSIBILITY"),
             (Capabilities::TIME, "TIME"),
+            (Capabilities::CONTEXT, "CONTEXT"),
+            (Capabilities::READS, "READS"),
+            (Capabilities::REQUESTS, "REQUESTS"),
         ];
         let mut list = f.debug_set();
         for (capability, name) in NAMES {
@@ -339,6 +361,79 @@ pub struct SemanticNode {
     pub multiline: bool,
 }
 
+/// One term of the page's filter bar: a field and the value it is held
+/// to, as the page shows them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Filter {
+    pub field: String,
+    pub value: String,
+}
+
+/// The page a block stands on — what its signature says it receives.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Context {
+    /// The page's filters, in the order its bar holds them.
+    pub filters: Vec<Filter>,
+    /// The record open on the page, on a record page.
+    pub record: Option<String>,
+}
+
+/// One record of a view the block reads.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Row {
+    /// The record's id.
+    pub record: String,
+    /// Its cells, one per [`Rows::columns`], as the ledger shows them;
+    /// `None` where the record holds nothing.
+    pub cells: Vec<Option<String>>,
+}
+
+/// The rows of one view the block's signature reads, as the person
+/// looking may see them, whole: each [`ToGuest::Rows`] replaces the last
+/// for its view.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Rows {
+    /// The view's id, as the signature names it.
+    pub view: String,
+    /// The fields of each row's cells, in order.
+    pub columns: Vec<String>,
+    pub rows: Vec<Row>,
+}
+
+impl Rows {
+    /// The cell of `row` under the column `field`.
+    pub fn cell<'a>(&self, row: &'a Row, field: &str) -> Option<&'a str> {
+        let at = self.columns.iter().position(|column| column == field)?;
+        row.cells.get(at)?.as_deref()
+    }
+}
+
+/// A block asking the shell to run a declared action.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Requested {
+    /// The block's own number for the request; the [`ToGuest::Answer`]
+    /// names it.
+    pub request: u64,
+    /// The action's id, as the signature names it.
+    pub action: String,
+    /// The record it acts on, when it acts on one.
+    pub record: Option<String>,
+}
+
+/// How the shell answered a request.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Outcome {
+    /// The action ran and its write is on the ledger.
+    Landed,
+    /// The action ran and waits for a person's approval.
+    Held,
+    /// The person was asked and said no.
+    Declined,
+    /// The shell refused it, and why: an action the signature does not
+    /// declare, one the person may not run, or the gate's own refusal.
+    Refused(String),
+}
+
 // =============================================================================
 // Messages
 // =============================================================================
@@ -370,6 +465,12 @@ pub enum ToGuest {
     Accessibility { node: u64, action: AccessAction },
     /// Time passed. The block has no clock of its own.
     Tick { dt_ms: f64 },
+    /// The page the block stands on, whole, when it changed.
+    Context(Context),
+    /// The rows of a view the block reads, whole, when they changed.
+    Rows(Rows),
+    /// How the shell answered the block's request `request`.
+    Answer { request: u64, outcome: Outcome },
 }
 
 /// What the block sends the host.
@@ -390,6 +491,8 @@ pub enum ToHost {
     Pace { animating: bool },
     /// Input the block could not read; it read nothing after it.
     Fault { reason: String },
+    /// The block asks the shell to run a declared action.
+    Request(Requested),
 }
 
 /// A message in either direction.
@@ -589,6 +692,48 @@ fn put_to_guest(message: &ToGuest, payload: &mut Vec<u8>) -> u8 {
             out.f64(*dt_ms);
             kind::TICK
         }
+        ToGuest::Context(context) => {
+            out.u32(context.filters.len() as u32);
+            for filter in &context.filters {
+                out.sized(|out| {
+                    out.string(&filter.field);
+                    out.string(&filter.value);
+                });
+            }
+            out.option(context.record.as_deref(), Out::string);
+            kind::CONTEXT
+        }
+        ToGuest::Rows(rows) => {
+            out.string(&rows.view);
+            out.u32(rows.columns.len() as u32);
+            for column in &rows.columns {
+                out.string(column);
+            }
+            out.u32(rows.rows.len() as u32);
+            for row in &rows.rows {
+                out.sized(|out| {
+                    out.string(&row.record);
+                    out.u32(row.cells.len() as u32);
+                    for cell in &row.cells {
+                        out.option(cell.as_deref(), Out::string);
+                    }
+                });
+            }
+            kind::ROWS
+        }
+        ToGuest::Answer { request, outcome } => {
+            out.u64(*request);
+            match outcome {
+                Outcome::Landed => out.u8(0),
+                Outcome::Held => out.u8(1),
+                Outcome::Declined => out.u8(2),
+                Outcome::Refused(reason) => {
+                    out.u8(3);
+                    out.string(reason);
+                }
+            }
+            kind::ANSWER
+        }
     }
 }
 
@@ -645,6 +790,12 @@ fn put_to_host(message: &ToHost, payload: &mut Vec<u8>) -> u8 {
         ToHost::Fault { reason } => {
             out.string(reason);
             kind::FAULT
+        }
+        ToHost::Request(requested) => {
+            out.u64(requested.request);
+            out.string(&requested.action);
+            out.option(requested.record.as_deref(), Out::string);
+            kind::REQUEST
         }
     }
 }
@@ -758,6 +909,47 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
             Message::ToGuest(ToGuest::Accessibility { node, action })
         }
         kind::TICK => Message::ToGuest(ToGuest::Tick { dt_ms: c.f64()? }),
+        kind::CONTEXT => {
+            let count = c.u32()? as usize;
+            let mut filters = Vec::with_capacity(count.min(payload.len()));
+            for _ in 0..count {
+                let mut f = Cursor { bytes: c.bytes()?, at: 0, kind };
+                filters.push(Filter { field: f.string()?, value: f.string()? });
+            }
+            Message::ToGuest(ToGuest::Context(Context { filters, record: c.option(Cursor::string)? }))
+        }
+        kind::ROWS => {
+            let view = c.string()?;
+            let count = c.u32()? as usize;
+            let mut columns = Vec::with_capacity(count.min(payload.len()));
+            for _ in 0..count {
+                columns.push(c.string()?);
+            }
+            let count = c.u32()? as usize;
+            let mut rows = Vec::with_capacity(count.min(payload.len()));
+            for _ in 0..count {
+                let mut r = Cursor { bytes: c.bytes()?, at: 0, kind };
+                let record = r.string()?;
+                let cells = r.u32()? as usize;
+                let mut row = Row { record, cells: Vec::with_capacity(cells.min(payload.len())) };
+                for _ in 0..cells {
+                    row.cells.push(r.option(Cursor::string)?);
+                }
+                rows.push(row);
+            }
+            Message::ToGuest(ToGuest::Rows(Rows { view, columns, rows }))
+        }
+        kind::ANSWER => {
+            let request = c.u64()?;
+            let outcome = match c.u8()? {
+                0 => Outcome::Landed,
+                1 => Outcome::Held,
+                2 => Outcome::Declined,
+                3 => Outcome::Refused(c.string()?),
+                tag => return Err(Malformed::BadTag { what: "Outcome", tag }),
+            };
+            Message::ToGuest(ToGuest::Answer { request, outcome })
+        }
         kind::ACCEPT => {
             c.magic()?;
             Message::ToHost(ToHost::Accept {
@@ -800,6 +992,11 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
         }
         kind::PACE => Message::ToHost(ToHost::Pace { animating: c.bool()? }),
         kind::FAULT => Message::ToHost(ToHost::Fault { reason: c.string()? }),
+        kind::REQUEST => Message::ToHost(ToHost::Request(Requested {
+            request: c.u64()?,
+            action: c.string()?,
+            record: c.option(Cursor::string)?,
+        })),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     Ok(Received::Message(message))

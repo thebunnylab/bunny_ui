@@ -3,8 +3,9 @@
 
 use bunny_ui_preview::wire;
 use bunny_ui_shell::protocol::{
-    self, AccessAction, Capabilities, Malformed, Message, Modifiers, PointerButton, PointerPhase, Reader, Received,
-    Role, Scheme, SemanticNode, ToGuest, ToHost, Versions, Viewport,
+    self, AccessAction, Capabilities, Context, Filter, Malformed, Message, Modifiers, Outcome, PointerButton,
+    PointerPhase, Reader, Received, Requested, Role, Row, Rows, Scheme, SemanticNode, ToGuest, ToHost, Versions,
+    Viewport,
 };
 
 fn round_trip(message: Message) {
@@ -91,6 +92,33 @@ fn every_message_survives_its_bytes() {
         })),
         Message::ToHost(ToHost::Pace { animating: true }),
         Message::ToHost(ToHost::Fault { reason: "kind 64 ended early".into() }),
+        Message::ToGuest(ToGuest::Context(Context::default())),
+        Message::ToGuest(ToGuest::Context(Context {
+            filters: vec![
+                Filter { field: "stage".into(), value: "doing".into() },
+                Filter { field: "owner".into(), value: "Ana Lúcia".into() },
+            ],
+            record: Some("task_01".into()),
+        })),
+        Message::ToGuest(ToGuest::Rows(Rows {
+            view: "devflow_active_work".into(),
+            columns: vec!["title".into(), "owner".into(), "estimate".into()],
+            rows: vec![
+                Row { record: "task_01".into(), cells: vec![Some("Ship it".into()), Some("Ana".into()), Some("3".into())] },
+                Row { record: "task_02".into(), cells: vec![Some("Review".into()), None, None] },
+            ],
+        })),
+        Message::ToGuest(ToGuest::Rows(Rows { view: "empty".into(), columns: Vec::new(), rows: Vec::new() })),
+        Message::ToGuest(ToGuest::Answer { request: 1, outcome: Outcome::Landed }),
+        Message::ToGuest(ToGuest::Answer { request: 2, outcome: Outcome::Held }),
+        Message::ToGuest(ToGuest::Answer { request: 3, outcome: Outcome::Declined }),
+        Message::ToGuest(ToGuest::Answer { request: 4, outcome: Outcome::Refused("not declared".into()) }),
+        Message::ToHost(ToHost::Request(Requested {
+            request: 9,
+            action: "send_task_to_review".into(),
+            record: Some("task_01".into()),
+        })),
+        Message::ToHost(ToHost::Request(Requested { request: 10, action: "new_task".into(), record: None })),
     ];
     for message in messages {
         round_trip(message);
@@ -225,4 +253,91 @@ fn a_role_names_itself_and_an_unknown_one_is_a_group() {
     assert_eq!(Role::Button.name(), "button");
     assert_eq!(Role::from_name("button"), Role::Button);
     assert_eq!(Role::from_name("carousel"), Role::Group);
+}
+
+/// The signature's kinds sit where the protocol document puts them, and a
+/// request's bytes never move: a block built today asks a shell of any
+/// later year in these bytes.
+#[test]
+fn a_request_is_pinned_byte_for_byte() {
+    let bytes = protocol::encode(&Message::ToHost(ToHost::Request(Requested {
+        request: 2,
+        action: "go".into(),
+        record: None,
+    })));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&16u32.to_le_bytes());
+    expected.push(0x08);
+    expected.extend_from_slice(&2u64.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(b"go");
+    expected.push(0);
+    assert_eq!(bytes, expected);
+    let kind_of = |message: ToGuest| protocol::encode(&Message::ToGuest(message))[4];
+    assert_eq!(kind_of(ToGuest::Context(Context::default())), 0x49);
+    assert_eq!(kind_of(ToGuest::Rows(Rows { view: String::new(), columns: Vec::new(), rows: Vec::new() })), 0x4a);
+    assert_eq!(kind_of(ToGuest::Answer { request: 0, outcome: Outcome::Landed }), 0x4b);
+    assert_eq!(Capabilities::CONTEXT.bits(), 1 << 6);
+    assert_eq!(Capabilities::READS.bits(), 1 << 7);
+    assert_eq!(Capabilities::REQUESTS.bits(), 1 << 8);
+}
+
+/// A block built before the signature knew none of its bits: the host's
+/// offer of them drops out of its answer, and the host sends it none of
+/// the signature's kinds.
+#[test]
+fn an_older_block_answers_without_the_signature_bits() {
+    let older = Capabilities::from_bits(0b11_1111);
+    let offered = Capabilities::KNOWN;
+    let answered = offered & older;
+    assert!(!answered.contains(Capabilities::CONTEXT));
+    assert!(!answered.contains(Capabilities::READS));
+    assert!(!answered.contains(Capabilities::REQUESTS));
+    assert_eq!(format!("{:?}", Capabilities::KNOWN), "{SCENE, POINTER, KEYS, TEXT, ACCESSIBILITY, TIME, CONTEXT, READS, REQUESTS}");
+}
+
+/// A filter, a row and a cell each sit behind their own length, so a
+/// newer shell may append to them and an older block reads what it knows.
+#[test]
+fn a_row_grown_at_its_end_reads_as_the_row_it_was() {
+    let rows = Rows {
+        view: "v".into(),
+        columns: vec!["title".into()],
+        rows: vec![Row { record: "r".into(), cells: vec![Some("t".into())] }],
+    };
+    let bytes = protocol::encode(&Message::ToGuest(ToGuest::Rows(rows.clone())));
+    // the row's element: its length sits after the view, the column and the row count
+    let at = 4 + 1 + (4 + 1) + 4 + (4 + 5) + 4;
+    let mut grown = bytes[..at].to_vec();
+    let element = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    grown.extend_from_slice(&(element + 3).to_le_bytes());
+    grown.extend_from_slice(&bytes[at + 4..]);
+    grown.extend_from_slice(&[7, 7, 7]);
+    let total = u32::from_le_bytes(grown[..4].try_into().unwrap()) + 3;
+    grown[..4].copy_from_slice(&total.to_le_bytes());
+    let mut reader = Reader::new();
+    reader.feed(&grown);
+    assert_eq!(reader.pull(), Ok(Some(Received::Message(Message::ToGuest(ToGuest::Rows(rows))))));
+}
+
+#[test]
+fn a_cell_is_found_by_its_column() {
+    let rows = Rows {
+        view: "v".into(),
+        columns: vec!["title".into(), "owner".into()],
+        rows: vec![Row { record: "r".into(), cells: vec![Some("t".into()), None] }],
+    };
+    let row = &rows.rows[0];
+    assert_eq!(rows.cell(row, "title"), Some("t"));
+    assert_eq!(rows.cell(row, "owner"), None);
+    assert_eq!(rows.cell(row, "stage"), None);
+}
+
+#[test]
+fn an_unknown_outcome_is_refused_by_name() {
+    let mut bytes = protocol::encode(&Message::ToGuest(ToGuest::Answer { request: 1, outcome: Outcome::Landed }));
+    *bytes.last_mut().unwrap() = 9;
+    let mut reader = Reader::new();
+    reader.feed(&bytes);
+    assert_eq!(reader.pull(), Err(Malformed::BadTag { what: "Outcome", tag: 9 }));
 }

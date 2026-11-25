@@ -37,8 +37,12 @@ pub mod abi;
 /// nothing it imports.
 ///
 /// ```ignore
-/// bunny_ui_shell::block!(hello);   // `fn hello() -> impl View`
+/// bunny_ui_shell::block!(hello);            // `fn hello() -> impl View`
+/// bunny_ui_shell::block!(page => capacity); // `fn capacity(page: Page) -> impl View`
 /// ```
+///
+/// The `page =>` form hands the view its [`guest::Page`]: what the block's
+/// signature lets it receive, read and request.
 ///
 /// On `wasm32` the crate (a `cdylib`) exports the shape of one
 /// component-model function, `call: func(input: list<u8>) -> list<u8>`
@@ -54,7 +58,13 @@ pub mod abi;
 /// nothing, so the crate still builds and tests natively.
 #[macro_export]
 macro_rules! block {
+    (page => $make:path) => {
+        $crate::block!(@exports $crate::guest::Guest::over($make));
+    };
     ($make:path) => {
+        $crate::block!(@exports $crate::guest::Guest::new($make()));
+    };
+    (@exports $guest:expr) => {
         #[cfg(target_arch = "wasm32")]
         mod __bunny_block {
             #[allow(unused_imports)]
@@ -81,7 +91,7 @@ macro_rules! block {
                 let bytes = unsafe { $crate::abi::take_input(input, len) };
                 let answer = GUEST.with(|guest| {
                     let mut guest = guest.borrow_mut();
-                    let guest = guest.get_or_insert_with(|| $crate::abi::Erased::new($crate::guest::Guest::new($make())));
+                    let guest = guest.get_or_insert_with(|| $crate::abi::Erased::new($guest));
                     guest.call(&bytes)
                 });
                 $crate::abi::give_answer(answer)

@@ -18,6 +18,11 @@
 //! - **The guest has no clock.** Time is what the host's
 //!   [`ToGuest::Tick`]s say it is; a block that animates says so with
 //!   [`ToHost::Pace`].
+//! - **A request is a question.** [`Page::request`] queues it; the turn
+//!   hands it to the host after the scene, and only under
+//!   [`Capabilities::REQUESTS`]. A shell that grants none answers every
+//!   request [`Outcome::Refused`] inside the guest, so the block can say
+//!   so instead of waiting.
 //! - **Text is measured with the engine's own face** (`PixelFont`, the
 //!   house's headless face), because a sandbox has no font to ask. The
 //!   scene names the font it laid out with; a host that paints the text
@@ -29,15 +34,15 @@ use bunny_ui_core::accessibility::{self, Action};
 use bunny_ui_core::action::{Key, KeyPattern, Stroke};
 use bunny_ui_core::custom;
 use bunny_ui_core::layout::Size;
-use bunny_ui_core::prelude::{EditCommand, Runtime};
+use bunny_ui_core::prelude::{EditCommand, Runtime, State};
 use bunny_ui_core::theme::Theme;
 use bunny_ui_core::view::View;
 use bunny_ui_preview::convert;
 use bunny_ui_preview::wire::{self, Frame};
 
 use crate::protocol::{
-    self, AccessAction, Capabilities, Message, Modifiers, PointerButton, PointerPhase, Reader, Received, Role, Scheme,
-    SemanticNode, ToGuest, ToHost, Versions, Viewport,
+    self, AccessAction, Capabilities, Context, Filter, Message, Modifiers, Outcome, PointerButton, PointerPhase, Reader,
+    Received, Requested, Role, Rows, Scheme, SemanticNode, ToGuest, ToHost, Versions, Viewport,
 };
 
 /// What the guest says it is, in its answer to the offer.
@@ -50,10 +55,102 @@ pub struct Session {
     pub capabilities: Capabilities,
 }
 
+/// What a block's view holds of the page it stands on — its signature,
+/// from the inside: the page's filters and open record, the rows of the
+/// views it reads, and the declared actions it asks the shell to run.
+///
+/// Every read records itself like a `State`'s, so a view that shows the
+/// open record draws again when the shell opens another.
+#[derive(Clone, Copy)]
+pub struct Page {
+    context: State<Context>,
+    reads: State<Vec<Rows>>,
+    asked: State<Vec<Requested>>,
+    answers: State<Vec<(u64, Outcome)>>,
+    next: State<u64>,
+}
+
+impl Page {
+    fn new() -> Page {
+        Page {
+            context: State::new(Context::default()),
+            reads: State::new(Vec::new()),
+            asked: State::new(Vec::new()),
+            answers: State::new(Vec::new()),
+            next: State::new(0),
+        }
+    }
+
+    /// The page as the shell last said it.
+    pub fn context(&self) -> Context {
+        self.context.with(Context::clone)
+    }
+
+    /// The page's filters.
+    pub fn filters(&self) -> Vec<Filter> {
+        self.context.with(|context| context.filters.clone())
+    }
+
+    /// The record open on the page, on a record page.
+    pub fn record(&self) -> Option<String> {
+        self.context.with(|context| context.record.clone())
+    }
+
+    /// The rows of `view` as the shell last sent them; `None` before the
+    /// first, or for a view the block's signature does not read.
+    pub fn rows(&self, view: &str) -> Option<Rows> {
+        self.reads.with(|reads| reads.iter().find(|rows| rows.view == view).cloned())
+    }
+
+    /// Asks the shell to run the declared action `action`, on `record` when
+    /// it acts on one, and answers the request's number: what
+    /// [`Page::answer`] looks it up by. The shell runs it through its own
+    /// gate; nothing is written by asking.
+    pub fn request(&self, action: &str, record: Option<&str>) -> u64 {
+        let request = self.next.update(|next| {
+            *next += 1;
+            *next
+        });
+        self.asked.update(|asked| {
+            asked.push(Requested { request, action: action.to_string(), record: record.map(str::to_string) });
+        });
+        request
+    }
+
+    /// How the shell answered `request`, once it has.
+    pub fn answer(&self, request: u64) -> Option<Outcome> {
+        self.answers.with(|answers| answers.iter().find(|(asked, _)| *asked == request).map(|(_, outcome)| outcome.clone()))
+    }
+
+    /// The requests waiting to be handed over, taken.
+    fn take_asked(&self) -> Vec<Requested> {
+        self.asked.update_if(|asked| (!asked.is_empty(), std::mem::take(asked)))
+    }
+
+    fn answered(&self, request: u64, outcome: Outcome) {
+        self.answers.update(|answers| answers.push((request, outcome)));
+    }
+
+    fn read(&self, rows: Rows) -> bool {
+        self.reads.update_if(|reads| match reads.iter_mut().find(|held| held.view == rows.view) {
+            Some(held) if *held == rows => (false, false),
+            Some(held) => {
+                *held = rows;
+                (true, true)
+            }
+            None => {
+                reads.push(rows);
+                (true, true)
+            }
+        })
+    }
+}
+
 /// A view, its runtime, and what the host has already been told.
 pub struct Guest<V> {
     runtime: Runtime,
     root: V,
+    page: Page,
     session: Option<Session>,
     viewport: Viewport,
     seq: u64,
@@ -81,11 +178,25 @@ impl<V: View> Guest<V> {
         Guest::with_runtime(Runtime::new(), root)
     }
 
+    /// A guest over the view `make` builds from the page it stands on —
+    /// a block with a signature.
+    pub fn over(make: impl FnOnce(Page) -> V) -> Self {
+        let runtime = Runtime::new();
+        let page = Page::new();
+        let root = make(page);
+        Guest::assemble(runtime, root, page)
+    }
+
     /// A guest over `root` on a runtime the caller built.
     pub fn with_runtime(runtime: Runtime, root: V) -> Self {
+        Guest::assemble(runtime, root, Page::new())
+    }
+
+    fn assemble(runtime: Runtime, root: V, page: Page) -> Self {
         Guest {
             runtime,
             root,
+            page,
             session: None,
             viewport: Viewport { width: 0.0, height: 0.0, scale: 1.0, scheme: Scheme::Light },
             seq: 0,
@@ -136,7 +247,30 @@ impl<V: View> Guest<V> {
             self.touched = false;
             self.present(&mut out);
         }
+        self.hand_over(&mut out);
         out
+    }
+
+    /// The requests the view made this turn: to the host when it grants
+    /// them, else answered as refused here, so the view can say so.
+    fn hand_over(&mut self, out: &mut Vec<u8>) {
+        let asked = self.page.take_asked();
+        if asked.is_empty() {
+            return;
+        }
+        if self.granted(Capabilities::REQUESTS) {
+            for requested in asked {
+                say(out, ToHost::Request(requested));
+            }
+        } else {
+            for requested in asked {
+                self.page.answered(requested.request, Outcome::Refused("this shell grants this block no requests".to_string()));
+            }
+            // the refusals are the view's to show
+            if self.session.is_some() {
+                self.present(out);
+            }
+        }
     }
 
     fn granted(&self, capability: Capabilities) -> bool {
@@ -179,6 +313,12 @@ impl<V: View> Guest<V> {
                 let ticked = runtime.tick(dt_ms / 1000.0);
                 ticked.scene || ticked.islands
             }
+            ToGuest::Context(context) if self.granted(Capabilities::CONTEXT) => self.page.context.set_if_changed(context),
+            ToGuest::Rows(rows) if self.granted(Capabilities::READS) => self.page.read(rows),
+            ToGuest::Answer { request, outcome } if self.granted(Capabilities::REQUESTS) => {
+                self.page.answered(request, outcome);
+                true
+            }
             // an event of a kind the host did not grant
             ToGuest::Pointer { .. }
             | ToGuest::Wheel { .. }
@@ -186,7 +326,10 @@ impl<V: View> Guest<V> {
             | ToGuest::Text { .. }
             | ToGuest::Focus { .. }
             | ToGuest::Accessibility { .. }
-            | ToGuest::Tick { .. } => false,
+            | ToGuest::Tick { .. }
+            | ToGuest::Context(_)
+            | ToGuest::Rows(_)
+            | ToGuest::Answer { .. } => false,
         };
         self.touched |= moved;
     }

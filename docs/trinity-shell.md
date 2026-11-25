@@ -70,6 +70,9 @@ count. Kinds `0x00..=0x3f` go guest → host, `0x40..=0x7f` host → guest,
 | `0x46` | `Focus` | focused `bool` | `KEYS` |
 | `0x47` | `Accessibility` | node `u64`, action (activate, focus, set text, increment, decrement, set value) | `ACCESSIBILITY` |
 | `0x48` | `Tick` | `dt_ms` `f64` — the block has no clock | `TIME` |
+| `0x49` | `Context` | the page's filters (each behind its length: field, value), then the open record (`Option`) | `CONTEXT` |
+| `0x4a` | `Rows` | a view the block reads, whole: its id, its columns, then its rows (each behind its length: record id, cells as `Option<string>`) | `READS` |
+| `0x4b` | `Answer` | the request's number `u64`, the outcome `u8` (landed, held for approval, declined by the person, refused + a reason) | `REQUESTS` |
 
 Modifiers: shift 1, command 2 (⌘ on a Mac, Ctrl elsewhere), option 4,
 control 8 (the Mac's ⌃).
@@ -85,19 +88,43 @@ control 8 (the Mac's ⌃).
 | `0x05` | `Semantics` | the scene's `seq`, then the nodes, each behind its own length: id, role (by name), label, value, bounds, focused, enabled, checked, expanded, level, multiline |
 | `0x06` | `Pace` | animating `bool` — whether the block wants ticks |
 | `0x07` | `Fault` | input the block could not read; it read nothing after it |
+| `0x08` | `Request` | the block's number for it `u64`, a declared action's id, the record it acts on (`Option`) — under `REQUESTS` |
 
 A scene, semantics and pace are sent only when they changed: a turn that
 changed nothing answers nothing.
 
 ### Capabilities
 
-`SCENE` 1, `POINTER` 2, `KEYS` 4, `TEXT` 8, `ACCESSIBILITY` 16, `TIME` 32.
+`SCENE` 1, `POINTER` 2, `KEYS` 4, `TEXT` 8, `ACCESSIBILITY` 16, `TIME` 32,
+`CONTEXT` 64, `READS` 128, `REQUESTS` 256.
 The host offers what it grants; the block answers the intersection with
 the ones it knows, and acts on no event of an ungranted kind. There is no
 capability to write, to open the network or to read a file: a block has no
-import to ask with. What a block may request next — a declared action, the
-page's filters, the open record (its signature) — joins as new kinds and
-new bits.
+import to ask with.
+
+### The signature
+
+A raw block is a block inside a declarative page, with a **signature**
+(D723): what it receives (the page's filters and the record open on it),
+which views it reads, and which declared actions it may request. The shell
+grants the three bits the signature names and no others:
+
+- `CONTEXT` — the shell sends `Context` when the page's filters or its open
+  record change.
+- `READS` — the shell sends `Rows` for each view the signature reads, as the
+  person looking may see them, whenever they change; each replaces the last
+  for its view.
+- `REQUESTS` — the block may send `Request`; the shell answers each with
+  `Answer`. A request is a question: the shell refuses an action the
+  signature does not declare without touching the ledger, runs a declared
+  one through its own gate (asking the person first when the action asks),
+  and says how it went. Nothing is written by asking.
+
+A view reaches its signature through `bunny_ui_shell::guest::Page`
+(`block!(page => make)`): `record()`, `filters()`, `rows(view)`,
+`request(action, record)` and `answer(request)`, each read recorded like a
+`State`'s. Under a shell that grants no `REQUESTS`, `request` is answered
+`Refused` inside the guest, so the view can say so rather than wait.
 
 ### How it grows
 
