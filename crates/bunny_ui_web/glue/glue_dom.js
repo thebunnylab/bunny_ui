@@ -72,7 +72,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 29;
+const EXPECTED_ABI = 30;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -573,7 +573,46 @@ const KIND_BASE = [
   // 17 rectangle, 18 ellipse: independent axes, inherited hover/press ink
   "box-sizing:border-box;background:currentColor",
   "box-sizing:border-box;background:currentColor;border-radius:50%",
+  // 19 drawing: a picture drawn inline, the box underneath owns the clicks
+  "pointer-events:none",
 ];
+
+// A drawing's elements and attributes by their codes on the wire —
+// bunny_ui::drawing::TAGS and ATTRIBUTES, in their order. Nothing else
+// is ever created or set: a name crosses as its place here.
+const DRAWING_TAGS = [
+  "svg", "g", "defs", "symbol", "use", "path", "rect", "circle", "ellipse", "line", "polyline",
+  "polygon", "linearGradient", "radialGradient", "stop", "clipPath", "mask",
+];
+const DRAWING_ATTRIBUTES = [
+  "id", "href", "viewBox", "preserveAspectRatio", "width", "height", "x", "y", "d", "rx", "ry",
+  "cx", "cy", "r", "fx", "fy", "fr", "x1", "y1", "x2", "y2", "points", "pathLength", "offset",
+  "transform", "gradientTransform", "gradientUnits", "spreadMethod", "clipPathUnits", "maskUnits",
+  "maskContentUnits", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width",
+  "stroke-opacity", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray",
+  "stroke-dashoffset", "opacity", "clip-path", "clip-rule", "mask", "stop-color", "stop-opacity",
+  "color", "display", "visibility", "vector-effect", "shape-rendering", "paint-order",
+];
+// What the root — the page's own <svg> — may wear: its viewport and the
+// paint its shapes inherit, never what moves, hides or clips the box, nor
+// an id (bunny_ui::drawing::ROOT_ATTRIBUTES).
+const DRAWING_ROOT = [
+  "viewBox", "preserveAspectRatio", "width", "height", "fill", "fill-opacity", "fill-rule",
+  "stroke", "stroke-width", "stroke-opacity", "stroke-linecap", "stroke-linejoin",
+  "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "clip-rule", "color",
+  "shape-rendering", "paint-order",
+];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// A drawing's value, checked again on this side of the border: a
+// reference names an element of the drawing (`#…`, `url(#…)`) or the
+// value is dropped, and no CSS escape gets through.
+function drawingValue(name, value) {
+  if (value.includes("\\")) return null;
+  if (name === "href") return /^#[\w-]+$/.test(value) ? value : null;
+  if (/url\s*\(/i.test(value)) return /^url\(#[\w-]+\)$/.test(value) ? value : null;
+  return value;
+}
 
 // The kinds whose line is a CSS border: the wrappers, whose children
 // each fill the box (a group, a box, layers), and the shapes, which hold
@@ -731,7 +770,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
     // a resizable picture takes its frame across as well: a width left
     // to the ratio spills a contained picture past its frame and crops
     // a covering one from one side
-    if (kind === 7) decl["align-self"] = "stretch";
+    if (kind === 7 || kind === 19) decl["align-self"] = "stretch";
   }
   if (layout.wrap !== null) {
     // a row that wraps: its lines break where its items' widths say
@@ -1106,7 +1145,8 @@ function createElementOf(kind, tag) {
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover,
   // 13 editor — the field of MANY lines, a `<textarea>` —
   // 14 iframe — the native host's page, 15 video — the video host's
-  // stream; 16 grid — a sparse equal-track container. The element is born BARE:
+  // stream; 16 grid — a sparse equal-track container, 17 rectangle,
+  // 18 ellipse, 19 drawing — an inline `<svg>`. The element is born BARE:
   // every declaration its kind brings along is the look's (op 21),
   // worn by class — a thousand rows that look alike share one rule
   if (kind === 6) return document.createElement("canvas");
@@ -1136,6 +1176,8 @@ function createElementOf(kind, tag) {
     svg.setAttribute("viewBox", "0 0 24 24");
     return svg;
   }
+  // 19: a drawing — its viewBox and its shapes arrive with op 29
+  if (kind === 19) return document.createElementNS(SVG_NS, "svg");
   if (kind === 3 || kind === 13) {
     // 13 is the field of MANY lines: a textarea, so the browser wraps,
     // breaks and scrolls it at home. A field that changes shape is
@@ -1882,6 +1924,35 @@ function applyPatches(view, length) {
         el.style.objectFit = fit === 1 ? "cover" : fit === 2 ? "contain" : "fill";
       }
       if (el && entry) el.src = entry.url;
+    } else if (op === 29) {
+      // a drawing: its tree replaces what the element held. Every element
+      // is made by createElementNS from its code, every attribute is a
+      // name of the table; a code past either table makes nothing, and
+      // its bytes are read all the same
+      const el = lookup(id);
+      if (el) {
+        for (const name of el.__drawn || []) el.removeAttribute(name);
+        el.__drawn = [];
+        el.replaceChildren();
+      }
+      const build = (parent, root) => {
+        const tag = DRAWING_TAGS[u8()];
+        const node = root ? el : parent && tag && tag !== "svg" ? document.createElementNS(SVG_NS, tag) : null;
+        const count = u8();
+        for (let a = 0; a < count; a++) {
+          const name = DRAWING_ATTRIBUTES[u8()];
+          const value = text(u32());
+          const allowed = name !== undefined && (root ? DRAWING_ROOT.includes(name) : true);
+          const kept = allowed ? drawingValue(name, value) : null;
+          if (!node || kept === null) continue;
+          node.setAttribute(name, kept);
+          if (root) node.__drawn.push(name);
+        }
+        const children = u16();
+        for (let c = 0; c < children; c++) build(node, false);
+        if (node && !root) parent.appendChild(node);
+      };
+      build(null, true);
     } else if (op === 10) {
       u32(); // the symbol identity rides for the debugger's eyes
       u32();

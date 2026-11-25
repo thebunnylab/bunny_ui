@@ -86,6 +86,9 @@ pub enum DomKind {
     /// record carries the IDENTITY; the shell's registry maps it to a
     /// URL the browser can load.
     Image(DomImage),
+    /// An `<svg>` an app drew inline (`.inline_svg()`): the picture's own
+    /// tree, allow-listed ([`crate::drawing`]), as elements of the page.
+    Drawing(DomDrawing),
     /// An `<svg>` — a vector glyph rendered AT HOME: the browser
     /// scales the drawing, and the tint is `currentColor`, so hover
     /// and press flip through the box above with no patch of their
@@ -152,6 +155,24 @@ pub struct DomImage {
     pub key: u64,
     pub cover: bool,
     pub contain: bool,
+}
+
+/// One inline drawing. `key` is the picture's identity, and the diff
+/// compares by it; the tree rides beside it, read once per key.
+/// `own_size`: a picture at its own size keeps the drawing's `width` and
+/// `height`; a resizable one leaves them out — on an `<svg>` they are
+/// CSS sizes, and the box is the layout's.
+#[derive(Clone, Debug)]
+pub struct DomDrawing {
+    pub key: u64,
+    pub drawing: Rc<crate::drawing::Drawing>,
+    pub own_size: bool,
+}
+
+impl PartialEq for DomDrawing {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.own_size == other.own_size
+    }
 }
 
 /// One vector glyph element. `key` is the SYMBOL's identity — never
@@ -1563,6 +1584,8 @@ pub enum CreateKind {
     Content,
     Canvas,
     Image,
+    /// An `<svg>` drawn inline, its tree the `SetDrawing` that follows.
+    Drawing,
     Icon,
     FlexColumn,
     FlexRow,
@@ -1690,6 +1713,8 @@ pub enum DomPatch {
     SetField { id: u32, field: Box<DomField> },
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
+    /// The drawing's whole tree, in place of what the element held.
+    SetDrawing { id: u32, drawing: DomDrawing },
     SetIcon { id: u32, icon: DomIcon },
     /// The iframe navigates — the diff only ships a CHANGED src, so
     /// the write is the navigation (writing the same one would
@@ -2508,6 +2533,7 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::Content => 6,
         DomKind::Canvas { .. } => 7,
         DomKind::Image(_) => 8,
+        DomKind::Drawing(_) => 20,
         DomKind::Icon(_) => 9,
         DomKind::Iframe { .. } => 10,
         DomKind::FlexColumn => 11,
@@ -2801,6 +2827,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Content => CreateKind::Content,
         DomKind::Canvas { .. } => CreateKind::Canvas,
         DomKind::Image(_) => CreateKind::Image,
+        DomKind::Drawing(_) => CreateKind::Drawing,
         DomKind::Icon(_) => CreateKind::Icon,
         DomKind::Iframe { .. } => CreateKind::Iframe,
         DomKind::Video { .. } => CreateKind::Video,
@@ -3395,6 +3422,9 @@ fn create_subtree(
         DomKind::Image(image) => {
             patches.push(DomPatch::SetImage { id, image: *image });
         }
+        DomKind::Drawing(drawing) => {
+            patches.push(DomPatch::SetDrawing { id, drawing: drawing.clone() });
+        }
         DomKind::Icon(icon) => {
             patches.push(DomPatch::SetIcon { id, icon: *icon });
         }
@@ -3846,6 +3876,9 @@ fn diff_node(
         (_, DomKind::Canvas { .. }) => note_island(id, &new, ctx),
         (DomKind::Image(before), DomKind::Image(after)) if before != after => {
             patches.push(DomPatch::SetImage { id, image: *after });
+        }
+        (DomKind::Drawing(before), DomKind::Drawing(after)) if before != after => {
+            patches.push(DomPatch::SetDrawing { id, drawing: after.clone() });
         }
         (DomKind::Icon(before), DomKind::Icon(after)) if before != after => {
             patches.push(DomPatch::SetIcon { id, icon: *after });
@@ -4641,7 +4674,16 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// (`.border_edge`: per side, clockwise from the top — top, trailing,
 /// bottom, leading — u32 rgba + f32 width, zero for none), sent in place
 /// of bit 3's ring, with bit 28's style.
-pub const ABI_VERSION: u32 = 29;
+///
+/// 30 (2026-11-25): a picture drawn inline. Create (op 1) gains kind 19,
+/// an `<svg>`, and SetDrawing (op 29) carries its tree, root first: u8
+/// tag, u8 attribute count, per attribute u8 name + u32 len + utf8, u16
+/// child count, the children. Tags and names are codes into
+/// `drawing::TAGS` and `drawing::ATTRIBUTES` — the glue's
+/// `DRAWING_TAGS` and `DRAWING_ATTRIBUTES` — so no name crosses; the
+/// glue replaces what the element held and creates each child with
+/// `createElementNS`.
+pub const ABI_VERSION: u32 = 30;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4657,7 +4699,7 @@ pub const ABI_VERSION: u32 = 29;
 ///                            8 icon, 9 flex column, 10 flex row,
 ///                            11 layers, 12 popover, 13 editor — the
 ///                            field of many lines, a `<textarea>`,
-///                            14 iframe, 15 video)
+///                            14 iframe, 15 video, 19 drawing)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -4797,6 +4839,10 @@ pub const ABI_VERSION: u32 = 29;
 ///  27 set language  u8 dir (0 ltr, 1 rtl), u8 len + utf8 tag — the
 ///                   element's `lang` and `dir`: the mount's, on the
 ///                   first frame and when the locale in effect moves
+///  29 set drawing   the tree, root first: u8 tag, u8 attribute count,
+///                   per attribute u8 name + u32 len + utf8, u16 child
+///                   count, the children — codes into `drawing::TAGS`
+///                   and `drawing::ATTRIBUTES`
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -4919,6 +4965,13 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, (image.key >> 32) as u32);
                 push_u32(&mut out, image.key as u32);
                 out.push(u8::from(image.cover) | u8::from(image.contain) << 1);
+            }
+            DomPatch::SetDrawing { id, drawing } => {
+                out.push(29);
+                push_u32(&mut out, *id);
+                let root = &drawing.drawing.root;
+                let attributes: Vec<&(u8, crate::drawing::Value)> = drawing.drawing.root_attributes(drawing.own_size).collect();
+                push_drawing_node(&mut out, root.tag, &attributes, &root.children, *id);
             }
             DomPatch::SetIcon { id, icon } => {
                 out.push(10);
@@ -5567,6 +5620,7 @@ pub(crate) fn kind_code(kind: CreateKind) -> u8 {
         CreateKind::Content => 5,
         CreateKind::Canvas => 6,
         CreateKind::Image => 7,
+        CreateKind::Drawing => 19,
         CreateKind::Icon => 8,
         CreateKind::FlexColumn => 9,
         CreateKind::FlexRow => 10,
@@ -5761,6 +5815,34 @@ fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// One element of a drawing and what it holds: u8 tag, u8 attribute
+/// count, per attribute u8 name + u32 len + utf8 (as element `scope`
+/// spells it), u16 child count, the children.
+// a node's attributes are distinct names of the table, its children no
+// more than a drawing holds: the u8 and the u16 below always fit
+const _: () = assert!(crate::drawing::ATTRIBUTES.len() <= u8::MAX as usize);
+const _: () = assert!(crate::drawing::MAX_NODES <= u16::MAX as usize);
+
+fn push_drawing_node(
+    out: &mut Vec<u8>,
+    tag: u8,
+    attributes: &[&(u8, crate::drawing::Value)],
+    children: &[crate::drawing::Node],
+    scope: u32,
+) {
+    out.push(tag);
+    out.push(attributes.len() as u8);
+    for (code, value) in attributes {
+        out.push(*code);
+        push_bytes_u32(out, value.spell(scope).as_bytes());
+    }
+    push_u16(out, children.len() as u16);
+    for child in children {
+        let attributes: Vec<&(u8, crate::drawing::Value)> = child.attributes.iter().collect();
+        push_drawing_node(out, child.tag, &attributes, &child.children, scope);
+    }
+}
+
 fn push_bytes_u16(out: &mut Vec<u8>, bytes: &[u8]) {
     push_u16(out, bytes.len() as u16);
     out.extend_from_slice(bytes);
@@ -5800,6 +5882,7 @@ mod tests {
             | DomPatch::SetText { id, .. }
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
+            | DomPatch::SetDrawing { id, .. }
             | DomPatch::SetIcon { id, .. }
             | DomPatch::SetIframe { id, .. }
             | DomPatch::SetVideo { id, .. }
@@ -7976,6 +8059,129 @@ mod tests {
             &patches[0],
             DomPatch::SetImage { image, .. } if image.key == tiny_image(11).key()
         ));
+    }
+
+    // MARK: - Drawings
+
+    fn sky(seed: u8) -> ImageSource {
+        let svg = format!(
+            r##"<svg viewBox="0 0 2 2"><linearGradient id="g"><stop stop-color="#0{seed}0"/></linearGradient><rect width="2" height="2" fill="url(#g)" onclick="alert(1)"/><script>alert(2)</script></svg>"##
+        );
+        ImageSource::from_bytes(svg.into_bytes())
+    }
+
+    #[derive(Clone)]
+    struct Drawn {
+        source: State<ImageSource>,
+    }
+
+    impl Component for Drawn {
+        fn body(self) -> impl View {
+            image(self.source.get()).inline_svg().resizable().frame(24.0, 24.0)
+        }
+    }
+
+    #[test]
+    fn an_inline_svg_mounts_as_a_drawing_and_retargets_by_key() {
+        let runtime = Runtime::new();
+        let view = Drawn { source: State::new(sky(1)) };
+        let size = Size { width: 100.0, height: 60.0 };
+
+        let patches = runtime.dom_frame(&view, size);
+        let creates = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Drawing, .. }))
+            .count();
+        assert_eq!(creates, 1, "one element for one drawing: {patches:?}");
+        assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::SetImage { .. })), "{patches:?}");
+        let drawn = patches.iter().find_map(|patch| match patch {
+            DomPatch::SetDrawing { drawing, .. } => Some(drawing),
+            _ => None,
+        });
+        let drawn = drawn.expect("the mount sends the tree");
+        assert_eq!(drawn.key, sky(1).key());
+        assert!(!drawn.own_size, "a resizable picture leaves its size to the layout");
+        let tags: Vec<&str> = drawn.drawing.root.children.iter().map(|node| crate::drawing::TAGS[usize::from(node.tag)]).collect();
+        assert_eq!(tags, ["linearGradient", "rect"], "no script crosses");
+
+        assert_eq!(runtime.dom_frame(&view, size), vec![]);
+
+        view.source.set(sky(2));
+        let patches = runtime.dom_frame(&view, size);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert!(matches!(&patches[0], DomPatch::SetDrawing { drawing, .. } if drawing.key == sky(2).key()));
+    }
+
+    #[test]
+    fn a_picture_that_is_no_svg_stays_an_image() {
+        #[derive(Clone, Copy)]
+        struct Photo;
+        impl Component for Photo {
+            fn body(self) -> impl View {
+                image(tiny_image(3)).inline_svg().resizable().frame(24.0, 24.0)
+            }
+        }
+        let patches = Runtime::new().dom_frame(&Photo, Size { width: 100.0, height: 60.0 });
+        assert!(patches.iter().any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Image, .. })), "{patches:?}");
+        assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::SetDrawing { .. })), "{patches:?}");
+    }
+
+    /// The tree crosses as codes and spelled values: the tag and the names
+    /// are places in the tables, and an id and its references are spelled
+    /// for the element that wears them.
+    #[test]
+    fn the_drawing_encoding_is_byte_stable() {
+        let drawing = crate::drawing::Drawing::parse(br##"<svg viewBox="0 0 1 1"><clipPath id="c"/><g clip-path="url(#c)"/></svg>"##)
+            .expect("a drawing");
+        let bytes = encode(&[DomPatch::SetDrawing { id: 7, drawing: DomDrawing { key: 1, drawing: Rc::new(drawing), own_size: false } }]);
+        let string = |value: &str| [&(value.len() as u32).to_le_bytes()[..], value.as_bytes()].concat();
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[29],
+            &7u32.to_le_bytes()[..],
+            &[0, 1, 2],
+            &string("0 0 1 1"),
+            &2u16.to_le_bytes()[..],
+            &[15, 1, 0],
+            &string("bunny-7-0"),
+            &0u16.to_le_bytes()[..],
+            &[1, 1, 43],
+            &string("url(#bunny-7-0)"),
+            &0u16.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+        assert_eq!(crate::drawing::ATTRIBUTES[43], "clip-path");
+    }
+
+    /// The glue makes what the tables name and nothing else: its tables
+    /// are this crate's, in the same order, and it reads op 29 by codes
+    /// with `createElementNS` — no markup string ever reaches the page.
+    #[test]
+    fn the_glue_builds_a_drawing_from_the_same_tables() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        let table = |name: &str| -> Vec<String> {
+            let start = glue.find(&format!("const {name} = [")).expect("the table") + name.len() + 10;
+            let end = start + glue[start..].find("];").expect("its end");
+            glue[start..end].split(',').map(|word| word.trim().trim_matches('"').to_string()).filter(|word| !word.is_empty()).collect()
+        };
+        assert_eq!(table("DRAWING_TAGS"), crate::drawing::TAGS);
+        assert_eq!(table("DRAWING_ATTRIBUTES"), crate::drawing::ATTRIBUTES);
+        // the root wears only what draws inside its box, on both sides
+        assert_eq!(table("DRAWING_ROOT"), crate::drawing::ROOT_ATTRIBUTES);
+        assert!(glue.contains("root ? DRAWING_ROOT.includes(name) : true"), "the glue's root allow-list");
+        assert!(glue.contains("} else if (op === 29) {"), "glue_dom.js reads op 29");
+        assert!(glue.contains("document.createElementNS(SVG_NS, tag)"), "an element by its code");
+        assert!(glue.contains("const tag = DRAWING_TAGS[u8()];") && glue.contains("const name = DRAWING_ATTRIBUTES[u8()];"));
+        assert!(glue.contains("if (kind === 19) return document.createElementNS(SVG_NS, \"svg\");"));
+        assert_eq!(kind_code(CreateKind::Drawing), 19);
+        for sink in ["innerHTML", "outerHTML", "insertAdjacentHTML", "DOMParser", "createContextualFragment", "document.write"] {
+            assert!(!glue.contains(sink), "glue_dom.js never parses markup ({sink})");
+        }
+        // the second check, on the page's side of the border
+        assert!(glue.contains(r#"if (name === "href") return /^#[\w-]+$/.test(value) ? value : null;"#));
+        assert!(glue.contains(r#"if (/url\s*\(/i.test(value)) return /^url\(#[\w-]+\)$/.test(value) ? value : null;"#));
+        assert!(glue.contains(r#"if (value.includes("\\")) return null;"#));
     }
 
     #[derive(Clone)]
