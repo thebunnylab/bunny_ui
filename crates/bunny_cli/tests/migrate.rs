@@ -104,6 +104,8 @@ fn the_bar_takes_items_and_the_refresh_is_async() {
         (".refreshable(async move || model.reload().await)", ".refreshable(async move || model.reload().await)"),
         ("navigation_stack(path, (root(),))", "navigation_stack(path, root())"),
         ("let link: NavigationLink<Text> = l;", "let link: NavLink<Text> = l;"),
+        ("navigation_link(Details::new(id), text(\"Open\"))", "nav_link(text(\"Open\"), move || Details::new(id))"),
+        ("navigation_link(\n    About,\n    text(\"About\"),\n)", "nav_link(\n    text(\"About\"),\n    move || About,\n)"),
     ];
     for (before, after) in cases {
         assert_eq!(migrate::source(before, V05, V06).unwrap().text, after, "{before}");
@@ -112,7 +114,7 @@ fn the_bar_takes_items_and_the_refresh_is_async() {
 
 #[test]
 fn what_no_rule_carries_is_named_where_it_stands() {
-    let source = "struct A {\n    path: State<NavigationPath>,\n}\nfn b() {\n    page.navigation_destination();\n    navigation_link(text(\"a\"), detail());\n    page.refreshable(reload);\n    navigation_stack_content((a(), b()));\n}\n";
+    let source = "struct A {\n    path: State<NavigationPath>,\n}\nfn b() {\n    page.navigation_destination();\n    page.refreshable(reload);\n    navigation_stack_content((a(), b()));\n}\n";
     let migrated = migrate::source(source, V05, V06).unwrap();
     assert_eq!(migrated.text, source, "a gap is named, never guessed at");
     let at: Vec<(usize, usize, &str)> = migrated.gaps.iter().map(|gap| (gap.line, gap.column, gap.found.as_str())).collect();
@@ -121,9 +123,8 @@ fn what_no_rule_carries_is_named_where_it_stands() {
         [
             (2, 17, "NavigationPath"),
             (5, 10, "navigation_destination"),
-            (6, 5, "navigation_link"),
-            (7, 10, "refreshable"),
-            (8, 5, "navigation_stack_content"),
+            (6, 10, "refreshable"),
+            (7, 5, "navigation_stack_content"),
         ]
     );
     assert!(migrated.gaps.iter().all(|gap| !gap.note.is_empty()));

@@ -76,6 +76,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::upgrade::run,
     },
     Command {
+        name: "migrate",
+        summary: commands::migrate::SUMMARY,
+        usage: commands::migrate::USAGE,
+        about: commands::migrate::ABOUT,
+        options: commands::migrate::OPTIONS,
+        run: commands::migrate::run,
+    },
+    Command {
         name: "doctor",
         summary: commands::doctor::SUMMARY,
         usage: commands::doctor::USAGE,

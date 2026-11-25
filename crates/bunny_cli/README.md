@@ -22,6 +22,7 @@ bunny build macos    # a signed app and its disk image, to hand out
 | `bunny signer generate` | Make the key pair that signs the app's updates |
 | `bunny updater merge` | Join the `latest.json` of each platform into one |
 | `bunny upgrade` | Bring the platform folders up to this `bunny`'s templates, your edits kept |
+| `bunny migrate` | Carry the app's source to a newer bunny-ui by rules, the diff shown before anything is written |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -201,6 +202,40 @@ stays yours, and the template's version is written beside it as
 you removed stays removed, and `src/` and `Cargo.toml` are never touched.
 `--dry-run` says what would change. `bunny doctor`, run inside an app, says
 when a folder follows an older template.
+
+## `bunny migrate`
+
+`bunny migrate` carries a crate written for one bunny-ui to the next. Each
+change of the API between two versions is a rule — arguments that changed
+places, a name that changed, a closure that became `async`, a view that became
+a bar item — and a rule rewrites a call site only where the rewrite is sure. It
+reads tokens, not text: a comment, a string or a function of the same name is
+left alone. The version to start from is the one `Cargo.toml` asks for (or the
+workspace's, or `--from`), the target the newest this `bunny` knows (or `--to`),
+and the steps chain: `0.4` to `0.6` is `0.4 → 0.5`, then `0.5 → 0.6`. The
+requirement in `Cargo.toml` moves with it, operator and precision kept.
+
+The diff of every file is shown before anything is written. On a terminal you
+are asked; elsewhere `--yes` writes, and `--dry-run` never does. What no rule
+can carry is listed with its file, line, column and what to do — the work left
+for you, or for an agent — and is not touched. `--json` answers with the plan,
+each file's diff and those places, for a tool such as Studio to show behind one
+"Update to bunny-ui x.y" button.
+
+```sh
+bunny migrate --dry-run         # the diff, nothing written
+bunny migrate                   # the diff, then: Write these changes? [y/N]
+bunny migrate --from 0.5 --yes  # a crate whose Cargo.toml names no version
+```
+
+| Step | Rewritten | Left for you |
+| --- | --- | --- |
+| `0.4 → 0.5` | `.modifiers_changed(m)` → `.modifiers_changed(m).present` | a `match` on `KeyMatch` needs a `Disabled` arm |
+| `0.5 → 0.6` | `nav_link_value(value, label)` → `nav_link_value(label, value)`; `navigation_link(page, label)` → `nav_link(label, move \|\| page)`; `NavigationLink` → `NavLink`; `.toolbar(view)` → `.toolbar(toolbar_item(view))`; `.refreshable(\|\| …)` → `.refreshable(async \|\| …)`; `navigation_stack_content((root,))` → `navigation_stack_content(root)` | `NavigationPath` (the path is your own `Vec` of routes now), `.navigation_destination()`, a stack given several roots, `.refreshable(f)` with no closure |
+
+The rules are `crates/bunny_cli/src/migrate/rules.rs`; a release that changes
+the API adds its step there, with a block written for the old version and its
+migrated form under `tests/migrate/`.
 
 ## `bunny setup android`
 

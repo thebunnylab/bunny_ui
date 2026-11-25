@@ -5,6 +5,7 @@ pub mod devices;
 pub mod doctor;
 pub mod fidelity;
 pub mod import;
+pub mod migrate;
 pub mod new;
 pub mod preview;
 pub mod run;
