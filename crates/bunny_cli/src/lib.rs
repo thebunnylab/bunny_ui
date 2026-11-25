@@ -22,6 +22,7 @@ pub mod ids;
 pub mod import;
 pub mod json;
 pub mod keys;
+pub mod migrate;
 pub mod net;
 pub mod platform;
 pub mod preview;

@@ -8,7 +8,7 @@ and accessibility stay with the shell. What crosses is the **shell
 protocol**: small, versioned, additive, and the one thing Trinity keeps
 loadable forever. Each block bundles the engine it was built with, so a
 bunny-ui change breaks nothing already shipped; source moves forward with
-`bunny migrate`.
+`bunny migrate` (`crates/bunny_cli/README.md`).
 
 The crate is `bunny-ui-shell` (`crates/bunny_ui_shell`):
 
