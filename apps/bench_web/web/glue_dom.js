@@ -575,6 +575,11 @@ const KIND_BASE = [
   "box-sizing:border-box;background:currentColor;border-radius:50%",
 ];
 
+// The kinds whose line is a CSS border: the wrappers, whose children
+// each fill the box (a group, a box, layers), and the shapes, which hold
+// none. A text, a field, a picture, a scroll or a stack keeps the outline.
+const LINED = new Set([0, 1, 11, 17, 18]);
+
 // A ramp's CSS: the engine's geometry, each color between the ends at
 // its place along the ramp. The twin of the serializer's `css_gradient`.
 function rampImage({ kind, a, b, c, d, aspect, near, far }, stops) {
@@ -742,10 +747,16 @@ function lookRules(selector, kind, flags, style, layout, face) {
     if (style.floor[0] > 0) decl["min-width"] = `${style.floor[0]}px`;
     if (style.floor[1] > 0) decl["min-height"] = `${style.floor[1]}px`;
   }
-  // a line drawn inward over the box and its children: an outline
-  // pulled in by its own width paints a CSS border's pixels and lays
-  // nothing out, where a border would push the content in
-  if (style.border) {
+  // the line drawn inward: on a box, a CSS border, painted with the
+  // background as the one box a page's own border is (an outline is a
+  // second paint, and the browser blends its edges differently), and
+  // the children pulled back under it by its width, so it lays nothing
+  // out. A text, a picture or a control has no child to pull back: an
+  // outline pulled in by its own width
+  const lined = style.border !== null && LINED.has(kind);
+  if (lined) {
+    decl.border = style.border;
+  } else if (style.border) {
     decl.outline = style.border;
     decl["outline-offset"] = `${-style.borderWidth}px`;
   }
@@ -850,6 +861,8 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (base !== null) rules.push(`${selector}>*{grid-area:1/1/3/3;z-index:0}`, `${selector}>:${base}{grid-area:1/1}`);
   else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1;z-index:0}`);
   if (overlap !== null) rules.push(`${selector}>*+*{${overlap}}`);
+  // at no specificity: a margin the child names itself still wins
+  if (lined) rules.push(`:where(${selector}>*){margin:${-style.borderWidth}px}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
   // the hover and a group frame costs no patch; a box without one
@@ -869,7 +882,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // the keyboard's ring is an outline as well: while it shows on a
   // control, the ring takes the outline and the line moves beneath it
   // as an inset shadow — the box keeps its line
-  if (style.border) {
+  if (style.border && !lined) {
     const line = `inset 0 0 0 ${style.borderWidth}px ${style.borderColor}`;
     const shadows = [...style.shadows, line].join(",");
     rules.push(`${selector}[role][tabindex]:focus-visible{${FOCUS_RING};box-shadow:${shadows}}`);
@@ -1248,7 +1261,8 @@ function applyPatches(view, length) {
       f32(); // damping — the CSS side keeps the duration
       // every colour the engine's springs move — the fill, the ink,
       // the border, the halo — and the transform
-      style.transition = ["background-color", "color", "outline-color", "box-shadow", "transform"]
+      const springs = ["background-color", "color", "border-color", "outline-color", "box-shadow", "transform"];
+      style.transition = springs
         .map((property) => `${property} ${response}s ease-out`)
         .join(", ");
     }

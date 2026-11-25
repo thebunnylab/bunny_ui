@@ -333,9 +333,10 @@ pub struct DomLook {
     pub color: Option<Color>,
     pub hover_color: Option<Color>,
     pub pressed_color: Option<Color>,
-    /// The line drawn inward over the box and its children. The page
-    /// draws it as an outline pulled in by its width: a CSS border
-    /// would push the content in.
+    /// The line drawn inward over the box and its children. On a box the
+    /// page draws a CSS border, painted with the background, and pulls the
+    /// child back under it by its width, so it lays nothing out; on a text,
+    /// a picture or a control, an outline pulled in by its width.
     pub border: Option<(Color, Px)>,
     /// The line's style — the browser fits its own dashes, the same
     /// rhythm the house traces.
@@ -5497,7 +5498,7 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
 }
 
 /// The kind's byte on the wire, shared by the create op and the rule.
-fn kind_code(kind: CreateKind) -> u8 {
+pub(crate) fn kind_code(kind: CreateKind) -> u8 {
     match kind {
         CreateKind::Group => 0,
         CreateKind::Box => 1,
