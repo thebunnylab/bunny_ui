@@ -99,6 +99,10 @@ pub enum Modifier {
     ColorFilter(crate::color_filter::ColorFilter),
     /// `.border_style(…)` — how the border's line is drawn.
     BorderStyle(crate::shapes::BorderStyle),
+    /// `.border_edge(…)` — a line along one edge: (edge, color, width).
+    BorderEdge(motor::views::Edge, Color, f64),
+    /// `.box_shadow(…)` — one layer of CSS's `box-shadow`.
+    BoxShadow(crate::shapes::BoxShadow),
     /// `.background_stripes(…)` — bands over the background.
     BackgroundStripes(crate::shapes::Stripes),
     /// `.quarter_turn(…)` — the subtree laid out upright and turned.
@@ -357,6 +361,8 @@ impl Modifier {
                 crate::color_filter::ColorFilter::Invert => "color_invert",
             },
             Modifier::BorderStyle { .. } => "border_style",
+            Modifier::BorderEdge { .. } => "border_edge",
+            Modifier::BoxShadow { .. } => "box_shadow",
             Modifier::BackgroundStripes { .. } => "background_stripes",
             Modifier::QuarterTurn { .. } => "quarter_turn",
             Modifier::CornerRadius { .. } => "corner_radius",
@@ -522,6 +528,16 @@ impl Modifier {
                 crate::color_filter::ColorFilter::Invert => " [.colorInvert()]".into(),
             },
             Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
+            Modifier::BorderEdge(edge, color, width) => format!(" [.border({edge}, {color}, width: {width})]"),
+            Modifier::BoxShadow(layer) => format!(
+                " [.boxShadow({}x: {}, y: {}, blur: {}, spread: {}, {})]",
+                if layer.inset { "inset, " } else { "" },
+                layer.x,
+                layer.y,
+                layer.blur,
+                layer.spread,
+                layer.color
+            ),
             Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
             Modifier::BackgroundStripes(stripes) => format!(
                 " [.background(Stripes({}°, {} every {}, {}))]",
@@ -734,7 +750,12 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
         // wrapper, where no style reached it to merge: the new one
         // nests, as it did. One that merges merges where it stands
         LayoutNode::Styled { props, hints, action: None, .. }
-            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() && filters_fold(props, &delta) => {
+            if hints.is_empty()
+                && props.blur.is_none()
+                && delta.blur.is_none()
+                && filters_fold(props, &delta)
+                && props.box_shadows.then(delta.box_shadows).is_some() =>
+            {
             VisualProps::restyle(props, delta);
         }
         _ => wrap_in_place(out.base_from(mark), |other| LayoutNode::Styled {
@@ -1578,6 +1599,16 @@ pub(crate) fn apply(
             out,
             mark,
             VisualProps { border_style: Some(*style), ..VisualProps::default() },
+        ),
+        Modifier::BorderEdge(edge, color, width) => wrap_styled(
+            out,
+            mark,
+            VisualProps { border_edges: crate::shapes::BorderEdges::one(*edge, *color, *width), ..VisualProps::default() },
+        ),
+        Modifier::BoxShadow(layer) => wrap_styled(
+            out,
+            mark,
+            VisualProps { box_shadows: crate::shapes::BoxShadows::one(*layer), ..VisualProps::default() },
         ),
         Modifier::BackgroundStripes(stripes) => wrap_styled(
             out,

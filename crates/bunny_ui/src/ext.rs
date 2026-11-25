@@ -736,6 +736,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::BorderStyle(style))
     }
 
+    /// `border-bottom: 1px solid …` — a line along one edge alone, drawn
+    /// inward as `.border(…)`'s ring is, in its place on that side. The
+    /// edges chain, and `.border_style(…)` dashes them too.
+    ///
+    /// ```ignore
+    /// // a toolbar ruled off from the page under it
+    /// bar.padding_edge(Edge::Bottom, 1.0).border_edge(Edge::Bottom, RULE, 1.0)
+    /// ```
+    #[track_caller]
+    fn border_edge(self, edge: Edge, color: Color, width: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::BorderEdge(edge, color, width))
+    }
+
     /// `.cornerRadius(8)` — rounds THIS node's background.
     ///
     /// One number rounds all four corners. A [`crate::layout::Corners`]
@@ -1453,6 +1466,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     #[track_caller]
     fn shadow_color(self, radius: f64, color: crate::layout::Color) -> Modified<Self> {
         Modified::new(self, Modifier::Shadow(radius, color))
+    }
+
+    /// One layer of CSS's `box-shadow`, as a design writes it: offset,
+    /// blur, spread, ink, inside or out ([`BoxShadow`](crate::shapes::BoxShadow)).
+    /// Each call adds a layer under the ones written before it, the CSS
+    /// list's order, so a chain reads as the declaration does.
+    ///
+    /// ```ignore
+    /// // `box-shadow: 0 0 0 4px rgba(107,211,139,.18)`: a ring round a dot
+    /// dot.box_shadow(BoxShadow::new(Color::rgba(107, 211, 139, 46)).spread(4.0))
+    /// ```
+    #[track_caller]
+    fn box_shadow(self, shadow: crate::shapes::BoxShadow) -> Modified<Self> {
+        Modified::new(self, Modifier::BoxShadow(shadow))
     }
 
 
