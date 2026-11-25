@@ -131,6 +131,13 @@ jobs:
           # the preview wire, the reference scan and the conversions to the core's types
           cargo test -p bunny-ui-preview --locked --all-targets
           cargo test -p bunny-ui-preview --locked --all-targets --all-features
+          # the Trinity shell target: the protocol alone, then the guest and
+          # the test host with the hello block held to its native render,
+          # and the block built for its zero-import sandbox
+          cargo test -p bunny-ui-shell --locked --all-targets
+          cargo test -p bunny-ui-shell -p hello-block --locked --all-targets --features bunny-ui-shell/engine
+          cargo clippy -p bunny-ui-shell -p hello-block --locked --all-targets --features bunny-ui-shell/engine --no-deps -- -D warnings
+          cargo clippy -p hello-block --locked --target wasm32-unknown-unknown --no-deps -- -D warnings
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-ios-sim \
             aarch64-linux-android wasm32-unknown-unknown; do
             cargo check -p bunny-ui --locked --all-targets --features hot --target "$target"

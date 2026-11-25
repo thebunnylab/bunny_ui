@@ -9,8 +9,11 @@ use bunny_ui_core::view::View;
 
 use crate::guest::Guest;
 
+/// One turn of a guest, its view's type forgotten.
+type Turn = dyn FnMut(&[u8]) -> Vec<u8>;
+
 /// A guest with its view's type forgotten — what the macro keeps.
-pub struct Erased(Box<dyn FnMut(&[u8]) -> Vec<u8>>);
+pub struct Erased(Box<Turn>);
 
 impl Erased {
     pub fn new<V: View + 'static>(mut guest: Guest<V>) -> Erased {

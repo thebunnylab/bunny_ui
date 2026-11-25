@@ -57,6 +57,9 @@ macro_rules! block {
     ($make:path) => {
         #[cfg(target_arch = "wasm32")]
         mod __bunny_block {
+            #[allow(unused_imports)]
+            use super::*;
+
             ::std::thread_local! {
                 static GUEST: ::std::cell::RefCell<Option<$crate::abi::Erased>> =
                     const { ::std::cell::RefCell::new(None) };

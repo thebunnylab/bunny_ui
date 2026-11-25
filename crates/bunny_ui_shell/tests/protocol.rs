@@ -1,6 +1,7 @@
 //! The shell protocol as bytes: what a Trinity shell and a block built
 //! with any engine version must keep agreeing on.
 
+use bunny_ui_preview::wire;
 use bunny_ui_shell::protocol::{
     self, AccessAction, Capabilities, Malformed, Message, Modifiers, PointerButton, PointerPhase, Reader, Received,
     Role, Scheme, SemanticNode, ToGuest, ToHost, Versions, Viewport,
@@ -12,6 +13,23 @@ fn round_trip(message: Message) {
     reader.feed(&bytes);
     assert_eq!(reader.pull(), Ok(Some(Received::Message(message))));
     assert_eq!(reader.pull(), Ok(None));
+}
+
+fn scene() -> wire::Frame {
+    wire::Frame {
+        preview: String::new(),
+        variant: 0,
+        seq: 3,
+        generation: 0,
+        size: wire::Size { width: 10.0, height: 20.0 },
+        scale: 2.0,
+        background: wire::Color { r: 255, g: 255, b: 255, a: 255 },
+        strings: vec!["hi".into()],
+        commands: vec![wire::Draw::PopClip],
+        sites: Vec::new(),
+        hosts: Vec::new(),
+        metrics: wire::Metrics { build_ms: 0.0, layout_ms: 0.0, body_passes: 0, commands: 1 },
+    }
 }
 
 fn viewport() -> Viewport {
@@ -66,6 +84,11 @@ fn every_message_survives_its_bytes() {
                 multiline: false,
             }],
         }),
+        Message::ToHost(ToHost::Scene(scene())),
+        Message::ToHost(ToHost::Resource(wire::Resource {
+            key: 5,
+            kind: wire::ResourceKind::Rgba { size: (1, 1), rgba: vec![1, 2, 3, 4] },
+        })),
         Message::ToHost(ToHost::Pace { animating: true }),
         Message::ToHost(ToHost::Fault { reason: "kind 64 ended early".into() }),
     ];

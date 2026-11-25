@@ -1,0 +1,12 @@
+/// The Trinity shell's view of a raw block (D723). The block is a
+/// zero-import component; everything it says and hears is the shell
+/// protocol, as bytes, through this one function — so the protocol's own
+/// handshake, not this file, carries its version. This world never
+/// changes.
+package bunnylab:shell@1.0.0;
+
+world block {
+    /// One turn: the host's protocol messages in, the block's answers out
+    /// (`docs/trinity-shell.md`).
+    export call: func(input: list<u8>) -> list<u8>;
+}

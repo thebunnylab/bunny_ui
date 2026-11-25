@@ -1,0 +1,11 @@
+[package]
+name = "harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wasm-sandbox = { path = "../wasm-sandbox" }
+wasmtime = { workspace = true }
+wit-component = "0.244"
+wit-parser = "0.244"
