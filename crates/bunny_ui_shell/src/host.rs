@@ -18,7 +18,9 @@ use bunny_ui_preview::convert::{self, Missing};
 use bunny_ui_preview::wire::Frame;
 
 use crate::guest::{apply, background, pixel_scale, pointer};
-use crate::protocol::{Capabilities, Malformed, Message, Reader, Received, SemanticNode, ToGuest, ToHost, Versions, Viewport};
+use crate::protocol::{
+    Capabilities, Malformed, Message, Reader, Received, Requested, SemanticNode, ToGuest, ToHost, Versions, Viewport,
+};
 
 /// What a handshake agreed, as the host heard it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub struct TestHost {
     semantics: Vec<SemanticNode>,
     animating: bool,
     faults: Vec<String>,
+    requests: Vec<Requested>,
 }
 
 impl TestHost {
@@ -69,6 +72,7 @@ impl TestHost {
                 ToHost::Semantics { nodes, .. } => self.semantics = nodes,
                 ToHost::Pace { animating } => self.animating = animating,
                 ToHost::Fault { reason } => self.faults.push(reason),
+                ToHost::Request(requested) => self.requests.push(requested),
             }
         }
         if reader.pending() > 0 {
@@ -101,6 +105,11 @@ impl TestHost {
 
     pub fn faults(&self) -> &[String] {
         &self.faults
+    }
+
+    /// Every action the block asked for, in the order it asked.
+    pub fn requests(&self) -> &[Requested] {
+        &self.requests
     }
 
     /// The last scene as the framework's display list.
