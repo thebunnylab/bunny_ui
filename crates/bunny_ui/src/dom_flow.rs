@@ -1231,7 +1231,20 @@ impl Walk<'_> {
             LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
                 out.push(node(DomKind::Box));
             }
-            LayoutNode::Image { source, fit, resizable } => {
+            LayoutNode::Image { source: Some(source), resizable, drawing: Some(drawing), .. } => {
+                // drawn into the page: the tree is all the element needs, so the
+                // platform never hears of the bytes
+                let mut picture = node(DomKind::Drawing(crate::dom::DomDrawing {
+                    key: source.key(),
+                    drawing: std::rc::Rc::clone(drawing),
+                    own_size: !*resizable,
+                }));
+                if *resizable && let Some(layout) = picture.layout.as_mut() {
+                    layout.fill = true;
+                }
+                out.push(picture);
+            }
+            LayoutNode::Image { source, fit, resizable, .. } => {
                 match source {
                     Some(source) => {
                         // the walk never measures, so nothing else asks
@@ -3556,6 +3569,7 @@ mod tests {
                 source: Some(crate::image_engine::ImageSource::bytes_keyed(1, vec![0u8; 4])),
                 resizable,
                 fit: None,
+                drawing: None,
             }),
         };
         let offsets = HashMap::default();

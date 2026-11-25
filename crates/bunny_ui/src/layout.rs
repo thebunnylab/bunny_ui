@@ -852,6 +852,9 @@ pub enum LayoutNode {
         source: Option<ImageSource>,
         resizable: bool,
         fit: Option<ContentMode>,
+        /// `.inline_svg()`: the element tiers draw this tree into the page
+        /// in place of an `<img>`.
+        drawing: Option<Rc<crate::drawing::Drawing>>,
     },
     /// A vector glyph. Rigid by nature — the natural size follows the
     /// INHERITED font (a glyph beside text scales with the text), and
@@ -7845,7 +7848,7 @@ impl LayoutNode {
                 Fit::Leaf,
             ),
 
-            LayoutNode::Image { source, resizable, fit } => {
+            LayoutNode::Image { source, resizable, fit, .. } => {
                 let size = match source {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
@@ -9732,7 +9735,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Image { source, fit, .. }, Fit::Leaf) => match source {
+            (LayoutNode::Image { source, fit, drawing, .. }, Fit::Leaf) => match source {
                 // the print-parity stub draws the SAME outline box the
                 // old Leaf did — goldens hold by construction
                 None => {
@@ -9751,14 +9754,20 @@ impl LayoutNode {
                 Some(source) => {
                     let cover = *fit == Some(ContentMode::Fill);
                     if let Some(dom) = out.dom.as_mut() {
-                        dom.leaf(
-                            crate::dom::DomKind::Image(crate::dom::DomImage {
+                        let kind = match drawing {
+                            Some(drawing) => crate::dom::DomKind::Drawing(crate::dom::DomDrawing {
+                                key: source.key(),
+                                drawing: Rc::clone(drawing),
+                                // the element's box is the frame the layout placed
+                                own_size: false,
+                            }),
+                            None => crate::dom::DomKind::Image(crate::dom::DomImage {
                                 key: source.key(),
                                 cover,
                                 contain: false,
                             }),
-                            frame,
-                        );
+                        };
+                        dom.leaf(kind, frame);
                     }
                     if cover {
                         // Fill spills over the frame on one axis — the

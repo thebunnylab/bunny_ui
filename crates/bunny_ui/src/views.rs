@@ -1502,7 +1502,7 @@ impl View for ImageUiImage {
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(crate::view::print_line(|| format!("Image ({})", self.0))));
-        out.push_layout(LayoutNode::Image { source: None, resizable: false, fit: None });
+        out.push_layout(LayoutNode::Image { source: None, resizable: false, fit: None, drawing: None });
     }
 }
 
@@ -1527,7 +1527,28 @@ pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
 pub struct Image {
     /// What the image shows.
     pub source: crate::image_engine::ImageSource,
+    drawing: Option<std::rc::Rc<crate::drawing::Drawing>>,
     site: crate::provenance::Site,
+}
+
+impl Image {
+    /// An SVG drawn into the page itself: on the element tiers the picture
+    /// is an `<svg>` whose shapes are elements of the document, painted
+    /// where they stand, as a page that wrote its drawing inline paints
+    /// it — where an `<img>` is a picture the browser decodes apart and
+    /// snaps to the pixel grid. Only what [`crate::drawing`] allows
+    /// survives: no script, no handler, no reference outside the drawing.
+    /// Bytes that are no SVG stay an image, and the pixel tiers draw the
+    /// picture as they always do.
+    ///
+    /// ```ignore
+    /// image(asset!("hills.svg")).inline_svg().resizable().frame(1440.0, 360.0)
+    /// ```
+    #[must_use]
+    pub fn inline_svg(mut self) -> Self {
+        self.drawing = crate::drawing::Drawing::of(&self.source);
+        self
+    }
 }
 
 impl View for Image {
@@ -1548,13 +1569,14 @@ impl Image {
             source: Some(self.source.clone()),
             resizable: false,
             fit: None,
+            drawing: self.drawing.clone(),
         });
     }
 }
 
 #[track_caller]
 pub fn image(source: impl Into<crate::image_engine::ImageSource>) -> Image {
-    Image { source: source.into(), site: crate::provenance::here() }
+    Image { source: source.into(), drawing: None, site: crate::provenance::here() }
 }
 
 /// A vector glyph. Sizes with the INHERITED font, the way a character

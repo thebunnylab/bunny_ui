@@ -173,6 +173,8 @@ struct Element {
     children: Vec<u32>,
     /// The look it wears — a class on the page's sheet.
     rule: Option<u64>,
+    /// An inline drawing's shapes, written after the element's own.
+    drawing: Option<std::rc::Rc<crate::drawing::Drawing>>,
 }
 
 struct Tree {
@@ -231,6 +233,7 @@ impl Tree {
             text: Vec::new(),
             children: Vec::new(),
             rule: None,
+            drawing: None,
         };
         root.attrs.insert("id", "app".to_string());
         root.attrs.insert("data-hydrate", "1".to_string());
@@ -260,6 +263,7 @@ impl Tree {
             text: Vec::new(),
             children: Vec::new(),
             rule: None,
+            drawing: None,
         };
         // the glue's three attributes on a video: muted, inline and
         // autoplaying — the audio is the app's business
@@ -717,6 +721,16 @@ impl Tree {
                     }
                 }
             }
+            DomPatch::SetDrawing { id, drawing } => {
+                // the same tree the glue builds: the root's attributes on
+                // the element, its shapes inside, every value escaped
+                if let Some(element) = self.elements.get_mut(id) {
+                    for (code, value) in drawing.drawing.root_attributes(drawing.own_size) {
+                        element.attrs.insert(crate::drawing::ATTRIBUTES[usize::from(*code)], value.spell(*id));
+                    }
+                    element.drawing = Some(std::rc::Rc::clone(&drawing.drawing));
+                }
+            }
             DomPatch::SetLanguage { id, lang, dir } => {
                 if let Some(element) = self.elements.get_mut(id) {
                     element.attrs.insert("lang", lang.to_string());
@@ -787,11 +801,33 @@ impl Tree {
                 None => out.push_str(&escape_text(run)),
             }
         }
+        if let Some(drawing) = &element.drawing {
+            for shape in &drawing.root.children {
+                serialize_shape(shape, element.id, out);
+            }
+        }
         for child in &element.children {
             self.serialize(*child, out);
         }
         out.push_str(&format!("</{}>", element.tag));
     }
+}
+
+/// One shape of a drawing and what it holds, as element `scope` wears
+/// them: the tag and the names from the tables, every value escaped.
+fn serialize_shape(shape: &crate::drawing::Node, scope: u32, out: &mut String) {
+    let tag = crate::drawing::TAGS[usize::from(shape.tag)];
+    out.push('<');
+    out.push_str(tag);
+    for (code, value) in &shape.attributes {
+        let name = crate::drawing::ATTRIBUTES[usize::from(*code)];
+        out.push_str(&format!(" {name}=\"{}\"", escape_attr(&value.spell(scope))));
+    }
+    out.push('>');
+    for child in &shape.children {
+        serialize_shape(child, scope, out);
+    }
+    out.push_str(&format!("</{tag}>"));
 }
 
 /// The tag an element of this kind is, and the declarations its kind
@@ -819,7 +855,7 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("min-height", "0"),
             ],
         ),
-        CreateKind::Icon => ("svg", &[("pointer-events", "none")]),
+        CreateKind::Icon | CreateKind::Drawing => ("svg", &[("pointer-events", "none")]),
         CreateKind::Field => (
             "input",
             &[
@@ -1151,7 +1187,7 @@ fn rule_text(
         base.insert("justify-self", "stretch".into());
         // a resizable picture takes its frame across as well (the glue's
         // `lookRules` says why)
-        if matches!(kind, CreateKind::Image) {
+        if matches!(kind, CreateKind::Image | CreateKind::Drawing) {
             base.insert("align-self", "stretch".into());
         }
     }
@@ -2475,6 +2511,46 @@ mod tests {
         // and it takes its frame on both axes, as the layout sizes it: a
         // width left to the ratio would spill a contained picture
         assert!(page.css.contains("flex:1 1 auto") && page.css.contains("align-self:stretch"), "{}", page.css);
+    }
+
+    /// A served drawing is the tree the glue builds: the allowed shapes
+    /// with every value escaped, and nothing that runs — no script, no
+    /// foreign object, no style sheet, no handler, no reference that
+    /// leaves the drawing, and no value that breaks out of its quotes.
+    #[test]
+    fn a_served_drawing_keeps_only_what_draws() {
+        #[derive(Clone)]
+        struct Drawn(crate::image_engine::ImageSource);
+
+        impl Component for Drawn {
+            fn body(self) -> impl View {
+                image(self.0.clone()).inline_svg().resizable().frame(20.0, 20.0)
+            }
+        }
+
+        let svg = r##"<svg viewBox="0 0 2 2" preserveAspectRatio="none" onload="alert(1)">
+            <script>alert(2)</script>
+            <foreignObject><p onclick="alert(3)">x</p></foreignObject>
+            <style>*{fill:url(https://evil.test/x)}</style>
+            <clipPath id="c"><rect width="2" height="1"/></clipPath>
+            <path d="M0 0" clip-path="url(#c)" fill="url(https://evil.test/x)" onclick="alert(4)"/>
+            <use href="javascript:alert(5)"/>
+            <path d="M0 0&quot; onmouseover=&quot;go&lt;/svg&gt;&lt;script&gt;"/>
+        </svg>"##;
+        let source = crate::image_engine::ImageSource::from_bytes(svg.as_bytes().to_vec());
+        let page = render(&Drawn(source), Size { width: 200.0, height: 200.0 });
+        let start = page.html.find("<svg").expect("the drawing is an svg");
+        let drawing = &page.html[start..start + page.html[start..].find("</svg>").expect("closed") + 6];
+        let n: u32 = drawing["<svg data-n=\"".len()..].split('"').next().and_then(|n| n.parse().ok()).expect("its number");
+        assert!(drawing.contains("viewBox=\"0 0 2 2\"") && drawing.contains("preserveAspectRatio=\"none\""), "{drawing}");
+        assert!(drawing.contains(&format!("<clipPath id=\"bunny-{n}-0\"><rect width=\"2\" height=\"1\"></rect></clipPath>")), "{drawing}");
+        assert!(drawing.contains(&format!("<path d=\"M0 0\" clip-path=\"url(#bunny-{n}-0)\"></path>")), "{drawing}");
+        assert!(drawing.contains("<use></use>"), "{drawing}");
+        assert!(drawing.contains("d=\"M0 0&quot; onmouseover=&quot;go&lt;/svg&gt;&lt;script&gt;\""), "{drawing}");
+        for gone in ["<script", "<foreignObject", "<style", "onload", "onclick", "onmouseover=\"", "javascript", "evil.test", "<p>", "<p "] {
+            assert!(!page.html.contains(gone), "{gone}: {drawing}");
+        }
+        assert!(page.css.contains("pointer-events:none"), "{}", page.css);
     }
 
     /// A served control says what it is before any script runs: the

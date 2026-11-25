@@ -64,6 +64,7 @@ pub mod custom;
 pub mod date;
 pub mod dom;
 pub mod diagnostics;
+pub mod drawing;
 mod dom_flow;
 pub mod effects;
 pub mod erased;
@@ -14574,6 +14575,7 @@ mod tests {
             source: Some(wide.clone()),
             resizable,
             fit,
+            drawing: None,
         };
         let size = |node: &LayoutNode, width: Option<f64>, height: Option<f64>| {
             layout(node, Proposal { width, height }).size
@@ -14614,10 +14616,10 @@ mod tests {
         // undecoded measures zero on every path — reflow on ready
         let broken = ImageSource::from_bytes(&b"junk"[..]);
         let pending =
-            LayoutNode::Image { source: Some(broken), resizable: true, fit: Some(ContentMode::Fit) };
+            LayoutNode::Image { source: Some(broken), resizable: true, fit: Some(ContentMode::Fit), drawing: None };
         assert_eq!(size(&pending, Some(100.0), Some(100.0)), Size::default());
         // the stub keeps the classic rigid box
-        let stub = LayoutNode::Image { source: None, resizable: false, fit: None };
+        let stub = LayoutNode::Image { source: None, resizable: false, fit: None, drawing: None };
         assert_eq!(
             size(&stub, Some(100.0), Some(100.0)),
             Size { width: 40.0, height: 40.0 }
@@ -14680,6 +14682,7 @@ mod tests {
                 source: Some(source),
                 resizable: true,
                 fit: Some(ContentMode::Fill),
+                drawing: None,
             }),
         };
         let result = layout(&node, Proposal { width: Some(60.0), height: Some(40.0) });
