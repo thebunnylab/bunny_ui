@@ -593,6 +593,15 @@ const DRAWING_ATTRIBUTES = [
   "stroke-dashoffset", "opacity", "clip-path", "clip-rule", "mask", "stop-color", "stop-opacity",
   "color", "display", "visibility", "vector-effect", "shape-rendering", "paint-order",
 ];
+// What the root — the page's own <svg> — may wear: its viewport and the
+// paint its shapes inherit, never what moves, hides or clips the box, nor
+// an id (bunny_ui::drawing::ROOT_ATTRIBUTES).
+const DRAWING_ROOT = [
+  "viewBox", "preserveAspectRatio", "width", "height", "fill", "fill-opacity", "fill-rule",
+  "stroke", "stroke-width", "stroke-opacity", "stroke-linecap", "stroke-linejoin",
+  "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "clip-rule", "color",
+  "shape-rendering", "paint-order",
+];
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // A drawing's value, checked again on this side of the border: a
@@ -1933,7 +1942,8 @@ function applyPatches(view, length) {
         for (let a = 0; a < count; a++) {
           const name = DRAWING_ATTRIBUTES[u8()];
           const value = text(u32());
-          const kept = name === undefined || (root && name === "id") ? null : drawingValue(name, value);
+          const allowed = name !== undefined && (root ? DRAWING_ROOT.includes(name) : true);
+          const kept = allowed ? drawingValue(name, value) : null;
           if (!node || kept === null) continue;
           node.setAttribute(name, kept);
           if (root) node.__drawn.push(name);

@@ -2513,6 +2513,34 @@ mod tests {
         assert!(page.css.contains("flex:1 1 auto") && page.css.contains("align-self:stretch"), "{}", page.css);
     }
 
+    /// A served drawing's root is the page's own `<svg>`: it wears its
+    /// viewport and inherited paint, and neither an id of the drawing nor
+    /// anything that moves, hides or clips the box — as the glue mounts it,
+    /// so a hydrated page keeps no attribute a mounted one would not.
+    #[test]
+    fn a_served_drawing_root_wears_only_its_viewport_and_paint() {
+        #[derive(Clone)]
+        struct Drawn(crate::image_engine::ImageSource);
+
+        impl Component for Drawn {
+            fn body(self) -> impl View {
+                image(self.0.clone()).inline_svg().resizable().frame(20.0, 20.0)
+            }
+        }
+
+        let svg = r##"<svg id="a" viewBox="0 0 2 2" transform="scale(40)" opacity="0" display="none" visibility="hidden" x="5" mask="url(#a)" fill="red"><linearGradient id="a"/><rect fill="url(#a)"/></svg>"##;
+        let source = crate::image_engine::ImageSource::from_bytes(svg.as_bytes().to_vec());
+        let page = render(&Drawn(source), Size { width: 200.0, height: 200.0 });
+        let start = page.html.find("<svg").expect("the drawing is an svg");
+        let root = &page.html[start..start + page.html[start..].find('>').expect("the tag ends")];
+        let n: u32 = root["<svg data-n=\"".len()..].split('"').next().and_then(|n| n.parse().ok()).expect("its number");
+        assert!(root.contains("viewBox=\"0 0 2 2\"") && root.contains("fill=\"red\""), "{root}");
+        for gone in [" id=", "transform", "opacity", "display", "visibility", " x=", "mask"] {
+            assert!(!root.contains(gone), "{gone}: {root}");
+        }
+        assert!(page.html.contains(&format!("<linearGradient id=\"bunny-{n}-0\"></linearGradient><rect fill=\"url(#bunny-{n}-0)\">")), "{}", page.html);
+    }
+
     /// A served drawing is the tree the glue builds: the allowed shapes
     /// with every value escaped, and nothing that runs — no script, no
     /// foreign object, no style sheet, no handler, no reference that

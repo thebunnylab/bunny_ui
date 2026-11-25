@@ -5818,6 +5818,11 @@ fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
 /// One element of a drawing and what it holds: u8 tag, u8 attribute
 /// count, per attribute u8 name + u32 len + utf8 (as element `scope`
 /// spells it), u16 child count, the children.
+// a node's attributes are distinct names of the table, its children no
+// more than a drawing holds: the u8 and the u16 below always fit
+const _: () = assert!(crate::drawing::ATTRIBUTES.len() <= u8::MAX as usize);
+const _: () = assert!(crate::drawing::MAX_NODES <= u16::MAX as usize);
+
 fn push_drawing_node(
     out: &mut Vec<u8>,
     tag: u8,
@@ -8162,6 +8167,9 @@ mod tests {
         };
         assert_eq!(table("DRAWING_TAGS"), crate::drawing::TAGS);
         assert_eq!(table("DRAWING_ATTRIBUTES"), crate::drawing::ATTRIBUTES);
+        // the root wears only what draws inside its box, on both sides
+        assert_eq!(table("DRAWING_ROOT"), crate::drawing::ROOT_ATTRIBUTES);
+        assert!(glue.contains("root ? DRAWING_ROOT.includes(name) : true"), "the glue's root allow-list");
         assert!(glue.contains("} else if (op === 29) {"), "glue_dom.js reads op 29");
         assert!(glue.contains("document.createElementNS(SVG_NS, tag)"), "an element by its code");
         assert!(glue.contains("const tag = DRAWING_TAGS[u8()];") && glue.contains("const name = DRAWING_ATTRIBUTES[u8()];"));

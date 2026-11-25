@@ -99,6 +99,40 @@ pub const ATTRIBUTES: &[&str] = &[
     "paint-order",
 ];
 
+/// What the root keeps: the root is the page's own `<svg>`, so its
+/// viewport and the paint its shapes inherit, never what moves, hides or
+/// clips the box (`transform`, `x`, `display`, `visibility`, `opacity`,
+/// `clip-path`, `mask`) nor an id, which is the element's. The glue's
+/// `DRAWING_ROOT`.
+pub const ROOT_ATTRIBUTES: &[&str] = &[
+    "viewBox",
+    "preserveAspectRatio",
+    "width",
+    "height",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-opacity",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "clip-rule",
+    "color",
+    "shape-rendering",
+    "paint-order",
+];
+
+fn on_root(code: u8) -> bool {
+    ATTRIBUTES.get(usize::from(code)).is_some_and(|name| ROOT_ATTRIBUTES.contains(name))
+}
+
+const _: () = assert!(ATTRIBUTES.len() <= u8::MAX as usize && TAGS.len() <= u8::MAX as usize);
+const _: () = assert!(MAX_NODES <= u16::MAX as usize);
+
 /// Where the presentation attributes start in [`ATTRIBUTES`].
 pub const PRESENTATION: usize = 31;
 
@@ -106,14 +140,22 @@ const ID: u8 = 0;
 const HREF: u8 = 1;
 const WIDTH: u8 = 4;
 const HEIGHT: u8 = 5;
+const USE: u8 = 4;
 
 /// The functions a value may call. `url` is one of them only as
 /// `url(#name)`.
 const FUNCTIONS: &[&str] =
     &["url", "rgb", "rgba", "hsl", "hsla", "matrix", "translate", "scale", "rotate", "skewx", "skewy"];
 
-const MAX_NODES: usize = 16_384;
+/// The most elements a drawing writes; the wire counts children in a u16.
+pub const MAX_NODES: usize = 16_384;
 const MAX_DEPTH: usize = 64;
+/// The most bytes a file may hold to be read as a drawing.
+const MAX_BYTES: usize = 2 << 20;
+/// The most shapes a drawing may draw once every `<use>` is expanded.
+const MAX_INSTANCES: u64 = 50_000;
+/// The most `<use>` a reference may pass through before its shape.
+const MAX_REFERENCE_DEPTH: usize = 16;
 
 /// Why a file is not a drawing; the image then stays an `<img>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +167,11 @@ pub enum DrawingError {
     Markup,
     /// The document's element is not an `<svg>`.
     NotSvg,
-    /// More elements, or deeper, than a drawing may hold.
+    /// More bytes, elements or depth than a drawing may hold, or more
+    /// shapes once its references are expanded.
     TooLarge,
+    /// A `<use>` that reaches itself through what it names.
+    Cycle,
 }
 
 /// One attribute's value, kept apart from its spelling: an id and a
@@ -171,6 +216,9 @@ pub struct Drawing {
 
 impl Drawing {
     pub fn parse(bytes: &[u8]) -> Result<Drawing, DrawingError> {
+        if bytes.len() > MAX_BYTES {
+            return Err(DrawingError::TooLarge);
+        }
         let text = std::str::from_utf8(bytes).map_err(|_| DrawingError::Encoding)?;
         let raw = read(text)?;
         if raw.name != "svg" {
@@ -181,13 +229,20 @@ impl Drawing {
         for child in raw.children.iter().filter(|child| kept(child)) {
             collect_ids(child, &mut ids);
         }
-        Ok(Drawing { root: keep(&raw, &ids, &mut Vec::new()) })
+        let root = keep(&raw, &ids, &mut Vec::new(), true);
+        let mut named = HashMap::default();
+        owners(&root, &mut named);
+        expanse(&root, &named, &mut HashMap::default(), &mut Vec::new())?;
+        Ok(Drawing { root })
     }
 
     /// The root's attributes the element wears: its `width` and `height`
     /// only when the picture keeps its own size.
     pub fn root_attributes(&self, own_size: bool) -> impl Iterator<Item = &(u8, Value)> {
-        self.root.attributes.iter().filter(move |(code, _)| own_size || !matches!(*code, WIDTH | HEIGHT))
+        self.root
+            .attributes
+            .iter()
+            .filter(move |(code, _)| on_root(*code) && (own_size || !matches!(*code, WIDTH | HEIGHT)))
     }
 
     /// The drawing a picture's bytes hold, read once per identity.
@@ -419,20 +474,26 @@ fn kept(raw: &Raw<'_>) -> bool {
     tag_code(raw.name).is_some_and(|tag| tag != 0)
 }
 
-fn keep(raw: &Raw<'_>, ids: &HashMap<String, u32>, claimed: &mut Vec<u32>) -> Node {
+fn keep(raw: &Raw<'_>, ids: &HashMap<String, u32>, claimed: &mut Vec<u32>, root: bool) -> Node {
     let tag = tag_code(raw.name).unwrap_or(0);
     let mut attributes: Vec<(u8, Value)> = Vec::new();
-    let mut set = |code: u8, value: Value| match attributes.iter_mut().find(|(have, _)| *have == code) {
-        Some(slot) => slot.1 = value,
-        None => attributes.push((code, value)),
+    let mut set = |code: u8, value: Value| {
+        if root && !on_root(code) {
+            return;
+        }
+        match attributes.iter_mut().find(|(have, _)| *have == code) {
+            Some(slot) => slot.1 = value,
+            None => attributes.push((code, value)),
+        }
     };
     let mut declared_id = false;
     for (name, value) in &raw.attributes {
         let Some(value) = value else { continue };
         let Some(code) = attribute_code(name) else { continue };
         if code == ID {
-            // the first element to declare an id owns it; a twin keeps none
-            if let Some(n) = ids.get(value.trim()).filter(|n| !declared_id && !claimed.contains(n)) {
+            // the first element to declare an id owns it; a twin keeps none,
+            // and the root none at all
+            if let Some(n) = ids.get(value.trim()).filter(|n| !root && !declared_id && !claimed.contains(n)) {
                 claimed.push(*n);
                 set(code, Value::Id(*n));
             }
@@ -458,8 +519,75 @@ fn keep(raw: &Raw<'_>, ids: &HashMap<String, u32>, claimed: &mut Vec<u32>) -> No
             }
         }
     }
-    let children = raw.children.iter().filter(|child| kept(child)).map(|child| keep(child, ids, claimed)).collect();
+    let children =
+        raw.children.iter().filter(|child| kept(child)).map(|child| keep(child, ids, claimed, false)).collect();
     Node { tag, attributes, children }
+}
+
+/// The elements that own an id, by its number.
+fn owners<'a>(node: &'a Node, out: &mut HashMap<u32, &'a Node>) {
+    if let Some((_, Value::Id(n))) = node.attributes.iter().find(|(code, _)| *code == ID) {
+        out.insert(*n, node);
+    }
+    for child in &node.children {
+        owners(child, out);
+    }
+}
+
+/// What a subtree draws once each `<use>` in it is replaced by what it
+/// names: its shapes, and the most references a shape sits behind.
+#[derive(Clone, Copy)]
+struct Expanse {
+    shapes: u64,
+    depth: usize,
+}
+
+/// The expanse of `node`, every id measured once; a reference that comes
+/// back to itself is refused, and so is one past either ceiling.
+fn expanse(
+    node: &Node,
+    owners: &HashMap<u32, &Node>,
+    measured: &mut HashMap<u32, Expanse>,
+    through: &mut Vec<u32>,
+) -> Result<Expanse, DrawingError> {
+    let mut total = Expanse { shapes: 1, depth: 0 };
+    let mut add = |part: Expanse, deeper: usize| {
+        total.shapes = total.shapes.saturating_add(part.shapes);
+        total.depth = total.depth.max(part.depth + deeper);
+        if total.shapes > MAX_INSTANCES || total.depth > MAX_REFERENCE_DEPTH {
+            return Err(DrawingError::TooLarge);
+        }
+        Ok(())
+    };
+    for child in &node.children {
+        add(expanse(child, owners, measured, through)?, 0)?;
+    }
+    let named = node.attributes.iter().find_map(|(code, value)| match value {
+        Value::Href(n) if *code == HREF && node.tag == USE => Some(*n),
+        _ => None,
+    });
+    let Some(n) = named else { return Ok(total) };
+    if through.contains(&n) {
+        return Err(DrawingError::Cycle);
+    }
+    let copied = match measured.get(&n) {
+        Some(copied) => *copied,
+        None => {
+            let Some(owner) = owners.get(&n) else { return Ok(total) };
+            // a path already this deep ends past the ceiling: the walk stops
+            // before the stack grows with it
+            if through.len() >= MAX_REFERENCE_DEPTH {
+                return Err(DrawingError::TooLarge);
+            }
+            through.push(n);
+            let copied = expanse(owner, owners, measured, through)?;
+            through.pop();
+            measured.insert(n, copied);
+            copied
+        }
+    };
+    add(copied, 1)?;
+    Ok(total)
 }
 
 /// A value the drawing may keep, or nothing. No CSS escape, no call to a
@@ -477,8 +605,10 @@ fn clean(code: u8, value: &str, ids: &HashMap<String, u32>) -> Option<Value> {
     let mut calls_url = false;
     for (open, _) in lower.match_indices('(') {
         let name_start = lower[..open]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .map_or(0, |index| index + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+            .map_or(0, |(index, c)| index + c.len_utf8());
         let name = &lower[name_start..open];
         if !FUNCTIONS.contains(&name) {
             return None;
@@ -723,5 +853,157 @@ mod tests {
         assert!(Rc::ptr_eq(&first, &again));
         let picture = crate::image_engine::ImageSource::bytes_keyed(0xD0D1, vec![0x89, b'P', b'N', b'G']);
         assert!(Drawing::of(&picture).is_none());
+    }
+
+    /// A wide character right before a call is no function name, and no
+    /// slice lands inside it: the value is dropped, the parse goes on.
+    #[test]
+    fn a_wide_character_before_a_call_drops_the_value() {
+        assert_eq!(spelled(&drawing(r#"<svg><rect fill="é(" width="1"/></svg>"#)), ["svg", "rect width=1"]);
+        assert_eq!(spelled(&drawing(r#"<svg><path style="fill:ü(1)" d="M0 0"/></svg>"#)), ["svg", "path d=M0 0"]);
+        assert_eq!(spelled(&drawing(r#"<svg><rect fill="aé(1)" stroke="日本(x)"/></svg>"#)), ["svg", "rect"]);
+    }
+
+    /// Markup cut and spliced at every place, wide characters and markup
+    /// signs among the splices, is a drawing or a refusal — never a panic.
+    #[test]
+    fn mutated_markup_never_panics() {
+        let seeds = [
+            r##"<svg viewBox="0 0 2 2" style="fill:red"><defs><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient></defs><g transform="rotate(4 1 1)"><path d="M0 0L2 2" fill="url(#g)"/><use href="#g"/></g></svg>"##,
+            r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY e "x">]><svg><!-- é --><rect x="1" y="&amp;&#233;"/><![CDATA[ü]]></svg>"#,
+        ];
+        let splices = [
+            "é",
+            "ü(",
+            "日",
+            "(",
+            ")",
+            "<",
+            ">",
+            "\"",
+            "'",
+            "&",
+            ";",
+            "#",
+            "/",
+            "=",
+            "\\",
+            "url(",
+            " ",
+            "\u{0}",
+            "&#x1F600;",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let seed = seeds[next(seeds.len())];
+            let mut text = seed.to_string();
+            for _ in 0..1 + next(3) {
+                let mut at = next(text.len() + 1);
+                while !text.is_char_boundary(at) {
+                    at -= 1;
+                }
+                if next(2) == 0 {
+                    text.insert_str(at, splices[next(splices.len())]);
+                } else {
+                    let mut end = (at + 1 + next(4)).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    text.replace_range(at..end, "");
+                }
+            }
+            let _ = Drawing::parse(text.as_bytes());
+        }
+    }
+
+    /// The root's id is the element's: it claims none of the drawing's,
+    /// so a child that shares its name keeps the id and the references.
+    #[test]
+    fn the_root_never_claims_an_id() {
+        let parsed = drawing(r##"<svg id="a"><linearGradient id="a"/><rect fill="url(#a)"/><use href="#a"/></svg>"##);
+        assert_eq!(
+            spelled(&parsed),
+            ["svg", "linearGradient id=bunny-7-0", "rect fill=url(#bunny-7-0)", "use href=#bunny-7-0"]
+        );
+        assert!(parsed.root_attributes(true).all(|(code, _)| *code != ID));
+    }
+
+    /// The root is the page's own box: it keeps its viewport and the paint
+    /// its shapes inherit, never what moves, hides or clips the box.
+    #[test]
+    fn the_root_keeps_only_its_viewport_and_inherited_paint() {
+        let parsed = drawing(
+            r##"<svg viewBox="0 0 4 2" preserveAspectRatio="none" x="9" y="9" transform="scale(40)" display="none" visibility="hidden" opacity="0" clip-path="url(#c)" mask="url(#c)" fill="red" stroke-width="2" style="transform: scale(9); opacity: 0; stroke: blue"><clipPath id="c"/></svg>"##,
+        );
+        let names: Vec<&str> = parsed.root_attributes(true).map(|(code, _)| ATTRIBUTES[usize::from(*code)]).collect();
+        assert_eq!(names, ["viewBox", "preserveAspectRatio", "fill", "stroke-width", "stroke"]);
+    }
+
+    fn nested_uses(levels: usize, fan: usize) -> String {
+        let mut svg = String::from(r#"<svg><defs><path id="l0" d="M0 0"/>"#);
+        for level in 1..=levels {
+            svg.push_str(&format!(r#"<g id="l{level}">"#));
+            for _ in 0..fan {
+                svg.push_str(&format!(r##"<use href="#l{}"/>"##, level - 1));
+            }
+            svg.push_str("</g>");
+        }
+        svg.push_str(&format!(r##"</defs><use href="#l{levels}"/></svg>"##));
+        svg
+    }
+
+    /// A `<use>` repeats what it names: ten levels of ten copies each is
+    /// ten billion shapes from two kilobytes. What the references expand
+    /// to is counted, and past the ceiling the file is no drawing.
+    #[test]
+    fn uses_that_multiply_past_the_ceiling_are_no_drawing() {
+        let bomb = nested_uses(10, 10);
+        assert!(bomb.len() < 4096);
+        assert_eq!(Drawing::parse(bomb.as_bytes()), Err(DrawingError::TooLarge));
+        // a few copies of a few shapes are what a sprite sheet is
+        assert!(Drawing::parse(nested_uses(3, 4).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_use_that_names_itself_or_its_holder_is_no_drawing() {
+        for svg in [
+            r##"<svg><use id="u" href="#u"/></svg>"##,
+            r##"<svg><g id="a"><use href="#a"/></g></svg>"##,
+            r##"<svg><g id="a"><use href="#b"/></g><g id="b"><use href="#a"/></g></svg>"##,
+        ] {
+            assert_eq!(Drawing::parse(svg.as_bytes()), Err(DrawingError::Cycle), "{svg}");
+        }
+    }
+
+    #[test]
+    fn a_long_chain_of_uses_is_no_drawing() {
+        assert_eq!(Drawing::parse(nested_uses(MAX_REFERENCE_DEPTH + 1, 1).as_bytes()), Err(DrawingError::TooLarge));
+        assert!(Drawing::parse(nested_uses(8, 1).as_bytes()).is_ok());
+        // the same chain written last link first: the order never changes the answer
+        let backwards = |levels: usize| {
+            let mut svg = format!(r##"<svg><use href="#l{levels}"/><defs>"##);
+            for level in (1..=levels).rev() {
+                svg.push_str(&format!(r##"<g id="l{level}"><use href="#l{}"/></g>"##, level - 1));
+            }
+            svg.push_str(r#"<path id="l0" d="M0 0"/></defs></svg>"#);
+            svg
+        };
+        assert_eq!(Drawing::parse(backwards(MAX_REFERENCE_DEPTH + 1).as_bytes()), Err(DrawingError::TooLarge));
+        assert_eq!(Drawing::parse(backwards(4000).as_bytes()), Err(DrawingError::TooLarge));
+        assert!(Drawing::parse(backwards(8).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_file_past_the_byte_ceiling_is_no_drawing() {
+        let mut big = String::from("<svg>");
+        big.push_str(&" ".repeat(MAX_BYTES));
+        big.push_str("</svg>");
+        assert_eq!(Drawing::parse(big.as_bytes()), Err(DrawingError::TooLarge));
     }
 }
