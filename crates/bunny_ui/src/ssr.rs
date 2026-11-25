@@ -965,6 +965,16 @@ fn decimal(value: f64, places: usize) -> String {
 /// spells the same one.
 const FOCUS_RING: &str = "outline:2px solid Highlight;outline-offset:2px";
 
+/// The kinds whose line is a CSS border: the wrappers, whose children
+/// each fill the box (a group, a box, layers), and the shapes, which hold
+/// none. A text, a field, a picture, a scroll or a stack keeps the outline.
+fn lined(kind: CreateKind) -> bool {
+    matches!(
+        kind,
+        CreateKind::Group | CreateKind::Box | CreateKind::Layers | CreateKind::Rectangle | CreateKind::Ellipse
+    )
+}
+
 /// The look's rule: the kind's defaults, the flow record, the style,
 /// the text's face — and its states, one rule each. The twin of the
 /// glue's `defineRule`: a served page must agree with a mounted one.
@@ -1165,13 +1175,23 @@ fn rule_text(
     if let Some(pressed) = style.pressed_background {
         states.push(format!("{}{{background-color:{}}}", on("active"), color(pressed)));
     }
+    // the line drawn inward: on a box, a CSS border, painted with the
+    // background as the one box a page's own border is (an outline is a
+    // second paint, and the browser blends its edges differently), and
+    // the children pulled back under it by its width, so it lays nothing
+    // out. A text, a picture or a control has no child to pull back: an
+    // outline pulled in by its own width
+    let lined = style.border.is_some() && lined(kind);
     if let Some((border, width)) = style.border {
-        // a line drawn inward over the box and its children: an outline
-        // pulled in by its own width paints a CSS border's pixels and
-        // lays nothing out, where a border would push the content in
         let line = style.border_style.map_or("solid", crate::shapes::BorderStyle::css);
-        base.insert("outline", format!("{} {line} {}", px(width), color(border)));
-        base.insert("outline-offset", px(-width));
+        if lined {
+            base.insert("border", format!("{} {line} {}", px(width), color(border)));
+            // at no specificity: a margin the child names itself still wins
+            states.push(format!(":where({selector}>*){{margin:{}}}", px(-width)));
+        } else {
+            base.insert("outline", format!("{} {line} {}", px(width), color(border)));
+            base.insert("outline-offset", px(-width));
+        }
     }
     if let Some(radii) = style.corner_radius {
         // one number when every corner shares it, four in the CSS
@@ -1212,7 +1232,8 @@ fn rule_text(
     if let Some((response, _)) = style.transition {
         // every colour the engine's springs move — the fill, the ink,
         // the border, the halo — and the transform
-        let eased: Vec<String> = ["background-color", "color", "outline-color", "box-shadow", "transform"]
+        let springs = ["background-color", "color", "border-color", "outline-color", "box-shadow", "transform"];
+        let eased: Vec<String> = springs
             .iter()
             .map(|property| format!("{property} {response}s ease-out"))
             .collect();
@@ -1319,7 +1340,7 @@ fn rule_text(
     // the keyboard's ring is an outline as well (the glue's sheet): while
     // it shows on a control, the ring takes the outline and the line
     // moves beneath it as an inset shadow — the box keeps its line
-    if let Some((border, width)) = style.border {
+    if let Some((border, width)) = style.border.filter(|_| !lined) {
         shadows.push(format!("inset 0 0 0 {} {}", px(width), color(border)));
         states.push(format!("{selector}[role][tabindex]:focus-visible{{{FOCUS_RING};box-shadow:{}}}", shadows.join(",")));
     }
@@ -1705,11 +1726,67 @@ mod tests {
         assert!(!rule.contains("padding:"), "no physical padding: {rule}");
     }
 
+    /// A box's line is a CSS border, painted with its background as the
+    /// one box a page's own bordered box is: an outline is a second paint,
+    /// and the browser blends its edges otherwise (no bleed avoidance, a
+    /// rounded corner a level or more apart). The child is pulled back
+    /// under the line by its width, so the line still lays nothing out.
+    #[test]
+    fn a_served_box_draws_its_border_with_its_background() {
+        #[derive(Clone)]
+        struct Card;
+        impl Component for Card {
+            fn body(self) -> impl View {
+                vstack!(text("card"))
+                    .padding_length(8.0)
+                    .background_color(Color::rgb(4, 5, 6))
+                    .corner_radius(12.0)
+                    .border(Color::rgb(1, 2, 3), 1.5)
+                    .border_style(BorderStyle::Dashed)
+            }
+        }
+
+        let page = render(&Card, Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        let rule = css
+            .split('}')
+            .find(|rule| rule.contains("border:1.5px dashed rgba(1, 2, 3, 1)"))
+            .unwrap_or_else(|| panic!("the box wears a border: {css}"));
+        assert!(rule.contains("background-color:rgba(4, 5, 6, 1)"), "with its background: {rule}");
+        assert!(rule.contains("border-radius:12px"), "and its corners: {rule}");
+        assert!(!rule.contains("outline"), "no outline beside it: {rule}");
+        let class = rule.split('.').nth(1).expect("a class selector");
+        assert!(
+            css.contains(&format!(":where(.{class}.{class}>*){{margin:-1.5px}}")),
+            "the child is pulled back under the line, at no specificity: {css}"
+        );
+        assert!(!css.contains("outline:1.5px"), "{css}");
+    }
+
+    /// The glue lowers a box's line the way the page does: a border on the
+    /// kinds whose children fill the box, the outline on the rest.
+    #[test]
+    fn the_glue_draws_a_box_line_as_the_page_does() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        let kinds = [CreateKind::Group, CreateKind::Box, CreateKind::Layers, CreateKind::Rectangle, CreateKind::Ellipse];
+        let lined: Vec<u8> = kinds
+            .into_iter()
+            .map(crate::dom::kind_code)
+            .collect();
+        let set = lined.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+        assert!(glue.contains(&format!("const LINED = new Set([{set}]);")), "the glue's kinds: {set}");
+        assert!(glue.contains("decl.border = style.border;"), "a border on them");
+        let pull = "rules.push(`:where(${selector}>*){margin:${-style.borderWidth}px}`);";
+        assert!(glue.contains(pull), "the child pulled back");
+        assert!(glue.contains("\"border-color\", \"outline-color\""), "the spring moves the border's colour");
+    }
+
     /// A border is a line drawn inward over the box and its children,
-    /// laying nothing out: the page draws it as an outline pulled in by
-    /// its own width — which paints a CSS border's very pixels — never
-    /// as a CSS border, which would push the content in. A broken line
-    /// keeps its dashes, and a field's focus colors the same line.
+    /// laying nothing out. A box's is a CSS border with its child pulled
+    /// back under it; a field's, which holds no child, an outline pulled
+    /// in by its own width. A broken line keeps its dashes, a field's
+    /// focus colors its line, and the keyboard's ring, an outline too,
+    /// moves a field's line beneath it.
     #[test]
     fn a_served_border_is_drawn_inward_and_lays_nothing_out() {
         #[derive(Clone)]
@@ -1726,16 +1803,22 @@ mod tests {
 
         let page = render(&Bordered(State::new(String::new())), Size { width: 240.0, height: 120.0 });
         let css = &page.css;
-        assert!(css.contains("outline:2px solid rgba(1, 2, 3, 1);outline-offset:-2px"), "{css}");
-        assert!(css.contains("outline:1.5px dashed rgba(1, 2, 3, 1);outline-offset:-1.5px"), "{css}");
+        assert!(css.contains("border:2px solid rgba(1, 2, 3, 1)"), "{css}");
+        assert!(css.contains(">*){margin:-2px}"), "{css}");
+        assert!(css.contains("border:1.5px dashed rgba(1, 2, 3, 1)"), "{css}");
+        assert!(css.contains(">*){margin:-1.5px}"), "{css}");
+        assert!(!css.contains("outline:2px solid rgba") && !css.contains("outline:1.5px"), "{css}");
+        // the field keeps the outline, its focus colors it, and the ring takes it
+        assert!(css.contains("outline:1px solid rgba(150, 155, 165, 1);outline-offset:-1px"), "{css}");
         assert!(css.contains(":focus{outline-color:"), "{css}");
-        // the keyboard's ring takes the outline, the line moves beneath it
         assert!(
-            css.contains("[role][tabindex]:focus-visible{outline:2px solid Highlight;outline-offset:2px;box-shadow:inset 0 0 0 2px rgba(1, 2, 3, 1)}"),
+            css.contains(
+                "[role][tabindex]:focus-visible{outline:2px solid Highlight;outline-offset:2px;\
+                 box-shadow:inset 0 0 0 1px rgba(150, 155, 165, 1)}"
+            ),
             "{css}"
         );
-        let pushes = css.split(['{', ';']).filter(|declaration| declaration.starts_with("border:") && *declaration != "border:0");
-        assert_eq!(pushes.count(), 0, "{css}");
+        assert!(!css.contains("box-shadow:inset 0 0 0 2px"), "a box's line needs no ring of its own: {css}");
     }
 
     /// A field's chrome is the theme's or none: the browser's own white
