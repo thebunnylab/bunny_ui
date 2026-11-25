@@ -20,6 +20,7 @@ members = [
     "crates/bunny_ui_windows",
     "crates/bunny_ui_linux",
     "crates/bunny_ui_web",
+    "crates/bunny_ui_shell",
     "crates/countries_core",
     "apps/countries_pure",
     "apps/arena",
@@ -27,6 +28,7 @@ members = [
     "apps/bench_web",
     "apps/landing_web",
     "apps/signin_web",
+    "apps/hello_block",
     "fidelity/corpus",
 ]
 
@@ -64,6 +66,7 @@ bunny-ui-dylib = { path = "crates/bunny_ui_dylib", version = "0.5.0" }
 bunny-ui-formats = { path = "crates/bunny_ui_formats", version = "0.5.0" }
 bunny-ui-release = { path = "crates/bunny_ui_release", version = "0.5.0" }
 bunny-ui-updater = { path = "crates/bunny_ui_updater", version = "0.5.0" }
+bunny-ui-shell = { path = "crates/bunny_ui_shell", version = "0.5.0" }
 countries-core = { path = "crates/countries_core" }
 
 countries-pure = { path = "apps/countries_pure" }
