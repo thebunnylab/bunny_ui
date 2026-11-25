@@ -13,7 +13,10 @@
 //!   handshake and the capabilities. Std only, always built: a shell that
 //!   only speaks the protocol adds this and nothing else.
 //! - `guest` (feature `engine`) — a view and its runtime behind the
-//!   protocol: [`guest::Guest::call`] takes the host's bytes and answers.
+//!   protocol: [`guest::Guest::call`] takes the host's bytes and answers;
+//!   and [`guest::Fixture`], the preview harness — the page a block stands
+//!   on, built natively, so its view draws in a preview before it is
+//!   built for the shell.
 //! - `host` (feature `engine`) — the test host: a scene painted with the
 //!   framework's own painter, and [`host::native`], the native render a
 //!   scene must equal.

@@ -27,6 +27,26 @@
 //!   house's headless face), because a sandbox has no font to ask. The
 //!   scene names the font it laid out with; a host that paints the text
 //!   with another face paints other widths.
+//! - **A [`Fixture`] page has no shell behind it.** It answers every
+//!   request at once, with the outcome the fixture names (refused unless
+//!   it names another), and its rows are the fixture's until the view
+//!   stands on a real page: a preview shows the block, never the ledger.
+//!
+//! ## Previews
+//!
+//! [`Fixture`] is the guest's preview harness: the page a block stands on
+//! — its filters, its open record, the rows of the views it reads, how
+//! its requests are answered — built natively, with no shell and no
+//! protocol, so a block's `make(page)` draws wherever a view does. A
+//! `#[preview]` over it is what Studio's dock shows on every save, before
+//! the block is built for the shell:
+//!
+//! ```ignore
+//! #[bunny_ui::preview]
+//! fn on_a_record_page() -> impl View {
+//!     capacity(Fixture::new().record("task_7").rows(work()).page())
+//! }
+//! ```
 
 use std::collections::HashSet;
 
@@ -68,16 +88,24 @@ pub struct Page {
     asked: State<Vec<Requested>>,
     answers: State<Vec<(u64, Outcome)>>,
     next: State<u64>,
+    /// How a [`Fixture`] page answers every request at once; `None` on a
+    /// page with a shell behind it, where a request waits for the shell.
+    standing: State<Option<Outcome>>,
 }
 
 impl Page {
     fn new() -> Page {
+        Page::standing(Context::default(), Vec::new(), None)
+    }
+
+    fn standing(context: Context, reads: Vec<Rows>, standing: Option<Outcome>) -> Page {
         Page {
-            context: State::new(Context::default()),
-            reads: State::new(Vec::new()),
+            context: State::new(context),
+            reads: State::new(reads),
             asked: State::new(Vec::new()),
             answers: State::new(Vec::new()),
             next: State::new(0),
+            standing: State::new(standing),
         }
     }
 
@@ -105,12 +133,17 @@ impl Page {
     /// Asks the shell to run the declared action `action`, on `record` when
     /// it acts on one, and answers the request's number: what
     /// [`Page::answer`] looks it up by. The shell runs it through its own
-    /// gate; nothing is written by asking.
+    /// gate; nothing is written by asking. A [`Fixture`] page answers it at
+    /// once, as the fixture says.
     pub fn request(&self, action: &str, record: Option<&str>) -> u64 {
         let request = self.next.update(|next| {
             *next += 1;
             *next
         });
+        if let Some(outcome) = self.standing.with(Option::clone) {
+            self.answered(request, outcome);
+            return request;
+        }
         self.asked.update(|asked| {
             asked.push(Requested { request, action: action.to_string(), record: record.map(str::to_string) });
         });
@@ -143,6 +176,90 @@ impl Page {
                 (true, true)
             }
         })
+    }
+}
+
+/// The page a preview stands a block on — its signature from the outside,
+/// filled by hand: the page's filters and open record, the rows of the
+/// views it reads, and how its requests are answered. [`Fixture::page`]
+/// is a [`Page`] with no shell behind it, so a block's `make(page)` runs
+/// natively, in a preview, a test or a window, exactly as it runs in the
+/// sandbox on the same page.
+///
+/// ```ignore
+/// let page = Fixture::new()
+///     .filter("stage", "doing")
+///     .record("task_7")
+///     .rows(Rows { view: "work".into(), columns: vec!["title".into()], rows })
+///     .answer(Outcome::Held)
+///     .page();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct Fixture {
+    context: Context,
+    reads: Vec<Rows>,
+    answer: Outcome,
+}
+
+impl Fixture {
+    /// What a fixture answers a request when it names nothing else.
+    pub const REFUSAL: &'static str = "a preview runs no actions";
+
+    /// An empty page: no filters, no open record, no rows; every request
+    /// refused.
+    pub fn new() -> Fixture {
+        Fixture { context: Context::default(), reads: Vec::new(), answer: Outcome::Refused(Fixture::REFUSAL.to_string()) }
+    }
+
+    /// The page's filters as the shell's [`Context`] says them, and its
+    /// open record.
+    pub fn context(mut self, context: Context) -> Fixture {
+        self.context = context;
+        self
+    }
+
+    /// One more of the page's filters, after the ones it holds.
+    pub fn filter(mut self, field: impl Into<String>, value: impl Into<String>) -> Fixture {
+        self.context.filters.push(Filter { field: field.into(), value: value.into() });
+        self
+    }
+
+    /// The record open on the page, as on a record page.
+    pub fn record(mut self, record: impl Into<String>) -> Fixture {
+        self.context.record = Some(record.into());
+        self
+    }
+
+    /// The rows of one view the block reads, whole: they replace the rows
+    /// the fixture held for that view, as a shell's `Rows` does.
+    pub fn rows(mut self, rows: Rows) -> Fixture {
+        match self.reads.iter_mut().find(|held| held.view == rows.view) {
+            Some(held) => *held = rows,
+            None => self.reads.push(rows),
+        }
+        self
+    }
+
+    /// How the page answers every request the block makes: at once, with
+    /// `outcome`.
+    pub fn answer(mut self, outcome: Outcome) -> Fixture {
+        self.answer = outcome;
+        self
+    }
+
+    /// The page, natively: [`Page::record`], [`Page::filters`] and
+    /// [`Page::rows`] read the fixture, and [`Page::request`] is answered
+    /// at once. Build it where the view is built — inside the preview, the
+    /// test's runtime or the window — since its reads are `State`s.
+    pub fn page(self) -> Page {
+        Page::standing(self.context, self.reads, Some(self.answer))
+    }
+}
+
+impl Default for Fixture {
+    fn default() -> Fixture {
+        Fixture::new()
     }
 }
 
