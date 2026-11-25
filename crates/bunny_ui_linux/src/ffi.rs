@@ -41,7 +41,7 @@ pub(crate) mod active;
 
 #[path = "window_ops.rs"]
 mod window_ops;
-pub use window_ops::{focus_window, set_window_parent};
+pub use window_ops::{focus_window, set_window_fullscreen, set_window_parent, set_window_title};
 #[path = "window_mapping.rs"]
 mod window_mapping;
 #[cfg(test)]

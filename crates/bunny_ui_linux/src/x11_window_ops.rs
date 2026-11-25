@@ -1,8 +1,8 @@
-//! ICCCM parent hints and EWMH activation requests.
+//! ICCCM parent hints and names, EWMH activation and full-screen requests.
 use super::{
-    ATOM_WINDOW, ATOM_WM_TRANSIENT_FOR, ClientMessageEvent, Connection, Cookie, GenericError,
-    PROP_MODE_REPLACE, SUBSTRUCTURE_MASKS, XCB_CLIENT_MESSAGE, free, window_ref, with_x,
-    xcb_connection_has_error,
+    ATOM_STRING, ATOM_WINDOW, ATOM_WM_NAME, ATOM_WM_TRANSIENT_FOR, ClientMessageEvent, Connection,
+    Cookie, GenericError, PROP_MODE_REPLACE, SUBSTRUCTURE_MASKS, XCB_CLIENT_MESSAGE, free,
+    window_ref, with_x, xcb_connection_has_error,
 };
 use bunny_ui::window::{WindowError, WindowParentKind};
 use std::ffi::{c_char, c_void};
@@ -126,6 +126,74 @@ pub fn focus_window(window: u32) -> Result<(), WindowError> {
             )
         };
         checked(client.connection, cookie, "_NET_ACTIVE_WINDOW")
+    })
+}
+
+/// Renames the window: the EWMH name a window manager shows, and the ICCCM one for those
+/// that read only that.
+pub fn set_window_title(window: u32, title: &str) -> Result<(), WindowError> {
+    let length =
+        u32::try_from(title.len()).map_err(|_| WindowError::Unsupported("title too long"))?;
+    with_x(|client| {
+        window_ref(client, window).ok_or(WindowError::StaleWindow)?;
+        let names = [
+            (
+                client.atoms.net_wm_name,
+                client.atoms.utf8_string,
+                "_NET_WM_NAME",
+            ),
+            (ATOM_WM_NAME, ATOM_STRING, "WM_NAME"),
+        ];
+        for (property, kind, operation) in names {
+            let cookie = unsafe {
+                xcb_change_property_checked(
+                    client.connection,
+                    PROP_MODE_REPLACE,
+                    window,
+                    property,
+                    kind,
+                    8,
+                    length,
+                    title.as_ptr().cast(),
+                )
+            };
+            checked(client.connection, cookie, operation)?;
+        }
+        Ok(())
+    })
+}
+
+/// Asks the window manager to take the window over its whole screen, or back.
+pub fn set_window_fullscreen(window: u32, fullscreen: bool) -> Result<(), WindowError> {
+    with_x(|client| {
+        let win = window_ref(client, window).ok_or(WindowError::StaleWindow)?;
+        if fullscreen && !win.mapped {
+            return Err(WindowError::HiddenWindow);
+        }
+        let message = ClientMessageEvent {
+            response_type: XCB_CLIENT_MESSAGE,
+            format: 32,
+            sequence: 0,
+            window,
+            kind: client.atoms.net_wm_state,
+            data32: [
+                u32::from(fullscreen),
+                client.atoms.net_wm_state_fullscreen,
+                0,
+                1,
+                0,
+            ],
+        };
+        let cookie = unsafe {
+            xcb_send_event_checked(
+                client.connection,
+                0,
+                client.root,
+                SUBSTRUCTURE_MASKS,
+                (&raw const message).cast(),
+            )
+        };
+        checked(client.connection, cookie, "_NET_WM_STATE")
     })
 }
 

@@ -277,6 +277,52 @@ pub fn focus_window(window: usize) -> Result<(), WindowError> {
     })
 }
 
+/// Renames the window's toplevel: the name the compositor's switcher and task bar show.
+pub fn set_window_title(window: usize, title: &str) -> Result<(), WindowError> {
+    if is_x11() {
+        return crate::x11::set_window_title(
+            u32::try_from(window).map_err(|_| WindowError::StaleWindow)?,
+            title,
+        );
+    }
+    let title = std::ffi::CString::new(title.replace('\0', "")).unwrap_or_default();
+    with_client(|client| {
+        let win = window_ref(client, window).ok_or(WindowError::StaleWindow)?;
+        connection_ready(client, "xdg_toplevel.set_title")?;
+        unsafe {
+            request(win.toplevel, 2, &mut [arg_s(&title)]);
+            wl_display_flush(client.display);
+        }
+        connection_ready(client, "xdg_toplevel.set_title")
+    })
+}
+
+/// Asks the compositor to take the window over the output it is on, or back.
+pub fn set_window_fullscreen(window: usize, fullscreen: bool) -> Result<(), WindowError> {
+    if is_x11() {
+        return crate::x11::set_window_fullscreen(
+            u32::try_from(window).map_err(|_| WindowError::StaleWindow)?,
+            fullscreen,
+        );
+    }
+    with_client(|client| {
+        let win = window_ref(client, window).ok_or(WindowError::StaleWindow)?;
+        connection_ready(client, "xdg_toplevel.set_fullscreen")?;
+        if fullscreen && win.map.hidden() {
+            return Err(WindowError::HiddenWindow);
+        }
+        unsafe {
+            if fullscreen {
+                request(win.toplevel, 11, &mut [arg_o(std::ptr::null_mut())]);
+            } else {
+                request(win.toplevel, 12, &mut no_args());
+            }
+            wl_display_flush(client.display);
+        }
+        connection_ready(client, "xdg_toplevel.set_fullscreen")
+    })
+}
+
 fn connection_ready(client: &Client, operation: &'static str) -> Result<(), WindowError> {
     let code = unsafe { wl_display_get_error(client.display) };
     if code == 0 {

@@ -41,7 +41,7 @@ use crate::ffi::{
 
 #[path = "x11_window_ops.rs"]
 mod window_ops;
-pub use window_ops::{focus_window, set_window_parent};
+pub use window_ops::{focus_window, set_window_fullscreen, set_window_parent, set_window_title};
 #[path = "x11_geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{dialog_geometry, restore_dialog_placement};
@@ -829,9 +829,11 @@ pub(crate) struct Atoms {
     /// KDE's blur behind a window: a property the compositor announces
     /// on the root while it can blur, and the region a window asks for.
     pub(crate) kde_blur_behind_region: u32,
+    /// The EWMH state of a window that covers its whole screen.
+    pub(crate) net_wm_state_fullscreen: u32,
 }
 
-const ATOM_NAMES: [&CStr; 19] = [
+const ATOM_NAMES: [&CStr; 20] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -851,6 +853,7 @@ const ATOM_NAMES: [&CStr; 19] = [
     c"_NET_ACTIVE_WINDOW",
     c"_NET_WM_CM_S0",
     c"_KDE_NET_WM_BLUR_BEHIND_REGION",
+    c"_NET_WM_STATE_FULLSCREEN",
 ];
 
 use std::ffi::CStr;
@@ -892,6 +895,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         net_wm_window_type_normal: atoms[15],
         net_wm_cm_s0: atoms[17],
         kde_blur_behind_region: atoms[18],
+        net_wm_state_fullscreen: atoms[19],
     }
 }
 

@@ -30,7 +30,7 @@ mod window_ops;
 pub use confirmation::{
     available as confirmation_available, defer as defer_confirmations, queue as queue_confirmation,
 };
-pub use window_ops::{focus_window, set_window_parent};
+pub use window_ops::{focus_window, set_window_fullscreen, set_window_parent, set_window_title};
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{

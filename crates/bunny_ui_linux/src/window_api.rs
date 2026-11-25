@@ -1,8 +1,33 @@
 //! Safe scene operations over the native window adapter.
 
 use crate::{App, WindowError, WindowId, WindowParent, WindowVisibility, ffi};
+use bunny_ui::window::FullscreenMode;
 
 impl App {
+    /// Renames a live window after it opened: the title the compositor's switcher, the task
+    /// bar and the window manager's frame show.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID.
+    pub fn set_title(&self, id: WindowId, title: &str) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::set_window_title(slot.window, title)
+    }
+
+    /// Asks the window over its whole screen or back among the others. Presentation is the
+    /// same request: the app hides its own toolbar over the full screen.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID and `HiddenWindow`
+    /// for a hidden one.
+    pub fn set_fullscreen(&self, id: WindowId, mode: FullscreenMode) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        if slot.lifecycle.is_hidden() && mode.is_fullscreen() {
+            return Err(WindowError::HiddenWindow);
+        }
+        ffi::set_window_fullscreen(slot.window, mode.is_fullscreen())
+    }
+
     /// Requests activation of a live singleton under window-system policy.
     /// This is a request, not proof of foreground focus. Explicitly hidden
     /// owners must be shown first. macOS and Windows respect native modal scope;
