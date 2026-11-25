@@ -6,3 +6,7 @@
 # may rewrite their line endings — a gradlew with CRLF does not run, and
 # a gradlew.bat with bare LF loses its labels.
 crates/bunny_cli/templates/** -text
+
+# The migration fixtures are compared byte for byte, and the diff of the
+# one is asserted line by line: no checkout may give them CRLF.
+crates/bunny_cli/tests/migrate/** -text
