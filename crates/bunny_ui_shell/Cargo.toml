@@ -1,0 +1,29 @@
+[package]
+name = "bunny-ui-shell"
+version.workspace = true
+edition.workspace = true
+description = "The Trinity shell target of bunny-ui — the engine as a zero-import Wasm guest that hands its host the semantic scene and takes events back, over a small, versioned, additive protocol"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "wasm", "sandbox", "gui"]
+categories = ["gui", "wasm"]
+
+[features]
+default = []
+# The engine on both sides of the protocol: the guest (a view, its
+# runtime, the scene it hands out and the events it takes) and the test
+# host (a scene raised and painted with the framework's own painter).
+# Off, the crate is the protocol alone, std only — what a shell that
+# only speaks the protocol adds.
+engine = ["dep:bunny-ui-core", "bunny-ui-preview/core"]
+
+[dependencies]
+# The scene's draws are the preview wire's: one scene vocabulary for
+# the ecosystem, frozen under the same additive rule.
+bunny-ui-preview.workspace = true
+bunny-ui-core = { workspace = true, optional = true, features = ["canvas"] }
+
+[[test]]
+name = "scene"
+required-features = ["engine"]

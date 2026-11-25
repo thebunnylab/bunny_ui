@@ -1,0 +1,15 @@
+[package]
+name = "hello-block"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "The hello block: a bunny-ui view built for the Trinity shell — the first raw block, measured before anything is promised (T2-APP-60)"
+
+[lib]
+# `cdylib` is the block a shell loads (wasm32-unknown-unknown); `rlib`
+# is what the acceptance test renders natively beside it
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bunny-ui = { workspace = true, features = ["canvas"] }
+bunny-ui-shell = { workspace = true, features = ["engine"] }
