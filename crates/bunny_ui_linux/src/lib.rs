@@ -8,6 +8,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod audio;
 pub mod credentials;
 pub mod dialog;
 #[doc(hidden)]

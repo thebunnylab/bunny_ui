@@ -106,8 +106,9 @@ pub use bunny_ui_web as platform;
 pub use platform::{run_window, run_window_with};
 
 /// Sound out of this target's speakers — see [`audio`]. CoreAudio on the
-/// Mac; every other target, and a build without the shell, plays nothing
-/// and keeps the clock running ([`audio::Silent`]).
+/// Mac, WASAPI on Windows, PulseAudio or ALSA on Linux; every other
+/// target, and a build without the shell, plays nothing and keeps the
+/// clock running ([`audio::Silent`]).
 ///
 /// ```no_run
 /// let format = bunny_ui::audio::AudioFormat::new(48_000, 2).unwrap();
@@ -119,5 +120,15 @@ pub use platform::{run_window, run_window_with};
 pub type AudioOutput = audio::AudioOutput<platform::audio::CoreAudio>;
 /// Sound out of this target's speakers — see [`audio`]. This target plays
 /// nothing and keeps the clock running ([`audio::Silent`]).
-#[cfg(not(all(feature = "shell", target_os = "macos")))]
+/// Sound out of this target's speakers — see [`audio`]: WASAPI.
+#[cfg(all(feature = "shell", target_os = "windows"))]
+pub type AudioOutput = audio::AudioOutput<platform::audio::Wasapi>;
+/// Sound out of this target's speakers — see [`audio`]: PulseAudio, or
+/// ALSA where no sound server runs.
+#[cfg(all(feature = "shell", target_os = "linux"))]
+pub type AudioOutput = audio::AudioOutput<platform::audio::LinuxAudio>;
+#[cfg(not(all(
+    feature = "shell",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+)))]
 pub type AudioOutput = audio::AudioOutput<audio::Silent>;

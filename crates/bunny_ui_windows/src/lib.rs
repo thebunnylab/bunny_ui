@@ -8,6 +8,7 @@
 
 #![cfg(target_os = "windows")]
 
+pub mod audio;
 pub mod credentials;
 mod d3d;
 pub mod dialog;
@@ -28,6 +29,7 @@ use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use d3d::OffscreenD3d;
+pub use ffi::preferred_locale;
 pub use image::WicImageEngine;
 pub use text::DirectWriteEngine;
 

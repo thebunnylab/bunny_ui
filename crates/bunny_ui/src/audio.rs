@@ -21,10 +21,10 @@
 //! device pulls, so they behave the same on every platform — a paused
 //! stream plays silence and its clock stands still.
 //!
-//! A [`Device`] is what a shell plugs in: macOS renders through CoreAudio
-//! and every other target through [`Silent`], which plays nothing and
-//! still advances the clock in real time, so a picture synchronised to it
-//! keeps moving. The facade names the right one `bunny_ui::AudioOutput`.
+//! A [`Device`] is what a shell plugs in: CoreAudio on macOS, WASAPI on
+//! Windows, PulseAudio or ALSA on Linux, and [`Silent`] everywhere else,
+//! which plays nothing and still advances the clock in real time, so a
+//! picture synchronised to it keeps moving. The facade names the right one `bunny_ui::AudioOutput`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
