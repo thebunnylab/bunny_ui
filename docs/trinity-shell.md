@@ -15,7 +15,7 @@ The crate is `bunny-ui-shell` (`crates/bunny_ui_shell`):
 | Piece | What it is |
 | --- | --- |
 | `protocol` | The messages in both directions as bytes, the version handshake, the capabilities. Std only, always built. |
-| `guest` (feature `engine`) | A view and its runtime behind the protocol: `Guest::call(bytes) -> bytes`. |
+| `guest` (feature `engine`) | A view and its runtime behind the protocol: `Guest::call(bytes) -> bytes`; and `Fixture`, the preview harness. |
 | `host` (feature `engine`) | The test host: a scene raised and painted with the framework's own painter, and `native`, the render a scene must equal. |
 | `block!` | The zero-import exports that make a `cdylib` a block. |
 | `wit/shell.wit` | The component-model world the exports lower: `export call: func(input: list<u8>) -> list<u8>`. |
@@ -125,6 +125,28 @@ A view reaches its signature through `bunny_ui_shell::guest::Page`
 `request(action, record)` and `answer(request)`, each read recorded like a
 `State`'s. Under a shell that grants no `REQUESTS`, `request` is answered
 `Refused` inside the guest, so the view can say so rather than wait.
+
+### Previews
+
+A block is previewed natively, before it is built for the shell:
+`bunny_ui_shell::guest::Fixture` is the page it stands on, filled by hand —
+`filter`, `record`, `rows` (whole, per view, as `Rows` replaces them) and
+`answer`, how every request is answered (`Refused` unless it names
+another outcome). `Fixture::page()` is a `Page` with no shell behind it, so
+the block's `make(page)` runs wherever a view does, and a `#[preview]` over
+it is what Studio's dock and `bunny preview` show on every save:
+
+```rust
+#[bunny_ui::preview(name = "Capacity", example = "On a record page")]
+fn on_a_record_page() -> impl View {
+    capacity(Fixture::new().record("task_7").rows(work()).page())
+}
+```
+
+The block draws on a fixture page exactly what it draws in the sandbox on
+the same page (`tests/preview.rs` holds the pixels equal). A fixture page
+answers a request at once and sends nothing: a preview shows the block,
+never the ledger.
 
 ### How it grows
 
