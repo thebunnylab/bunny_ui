@@ -656,8 +656,14 @@ fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
 /// — layers belong to `zstack`. The merge only happens with a literal
 /// `Styled` on top: `.background_color(a).padding().background_color(b)`
 /// truly nests (different geometries, both paint).
+///
+/// A recording pass puts a `Sited` wrapper over every modifier, and the
+/// style beneath is still the one to merge into: the wrapper measures and
+/// places as its child does, and a sited pass paints what an unsited one
+/// does (`provenance`). Each modifier keeps its own wrapper, so its site
+/// is still recorded.
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
-    match out.base_from(mark) {
+    match beneath_sites(out.base_from(mark)) {
         // a style that wears hints or an action stood behind their
         // wrapper, where no style reached it to merge: the new one
         // nests, as it did. One that merges merges where it stands
@@ -665,12 +671,22 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
             if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() => {
             VisualProps::restyle(props, delta);
         }
-        node => wrap_in_place(node, |other| LayoutNode::Styled {
+        _ => wrap_in_place(out.base_from(mark), |other| LayoutNode::Styled {
             props: delta.shared(),
             child: Box::new(other),
             hints: Default::default(),
             action: None,
         }),
+    }
+}
+
+/// The node under the site wrappers a recording pass adds — and only
+/// those: a padding or a frame between two styles is a real geometry, and
+/// the styles on either side of it nest.
+fn beneath_sites(node: &mut LayoutNode) -> &mut LayoutNode {
+    match node {
+        LayoutNode::Sited { child, .. } => beneath_sites(child),
+        other => other,
     }
 }
 
