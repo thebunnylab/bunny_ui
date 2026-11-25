@@ -2896,6 +2896,47 @@ impl GlassPaint {
     }
 }
 
+/// What the pixel pipelines draw for one outer layer of CSS's shadow: the
+/// house halo, `blur` wide, round the box's outline moved and grown by
+/// the layer, and the band the spread adds as a solid ring — exact for a
+/// ring that is not moved, the halo's own curve for the blur.
+fn cast_shadow(frame: Rect, corners: Corners, layer: crate::shapes::BoxShadow) -> impl Iterator<Item = DrawCommand> {
+    let spread = layer.spread.max(-frame.size.width / 2.0).max(-frame.size.height / 2.0);
+    let rect = Rect {
+        origin: Point { x: frame.origin.x + layer.x - spread, y: frame.origin.y + layer.y - spread },
+        size: Size { width: frame.size.width + 2.0 * spread, height: frame.size.height + 2.0 * spread },
+    };
+    let grow = |radius: Px| if radius > 0.0 { (radius + spread).max(0.0) } else { 0.0 };
+    let corner_radius = Corners {
+        top_left: grow(corners.top_left),
+        top_right: grow(corners.top_right),
+        bottom_right: grow(corners.bottom_right),
+        bottom_left: grow(corners.bottom_left),
+    };
+    let color = layer.color;
+    let visible = color.a > 0;
+    let ring = (visible && spread > 0.0).then_some(DrawCommand::StrokeRect { rect, color, width: spread, corner_radius });
+    let halo = (visible && layer.blur > 0.0).then_some(DrawCommand::Shadow { rect, radius: layer.blur, color, corner_radius });
+    halo.into_iter().chain(ring)
+}
+
+/// The bars the pixel pipelines draw for a border set side by side: each
+/// side's width inward along its edge, the leading one on the right in a
+/// right-to-left scene. Square at the corners.
+fn edge_bars(frame: Rect, [top, trailing, bottom, leading]: [crate::shapes::EdgeLine; 4], rtl: bool) -> impl Iterator<Item = (Rect, Color)> {
+    let (left, right) = if rtl { (trailing, leading) } else { (leading, trailing) };
+    let Rect { origin: Point { x, y }, size: Size { width, height } } = frame;
+    let bar = |x: Px, y: Px, width: Px, height: Px| Rect { origin: Point { x, y }, size: Size { width, height } };
+    [
+        (bar(x, y, width, top.1), top.0),
+        (bar(x + width - right.1, y, right.1, height), right.0),
+        (bar(x, y + height - bottom.1, width, bottom.1), bottom.0),
+        (bar(x, y, left.1, height), left.0),
+    ]
+    .into_iter()
+    .filter(|(rect, color)| rect.size.width > 0.0 && rect.size.height > 0.0 && color.a > 0)
+}
+
 /// VISUAL properties of a scene node — paint only, by construction: no
 /// field here changes measure (the "hover does not touch layout" LAW,
 /// guaranteed by the type). In Dom mode this becomes the element's CSS;
@@ -2975,6 +3016,11 @@ pub struct VisualProps {
     /// `.shadow_offset(x, y)` — where the halo sits from the box: SwiftUI's
     /// `.shadow(…, x:, y:)`, CSS's offset. `None` is under the box.
     pub shadow_offset: Option<(Px, Px)>,
+    /// `.box_shadow(…)` — CSS's own shadow layers, the top one first.
+    pub box_shadows: crate::shapes::BoxShadows,
+    /// `.border_edge(…)` — a line along one edge, in place of the
+    /// border's on that side.
+    pub border_edges: crate::shapes::BorderEdges,
     /// `.offset(x, y)` — the box and everything in it drawn this far from
     /// where the layout put it, as SwiftUI's `.offset`: paint and pointer
     /// move, the layout around it never hears of it.
@@ -3085,6 +3131,10 @@ impl VisualProps {
             flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
             shadow_offset: self.shadow_offset.or(outer.shadow_offset),
+            // the inner layers over the outer ones; a chain too long for
+            // one stays nested
+            box_shadows: self.box_shadows.then(outer.box_shadows).unwrap_or(self.box_shadows),
+            border_edges: self.border_edges.or(outer.border_edges),
             // two offsets add up, as SwiftUI's do: `.offset(x: 1).offset(x: 2)`
             // is three
             offset: match (self.offset, outer.offset) {
@@ -10298,6 +10348,12 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
+                // the shadow's own layers, the bottom one first
+                for layer in props.box_shadows.iter().rev().filter(|layer| !layer.inset) {
+                    for command in cast_shadow(frame, props.corner_radius.unwrap_or_default(), layer) {
+                        out.draw(command);
+                    }
+                }
                 // the pane comes after the halo and before everything
                 // else: it reads the scene BEHIND the box, and the
                 // box's own paint must stay sharp on top of it. The
@@ -10427,6 +10483,14 @@ impl LayoutNode {
                         let mark = 0;
                         mark
                     });
+                // an inset layer lies over the grounds and under the child
+                for layer in props.box_shadows.iter().rev().filter(|layer| layer.inset) {
+                    let width = layer.spread + layer.blur / 2.0;
+                    if width > 0.0 && layer.color.a > 0 {
+                        let corner_radius = props.corner_radius.unwrap_or_default();
+                        out.draw(DrawCommand::StrokeRect { rect: frame, color: layer.color, width, corner_radius });
+                    }
+                }
                 // the background IS the shape, so it paints before the
                 // cut; the border paints after, over the cut child — a
                 // ring blended once, never twice
@@ -10450,7 +10514,12 @@ impl LayoutNode {
                     #[cfg(not(feature = "canvas"))]
                     let _ = mark;
                 }
-                if let Some((color, width)) = props.border {
+                if !props.border_edges.is_empty() {
+                    let sides = props.border_edges.or(crate::shapes::BorderEdges::ring(props.border)).sides();
+                    for (rect, color) in edge_bars(frame, sides, env.rtl()) {
+                        out.draw(DrawCommand::FillRect { rect, color, corner_radius: Corners::ZERO });
+                    }
+                } else if let Some((color, width)) = props.border {
                     let color = animated(crate::anim::Channel::Border, color);
                     let corner_radius = props.corner_radius.unwrap_or_default();
                     // a broken line is a traced path; the solid one keeps

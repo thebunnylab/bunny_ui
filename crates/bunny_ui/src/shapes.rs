@@ -289,9 +289,211 @@ fn clip_half(polygon: &[(f64, f64)], inside: impl Fn((f64, f64)) -> f64) -> Vec<
     out
 }
 
+// =============================================================================
+// Box shadows
+// =============================================================================
+
+/// One layer of CSS's `box-shadow`: the box's outline moved by `x` and
+/// `y`, grown by `spread` (shrunk when negative), blurred by `blur` and
+/// filled with `color` — outside the box, or inside it when `inset`.
+///
+/// ```ignore
+/// // `box-shadow: 0 50px 120px -20px rgba(0,0,0,.7), 0 0 0 1px rgba(0,0,0,.4)`
+/// window
+///     .box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 179)).offset(0.0, 50.0).blur(120.0).spread(-20.0))
+///     .box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 102)).spread(1.0))
+/// ```
+///
+/// The element lowering hands the browser the layer as written. The
+/// pixel pipelines draw the house halo, `blur` wide, around the moved
+/// and grown outline, the band the spread adds as a solid ring, and an
+/// inset layer as a ring inward.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct BoxShadow {
+    pub x: Px,
+    pub y: Px,
+    pub blur: Px,
+    pub spread: Px,
+    pub color: Color,
+    pub inset: bool,
+}
+
+impl BoxShadow {
+    /// A layer of `color` right under the box: no offset, blur or spread.
+    #[must_use]
+    pub const fn new(color: Color) -> BoxShadow {
+        BoxShadow { x: 0.0, y: 0.0, blur: 0.0, spread: 0.0, color, inset: false }
+    }
+
+    /// The layer moved this far from the box.
+    #[must_use]
+    pub const fn offset(self, x: Px, y: Px) -> BoxShadow {
+        BoxShadow { x, y, ..self }
+    }
+
+    /// CSS's blur radius: the edge fades over about this far.
+    #[must_use]
+    pub const fn blur(self, blur: Px) -> BoxShadow {
+        BoxShadow { blur, ..self }
+    }
+
+    /// The outline grown this far on every side before the blur.
+    #[must_use]
+    pub const fn spread(self, spread: Px) -> BoxShadow {
+        BoxShadow { spread, ..self }
+    }
+
+    /// Cast inside the box, over its background and under its content.
+    #[must_use]
+    pub const fn inset(self) -> BoxShadow {
+        BoxShadow { inset: true, ..self }
+    }
+}
+
+/// The layers of a box's shadow, the top one first, as CSS lists them —
+/// held inline, so the paint props stay `Copy`.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct BoxShadows {
+    held: [Option<BoxShadow>; BoxShadows::MOST],
+}
+
+impl BoxShadows {
+    /// The most one view holds; more layers nest a second box.
+    pub const MOST: usize = 4;
+
+    pub const NONE: BoxShadows = BoxShadows { held: [None; BoxShadows::MOST] };
+
+    #[must_use]
+    pub const fn one(shadow: BoxShadow) -> BoxShadows {
+        let mut held = [None; BoxShadows::MOST];
+        held[0] = Some(shadow);
+        BoxShadows { held }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.held[0].is_none()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.held.iter().flatten().count()
+    }
+
+    /// The layers, the top one first.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = BoxShadow> + '_ {
+        self.held.iter().flatten().copied()
+    }
+
+    /// These over `outer`'s — `None` when the two do not fit in one.
+    #[must_use]
+    pub fn then(self, outer: BoxShadows) -> Option<BoxShadows> {
+        let len = self.len();
+        if len + outer.len() > BoxShadows::MOST {
+            return None;
+        }
+        let mut held = self.held;
+        for (slot, shadow) in held[len..].iter_mut().zip(outer.iter()) {
+            *slot = Some(shadow);
+        }
+        Some(BoxShadows { held })
+    }
+}
+
+// =============================================================================
+// Border edges
+// =============================================================================
+
+/// A line along one edge: its ink and its width.
+pub type EdgeLine = (Color, Px);
+
+/// The lines along a box's edges one by one — CSS's `border-top`,
+/// `border-bottom` and the two inline sides — each drawn inward, as
+/// `.border(…)`'s ring is. A side set here takes the place of the
+/// ring's on that side; a side left `None` keeps the ring's, if any.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct BorderEdges {
+    pub top: Option<EdgeLine>,
+    pub trailing: Option<EdgeLine>,
+    pub bottom: Option<EdgeLine>,
+    pub leading: Option<EdgeLine>,
+}
+
+impl BorderEdges {
+    pub const NONE: BorderEdges = BorderEdges { top: None, trailing: None, bottom: None, leading: None };
+
+    /// A line along `edge` alone.
+    #[must_use]
+    pub const fn one(edge: motor::views::Edge, color: Color, width: Px) -> BorderEdges {
+        let line = Some((color, width));
+        match edge {
+            motor::views::Edge::Top => BorderEdges { top: line, ..BorderEdges::NONE },
+            motor::views::Edge::Trailing => BorderEdges { trailing: line, ..BorderEdges::NONE },
+            motor::views::Edge::Bottom => BorderEdges { bottom: line, ..BorderEdges::NONE },
+            motor::views::Edge::Leading => BorderEdges { leading: line, ..BorderEdges::NONE },
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.top.is_none() && self.trailing.is_none() && self.bottom.is_none() && self.leading.is_none()
+    }
+
+    /// Side by side, these where set, `outer`'s where not.
+    #[must_use]
+    pub fn or(self, outer: BorderEdges) -> BorderEdges {
+        BorderEdges {
+            top: self.top.or(outer.top),
+            trailing: self.trailing.or(outer.trailing),
+            bottom: self.bottom.or(outer.bottom),
+            leading: self.leading.or(outer.leading),
+        }
+    }
+
+    /// `line` on all four sides: `.border(…)`'s ring.
+    #[must_use]
+    pub const fn ring(line: Option<EdgeLine>) -> BorderEdges {
+        BorderEdges { top: line, trailing: line, bottom: line, leading: line }
+    }
+
+    /// The four sides clockwise from the top — top, trailing, bottom,
+    /// leading — zero wide where none is set.
+    #[must_use]
+    pub fn sides(self) -> [EdgeLine; 4] {
+        let none = (Color::rgba(0, 0, 0, 0), 0.0);
+        [self.top, self.trailing, self.bottom, self.leading].map(|side| side.unwrap_or(none))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_layers_stack_in_the_order_written_while_they_fit() {
+        let ink = Color::rgba(0, 0, 0, 90);
+        let near = BoxShadows::one(BoxShadow::new(ink).blur(4.0));
+        let far = BoxShadows::one(BoxShadow::new(ink).spread(1.0).inset());
+        let both = near.then(far).expect("two fit");
+        assert_eq!(both.iter().map(|layer| layer.inset).collect::<Vec<_>>(), [false, true]);
+        let full = both.then(both).expect("four fit");
+        assert_eq!(full.len(), BoxShadows::MOST);
+        assert_eq!(full.then(near), None, "a fifth nests");
+        assert_eq!(BoxShadow::new(ink).offset(1.0, 2.0), BoxShadow { x: 1.0, y: 2.0, ..BoxShadow::new(ink) });
+    }
+
+    #[test]
+    fn an_edge_set_alone_takes_the_rings_place_on_its_side() {
+        let ring = (Color::rgb(1, 1, 1), 1.0);
+        let rule = (Color::rgb(2, 2, 2), 3.0);
+        let edges = BorderEdges::one(motor::views::Edge::Bottom, rule.0, rule.1);
+        assert_eq!(edges.or(BorderEdges::ring(Some(ring))).sides(), [ring, ring, rule, ring]);
+        let none = (Color::rgba(0, 0, 0, 0), 0.0);
+        assert_eq!(edges.sides(), [none, none, rule, none]);
+        let top = BorderEdges::one(motor::views::Edge::Top, ring.0, ring.1);
+        assert_eq!(edges.or(top).or(BorderEdges::one(motor::views::Edge::Bottom, ring.0, 9.0)).sides(), [ring, none, rule, none]);
+        assert!(BorderEdges::NONE.is_empty() && !edges.is_empty());
+    }
 
     fn raster(source: &ImageSource, width: usize, height: usize) -> std::rc::Rc<crate::image_engine::ImageRaster> {
         let engine = crate::image_engine::RawImages::default();

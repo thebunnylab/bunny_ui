@@ -926,6 +926,32 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
     }
 }
 
+/// The four sides of a line set side by side, clockwise from the top: the
+/// border longhand and margin each one names, and the offset of the inset
+/// shadow that draws it on a kind that keeps no border (the glue's `EDGES`).
+const EDGES: [Side; 4] = [
+    ("border-top", "margin-top", |width| format!("0 {}", px(width))),
+    ("border-inline-end", "margin-inline-end", |width| format!("{} 0", px(-width))),
+    ("border-bottom", "margin-bottom", |width| format!("0 {}", px(-width))),
+    ("border-inline-start", "margin-inline-start", |width| format!("{} 0", px(width))),
+];
+
+/// A side's border longhand, its margin and its inset shadow's offset.
+type Side = (&'static str, &'static str, fn(f64) -> String);
+
+/// One layer of the shadow's own, as CSS writes it.
+fn css_shadow(layer: crate::shapes::BoxShadow) -> String {
+    format!(
+        "{}{} {} {} {} {}",
+        if layer.inset { "inset " } else { "" },
+        px(layer.x),
+        px(layer.y),
+        px(layer.blur),
+        px(layer.spread),
+        color(layer.color)
+    )
+}
+
 /// The house halo falls off as (1 − d/r)² from the edge and stops at
 /// its reach; one CSS blur is a Gaussian. Two blurred layers — a spread
 /// and a blur in reaches, and an exponent on the ink's opacity — follow
@@ -1181,9 +1207,28 @@ fn rule_text(
     // the children pulled back under it by its width, so it lays nothing
     // out. A text, a picture or a control has no child to pull back: an
     // outline pulled in by its own width
-    let lined = style.border.is_some() && lined(kind);
+    let edged = !style.border_edges.is_empty();
+    let lined = (style.border.is_some() || edged) && lined(kind);
+    let line = style.border_style.map_or("solid", crate::shapes::BorderStyle::css);
+    // a line along one edge alone: each side its own longhand, as a page
+    // writes `border-bottom`, or an inset shadow on a kind without one
+    let sides: Vec<_> = style
+        .border_edges
+        .sides()
+        .into_iter()
+        .zip(EDGES)
+        .filter(|((_, width), _)| *width > 0.0)
+        .collect();
+    if edged && lined {
+        for &((ink, width), (border, _, _)) in &sides {
+            base.insert(border, format!("{} {line} {}", px(width), color(ink)));
+        }
+        let pulls: Vec<String> = sides.iter().map(|&((_, width), (_, margin, _))| format!("{margin}:{}", px(-width))).collect();
+        if !pulls.is_empty() {
+            states.push(format!(":where({selector}>*){{{}}}", pulls.join(";")));
+        }
+    }
     if let Some((border, width)) = style.border {
-        let line = style.border_style.map_or("solid", crate::shapes::BorderStyle::css);
         if lined {
             base.insert("border", format!("{} {line} {}", px(width), color(border)));
             // at no specificity: a margin the child names itself still wins
@@ -1212,8 +1257,9 @@ fn rule_text(
         };
         base.insert("border-radius", value);
     }
-    // the halo and the glass rim share one property
-    let mut shadows: Vec<String> = Vec::new();
+    // the shadow's own layers, as CSS writes them, the halo and the
+    // glass rim share one property
+    let mut shadows: Vec<String> = style.box_shadows.iter().map(css_shadow).collect();
     if let Some((radius, shadow)) = style.shadow {
         shadows.extend(halo(radius, shadow, style.shadow_offset.unwrap_or_default()));
     }
@@ -1333,6 +1379,9 @@ fn rule_text(
             shadows.push(format!("inset {spread}px {spread}px {soft}px -{spread}px {rim}"));
             shadows.push(format!("inset -{spread}px -{spread}px {soft}px -{spread}px {rim}"));
         }
+    }
+    if edged && !lined {
+        shadows.extend(sides.iter().map(|&((ink, width), (_, _, inward))| format!("inset {} 0 0 {}", inward(width), color(ink))));
     }
     if !shadows.is_empty() {
         base.insert("box-shadow", shadows.join(","));
@@ -1761,6 +1810,108 @@ mod tests {
             "the child is pulled back under the line, at no specificity: {css}"
         );
         assert!(!css.contains("outline:1.5px"), "{css}");
+    }
+
+    /// A shadow's own layers are served as CSS writes them: offset, blur,
+    /// spread, ink, inset, the first one written on top, and over the
+    /// house halo when the box wears one too.
+    #[test]
+    fn a_served_box_shadow_is_the_css_a_design_writes() {
+        #[derive(Clone)]
+        struct Window;
+        impl Component for Window {
+            fn body(self) -> impl View {
+                vstack!(
+                    text("window")
+                        .padding_length(8.0)
+                        .background_color(Color::rgb(30, 30, 32))
+                        .corner_radius(18.0)
+                        .box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 179)).offset(0.0, 50.0).blur(120.0).spread(-20.0))
+                        .box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 102)).spread(1.0)),
+                    text("pressed").box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 51)).offset(0.0, 1.5).blur(2.0).inset()).shadow_color(10.0, Color::rgba(0, 0, 0, 128)),
+                )
+            }
+        }
+
+        let page = render(&Window, Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        let rule = css
+            .split('}')
+            .find(|rule| rule.contains("background-color:rgba(30, 30, 32, 1)"))
+            .unwrap_or_else(|| panic!("the window has a rule: {css}"));
+        assert!(
+            rule.contains("box-shadow:0px 50px 120px -20px rgba(0, 0, 0, 0.7019607843137254),0px 0px 0px 1px rgba(0, 0, 0, 0.4)"),
+            "both layers, the first on top: {rule}"
+        );
+        assert!(
+            css.contains("box-shadow:inset 0px 1.5px 2px 0px rgba(0, 0, 0, 0.2),0px 0px 5.124px 3.262px"),
+            "an inset layer, over the halo: {css}"
+        );
+    }
+
+    /// A line along one edge is served as its own longhand, as a page
+    /// writes `border-bottom`, the ring's line on the other sides, and
+    /// the child pulled back under it on that side alone. A text keeps no
+    /// border: its edge is an inset shadow.
+    #[test]
+    fn a_served_edge_is_its_own_border_longhand() {
+        #[derive(Clone)]
+        struct Ruled;
+        impl Component for Ruled {
+            fn body(self) -> impl View {
+                vstack!(
+                    vstack!(text("bar")).padding_edge(Edge::Bottom, 1.0).border_edge(Edge::Bottom, Color::rgb(1, 2, 3), 1.0),
+                    vstack!(text("card"))
+                        .background_color(Color::rgb(9, 9, 9))
+                        .border(Color::rgb(4, 5, 6), 1.0)
+                        .border_edge(Edge::Leading, Color::rgb(7, 8, 9), 3.0),
+                )
+            }
+        }
+
+        let page = render(&Ruled, Size { width: 240.0, height: 120.0 });
+        let css = &page.css;
+        let bar = css
+            .split('}')
+            .find(|rule| rule.contains("border-bottom:1px solid rgba(1, 2, 3, 1)"))
+            .unwrap_or_else(|| panic!("the bar wears its rule: {css}"));
+        assert!(!bar.contains("border-top") && !bar.contains("border:"), "and no other side: {bar}");
+        let class = bar.split('.').nth(1).expect("a class selector").split(['{', '>']).next().expect("a class");
+        assert!(css.contains(&format!(":where(.{class}.{class}>*){{margin-bottom:-1px}}")), "pulled back at the bottom alone: {css}");
+        let card = css
+            .split('}')
+            .find(|rule| rule.contains("background-color:rgba(9, 9, 9, 1)"))
+            .unwrap_or_else(|| panic!("the card has a rule: {css}"));
+        for side in ["border-top:1px solid rgba(4, 5, 6, 1)", "border-inline-end:1px", "border-bottom:1px", "border-inline-start:3px solid rgba(7, 8, 9, 1)"] {
+            assert!(card.contains(side), "{side}: {card}");
+        }
+        assert!(css.contains("{margin-top:-1px;margin-inline-end:-1px;margin-bottom:-1px;margin-inline-start:-3px}"), "{css}");
+
+        let ruled = crate::dom::DomLook {
+            border_edges: crate::shapes::BorderEdges::one(Edge::Bottom, Color::rgb(1, 2, 3), 2.0),
+            ..crate::dom::DomLook::default()
+        };
+        let field = rule_text("k", crate::dom::CreateKind::Field, false, &ruled, &crate::dom::DomLayout::default(), None);
+        assert!(field.contains("box-shadow:inset 0 -2px 0 0 rgba(1, 2, 3, 1)"), "{field}");
+        assert!(!field.contains("border-bottom") && !field.contains("margin-bottom"), "{field}");
+    }
+
+    /// The glue writes both as the page does: the layers into the shadow
+    /// list, the edges as longhands from the same table of sides.
+    #[test]
+    fn the_glue_writes_shadow_layers_and_edges_as_the_page_does() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("const last = u8();"), "the third mask");
+        assert!(glue.contains("${u8() ? \"inset \" : \"\"}${x}px ${y}px ${blur}px ${spread}px ${ink}"), "a layer as CSS writes it");
+        assert!(glue.contains("style.shadows.unshift(...layers);"), "over the halo");
+        assert!(glue.contains("decl[`border-${side}`] = `${width}px ${style.lineStyle} ${ink}`;"), "the longhand");
+        assert!(glue.contains("`margin-${side}:${-width}px`"), "the pull-back");
+        for (border, margin, inward) in EDGES {
+            let side = border.trim_start_matches("border-");
+            assert_eq!(margin, format!("margin-{side}"));
+            let spelled = inward(1.0).replace("1px", "${w}px").replace("-${w}px", "${-w}px");
+            assert!(glue.contains(&format!("[\"{side}\", (w) => `{spelled}`]")), "the glue's {side}: {spelled}");
+        }
     }
 
     /// The glue lowers a box's line the way the page does: a border on the

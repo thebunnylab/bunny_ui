@@ -97,7 +97,7 @@ pub mod pacing;
 mod paranoid;
 mod reconciler;
 mod shapes;
-pub use shapes::{BorderStyle, Stripes};
+pub use shapes::{BorderEdges, BorderStyle, BoxShadow, BoxShadows, Stripes};
 pub mod progress;
 pub mod runtime;
 pub mod search_field;
@@ -267,7 +267,7 @@ pub mod prelude {
     };
     pub use crate::icon::house as symbol;
     pub use crate::angle::{Angle, QuarterTurn};
-    pub use crate::shapes::{BorderStyle, Stripes};
+    pub use crate::shapes::{BorderStyle, BoxShadow, Stripes};
     pub use crate::icon::{Cap, Dash, ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
         FeedBytes, FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages,
@@ -2385,10 +2385,10 @@ mod tests {
             };
             let bytes = crate::dom::encode(&[look_with(text)]);
             // count(4), op(1), rule(8), kind(1), flags(1), a bare style
-            // mask(4) and its second byte (ABI 28), a bare flow mask(2),
-            // the text flag(1) — then the face: color(4), inherits(1),
-            // size(4), and the weight
-            bytes[4 + 1 + 8 + 1 + 1 + 4 + 1 + 2 + 1 + 4 + 1 + 4]
+            // mask(4), its second byte and third (ABI 28, 29), a bare flow
+            // mask(2), the text flag(1) — then the face: color(4),
+            // inherits(1), size(4), and the weight
+            bytes[4 + 1 + 8 + 1 + 1 + 4 + 1 + 1 + 2 + 1 + 4 + 1 + 4]
         };
         let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
         assert_eq!(codes, vec![6, 7, 8, 0, 1, 2, 3, 4, 5]);

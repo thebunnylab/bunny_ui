@@ -216,6 +216,24 @@ const fn weight(weight: u16) -> &'static str {
 /// A number as Rust writes an `f64`: `12.0`, `0.5`, four decimals at most
 /// — a grid of equal tracks adds each one's rounding up across the row,
 /// and the browser keeps its geometry in sixty-fourths.
+/// One `box-shadow` layer as bunny spells it: what it sets, and no more.
+fn shadow_code(shadow: &css::Shadow) -> String {
+    let mut code = format!("BoxShadow::new({})", shadow.color.code());
+    if shadow.x.abs() > 1e-9 || shadow.y.abs() > 1e-9 {
+        let _ = write!(code, ".offset({}, {})", num(shadow.x), num(shadow.y));
+    }
+    if shadow.blur > 1e-9 {
+        let _ = write!(code, ".blur({})", num(shadow.blur));
+    }
+    if shadow.spread.abs() > 1e-9 {
+        let _ = write!(code, ".spread({})", num(shadow.spread));
+    }
+    if shadow.inset {
+        code.push_str(".inset()");
+    }
+    code
+}
+
 fn num(value: f64) -> String {
     let rounded = (value * 10_000.0).round() / 10_000.0;
     let rounded = if rounded == 0.0 { 0.0 } else { rounded };
@@ -761,21 +779,10 @@ impl Writer<'_> {
             }
         }
         self.border(node, view);
-        for shadow in css::shadows(node.css("box-shadow")).iter().take(1) {
-            if shadow.inset {
-                self.gap(node, "box-shadow: inset", node.css("box-shadow").to_owned());
-                continue;
-            }
-            if shadow.spread.abs() > 1e-9 {
-                self.gap(node, "box-shadow: spread", num(shadow.spread));
-            }
-            let _ = write!(view, "\n.shadow_color({}, {})", num(shadow.blur.max(1.0)), shadow.color.code());
-            if shadow.x.abs() > 1e-9 || shadow.y.abs() > 1e-9 {
-                let _ = write!(view, "\n.shadow_offset({}, {})", num(shadow.x), num(shadow.y));
-            }
-        }
-        if css::shadows(node.css("box-shadow")).len() > 1 {
-            self.gap(node, "box-shadow: layers", node.css("box-shadow").to_owned());
+        // every layer as written, the first on top; past what one box
+        // holds, bunny nests a second
+        for shadow in css::shadows(node.css("box-shadow")) {
+            let _ = write!(view, "\n.box_shadow({})", shadow_code(&shadow));
         }
         if node.css("overflow-x") != "visible" && !node.css("overflow-x").is_empty() || node.css("overflow-y") != "visible" && !node.css("overflow-y").is_empty() {
             view.push_str("\n.clipped()");
@@ -871,22 +878,31 @@ impl Writer<'_> {
             }
             return;
         }
-        // one side at a time: a rule along that edge, over the box
+        // one side at a time: its own line along that edge, inward
+        let mut styles = Vec::new();
         for (index, side) in sides.iter().enumerate() {
             if !drawn(index) {
                 continue;
             }
             let Some(ink) = color[index] else { continue };
-            let (point, rule) = match *side {
-                "top" => ("TOP", format!("spacer().frame_height({})", num(width[index]))),
-                "bottom" => ("BOTTOM", format!("spacer().frame_height({})", num(width[index]))),
-                "left" => ("LEADING", format!("spacer().frame_width({})", num(width[index]))),
-                _ => ("TRAILING", format!("spacer().frame_width({})", num(width[index]))),
+            let edge = match *side {
+                "top" => "Top",
+                "bottom" => "Bottom",
+                "left" => "Leading",
+                _ => "Trailing",
             };
-            let _ = write!(view, "\n.overlay(UnitPoint::{point}, {rule}.background_color({}))", ink.code());
-            if style[index] != "solid" {
-                self.gap(node, "border-style: one side", style[index].to_owned());
-            }
+            let _ = write!(view, "\n.border_edge(Edge::{edge}, {}, {})", ink.code(), num(width[index]));
+            styles.push(style[index]);
+        }
+        // one style dresses every side bunny draws
+        match styles.as_slice() {
+            [first, rest @ ..] if rest.iter().all(|style| style == first) => match *first {
+                "dashed" => view.push_str("\n.border_style(BorderStyle::Dashed)"),
+                "dotted" => view.push_str("\n.border_style(BorderStyle::Dotted)"),
+                "solid" => {}
+                other => self.gap(node, "border-style", other.to_owned()),
+            },
+            _ => self.gap(node, "border-style: sides", styles.join(" ")),
         }
     }
 
@@ -2588,6 +2604,51 @@ const DRAWING_1: Symbol = Symbol::new({name:?}, &DRAWING_1_GLYPH);
         assert!(code.contains("spacer(),"), "{code}");
         assert!(code.contains(".frame_aligned(300.0, 34.0"), "{code}");
         assert!(!code.contains("frame_max(f64::INFINITY"), "{code}");
+    }
+
+    /// Every `box-shadow` layer is its own `.box_shadow(…)`, in the order
+    /// written — the inset and the spread ones too — and a border on one
+    /// side is that edge's own line, not a rule laid over the box.
+    #[test]
+    fn shadow_layers_and_a_one_sided_border_are_their_modifiers() {
+        let mut bar = Node { tag: "div".to_owned(), id: "bar".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 300.0, h: 45.0 }, ..Node::default() };
+        for (property, value) in [
+            ("display", "block"),
+            ("box-shadow", "rgba(0, 0, 0, 0.7) 0px 50px 120px -20px, rgba(0, 0, 0, 0.4) 0px 0px 0px 1px, rgb(255, 255, 255) 0px 1px 2px 0px inset"),
+            ("border-bottom-width", "1px"),
+            ("border-bottom-style", "dashed"),
+            ("border-bottom-color", "rgba(255, 255, 255, 0.08)"),
+            ("border-left-width", "2px"),
+            ("border-left-style", "dashed"),
+            ("border-left-color", "rgb(1, 2, 3)"),
+        ] {
+            bar.style.insert(property.to_owned(), value.to_owned());
+        }
+        let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 300.0, h: 45.0 }, ..Node::default() };
+        body.style.insert("display".to_owned(), "block".to_owned());
+        body.children.push(bar);
+        let options = Options {
+            prelude: String::new(),
+            module_dir: PathBuf::new(),
+            site_root: PathBuf::new(),
+            page_dir: PathBuf::new(),
+            drawings_dir: PathBuf::new(),
+            source: "page.html".to_owned(),
+        };
+        let converted = convert(&Page { root: body, html: String::new(), width: 300.0, height: 45.0 }, &options);
+        let code = &converted.code;
+        let layers = [
+            ".box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 179)).offset(0.0, 50.0).blur(120.0).spread(-20.0))",
+            ".box_shadow(BoxShadow::new(Color::rgba(0, 0, 0, 102)).spread(1.0))",
+            ".box_shadow(BoxShadow::new(Color::rgb(255, 255, 255)).offset(0.0, 1.0).blur(2.0).inset())",
+        ];
+        let at: Vec<usize> = layers.iter().map(|layer| code.find(layer).unwrap_or_else(|| panic!("{layer}: {code}"))).collect();
+        assert!(at.is_sorted(), "in the order written: {code}");
+        assert!(code.contains(".border_edge(Edge::Bottom, Color::rgba(255, 255, 255, 20), 1.0)"), "{code}");
+        let leading = code.find(".border_edge(Edge::Leading, Color::rgb(1, 2, 3), 2.0)").unwrap_or_else(|| panic!("{code}"));
+        assert!(code.find(".border_style(BorderStyle::Dashed)") > Some(leading), "one style for both sides: {code}");
+        assert!(!code.contains(".overlay(") && !code.contains(".shadow_color("), "{code}");
+        assert!(converted.gaps.iter().all(|gap| !gap.feature.starts_with("box-shadow") && !gap.feature.starts_with("border")), "{:?}", converted.gaps);
     }
 
     #[test]

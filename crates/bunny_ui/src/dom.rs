@@ -341,6 +341,10 @@ pub struct DomLook {
     /// The line's style — the browser fits its own dashes, the same
     /// rhythm the house traces.
     pub border_style: Option<crate::shapes::BorderStyle>,
+    /// The lines side by side, when one edge has a line of its own
+    /// (`.border_edge`): the ring's fills the other sides and `border`
+    /// is `None`. The page's border longhands.
+    pub border_edges: crate::shapes::BorderEdges,
     /// A `repeating-linear-gradient` over the background.
     pub stripes: Option<crate::shapes::Stripes>,
     /// A quarter turn of the box's content: `true` when the browser lays
@@ -351,6 +355,8 @@ pub struct DomLook {
     pub shadow: Option<(Px, Color)>,
     /// Where the halo sits from the box (`.shadow_offset`).
     pub shadow_offset: Option<(Px, Px)>,
+    /// CSS's own shadow layers (`.box_shadow`), the top one first.
+    pub box_shadows: crate::shapes::BoxShadows,
     /// How far the box is drawn from its place (`.offset`): CSS
     /// `translate`, which the box's neighbours never feel.
     pub offset: Option<(Px, Px)>,
@@ -451,11 +457,13 @@ impl DomLook {
         pressed_color: None,
         border: None,
         border_style: None,
+        border_edges: crate::shapes::BorderEdges::NONE,
         stripes: None,
         turn: None,
         corner_radius: None,
         shadow: None,
         shadow_offset: None,
+        box_shadows: crate::shapes::BoxShadows::NONE,
         offset: None,
         rotation: None,
         ink_gradient: None,
@@ -478,6 +486,7 @@ impl DomLook {
     };
 
     pub(crate) fn from_props(props: &VisualProps) -> DomLook {
+        let edged = !props.border_edges.is_empty();
         DomLook {
             background: props.background,
             gradient: props.gradient,
@@ -486,13 +495,19 @@ impl DomLook {
             color: None,
             hover_color: props.foreground_hovered,
             pressed_color: props.foreground_pressed,
-            border: props.border,
-            border_style: props.border_style.filter(|_| props.border.is_some()),
+            border: props.border.filter(|_| !edged),
+            border_style: props.border_style.filter(|_| props.border.is_some() || edged),
+            border_edges: if edged {
+                props.border_edges.or(crate::shapes::BorderEdges::ring(props.border))
+            } else {
+                crate::shapes::BorderEdges::NONE
+            },
             stripes: props.stripes,
             turn: None,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
             shadow_offset: props.shadow_offset.filter(|_| props.shadow.is_some()),
+            box_shadows: props.box_shadows,
             offset: props.offset,
             rotation: props.rotation.map(|(degrees, anchor)| (degrees, anchor.x, anchor.y)),
             ink_gradient: props.foreground_gradient,
@@ -527,9 +542,11 @@ impl DomLook {
             || props.foreground_hovered.is_some()
             || props.foreground_pressed.is_some()
             || props.border.is_some()
+            || !props.border_edges.is_empty()
             || props.stripes.is_some()
             || props.corner_radius.is_some()
             || props.shadow.is_some()
+            || !props.box_shadows.is_empty()
             || props.offset.is_some()
             || props.rotation.is_some()
             || props.foreground_gradient.is_some()
@@ -2580,6 +2597,11 @@ fn look_hash(node: &DomNode) -> u64 {
             (kind, amount.to_bits()).hash(&mut hasher);
         }
     }
+    let mut last = Vec::new();
+    encode_last(&mut last, style);
+    if last != [0] {
+        (8u8, last).hash(&mut hasher);
+    }
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
@@ -4611,7 +4633,15 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// shows (`.line_limit`, 0 for none; the glue clamps the element to them,
 /// `-webkit-line-clamp`), then the figures' byte — bit 0, one advance
 /// each (`.monospaced_digit()`, CSS `tabular-nums`).
-pub const ABI_VERSION: u32 = 28;
+///
+/// 29 (2026-11-25): a look's record ends with a third mask, a byte, the
+/// second one being full: bit 0 CSS's own shadow layers (`.box_shadow`:
+/// u8 count, then per layer, the top one first, f32 x, y, blur and
+/// spread, u32 rgba, u8 inset), bit 1 the border's lines side by side
+/// (`.border_edge`: per side, clockwise from the top — top, trailing,
+/// bottom, leading — u32 rgba + f32 width, zero for none), sent in place
+/// of bit 3's ring, with bit 28's style.
+pub const ABI_VERSION: u32 = 29;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -5331,6 +5361,33 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
             push_f32(out, amount);
         }
     }
+    encode_last(out, style);
+}
+
+/// The look's third mask, a byte, and what it says: bit 0 the shadow's
+/// own layers (u8 count, then per layer, the top one first, f32 x, y,
+/// blur and spread, u32 rgba, u8 inset), bit 1 the lines side by side
+/// (per side, clockwise from the top — top, trailing, bottom, leading —
+/// u32 rgba + f32 width, zero for none).
+fn encode_last(out: &mut Vec<u8>, style: &DomLook) {
+    out.push(u8::from(!style.box_shadows.is_empty()) | u8::from(!style.border_edges.is_empty()) << 1);
+    if !style.box_shadows.is_empty() {
+        #[allow(clippy::cast_possible_truncation, reason = "at most BoxShadows::MOST")]
+        out.push(style.box_shadows.len() as u8);
+        for layer in style.box_shadows.iter() {
+            for value in [layer.x, layer.y, layer.blur, layer.spread] {
+                push_f32(out, value);
+            }
+            push_u32(out, pack_color(layer.color));
+            out.push(u8::from(layer.inset));
+        }
+    }
+    if !style.border_edges.is_empty() {
+        for (color, width) in style.border_edges.sides() {
+            push_u32(out, pack_color(color));
+            push_f32(out, width);
+        }
+    }
 }
 
 /// A ramp's shape and its two ends: u8 kind (0 the rings, 1 the line),
@@ -5789,8 +5846,8 @@ mod tests {
     const MASK_AT: usize = 4 + 1 + 8 + 1 + 1;
     /// What follows a look's style record when the flow record is bare
     /// and no text face rides along: the second style mask (ABI 28), the
-    /// flow mask and the text flag.
-    const BARE_TAIL: usize = 1 + 2 + 1;
+    /// third (ABI 29), the flow mask and the text flag.
+    const BARE_TAIL: usize = 1 + 1 + 2 + 1;
 
     #[derive(Clone)]
     struct MiniList {
@@ -8354,11 +8411,13 @@ mod tests {
             pressed_color: Some(Color::hex(0x667788)),
             border: Some((Color::hex(0x778899), 1.5)),
             border_style: None,
+            border_edges: crate::shapes::BorderEdges::NONE,
             stripes: None,
             turn: None,
             corner_radius: Some(Corners::all(6.0)),
             shadow: Some((4.0, Color::hex_a(0x0000_0040))),
             shadow_offset: None,
+            box_shadows: crate::shapes::BoxShadows::NONE,
             offset: None,
             rotation: None,
             ink_gradient: None,
@@ -8421,7 +8480,7 @@ mod tests {
         let soft = DomLook { background: Some(Color::WHITE), blur: Some(3.5), ..DomLook::default() };
         let mut encoded = Vec::new();
         encode_style(&mut encoded, &soft);
-        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64, 0]);
+        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64, 0, 0]);
     }
 
     #[test]
@@ -8567,8 +8626,8 @@ mod tests {
         tail.extend_from_slice(&pack_color(ink).to_le_bytes());
         // three quarters, laid out by the browser: the flow's code
         tail.push(2 + 3);
-        // and the second mask, empty (ABI 28)
-        tail.push(0);
+        // and the second mask and the third, empty (ABI 28, 29)
+        tail.extend([0, 0]);
         assert!(out.ends_with(&tail), "{out:?}");
         // the glue reads all three
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
@@ -8587,13 +8646,14 @@ mod tests {
         let look = |gradient| DomLook { gradient: Some(gradient), ..DomLook::NONE };
         let mut plain = Vec::new();
         encode_style(&mut plain, &look(ramp));
-        assert_eq!(plain.last(), Some(&0), "a two-color ramp leaves the second mask empty");
+        assert!(plain.ends_with(&[0, 0]), "a two-color ramp leaves the second mask empty, and the third");
         let green = Color::rgb(0, 255, 0);
         let mut striped = Vec::new();
         encode_style(&mut striped, &look(ramp.stop(0.5, green)));
         let mut tail = vec![1 << 3, 1];
         tail.extend_from_slice(&0.5f32.to_le_bytes());
         tail.extend_from_slice(&pack_color(green).to_le_bytes());
+        tail.push(0);
         assert!(striped.ends_with(&tail), "{striped:?}");
         assert_eq!(striped.len(), plain.len() + 1 + 8);
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
@@ -8610,11 +8670,11 @@ mod tests {
         encode_style(&mut out, &DomLook { ink_gradient: Some(ramp), ..DomLook::NONE });
         let mut tail = vec![1 << 4];
         encode_ramp(&mut tail, &ramp);
-        tail.push(0);
+        tail.extend([0, 0]);
         assert!(out.ends_with(&tail), "{out:?}");
         let mut own = Vec::new();
         encode_style(&mut own, &DomLook { own_ink: true, ..DomLook::NONE });
-        assert_eq!(own.last(), Some(&(1 << 5)));
+        assert!(own.ends_with(&[1 << 5, 0]), "{own:?}");
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
         assert!(glue.contains("more & 16") && glue.contains("more & 32"), "glue_dom.js reads both");
     }
@@ -8628,6 +8688,7 @@ mod tests {
         let mut tail = vec![1 << 6];
         tail.extend_from_slice(&18f32.to_le_bytes());
         tail.extend_from_slice(&0f32.to_le_bytes());
+        tail.push(0);
         assert!(out.ends_with(&tail), "{out:?}");
         assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 64"), "glue_dom.js reads it");
     }
@@ -8662,6 +8723,7 @@ mod tests {
         tail.extend_from_slice(&1f32.to_le_bytes());
         tail.push(3);
         tail.extend_from_slice(&90f32.to_le_bytes());
+        tail.push(0);
         assert!(out.ends_with(&tail), "{out:?}");
         assert!(include_str!("../../bunny_ui_web/glue/glue_dom.js").contains("more & 128"), "glue_dom.js reads them");
         let node = |look: DomLook| {
@@ -8670,6 +8732,70 @@ mod tests {
             look_hash(&node)
         };
         assert_ne!(node(look), node(DomLook::NONE));
+    }
+
+    /// CSS's own shadow layers (bit 0) and the lines side by side (bit 1)
+    /// ride the third mask (ABI 29): the layers in their order, the sides
+    /// clockwise from the top, zero wide where none is set. A look with
+    /// neither sends the byte empty.
+    #[test]
+    fn shadow_layers_and_edges_ride_the_third_mask() {
+        use crate::shapes::{BorderEdges, BoxShadow, BoxShadows};
+        let ink = Color::rgba(0, 0, 0, 102);
+        let layers = BoxShadows::one(BoxShadow::new(ink).offset(0.0, 50.0).blur(120.0).spread(-20.0))
+            .then(BoxShadows::one(BoxShadow::new(ink).spread(1.0).inset()))
+            .expect("two fit");
+        let look = DomLook {
+            box_shadows: layers,
+            border_edges: BorderEdges::one(motor::views::Edge::Bottom, Color::WHITE, 1.0),
+            ..DomLook::NONE
+        };
+        let mut out = Vec::new();
+        encode_style(&mut out, &look);
+        let mut tail = vec![0, 1 | 1 << 1, 2];
+        for (values, inset) in [([0.0f32, 50.0, 120.0, -20.0], 0), ([0.0, 0.0, 0.0, 1.0], 1)] {
+            for value in values {
+                tail.extend_from_slice(&value.to_le_bytes());
+            }
+            tail.extend_from_slice(&pack_color(ink).to_le_bytes());
+            tail.push(inset);
+        }
+        for (color, width) in [(Color::rgba(0, 0, 0, 0), 0.0f32), (Color::rgba(0, 0, 0, 0), 0.0), (Color::WHITE, 1.0), (Color::rgba(0, 0, 0, 0), 0.0)] {
+            tail.extend_from_slice(&pack_color(color).to_le_bytes());
+            tail.extend_from_slice(&width.to_le_bytes());
+        }
+        assert!(out.ends_with(&tail), "{out:?}");
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("if (last & 1)") && glue.contains("if (last & 2)"), "glue_dom.js reads both");
+        let node = |look: DomLook| {
+            let mut node = flow_row("a");
+            node.style = DomStyle::new(None, look, DomMarks::default());
+            look_hash(&node)
+        };
+        assert_ne!(node(look.clone()), node(DomLook { box_shadows: BoxShadows::NONE, ..look.clone() }));
+        assert_ne!(node(look.clone()), node(DomLook { border_edges: BorderEdges::NONE, ..look }));
+    }
+
+    /// An edge with a line of its own sends the four sides in place of the
+    /// ring, the ring's line on the sides it leaves, and its style with
+    /// them.
+    #[test]
+    fn an_edge_sends_the_sides_in_place_of_the_ring() {
+        use crate::shapes::{BorderEdges, BorderStyle};
+        let ring = (Color::rgb(1, 2, 3), 1.0);
+        let props = VisualProps {
+            border: Some(ring),
+            border_style: Some(BorderStyle::Dashed),
+            border_edges: BorderEdges::one(motor::views::Edge::Top, Color::WHITE, 2.0),
+            ..VisualProps::default()
+        };
+        let look = DomLook::from_props(&props);
+        assert_eq!(look.border, None);
+        assert_eq!(look.border_style, Some(BorderStyle::Dashed));
+        assert_eq!(look.border_edges.sides(), [(Color::WHITE, 2.0), ring, ring, ring]);
+        assert!(DomLook::paints(&VisualProps { border_edges: props.border_edges, ..VisualProps::default() }));
+        let ringed = DomLook::from_props(&VisualProps { border_edges: BorderEdges::NONE, ..props });
+        assert_eq!((ringed.border, ringed.border_edges), (Some(ring), BorderEdges::NONE), "a ring alone travels as it did");
     }
 
     /// The text look's record ends with the figures' byte: bit 0, one
@@ -9897,8 +10023,8 @@ mod tests {
             &[10, 1],
             &1u32.to_le_bytes()[..],
             &0x112233FFu32.to_le_bytes()[..],
-            // the second style mask, empty (ABI 28)
-            &[0],
+            // the second style mask and the third, empty (ABI 28, 29)
+            &[0, 0],
             &(1u16 | 1 << 7).to_le_bytes()[..],
             &8f32.to_le_bytes()[..],
             &[0],

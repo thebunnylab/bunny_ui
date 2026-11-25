@@ -72,7 +72,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 28;
+const EXPECTED_ABI = 29;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -580,6 +580,16 @@ const KIND_BASE = [
 // none. A text, a field, a picture, a scroll or a stack keeps the outline.
 const LINED = new Set([0, 1, 11, 17, 18]);
 
+// The four sides of a line set side by side, clockwise from the top as
+// the wire sends them: the border longhand and margin each one names,
+// and the inset shadow that draws it on a kind that keeps no border.
+const EDGES = [
+  ["top", (w) => `0 ${w}px`],
+  ["inline-end", (w) => `${-w}px 0`],
+  ["bottom", (w) => `0 ${-w}px`],
+  ["inline-start", (w) => `${w}px 0`],
+];
+
 // A ramp's CSS: the engine's geometry, each color between the ends at
 // its place along the ramp. The twin of the serializer's `css_gradient`.
 function rampImage({ kind, a, b, c, d, aspect, near, far }, stops) {
@@ -753,16 +763,24 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // the children pulled back under it by its width, so it lays nothing
   // out. A text, a picture or a control has no child to pull back: an
   // outline pulled in by its own width
-  const lined = style.border !== null && LINED.has(kind);
-  if (lined) {
+  const lined = (style.border !== null || style.edges !== null) && LINED.has(kind);
+  // a line along one edge alone: each side its own longhand, as a page
+  // writes `border-bottom`, or an inset shadow on a kind without one
+  const sides = (style.edges || []).map(([width, ink], at) => [EDGES[at], width, ink]).filter(([, width]) => width > 0);
+  const shadows = style.edges && !lined
+    ? [...style.shadows, ...sides.map(([[, inward], width, ink]) => `inset ${inward(width)} 0 0 ${ink}`)]
+    : style.shadows;
+  if (lined && style.edges) {
+    for (const [[side], width, ink] of sides) decl[`border-${side}`] = `${width}px ${style.lineStyle} ${ink}`;
+  } else if (lined) {
     decl.border = style.border;
   } else if (style.border) {
     decl.outline = style.border;
     decl["outline-offset"] = `${-style.borderWidth}px`;
   }
   if (style.radius) decl["border-radius"] = style.radius;
-  // the halo and the glass rim share one property
-  if (style.shadows.length) decl["box-shadow"] = style.shadows.join(",");
+  // the shadow's own layers, the halo and the glass rim share one property
+  if (shadows.length) decl["box-shadow"] = shadows.join(",");
   if (style.transition) decl.transition = style.transition;
   // `.offset(x, y)`: drawn away from its place, its neighbours unmoved
   if (style.offset) decl.translate = `${style.offset[0]}px ${style.offset[1]}px`;
@@ -862,7 +880,10 @@ function lookRules(selector, kind, flags, style, layout, face) {
   else if (kind === 11) rules.push(`${selector}>*{grid-area:1/1;z-index:0}`);
   if (overlap !== null) rules.push(`${selector}>*+*{${overlap}}`);
   // at no specificity: a margin the child names itself still wins
-  if (lined) rules.push(`:where(${selector}>*){margin:${-style.borderWidth}px}`);
+  if (lined && style.edges) {
+    const pulls = sides.map(([[side], width]) => `margin-${side}:${-width}px`);
+    if (pulls.length) rules.push(`:where(${selector}>*){${pulls.join(";")}}`);
+  } else if (lined) rules.push(`:where(${selector}>*){margin:${-style.borderWidth}px}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
   // the hover and a group frame costs no patch; a box without one
@@ -1216,6 +1237,8 @@ function applyPatches(view, length) {
       border: null,
       borderWidth: 0,
       borderColor: null,
+      lineStyle: "solid",
+      edges: null,
       radius: null,
       shadows: [],
       transition: null,
@@ -1329,6 +1352,7 @@ function applyPatches(view, length) {
     // bit 28: the border's line — the browser fits its own dashes
     if (mask & 268435456) {
       const keyword = ["solid", "dashed", "dotted"][u8()] || "solid";
+      style.lineStyle = keyword;
       if (style.border) style.border = style.border.replace(" solid ", ` ${keyword} `);
     }
     // bit 29: bands over the background, CSS's own hard-stop repeat
@@ -1367,6 +1391,25 @@ function applyPatches(view, length) {
     if (more & 64) style.floor = [f32(), f32()];
     if (more & 128) style.filters = readFilters();
     if (style.halo) style.shadows.unshift(...halo(style.halo[0], style.halo[1], shadowOffset));
+    // the second mask is full as well: a third byte — bit 0 the
+    // shadow's own layers, written as CSS writes them, over the halo;
+    // bit 1 the lines side by side
+    const last = u8();
+    if (last & 1) {
+      const layers = [];
+      for (let n = u8(); n > 0; n--) {
+        const [x, y, blur, spread] = [f32(), f32(), f32(), f32()];
+        const ink = rgba(u32());
+        layers.push(`${u8() ? "inset " : ""}${x}px ${y}px ${blur}px ${spread}px ${ink}`);
+      }
+      style.shadows.unshift(...layers);
+    }
+    if (last & 2) {
+      style.edges = EDGES.map(() => {
+        const ink = rgba(u32());
+        return [f32(), ink];
+      });
+    }
     return style;
   };
   const readLayout = () => {
