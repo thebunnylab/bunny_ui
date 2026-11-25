@@ -14,6 +14,14 @@ use std::path::{Component, Path, PathBuf};
 
 use super::css::{self, Image, Rgba};
 use super::extract::{Kind, Node, Page, Rect};
+use super::svg;
+
+/// The gap of an inline drawing written as a picture instead of a
+/// symbol: the report lists each one, with why.
+pub const KEPT_AS_PICTURE: &str = "svg: kept as a picture";
+
+/// The gap of a drawing the symbol draws only nearly.
+pub const DRAWN_APPROXIMATELY: &str = "svg: drawn approximately";
 
 /// How many stops a bunny ramp holds between its ends (`Stops::MOST`).
 const MOST_STOPS: usize = 6;
@@ -69,6 +77,7 @@ pub fn convert(page: &Page, options: &Options) -> Converted {
         gaps: Vec::new(),
         pictures: BTreeMap::new(),
         drawings: BTreeMap::new(),
+        symbols: BTreeMap::new(),
         root: TextStyle::of(&page.root),
         hug: (false, false),
         container_width: page.width,
@@ -80,6 +89,11 @@ pub fn convert(page: &Page, options: &Options) -> Converted {
         let _ = write!(code, 
             "\nfn {name}() -> ImageSource {{\n    ImageSource::from_bytes(include_bytes!(\"{path}\").as_slice())\n}}\n"
         );
+    }
+    let mut symbols: Vec<&Symbolic> = writer.symbols.values().collect();
+    symbols.sort_by_key(|symbol| symbol.number);
+    for symbol in symbols {
+        let _ = write!(code, "\n{}", symbol.source);
     }
     let _ = write!(code, "\n#[must_use]\npub fn view() -> impl View {{\n    {}\n}}\n", indent(&body, 1));
     writer.gaps.sort();
@@ -406,6 +420,20 @@ fn is_inline(node: &Node) -> bool {
     }
 }
 
+/// An inline drawing written as a `const` symbol.
+struct Symbolic {
+    /// Its place among the page's drawings, pictures and symbols alike.
+    number: usize,
+    /// The const the view names.
+    name: String,
+    /// The glyph and the symbol, as Rust.
+    source: String,
+    /// The one colour it is drawn in, which the view paints.
+    ink: Option<Rgba>,
+    /// What it draws only nearly: a gap wherever it is drawn.
+    warnings: Vec<String>,
+}
+
 struct Writer<'a> {
     options: &'a Options,
     named: BTreeSet<String>,
@@ -413,8 +441,11 @@ struct Writer<'a> {
     /// Pictures by their path from the module, and the function that
     /// reads each.
     pictures: BTreeMap<String, String>,
-    /// The inline drawings: each markup once, by the file it is written to.
+    /// The inline drawings kept as pictures: each markup once, by the
+    /// file it is written to.
     drawings: BTreeMap<String, String>,
+    /// The inline drawings written as symbols: each markup once.
+    symbols: BTreeMap<String, Symbolic>,
     /// The page's own text: a view says only what differs.
     root: TextStyle,
     /// Whether the box whose children are being written hugs its content
@@ -1719,11 +1750,40 @@ impl Writer<'_> {
             self.gap(node, "svg", "drawn as an empty box");
             return "spacer()".to_owned();
         };
-        let count = self.drawings.len();
+        let refusal = match self.symbol(node, markup) {
+            Ok(view) => return view,
+            Err(refusal) => refusal,
+        };
+        let count = self.drawings.len() + self.symbols.len();
         let file = self.drawings.entry(markup.to_owned()).or_insert_with(|| format!("drawing-{}.svg", count + 1)).clone();
+        self.gap(node, KEPT_AS_PICTURE, format!("{file}: {refusal}"));
         let path = relative(&self.options.module_dir, &self.options.drawings_dir.join(&file));
         let name = self.pictures.entry(path).or_insert_with(|| file.trim_end_matches(".svg").replace('-', "_")).clone();
         format!("image({name}())\n.resizable()")
+    }
+
+    /// An inline drawing as a `const` symbol, written once per markup:
+    /// in one colour, a symbol of the ink the view paints; in several,
+    /// each draw in its own. What the parser refuses comes back, and
+    /// the drawing stays a picture.
+    fn symbol(&mut self, node: &Node, markup: &str) -> Result<String, svg::SvgError> {
+        if !self.symbols.contains_key(markup) {
+            let mut parsed = svg::parse(markup)?;
+            let ink = parsed.take_ink();
+            let number = self.drawings.len() + self.symbols.len() + 1;
+            let name = format!("DRAWING_{number}");
+            let source = svg::to_rust_const(&name, &svg::symbol_name(markup), &parsed);
+            self.symbols.insert(markup.to_owned(), Symbolic { number, name, source, ink, warnings: parsed.warnings });
+        }
+        let symbol = &self.symbols[markup];
+        let mut view = format!("icon({})\n.resizable()", symbol.name);
+        if let Some(ink) = symbol.ink {
+            let _ = write!(view, "\n.foreground_color({})", ink.code());
+        }
+        for warning in symbol.warnings.clone() {
+            self.gap(node, DRAWN_APPROXIMATELY, warning);
+        }
+        Ok(view)
     }
 
     /// The function that reads the picture at `url`, written once per file.
@@ -2196,6 +2256,7 @@ mod tests {
             gaps: Vec::new(),
             pictures: BTreeMap::new(),
             drawings: BTreeMap::new(),
+            symbols: BTreeMap::new(),
             root: TextStyle::of(&Node::default()),
             hug: (false, false),
             container_width: 300.0,
@@ -2296,6 +2357,153 @@ mod tests {
         assert!(converted.code.contains("image(drawing_2())"), "{}", converted.code);
         assert!(converted.code.contains(".frame_aligned(16.0, 16.0, Alignment::TopLeading)"), "{}", converted.code);
         assert!(!converted.gaps.iter().any(|gap| gap.feature == "svg"), "{:?}", converted.gaps);
+    }
+
+    /// The code with every line flush left: a view's lines are indented
+    /// as deep as it sits.
+    fn flush(code: &str) -> String {
+        code.lines().map(str::trim_start).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The gaps a drawing left: the bare nodes of these pages leave
+    /// others of their own.
+    fn svg_gaps(converted: &Converted) -> Vec<Gap> {
+        converted.gaps.iter().filter(|gap| gap.feature.starts_with("svg")).cloned().collect()
+    }
+
+    /// One drawing in a row, converted as the importer converts a page.
+    fn one_drawing(markup: &str) -> Converted {
+        let mut svg = Node { tag: "svg".to_owned(), id: "glyph".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 16.0, h: 16.0 }, ..Node::default() };
+        svg.style.insert("display".to_owned(), "block".to_owned());
+        svg.attrs.insert("drawing".to_owned(), markup.to_owned());
+        let mut row = Node { tag: "div".to_owned(), id: "row".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 16.0 }, ..Node::default() };
+        row.style.insert("display".to_owned(), "flex".to_owned());
+        row.children = vec![svg];
+        let mut body = Node { tag: "body".to_owned(), rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 }, ..Node::default() };
+        body.style.insert("display".to_owned(), "block".to_owned());
+        body.children.push(row);
+        let options = Options {
+            prelude: String::new(),
+            module_dir: PathBuf::from("/case"),
+            site_root: PathBuf::new(),
+            page_dir: PathBuf::new(),
+            drawings_dir: PathBuf::from("/case/drawings"),
+            source: "page.html".to_owned(),
+        };
+        convert(&Page { root: body, html: String::new(), width: 100.0, height: 50.0 }, &options)
+    }
+
+    /// A drawing in one colour is a symbol of the ink: the colour leaves
+    /// the draws and the view paints it, so the glyph takes a new ink
+    /// like a word does. What the pen cannot draw exactly is a gap.
+    #[test]
+    fn a_drawing_in_one_colour_is_a_symbol_of_the_ink() {
+        let markup = r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M2 2H14V14Z" fill="rgb(144, 137, 171)"/><path d="M2 14h4" fill="none" stroke="rgb(144, 137, 171)" stroke-width="2" stroke-linecap="butt"/></svg>"#;
+        let converted = one_drawing(markup);
+        let name = super::super::svg::symbol_name(markup);
+        let golden = format!(
+            "const DRAWING_1_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {{
+    draws: &[
+        bunny_ui::icon::Draw {{
+            paint: Paint::Fill(Rule::NonZero),
+            tint: None,
+            path: &[
+                Verb::Move(3.0, 3.0),
+                Verb::Line(21.0, 3.0),
+                Verb::Line(21.0, 21.0),
+                Verb::Close,
+            ],
+        }},
+        bunny_ui::icon::Draw {{
+            paint: Paint::Stroke {{ width: 3.0 }},
+            tint: None,
+            path: &[
+                Verb::Move(3.0, 21.0),
+                Verb::Line(9.0, 21.0),
+            ],
+        }},
+    ],
+}};
+
+const DRAWING_1: Symbol = Symbol::new({name:?}, &DRAWING_1_GLYPH);
+"
+        );
+        assert!(converted.code.contains(&golden), "{}", converted.code);
+        assert!(flush(&converted.code).contains("icon(DRAWING_1)\n.resizable()\n.foreground_color(Color::rgb(144, 137, 171))\n.frame_aligned(16.0, 16.0, Alignment::TopLeading)"), "{}", converted.code);
+        assert!(converted.drawings.is_empty(), "a symbol needs no file: {:?}", converted.drawings);
+        assert!(!converted.code.contains("ImageSource"), "{}", converted.code);
+        assert_eq!(
+            svg_gaps(&converted),
+            [Gap { feature: DRAWN_APPROXIMATELY.to_owned(), detail: "stroke-linecap=\"butt\" becomes round — the one shape the pen has.".to_owned(), id: "glyph".to_owned() }]
+        );
+    }
+
+    /// A drawing in several colours keeps each draw's own; a fill with
+    /// no area (the default black under an open stroke) draws nothing
+    /// and is left out, and an opacity is the colour's alpha.
+    #[test]
+    fn a_drawing_in_several_colours_keeps_each_draws_own() {
+        let markup = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" fill="#F2994A"/><path d="M8 4v4" stroke="#140C26" stroke-width="2"/><rect x="10" y="10" width="2" height="2" fill="#140C26" fill-opacity="0.5"/></svg>"##;
+        let converted = one_drawing(markup);
+        let name = super::super::svg::symbol_name(markup);
+        let golden = format!(
+            "const DRAWING_1_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {{
+    draws: &[
+        bunny_ui::icon::Draw {{
+            paint: Paint::Fill(Rule::NonZero),
+            tint: Some(Color::rgb(242, 153, 74)),
+            path: &[
+                Verb::Move(3.0, 3.0),
+                Verb::Line(21.0, 3.0),
+                Verb::Line(21.0, 21.0),
+                Verb::Line(3.0, 21.0),
+                Verb::Close,
+            ],
+        }},
+        bunny_ui::icon::Draw {{
+            paint: Paint::Stroke {{ width: 3.0 }},
+            tint: Some(Color::rgb(20, 12, 38)),
+            path: &[
+                Verb::Move(12.0, 6.0),
+                Verb::Line(12.0, 12.0),
+            ],
+        }},
+        bunny_ui::icon::Draw {{
+            paint: Paint::Fill(Rule::NonZero),
+            tint: Some(Color::rgba(20, 12, 38, 128)),
+            path: &[
+                Verb::Move(15.0, 15.0),
+                Verb::Line(18.0, 15.0),
+                Verb::Line(18.0, 18.0),
+                Verb::Line(15.0, 18.0),
+                Verb::Close,
+            ],
+        }},
+    ],
+}};
+
+const DRAWING_1: Symbol = Symbol::new({name:?}, &DRAWING_1_GLYPH);
+"
+        );
+        assert!(converted.code.contains(&golden), "{}", converted.code);
+        assert!(flush(&converted.code).contains("icon(DRAWING_1)\n.resizable()\n.frame_aligned(16.0, 16.0, Alignment::TopLeading)"), "{}", converted.code);
+        assert!(!converted.code.contains(".foreground_color("), "the draws keep their colours: {}", converted.code);
+        assert!(svg_gaps(&converted).is_empty(), "{:?}", converted.gaps);
+    }
+
+    /// A drawing the parser refuses stays the picture it was, and the
+    /// report says which and why.
+    #[test]
+    fn a_drawing_the_parser_refuses_stays_a_picture_and_says_why() {
+        let markup = r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M2 2T4 4"/></svg>"#;
+        let converted = one_drawing(markup);
+        assert_eq!(converted.drawings, [("drawing-1.svg".to_owned(), markup.to_owned())]);
+        assert!(flush(&converted.code).contains("image(drawing_1())\n.resizable()\n.frame_aligned(16.0, 16.0, Alignment::TopLeading)"), "{}", converted.code);
+        assert!(!converted.code.contains("Symbol::new"), "{}", converted.code);
+        let detail = "drawing-1.svg: line 1: The command T is not supported. Use Q with its control point.";
+        assert_eq!(svg_gaps(&converted), [Gap { feature: KEPT_AS_PICTURE.to_owned(), detail: detail.to_owned(), id: "glyph".to_owned() }]);
+        let report = super::super::gap_report("page.html", &converted);
+        assert!(report.contains(&format!("## Drawings kept as pictures\n\n- `glyph`: {detail}\n")), "{report}");
     }
 
     /// A box out of the flow is painted over the flow, unless every box

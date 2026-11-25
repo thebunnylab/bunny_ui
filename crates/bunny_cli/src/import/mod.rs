@@ -12,6 +12,7 @@
 pub mod css;
 pub mod emit;
 pub mod extract;
+pub mod svg;
 
 use std::fmt::Write as _;
 use std::collections::BTreeMap;
@@ -207,6 +208,15 @@ pub fn gap_report(source: &str, converted: &emit::Converted) -> String {
         let more = if gaps.len() > 4 { ", …" } else { "" };
         let detail = gaps[0].detail.replace('|', "\\|");
         let _ = writeln!(report, "| `{feature}` | {} | {}{more} | {detail} |", gaps.len(), ids.join(", "));
+    }
+    // the table names one reason per feature: every drawing that stayed
+    // a picture is listed with its own
+    let pictures: Vec<&emit::Gap> = converted.gaps.iter().filter(|gap| gap.feature == emit::KEPT_AS_PICTURE).collect();
+    if !pictures.is_empty() {
+        report.push_str("\n## Drawings kept as pictures\n\n");
+        for gap in pictures {
+            let _ = writeln!(report, "- `{}`: {}", gap.id, gap.detail);
+        }
     }
     report
 }
