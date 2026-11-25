@@ -2,7 +2,8 @@
 //! the binary, its `.desktop` entry, its icon and an `install.sh` that
 //! puts them where the desktop looks — under `build/linux/`.
 //!
-//! The `.desktop` file is named by the app's id, and so are the icon and
+//! The `.desktop` file is the app's own `linux/app.desktop` when it has
+//! one, else a plain one. It is named by the app's id, and so are the icon and
 //! `StartupWMClass`: it is the id the window gives Wayland and X11, and
 //! the desktop matches the window to its entry by it. The libraries the
 //! binary needs are read from it (`DT_NEEDED`) and named as each
@@ -66,12 +67,20 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
 
     let id = project.id.clone().unwrap_or_else(|| project.package.clone());
     let root = format!("{}-{}", project.package, project.version);
+    let entry_path = project.dir.join("linux").join("app.desktop");
+    let entry = if entry_path.is_file() {
+        let template = fs::read_to_string(&entry_path).map_err(error::at(&entry_path))?;
+        log.note("linux/app.desktop is the desktop entry");
+        own_desktop(&template, &project.name, bin, &id).map_err(Error::new)?
+    } else {
+        desktop(&project.name, bin, &id)
+    };
     let mut entries = vec![
         tar::Entry::folder(&root),
         tar::Entry::folder(&format!("{root}/bin")),
         tar::Entry::file(&format!("{root}/bin/{bin}"), 0o755, binary),
         tar::Entry::folder(&format!("{root}/share/applications")),
-        tar::Entry::file(&format!("{root}/share/applications/{id}.desktop"), 0o644, desktop(&project.name, bin, &id).into_bytes()),
+        tar::Entry::file(&format!("{root}/share/applications/{id}.desktop"), 0o644, entry.into_bytes()),
     ];
     let icon_path = project.dir.join("linux").join("AppIcon.png");
     let icon = if icon_path.is_file() {
@@ -145,6 +154,35 @@ pub fn desktop(name: &str, bin: &str, id: &str) -> String {
     )
 }
 
+/// The app's own desktop entry, `linux/app.desktop`, with the placeholders
+/// `macos/Info.plist` takes: `@BUNNY_APP_NAME@`, `@BUNNY_EXECUTABLE@` and
+/// `@BUNNY_BUNDLE_ID@`. It keeps the keys the launcher and the window need
+/// to find each other.
+pub fn own_desktop(template: &str, name: &str, bin: &str, id: &str) -> std::result::Result<String, String> {
+    let entry = template
+        .replace("@BUNNY_APP_NAME@", name)
+        .replace("@BUNNY_EXECUTABLE@", bin)
+        .replace("@BUNNY_BUNDLE_ID@", id);
+    if !entry.trim_start().starts_with("[Desktop Entry]") {
+        return Err(String::from("linux/app.desktop must start with [Desktop Entry]"));
+    }
+    for key in ["Type=", "Name=", "Exec="] {
+        if !entry.lines().any(|line| line.starts_with(key)) {
+            return Err(format!("linux/app.desktop needs a {key} line"));
+        }
+    }
+    let mut entry = entry;
+    if !entry.ends_with('\n') {
+        entry.push('\n');
+    }
+    for (key, value) in [("Icon=", id), ("StartupWMClass=", id)] {
+        if !entry.lines().any(|line| line.starts_with(key)) {
+            entry.push_str(&format!("{key}{value}\n"));
+        }
+    }
+    Ok(entry)
+}
+
 /// Where the icon goes under `share/`: the hicolor folder of its size,
 /// or `pixmaps` for a size the theme has no folder for. `None`: not a PNG.
 pub fn icon_folder(png: &[u8]) -> Option<String> {
@@ -176,7 +214,7 @@ prefix="${{1:-$HOME/.local}}"
 mkdir -p "$prefix/bin" "$prefix/share/applications"
 cp "$here/bin/{bin}" "$prefix/bin/"
 chmod 755 "$prefix/bin/{bin}"
-sed "s|^Exec=.*|Exec=$prefix/bin/{bin}|" "$here/share/applications/{id}.desktop" > "$prefix/share/applications/{id}.desktop"
+sed "s|^Exec=[^ ]*|Exec=$prefix/bin/{bin}|" "$here/share/applications/{id}.desktop" > "$prefix/share/applications/{id}.desktop"
 {icon_lines}command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$prefix/share/applications" || true
 echo "installed {bin} in $prefix"
 "#
@@ -226,6 +264,21 @@ mod tests {
         assert_eq!(icon_folder(&png(512)).as_deref(), Some("icons/hicolor/512x512/apps"));
         assert_eq!(icon_folder(&png(1024)).as_deref(), Some("pixmaps"));
         assert_eq!(icon_folder(b"GIF89a"), None);
+    }
+
+    #[test]
+    fn an_own_desktop_entry_takes_the_placeholders_and_keeps_the_window_keys() {
+        let template = "[Desktop Entry]\nType=Application\nName=@BUNNY_APP_NAME@\nExec=@BUNNY_EXECUTABLE@ %u\nMimeType=text/html;\n";
+        let entry = own_desktop(template, "hop", "hop", "dev.hop.browser").expect("entry");
+        assert!(entry.contains("\nName=hop\n") && entry.contains("\nExec=hop %u\n"));
+        assert!(entry.contains("\nIcon=dev.hop.browser\n") && entry.contains("\nStartupWMClass=dev.hop.browser\n"));
+        assert!(own_desktop("Name=x\n", "a", "a", "a").is_err());
+        assert!(own_desktop("[Desktop Entry]\nType=Application\nName=a\n", "a", "a", "a").is_err());
+    }
+
+    #[test]
+    fn the_install_script_keeps_the_arguments_of_exec() {
+        assert!(install_script("hop", "dev.hop.browser", None).contains("s|^Exec=[^ ]*|Exec=$prefix/bin/hop|"));
     }
 
     #[test]
