@@ -19,7 +19,8 @@ use bunny_ui_preview::wire::Frame;
 
 use crate::guest::{apply, background, pixel_scale, pointer};
 use crate::protocol::{
-    Capabilities, Malformed, Message, Reader, Received, Requested, SemanticNode, ToGuest, ToHost, Versions, Viewport,
+    Capabilities, Fetch, Malformed, Message, Reader, Received, Requested, SemanticNode, ToGuest, ToHost, Versions,
+    Viewport,
 };
 
 /// What a handshake agreed, as the host heard it.
@@ -41,6 +42,7 @@ pub struct TestHost {
     animating: bool,
     faults: Vec<String>,
     requests: Vec<Requested>,
+    fetches: Vec<Fetch>,
 }
 
 impl TestHost {
@@ -73,6 +75,7 @@ impl TestHost {
                 ToHost::Pace { animating } => self.animating = animating,
                 ToHost::Fault { reason } => self.faults.push(reason),
                 ToHost::Request(requested) => self.requests.push(requested),
+                ToHost::Fetch(fetch) => self.fetches.push(fetch),
             }
         }
         if reader.pending() > 0 {
@@ -110,6 +113,12 @@ impl TestHost {
     /// Every action the block asked for, in the order it asked.
     pub fn requests(&self) -> &[Requested] {
         &self.requests
+    }
+
+    /// Every fetch the block asked for, in the order it asked — performed
+    /// by nobody: a test host opens no network.
+    pub fn fetches(&self) -> &[Fetch] {
+        &self.fetches
     }
 
     /// The last scene as the framework's display list.

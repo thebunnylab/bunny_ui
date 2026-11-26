@@ -3,9 +3,9 @@
 
 use bunny_ui_preview::wire;
 use bunny_ui_shell::protocol::{
-    self, AccessAction, Capabilities, Context, Filter, Malformed, Message, Modifiers, Outcome, PointerButton,
-    PointerPhase, Reader, Received, Requested, Role, Row, Rows, Scheme, SemanticNode, ToGuest, ToHost, Versions,
-    Viewport,
+    self, AccessAction, Capabilities, Context, Fetch, Fetched, Filter, Malformed, Message, Modifiers, Outcome,
+    PointerButton, PointerPhase, Reader, Received, Requested, Response, Role, Row, Rows, Scheme, SemanticNode, ToGuest,
+    ToHost, Versions, Viewport,
 };
 
 fn round_trip(message: Message) {
@@ -293,7 +293,10 @@ fn an_older_block_answers_without_the_signature_bits() {
     assert!(!answered.contains(Capabilities::CONTEXT));
     assert!(!answered.contains(Capabilities::READS));
     assert!(!answered.contains(Capabilities::REQUESTS));
-    assert_eq!(format!("{:?}", Capabilities::KNOWN), "{SCENE, POINTER, KEYS, TEXT, ACCESSIBILITY, TIME, CONTEXT, READS, REQUESTS}");
+    assert_eq!(
+        format!("{:?}", Capabilities::KNOWN),
+        "{SCENE, POINTER, KEYS, TEXT, ACCESSIBILITY, TIME, CONTEXT, READS, REQUESTS, FETCHES}"
+    );
 }
 
 /// A filter, a row and a cell each sit behind their own length, so a
@@ -340,4 +343,85 @@ fn an_unknown_outcome_is_refused_by_name() {
     let mut reader = Reader::new();
     reader.feed(&bytes);
     assert_eq!(reader.pull(), Err(Malformed::BadTag { what: "Outcome", tag: 9 }));
+}
+
+// =============================================================================
+// The Effect level: fetches
+// =============================================================================
+
+/// Every shape of a fetch and its answer survives the bytes.
+#[test]
+fn a_fetch_and_every_answer_round_trip() {
+    let messages = [
+        Message::ToHost(ToHost::Fetch(Fetch { fetch: 3, url: "https://api.example.com/rates?day=1".into() })),
+        Message::ToGuest(ToGuest::Fetched {
+            fetch: 3,
+            fetched: Fetched::Answered(Response {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: br#"{"usd":5.1}"#.to_vec(),
+            }),
+        }),
+        Message::ToGuest(ToGuest::Fetched {
+            fetch: 4,
+            fetched: Fetched::Answered(Response { status: 204, content_type: None, body: Vec::new() }),
+        }),
+        Message::ToGuest(ToGuest::Fetched { fetch: 5, fetched: Fetched::Refused("not granted".into()) }),
+        Message::ToGuest(ToGuest::Fetched { fetch: 6, fetched: Fetched::Failed("timed out".into()) }),
+    ];
+    for message in messages {
+        round_trip(message);
+    }
+}
+
+/// The Effect level's kinds and bit sit where the protocol document puts
+/// them, and a fetch's bytes never move.
+#[test]
+fn a_fetch_is_pinned_byte_for_byte() {
+    let bytes = protocol::encode(&Message::ToHost(ToHost::Fetch(Fetch { fetch: 7, url: "https://a.io/".into() })));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&26u32.to_le_bytes());
+    expected.push(0x09);
+    expected.extend_from_slice(&7u64.to_le_bytes());
+    expected.extend_from_slice(&13u32.to_le_bytes());
+    expected.extend_from_slice(b"https://a.io/");
+    assert_eq!(bytes, expected);
+
+    let answered = protocol::encode(&Message::ToGuest(ToGuest::Fetched {
+        fetch: 7,
+        fetched: Fetched::Answered(Response { status: 404, content_type: None, body: b"no".to_vec() }),
+    }));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&19u32.to_le_bytes());
+    expected.push(0x4c);
+    expected.extend_from_slice(&7u64.to_le_bytes());
+    expected.push(0); // answered
+    expected.extend_from_slice(&404u16.to_le_bytes());
+    expected.push(0); // no content type
+    expected.extend_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(b"no");
+    assert_eq!(answered, expected);
+    assert_eq!(Capabilities::FETCHES.bits(), 1 << 9);
+}
+
+/// A block built before the Effect level knows no `FETCHES`: the bit drops
+/// out of its answer, and a `Fetched` sent to it anyway is skipped by its
+/// length like any kind it has never heard of.
+#[test]
+fn an_older_block_answers_without_the_fetch_bit() {
+    let signature_era = Capabilities::from_bits(0b1_1111_1111);
+    assert!(!(Capabilities::KNOWN & signature_era).contains(Capabilities::FETCHES));
+    let bytes = protocol::encode(&Message::ToGuest(ToGuest::Fetched { fetch: 1, fetched: Fetched::Refused("no".into()) }));
+    assert_eq!(bytes[4], 0x4c);
+    assert!(bytes[4] >= 0x40, "a fetch's answer travels host to guest");
+}
+
+#[test]
+fn an_unknown_fetch_answer_is_refused_by_name() {
+    let mut bytes = protocol::encode(&Message::ToGuest(ToGuest::Fetched { fetch: 1, fetched: Fetched::Refused(String::new()) }));
+    // the tag sits after the length, the kind and the fetch's number
+    bytes[4 + 1 + 8] = 9;
+    let mut reader = Reader::new();
+    reader.feed(&bytes);
+    assert_eq!(reader.pull(), Err(Malformed::BadTag { what: "Fetched", tag: 9 }));
 }

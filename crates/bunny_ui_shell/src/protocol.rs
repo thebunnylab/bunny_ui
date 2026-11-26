@@ -39,16 +39,28 @@
 //!
 //! ## What a block can never ask for
 //!
-//! There is no capability to write, to open the network or to read a
-//! file: a block is a zero-import Wasm module, so it has nothing to ask
-//! with. What its **signature** lets it have joins as kinds and bits the
-//! host grants or withholds: the page it stands on ([`Context`], under
+//! There is no capability to write, to open a socket or to read a file:
+//! a block is a zero-import Wasm module, so it has nothing to ask with.
+//! What its **signature** lets it have joins as kinds and bits the host
+//! grants or withholds: the page it stands on ([`Context`], under
 //! [`Capabilities::CONTEXT`]), the rows of the views it reads ([`Rows`],
 //! under [`Capabilities::READS`]) and the declared actions it may ask the
 //! shell to run ([`Requested`], under [`Capabilities::REQUESTS`]). A
 //! request is a question, never a write: the shell judges it against the
 //! signature, runs it through its own gate, and answers with an
 //! [`Outcome`].
+//!
+//! ## The Effect level: a fetch is a question too
+//!
+//! A block is born Pure. At the Effect level it may read the network —
+//! still without a socket: it asks the host to fetch a URL on its behalf
+//! ([`Fetch`], under [`Capabilities::FETCHES`]), and the host answers
+//! what came back ([`ToGuest::Fetched`]). The host performs only a `GET`
+//! over `https` to a host the block's signature declares **and** its org
+//! grants, under a size and a time limit of its own; anything else is
+//! answered [`Fetched::Refused`], by name, and never leaves the machine.
+//! The block cannot tell a host the shell refuses from one that does not
+//! exist, and needs to: it shows the refusal's sentence.
 //!
 //! ## The scene
 //!
@@ -84,6 +96,7 @@ mod kind {
     pub const PACE: u8 = 0x06;
     pub const FAULT: u8 = 0x07;
     pub const REQUEST: u8 = 0x08;
+    pub const FETCH: u8 = 0x09;
     // host → guest
     pub const OFFER: u8 = 0x40;
     pub const RESIZE: u8 = 0x41;
@@ -97,6 +110,7 @@ mod kind {
     pub const CONTEXT: u8 = 0x49;
     pub const ROWS: u8 = 0x4a;
     pub const ANSWER: u8 = 0x4b;
+    pub const FETCHED: u8 = 0x4c;
 }
 
 // =============================================================================
@@ -154,8 +168,13 @@ impl Capabilities {
     /// The block may ask the shell to run a declared action
     /// ([`ToHost::Request`]), and hears how it went ([`ToGuest::Answer`]).
     pub const REQUESTS: Capabilities = Capabilities(1 << 8);
+    /// The block may ask the host to fetch a URL on its behalf
+    /// ([`ToHost::Fetch`]), and hears what came back
+    /// ([`ToGuest::Fetched`]) — the Effect level. The host still judges
+    /// every fetch: the bit opens the conversation, never a host.
+    pub const FETCHES: Capabilities = Capabilities(1 << 9);
     /// Every capability this build has a name for.
-    pub const KNOWN: Capabilities = Capabilities(0b1_1111_1111);
+    pub const KNOWN: Capabilities = Capabilities(0b11_1111_1111);
 
     /// The capabilities a peer sent, unknown bits and all.
     pub const fn from_bits(bits: u64) -> Capabilities {
@@ -188,7 +207,7 @@ impl BitAnd for Capabilities {
 
 impl fmt::Debug for Capabilities {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(Capabilities, &str); 9] = [
+        const NAMES: [(Capabilities, &str); 10] = [
             (Capabilities::SCENE, "SCENE"),
             (Capabilities::POINTER, "POINTER"),
             (Capabilities::KEYS, "KEYS"),
@@ -198,6 +217,7 @@ impl fmt::Debug for Capabilities {
             (Capabilities::CONTEXT, "CONTEXT"),
             (Capabilities::READS, "READS"),
             (Capabilities::REQUESTS, "REQUESTS"),
+            (Capabilities::FETCHES, "FETCHES"),
         ];
         let mut list = f.debug_set();
         for (capability, name) in NAMES {
@@ -434,6 +454,46 @@ pub enum Outcome {
     Refused(String),
 }
 
+/// A block asking the host to fetch a URL on its behalf: a `GET`, whose
+/// body comes back whole in a [`ToGuest::Fetched`]. A method other than
+/// `GET`, and headers, would grow this message at its end.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Fetch {
+    /// The block's own number for the fetch; the [`ToGuest::Fetched`]
+    /// names it. One counter with [`Requested::request`], so a number
+    /// names one question.
+    pub fetch: u64,
+    /// The URL, whole — `https://<host>/<path>?<query>`.
+    pub url: String,
+}
+
+/// What a host that performed a fetch heard back.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Response {
+    /// The HTTP status. A redirect is answered as it came — the host never
+    /// follows one to a host the block was not granted.
+    pub status: u16,
+    /// The `Content-Type` it named, when it named one.
+    pub content_type: Option<String>,
+    /// The body, whole, within the host's size limit.
+    pub body: Vec<u8>,
+}
+
+/// How the host answered a fetch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Fetched {
+    /// The host performed it, and this came back.
+    Answered(Response),
+    /// The host refused it, and why — a host the signature does not
+    /// declare, one the org does not grant, a scheme other than `https`,
+    /// a shell that grants no network: it never left the machine.
+    Refused(String),
+    /// The host performed it and it did not come back whole, and why: the
+    /// network failed, the time limit passed, the body outgrew the size
+    /// limit.
+    Failed(String),
+}
+
 // =============================================================================
 // Messages
 // =============================================================================
@@ -471,6 +531,8 @@ pub enum ToGuest {
     Rows(Rows),
     /// How the shell answered the block's request `request`.
     Answer { request: u64, outcome: Outcome },
+    /// How the host answered the block's fetch `fetch`.
+    Fetched { fetch: u64, fetched: Fetched },
 }
 
 /// What the block sends the host.
@@ -493,6 +555,8 @@ pub enum ToHost {
     Fault { reason: String },
     /// The block asks the shell to run a declared action.
     Request(Requested),
+    /// The block asks the host to fetch a URL on its behalf.
+    Fetch(Fetch),
 }
 
 /// A message in either direction.
@@ -568,6 +632,9 @@ impl Out<'_> {
     }
     fn bool(&mut self, value: bool) {
         self.u8(u8::from(value));
+    }
+    fn u16(&mut self, value: u16) {
+        self.0.extend_from_slice(&value.to_le_bytes());
     }
     fn u32(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_le_bytes());
@@ -734,6 +801,26 @@ fn put_to_guest(message: &ToGuest, payload: &mut Vec<u8>) -> u8 {
             }
             kind::ANSWER
         }
+        ToGuest::Fetched { fetch, fetched } => {
+            out.u64(*fetch);
+            match fetched {
+                Fetched::Answered(response) => {
+                    out.u8(0);
+                    out.u16(response.status);
+                    out.option(response.content_type.as_deref(), Out::string);
+                    out.bytes(&response.body);
+                }
+                Fetched::Refused(reason) => {
+                    out.u8(1);
+                    out.string(reason);
+                }
+                Fetched::Failed(reason) => {
+                    out.u8(2);
+                    out.string(reason);
+                }
+            }
+            kind::FETCHED
+        }
     }
 }
 
@@ -796,6 +883,11 @@ fn put_to_host(message: &ToHost, payload: &mut Vec<u8>) -> u8 {
             out.string(&requested.action);
             out.option(requested.record.as_deref(), Out::string);
             kind::REQUEST
+        }
+        ToHost::Fetch(fetch) => {
+            out.u64(fetch.fetch);
+            out.string(&fetch.url);
+            kind::FETCH
         }
     }
 }
@@ -950,6 +1042,20 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
             };
             Message::ToGuest(ToGuest::Answer { request, outcome })
         }
+        kind::FETCHED => {
+            let fetch = c.u64()?;
+            let fetched = match c.u8()? {
+                0 => Fetched::Answered(Response {
+                    status: c.u16()?,
+                    content_type: c.option(Cursor::string)?,
+                    body: c.bytes()?.to_vec(),
+                }),
+                1 => Fetched::Refused(c.string()?),
+                2 => Fetched::Failed(c.string()?),
+                tag => return Err(Malformed::BadTag { what: "Fetched", tag }),
+            };
+            Message::ToGuest(ToGuest::Fetched { fetch, fetched })
+        }
         kind::ACCEPT => {
             c.magic()?;
             Message::ToHost(ToHost::Accept {
@@ -997,6 +1103,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
             action: c.string()?,
             record: c.option(Cursor::string)?,
         })),
+        kind::FETCH => Message::ToHost(ToHost::Fetch(Fetch { fetch: c.u64()?, url: c.string()? })),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     Ok(Received::Message(message))
@@ -1029,6 +1136,9 @@ impl<'a> Cursor<'a> {
             1 => Ok(true),
             tag => Err(Malformed::BadTag { what: "bool", tag }),
         }
+    }
+    fn u16(&mut self) -> Result<u16, Malformed> {
+        Ok(u16::from_le_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, Malformed> {
         Ok(u32::from_le_bytes(self.array()?))
