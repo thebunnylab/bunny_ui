@@ -73,6 +73,7 @@ count. Kinds `0x00..=0x3f` go guest → host, `0x40..=0x7f` host → guest,
 | `0x49` | `Context` | the page's filters (each behind its length: field, value), then the open record (`Option`) | `CONTEXT` |
 | `0x4a` | `Rows` | a view the block reads, whole: its id, its columns, then its rows (each behind its length: record id, cells as `Option<string>`) | `READS` |
 | `0x4b` | `Answer` | the request's number `u64`, the outcome `u8` (landed, held for approval, declined by the person, refused + a reason) | `REQUESTS` |
+| `0x4c` | `Fetched` | the fetch's number `u64`, then a tag `u8`: 0 answered (status `u16`, content type `Option<string>`, body behind a `u32` length), 1 refused + a reason, 2 failed + a reason | `FETCHES` |
 
 Modifiers: shift 1, command 2 (⌘ on a Mac, Ctrl elsewhere), option 4,
 control 8 (the Mac's ⌃).
@@ -89,6 +90,7 @@ control 8 (the Mac's ⌃).
 | `0x06` | `Pace` | animating `bool` — whether the block wants ticks |
 | `0x07` | `Fault` | input the block could not read; it read nothing after it |
 | `0x08` | `Request` | the block's number for it `u64`, a declared action's id, the record it acts on (`Option`) — under `REQUESTS` |
+| `0x09` | `Fetch` | the block's number for it `u64` (one counter with `Request`'s), the URL, whole — a `GET`, under `FETCHES` |
 
 A scene, semantics and pace are sent only when they changed: a turn that
 changed nothing answers nothing.
@@ -96,11 +98,12 @@ changed nothing answers nothing.
 ### Capabilities
 
 `SCENE` 1, `POINTER` 2, `KEYS` 4, `TEXT` 8, `ACCESSIBILITY` 16, `TIME` 32,
-`CONTEXT` 64, `READS` 128, `REQUESTS` 256.
+`CONTEXT` 64, `READS` 128, `REQUESTS` 256, `FETCHES` 512.
 The host offers what it grants; the block answers the intersection with
 the ones it knows, and acts on no event of an ungranted kind. There is no
-capability to write, to open the network or to read a file: a block has no
-import to ask with.
+capability to write, to open a socket or to read a file: a block has no
+import to ask with. `FETCHES` is a question the host answers on the
+block's behalf, never a socket (below).
 
 ### The signature
 
@@ -126,13 +129,38 @@ A view reaches its signature through `bunny_ui_shell::guest::Page`
 `State`'s. Under a shell that grants no `REQUESTS`, `request` is answered
 `Refused` inside the guest, so the view can say so rather than wait.
 
+### The Effect level: fetches
+
+A block is born Pure. At the Effect level its signature may also name the
+hosts it fetches from, and the shell offers `FETCHES`. The block still
+opens nothing: it sends `Fetch` with a URL, and the host — Trinity — fetches
+it on its behalf and answers `Fetched`:
+
+- **Performed** only as a `GET` over `https`, to a host the signature
+  declares **and** the block's org grants, within the host's own size and
+  time limits. A redirect is answered as it came, never followed: the host
+  it points at was not judged.
+- **Refused** by name, never sent, for a host the signature does not
+  declare, one the org does not grant, any other scheme, or more fetches in
+  flight than the host allows. The reason is the host's sentence, for the
+  view to show.
+- **Failed**, with the reason, when the request left and did not come back
+  whole: the network, the time limit, a body past the size limit.
+
+`Page::fetch(url)` asks and answers the fetch's number; `Page::fetched(n)`
+reads the answer once it arrives. Under a shell that grants no `FETCHES`,
+`fetch` is answered `Refused` inside the guest. Where the grant lives and
+how the limits are set are the host's: the protocol carries the question
+and the answer.
+
 ### Previews
 
 A block is previewed natively, before it is built for the shell:
 `bunny_ui_shell::guest::Fixture` is the page it stands on, filled by hand —
 `filter`, `record`, `rows` (whole, per view, as `Rows` replaces them) and
 `answer`, how every request is answered (`Refused` unless it names
-another outcome). `Fixture::page()` is a `Page` with no shell behind it, so
+another outcome), and `fetches(url, fetched)`, what a fetch of a URL brings
+back (`Refused` — "a preview opens no network" — for any other URL). `Fixture::page()` is a `Page` with no shell behind it, so
 the block's `make(page)` runs wherever a view does, and a `#[preview]` over
 it is what Studio's dock and `bunny preview` show on every save:
 
@@ -145,8 +173,8 @@ fn on_a_record_page() -> impl View {
 
 The block draws on a fixture page exactly what it draws in the sandbox on
 the same page (`tests/preview.rs` holds the pixels equal). A fixture page
-answers a request at once and sends nothing: a preview shows the block,
-never the ledger.
+answers a request and a fetch at once and sends nothing: a preview shows
+the block, never the ledger and never the network.
 
 ### How it grows
 

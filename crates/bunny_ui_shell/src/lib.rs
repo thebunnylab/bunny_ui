@@ -45,7 +45,7 @@ pub mod abi;
 /// ```
 ///
 /// The `page =>` form hands the view its [`guest::Page`]: what the block's
-/// signature lets it receive, read and request.
+/// signature lets it receive, read, request and fetch.
 ///
 /// On `wasm32` the crate (a `cdylib`) exports the shape of one
 /// component-model function, `call: func(input: list<u8>) -> list<u8>`

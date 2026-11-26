@@ -23,14 +23,22 @@
 //!   [`Capabilities::REQUESTS`]. A shell that grants none answers every
 //!   request [`Outcome::Refused`] inside the guest, so the block can say
 //!   so instead of waiting.
+//! - **A fetch is a question too** — the Effect level. [`Page::fetch`]
+//!   queues a URL; the turn hands it to the host under
+//!   [`Capabilities::FETCHES`], and the host fetches it on the block's
+//!   behalf or refuses it by name. The guest has no socket: a shell that
+//!   grants no network answers every fetch [`Fetched::Refused`] inside
+//!   the guest, as it does a request.
 //! - **Text is measured with the engine's own face** (`PixelFont`, the
 //!   house's headless face), because a sandbox has no font to ask. The
 //!   scene names the font it laid out with; a host that paints the text
 //!   with another face paints other widths.
 //! - **A [`Fixture`] page has no shell behind it.** It answers every
 //!   request at once, with the outcome the fixture names (refused unless
-//!   it names another), and its rows are the fixture's until the view
-//!   stands on a real page: a preview shows the block, never the ledger.
+//!   it names another), every fetch at once with the answer it holds for
+//!   the URL (refused unless it holds one), and its rows are the
+//!   fixture's until the view stands on a real page: a preview shows the
+//!   block, never the ledger and never the network.
 //!
 //! ## Previews
 //!
@@ -61,8 +69,8 @@ use bunny_ui_preview::convert;
 use bunny_ui_preview::wire::{self, Frame};
 
 use crate::protocol::{
-    self, AccessAction, Capabilities, Context, Filter, Message, Modifiers, Outcome, PointerButton, PointerPhase, Reader,
-    Received, Requested, Role, Rows, Scheme, SemanticNode, ToGuest, ToHost, Versions, Viewport,
+    self, AccessAction, Capabilities, Context, Fetch, Fetched, Filter, Message, Modifiers, Outcome, PointerButton,
+    PointerPhase, Reader, Received, Requested, Role, Rows, Scheme, SemanticNode, ToGuest, ToHost, Versions, Viewport,
 };
 
 /// What the guest says it is, in its answer to the offer.
@@ -77,7 +85,8 @@ pub struct Session {
 
 /// What a block's view holds of the page it stands on — its signature,
 /// from the inside: the page's filters and open record, the rows of the
-/// views it reads, and the declared actions it asks the shell to run.
+/// views it reads, the declared actions it asks the shell to run, and the
+/// URLs it asks the host to fetch.
 ///
 /// Every read records itself like a `State`'s, so a view that shows the
 /// open record draws again when the shell opens another.
@@ -87,10 +96,29 @@ pub struct Page {
     reads: State<Vec<Rows>>,
     asked: State<Vec<Requested>>,
     answers: State<Vec<(u64, Outcome)>>,
+    fetching: State<Vec<Fetch>>,
+    fetched: State<Vec<(u64, Fetched)>>,
     next: State<u64>,
-    /// How a [`Fixture`] page answers every request at once; `None` on a
-    /// page with a shell behind it, where a request waits for the shell.
-    standing: State<Option<Outcome>>,
+    /// How a [`Fixture`] page answers every request and fetch at once;
+    /// `None` on a page with a shell behind it, where both wait for it.
+    standing: State<Option<Standing>>,
+}
+
+/// How a page with no shell behind it answers: every request with one
+/// outcome, every fetch with what it holds for the URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Standing {
+    answer: Outcome,
+    fetches: Vec<(String, Fetched)>,
+}
+
+impl Standing {
+    fn fetched(&self, url: &str) -> Fetched {
+        self.fetches
+            .iter()
+            .find(|(held, _)| held == url)
+            .map_or_else(|| Fetched::Refused(Fixture::OFFLINE.to_string()), |(_, fetched)| fetched.clone())
+    }
 }
 
 impl Page {
@@ -98,12 +126,14 @@ impl Page {
         Page::standing(Context::default(), Vec::new(), None)
     }
 
-    fn standing(context: Context, reads: Vec<Rows>, standing: Option<Outcome>) -> Page {
+    fn standing(context: Context, reads: Vec<Rows>, standing: Option<Standing>) -> Page {
         Page {
             context: State::new(context),
             reads: State::new(reads),
             asked: State::new(Vec::new()),
             answers: State::new(Vec::new()),
+            fetching: State::new(Vec::new()),
+            fetched: State::new(Vec::new()),
             next: State::new(0),
             standing: State::new(standing),
         }
@@ -136,12 +166,9 @@ impl Page {
     /// gate; nothing is written by asking. A [`Fixture`] page answers it at
     /// once, as the fixture says.
     pub fn request(&self, action: &str, record: Option<&str>) -> u64 {
-        let request = self.next.update(|next| {
-            *next += 1;
-            *next
-        });
-        if let Some(outcome) = self.standing.with(Option::clone) {
-            self.answered(request, outcome);
+        let request = self.number();
+        if let Some(standing) = self.standing.with(Option::clone) {
+            self.answered(request, standing.answer);
             return request;
         }
         self.asked.update(|asked| {
@@ -155,9 +182,48 @@ impl Page {
         self.answers.with(|answers| answers.iter().find(|(asked, _)| *asked == request).map(|(_, outcome)| outcome.clone()))
     }
 
+    /// Asks the host to fetch `url` — a `GET`, the whole URL with its
+    /// scheme — on the block's behalf, and answers the fetch's number:
+    /// what [`Page::fetched`] looks it up by. The host fetches only from a
+    /// host the block's signature declares and its org grants; anything
+    /// else is answered [`Fetched::Refused`], with the host's reason. A
+    /// [`Fixture`] page answers it at once, with what it holds for `url`.
+    pub fn fetch(&self, url: &str) -> u64 {
+        let fetch = self.number();
+        if let Some(standing) = self.standing.with(Option::clone) {
+            self.arrived(fetch, standing.fetched(url));
+            return fetch;
+        }
+        self.fetching.update(|fetching| fetching.push(Fetch { fetch, url: url.to_string() }));
+        fetch
+    }
+
+    /// What the host answered the fetch `fetch`, once it has.
+    pub fn fetched(&self, fetch: u64) -> Option<Fetched> {
+        self.fetched.with(|fetched| fetched.iter().find(|(asked, _)| *asked == fetch).map(|(_, answer)| answer.clone()))
+    }
+
+    /// The next number a request or a fetch is known by: one counter, so a
+    /// number names one question.
+    fn number(&self) -> u64 {
+        self.next.update(|next| {
+            *next += 1;
+            *next
+        })
+    }
+
     /// The requests waiting to be handed over, taken.
     fn take_asked(&self) -> Vec<Requested> {
         self.asked.update_if(|asked| (!asked.is_empty(), std::mem::take(asked)))
+    }
+
+    /// The fetches waiting to be handed over, taken.
+    fn take_fetching(&self) -> Vec<Fetch> {
+        self.fetching.update_if(|fetching| (!fetching.is_empty(), std::mem::take(fetching)))
+    }
+
+    fn arrived(&self, fetch: u64, fetched: Fetched) {
+        self.fetched.update(|held| held.push((fetch, fetched)));
     }
 
     fn answered(&self, request: u64, outcome: Outcome) {
@@ -181,7 +247,8 @@ impl Page {
 
 /// The page a preview stands a block on — its signature from the outside,
 /// filled by hand: the page's filters and open record, the rows of the
-/// views it reads, and how its requests are answered. [`Fixture::page`]
+/// views it reads, how its requests are answered, and what its fetches
+/// bring back. [`Fixture::page`]
 /// is a [`Page`] with no shell behind it, so a block's `make(page)` runs
 /// natively, in a preview, a test or a window, exactly as it runs in the
 /// sandbox on the same page.
@@ -192,6 +259,7 @@ impl Page {
 ///     .record("task_7")
 ///     .rows(Rows { view: "work".into(), columns: vec!["title".into()], rows })
 ///     .answer(Outcome::Held)
+///     .fetches("https://api.example.com/rates", Fetched::Answered(rates))
 ///     .page();
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,16 +268,25 @@ pub struct Fixture {
     context: Context,
     reads: Vec<Rows>,
     answer: Outcome,
+    fetches: Vec<(String, Fetched)>,
 }
 
 impl Fixture {
     /// What a fixture answers a request when it names nothing else.
     pub const REFUSAL: &'static str = "a preview runs no actions";
 
+    /// What a fixture answers a fetch of a URL it holds nothing for.
+    pub const OFFLINE: &'static str = "a preview opens no network";
+
     /// An empty page: no filters, no open record, no rows; every request
-    /// refused.
+    /// and every fetch refused.
     pub fn new() -> Fixture {
-        Fixture { context: Context::default(), reads: Vec::new(), answer: Outcome::Refused(Fixture::REFUSAL.to_string()) }
+        Fixture {
+            context: Context::default(),
+            reads: Vec::new(),
+            answer: Outcome::Refused(Fixture::REFUSAL.to_string()),
+            fetches: Vec::new(),
+        }
     }
 
     /// The page's filters as the shell's [`Context`] says them, and its
@@ -248,12 +325,25 @@ impl Fixture {
         self
     }
 
+    /// What a fetch of `url` — the whole URL, as the block asks it —
+    /// brings back: at once, `fetched`. It replaces what the fixture held
+    /// for that URL.
+    pub fn fetches(mut self, url: impl Into<String>, fetched: Fetched) -> Fixture {
+        let url = url.into();
+        match self.fetches.iter_mut().find(|(held, _)| *held == url) {
+            Some((_, held)) => *held = fetched,
+            None => self.fetches.push((url, fetched)),
+        }
+        self
+    }
+
     /// The page, natively: [`Page::record`], [`Page::filters`] and
-    /// [`Page::rows`] read the fixture, and [`Page::request`] is answered
-    /// at once. Build it where the view is built — inside the preview, the
-    /// test's runtime or the window — since its reads are `State`s.
+    /// [`Page::rows`] read the fixture, and [`Page::request`] and
+    /// [`Page::fetch`] are answered at once. Build it where the view is
+    /// built — inside the preview, the test's runtime or the window —
+    /// since its reads are `State`s.
     pub fn page(self) -> Page {
-        Page::standing(self.context, self.reads, Some(self.answer))
+        Page::standing(self.context, self.reads, Some(Standing { answer: self.answer, fetches: self.fetches }))
     }
 }
 
@@ -368,25 +458,36 @@ impl<V: View> Guest<V> {
         out
     }
 
-    /// The requests the view made this turn: to the host when it grants
-    /// them, else answered as refused here, so the view can say so.
+    /// The requests and fetches the view made this turn: to the host when
+    /// it grants them, else answered as refused here, so the view can say
+    /// so.
     fn hand_over(&mut self, out: &mut Vec<u8>) {
         let asked = self.page.take_asked();
-        if asked.is_empty() {
-            return;
-        }
+        let fetching = self.page.take_fetching();
+        let mut refused = false;
         if self.granted(Capabilities::REQUESTS) {
             for requested in asked {
                 say(out, ToHost::Request(requested));
             }
         } else {
             for requested in asked {
+                refused = true;
                 self.page.answered(requested.request, Outcome::Refused("this shell grants this block no requests".to_string()));
             }
-            // the refusals are the view's to show
-            if self.session.is_some() {
-                self.present(out);
+        }
+        if self.granted(Capabilities::FETCHES) {
+            for fetch in fetching {
+                say(out, ToHost::Fetch(fetch));
             }
+        } else {
+            for fetch in fetching {
+                refused = true;
+                self.page.arrived(fetch.fetch, Fetched::Refused("this shell grants this block no network".to_string()));
+            }
+        }
+        // the refusals are the view's to show
+        if refused && self.session.is_some() {
+            self.present(out);
         }
     }
 
@@ -436,6 +537,10 @@ impl<V: View> Guest<V> {
                 self.page.answered(request, outcome);
                 true
             }
+            ToGuest::Fetched { fetch, fetched } if self.granted(Capabilities::FETCHES) => {
+                self.page.arrived(fetch, fetched);
+                true
+            }
             // an event of a kind the host did not grant
             ToGuest::Pointer { .. }
             | ToGuest::Wheel { .. }
@@ -446,7 +551,8 @@ impl<V: View> Guest<V> {
             | ToGuest::Tick { .. }
             | ToGuest::Context(_)
             | ToGuest::Rows(_)
-            | ToGuest::Answer { .. } => false,
+            | ToGuest::Answer { .. }
+            | ToGuest::Fetched { .. } => false,
         };
         self.touched |= moved;
     }
